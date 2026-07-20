@@ -1,0 +1,10 @@
+/bin/
+/build/
+*.out
+*.test
+*.tar
+.env
+# The generated run-credential keypair (ADR 0002): public half -> gofer secret,
+# private half -> the AEI controller. Kept out of git; stable across dev-up runs.
+.gofer-agent-key.env
+/server

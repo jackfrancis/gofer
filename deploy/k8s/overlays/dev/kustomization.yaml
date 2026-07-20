@@ -1,0 +1,9 @@
+# Dev overlay: gofer's application base plus its AEI dispatch registration. This
+# is what `make dev-up` applies; it assumes AEI is already installed on the
+# cluster (the agents.x-k8s.io CRDs, the aei-controller in aei-system, and an
+# AgentProviderClass named "gofer" — see agentapp.yaml).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - agentapp.yaml

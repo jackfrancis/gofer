@@ -1,0 +1,7 @@
+# The images package prebuilt linux binaries (see Dockerfile); send only those to
+# the build context, not the whole module tree (source, the sibling AEI checkout
+# is not here anyway, .git, etc.).
+*
+!bin
+bin/*
+!bin/linux

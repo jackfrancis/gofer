@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gofer</title>
+  {{if .RefreshSecs}}<meta http-equiv="refresh" content="{{.RefreshSecs}}">{{end}}
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="zz-container">
+    <header class="zz-header">
+      <span class="zz-brand">gofer</span>
+      {{if .User}}<span class="zz-user">{{with .User.Name}}{{.}}{{else}}{{.User.Email}}{{end}}</span>{{end}}
+    </header>
+
+    {{if eq .View "signin"}}
+      <div class="zz-signin">
+        <h1>Your work, ranked.</h1>
+        <p>Sign in to see your GitHub work ordered by what needs your attention.</p>
+        <div class="zz-actions">
+          {{range .Providers}}
+            <a class="btn btn-primary" href="/auth/{{.}}/login">Sign in with {{. | title}}</a>
+          {{else}}
+            <p>No sign-in providers are configured.</p>
+          {{end}}
+        </div>
+      </div>
+
+    {{else if eq .View "processing"}}
+      <div class="zz-empty">
+        <h1>Discovering your work&hellip;</h1>
+        <p>We're pulling your GitHub work and ranking it. This page refreshes automatically.</p>
+      </div>
+
+    {{else if eq .View "error"}}
+      <div class="zz-empty">
+        <h1>Something went wrong</h1>
+        {{if .Message}}
+        <p>We couldn't finish discovering your work:</p>
+        <p class="zz-error-detail">{{.Message}}</p>
+        {{else}}
+        <p>We couldn't load your work right now. Try again in a moment.</p>
+        {{end}}
+        <div class="zz-actions"><a class="btn btn-primary" href="/">Try again</a></div>
+      </div>
+
+    {{else if eq .View "thread"}}
+      <p><a href="/">&larr; Back to radar</a></p>
+      <div class="zz-thread-head">
+        <div class="zz-title"><a href="{{.Item.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.Item.GitHub.Title}}</a></div>
+        <div class="zz-meta">{{.Item.GitHub.Repo}}{{if .Item.GitHub.Number}} #{{.Item.GitHub.Number}}{{end}}</div>
+      </div>
+      <div class="zz-chat">
+        {{range .Item.Thread}}
+          <div class="zz-msg zz-msg--{{.Role}}">{{if eq .Role "agent"}}{{markdown .Content}}{{else}}{{.Content}}{{end}}</div>
+        {{else}}
+          <p class="zz-meta">Ask the assistant about this item &mdash; it can summarize the discussion, draft a review request, or suggest reviewers. It is read-only and never posts to GitHub.</p>
+        {{end}}
+      </div>
+      {{if .ConvEnabled}}
+      <form class="zz-chat-form" method="post" action="/items/thread">
+        <input type="hidden" name="id" value="{{.Item.ID}}">
+        <textarea name="content" rows="3" placeholder="e.g. draft a review request for this PR"></textarea>
+        <button class="btn btn-primary" type="submit">Send</button>
+      </form>
+      {{else}}
+      <p class="zz-meta">The assistant is not configured.</p>
+      {{end}}
+
+    {{else}}
+      <p class="zz-count">{{len .Items}} item{{if ne (len .Items) 1}}s{{end}} on your radar</p>
+      {{range .Items}}
+        <div class="zz-item">
+          <div class="zz-item-head">
+            <div class="zz-title"><a href="{{.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.GitHub.Title}}</a></div>
+            {{if $.ConvEnabled}}
+            <div class="zz-item-actions">
+              {{if .HasUnreadReply}}
+              <a class="btn btn-sm zz-discuss zz-discuss--unread" href="/items/thread?id={{.ID | urlquery}}" title="New assistant reply to read">&#10024; Discuss</a>
+              {{else}}
+              <a class="btn btn-sm zz-discuss" href="/items/thread?id={{.ID | urlquery}}">{{if .Thread}}&#10024; {{end}}Discuss</a>
+              {{end}}
+            </div>
+            {{end}}
+          </div>
+          <div class="zz-meta">
+            <span>{{.GitHub.Repo}} #{{.GitHub.Number}}</span>
+            <span class="Label {{priorityClass .Meta.Priority}}">{{with .Meta.Priority}}{{.}}{{else}}unranked{{end}}</span>
+            <span class="Label Label--secondary">{{typeLabel .Type}}</span>
+          </div>
+          <div class="zz-bar"><span class="zz-w-{{pctBucket .Meta.Rank}}"></span></div>
+          <div class="zz-axes">
+            <span>Relevance <b>{{axis2 .Meta.Relevance}}</b></span>
+            <span>Impact <b>{{axis2 .Meta.Impact}}</b></span>
+            <span>Engagement <b>{{axis2 .Meta.Engagement}}</b></span>
+            <span>Urgency <b>{{axis2 .Meta.Urgency}}</b></span>
+          </div>
+          {{with .Meta.Rationale}}<div class="zz-rationale">{{.}}</div>{{end}}
+        </div>
+      {{else}}
+        <div class="zz-empty"><p>Nothing on your radar right now.</p></div>
+      {{end}}
+    {{end}}
+  </div>
+</body>
+</html>

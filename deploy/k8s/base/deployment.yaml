@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gofer
+  namespace: gofer
+  labels:
+    app.kubernetes.io/name: gofer
+spec:
+  # replicas: 1 — the dev deployment keeps its state (vault + worklist store) in
+  # memory in this pod, so a second replica would not share it. Persistence /
+  # horizontal scale is a later concern.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gofer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gofer
+    spec:
+      serviceAccountName: gofer
+      securityContext:
+        runAsNonRoot: true
+        # distroless "nonroot" is UID/GID 65532; set it numerically so the kubelet
+        # can verify non-root (a non-numeric image USER fails the runAsNonRoot check).
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: server
+          # Loaded into kind by `make kind-load`; IfNotPresent so kind never tries
+          # to pull the localhost/ image from a registry.
+          image: localhost/gofer:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: gofer-config
+            - secretRef:
+                name: gofer-secrets
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

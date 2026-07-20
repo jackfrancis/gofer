@@ -1,0 +1,9 @@
+# gofer agent runtime (cmd/runtime), packaged from a prebuilt HOST binary (see the
+# note in Dockerfile). The AEI k8s-job launcher runs this image as a one-shot Job;
+# it makes outbound HTTPS to GitHub, the chat model, and gofer's own sink, so the
+# distroless/static base (with CA certs) suffices.
+FROM gcr.io/distroless/static:nonroot
+COPY bin/linux/runtime /runtime
+# Numeric UID/GID (distroless nonroot) so a runAsNonRoot pod can verify non-root.
+USER 65532:65532
+ENTRYPOINT ["/runtime"]
