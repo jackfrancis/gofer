@@ -1,0 +1,34 @@
+# gofer dev monitoring stack: Prometheus (scrapes gofer's /metrics + the
+# aei-controller's /metrics) and Grafana (a provisioned datasource + a starter
+# dashboard for gofer_review_all_* and aei_run_*). This is OPT-IN dev tooling, kept
+# out of the app overlay; apply it with `make dev-monitoring`.
+#
+# It assumes AEI is installed (for the aei-controller scrape target) but does not
+# require it — a missing controller just shows that one target down.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: gofer-monitoring
+
+resources:
+  - namespace.yaml
+  - prometheus-rbac.yaml
+  - prometheus.yaml
+  - grafana.yaml
+
+# Stable names (no content-hash suffix) so the Deployments' volume references resolve.
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: prometheus-config
+    files:
+      - prometheus.yml=files/prometheus.yml
+  - name: grafana-datasources
+    files:
+      - datasource.yml=files/grafana-datasource.yml
+  - name: grafana-dashboard-providers
+    files:
+      - providers.yml=files/grafana-dashboard-providers.yml
+  - name: grafana-dashboards
+    files:
+      - gofer.json=files/gofer-dashboard.json

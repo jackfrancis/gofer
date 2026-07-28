@@ -1,0 +1,32 @@
+# Prometheus discovers scrape targets through the Kubernetes API (pod service
+# discovery), so it needs cluster-wide read on pods/services/endpoints. This is dev
+# observability tooling; it reads nothing from gofer's or AEI's app data.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: gofer-monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gofer-prometheus
+rules:
+  - apiGroups: [""]
+    resources: [nodes, nodes/metrics, services, endpoints, pods]
+    verbs: [get, list, watch]
+  - nonResourceURLs: ["/metrics"]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gofer-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gofer-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: gofer-monitoring

@@ -1,0 +1,13 @@
+# Grafana dashboard provisioning: load every dashboard JSON mounted under the path
+# below (the gofer-dashboards ConfigMap) into a "gofer" folder on startup.
+apiVersion: 1
+providers:
+  - name: gofer
+    orgId: 1
+    folder: gofer
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

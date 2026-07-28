@@ -1,0 +1,11 @@
+# Grafana datasource provisioning: the in-cluster Prometheus. The fixed uid lets
+# the provisioned dashboard bind to it without manual wiring.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus.gofer-monitoring.svc:9090
+    isDefault: true
+    editable: false
