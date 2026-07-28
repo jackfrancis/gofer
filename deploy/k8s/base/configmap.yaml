@@ -28,11 +28,14 @@ data:
   # write results). Distinct from BASE_URL: the runtime resolves gofer's Service,
   # not the browser port-forward.
   GOFER_SINK_URL: "http://gofer.gofer.svc.cluster.local:8080"
-  # Chat model coordinates (OpenAI-compatible), non-secret. gofer BROKERS the model
-  # token: the web tier carries these coordinates to each runtime as run parameters
-  # (ai_endpoint, ai_model) and vends the token (AI_TOKEN, in gofer-secrets) per run
-  # as provider "ai", so the sandbox never holds a standing model secret. The model
-  # is enabled only when all three (endpoint, model, token) are set. Override for a
-  # different provider.
-  AI_ENDPOINT: "https://api.githubcopilot.com/chat/completions"
-  AI_MODEL: "claude-opus-4.8"
+  # Chat model connections (OpenAI-compatible), non-secret. gofer BROKERS the token:
+  # the web tier carries each connection's non-secret coordinates to a runtime as run
+  # parameters (ai_endpoint, ai_model) and vends the shared token (AI_TOKEN, in
+  # gofer-secrets) per run as provider "ai", so the sandbox never holds a standing
+  # model secret. AI is enabled only when AI_CONNECTIONS and AI_TOKEN are both set.
+  #
+  # AI_CONNECTIONS is a JSON array of {endpoint, models} in priority order: element 0
+  # is the default connection and each connection's models[0] is its default model.
+  # Every connection shares AI_TOKEN (fanned out at load); connections carry no token.
+  # Reorder the array to change the default. Example (one connection, two models):
+  AI_CONNECTIONS: '[{"endpoint":"https://api.githubcopilot.com/chat/completions","models":["claude-opus-4.8","gpt-5.4"]}]'
