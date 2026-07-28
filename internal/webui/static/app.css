@@ -37,8 +37,45 @@ body {
   text-decoration: none; font-size: 14px; font-weight: 500; cursor: pointer;
 }
 .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+/* Destructive action (Reset Conversations): outlined, not filled — it sits beside the
+   batch actions and should read as a deliberate choice, not a primary one. */
+.btn-danger { color: var(--danger); border-color: var(--danger); background: #fff; }
 
 .zz-count { color: var(--muted); font-size: 14px; margin: 0 0 16px; }
+
+/* Radar toolbar: item count on the left, batch actions (Review all PRs) on the
+   right. justify-content gives the horizontal separation between them; the
+   toolbar's own margin gives the vertical separation from the header above and the
+   items below. It wraps to two rows on narrow viewports. */
+.zz-toolbar {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 12px; margin: 0 0 16px;
+}
+.zz-toolbar .zz-count { margin: 0; }
+.zz-toolbar-actions { margin: 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.zz-toolbar-actions form { margin: 0; }
+
+/* No-JS dropdown: a <details> whose <summary> is the button and whose body is a
+   floating menu of per-model submit forms. Closes on submit (the page reloads). */
+.zz-menu { position: relative; display: inline-block; }
+.zz-menu > summary { list-style: none; }
+.zz-menu > summary::-webkit-details-marker { display: none; }
+.zz-menu > summary::marker { content: ""; }
+.zz-menu-list {
+  position: absolute; z-index: 20; top: calc(100% + 4px); left: 0;
+  min-width: 100%; white-space: nowrap;
+  background: #fff; border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(31, 35, 40, 0.12); padding: 4px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.zz-menu-list form { margin: 0; }
+.zz-menu-head { padding: 4px 10px 2px; font-size: 11px; color: var(--muted); }
+.zz-menu-item {
+  display: block; width: 100%; text-align: left;
+  background: none; border: 0; padding: 6px 10px; border-radius: 6px;
+  font: inherit; font-size: 13px; color: var(--fg); cursor: pointer;
+}
+.zz-menu-item:hover { background: var(--bg-subtle); }
 
 .zz-item {
   border: 1px solid var(--border); border-radius: 8px;
@@ -94,6 +131,16 @@ body {
 .zz-msg--agent { align-self: flex-start; background: var(--bg-subtle); border: 1px solid var(--border); }
 .zz-msg--agent a { color: var(--accent); }
 .zz-msg--agent pre { overflow-x: auto; background: #fff; padding: 8px; border-radius: 6px; }
+.zz-model { font-size: 12px; color: var(--muted); }
+.zz-msg .zz-msgfoot { display: flex; gap: 12px; align-items: center; margin-top: 8px; }
+.zz-msgfoot form { margin: 0; }
+.zz-linkbtn { background: none; border: 0; padding: 0; font-family: inherit; font-size: 12px; text-decoration: underline; cursor: pointer; color: var(--muted); }
+.zz-linkbtn:hover { color: var(--accent); }
+.zz-msg--user .zz-linkbtn { color: rgba(255, 255, 255, 0.85); }
+.zz-msg--user .zz-linkbtn:hover { color: #fff; }
+.zz-hidden { align-self: center; display: flex; gap: 8px; align-items: center; font-size: 12px; font-style: italic; color: var(--muted); }
+.zz-hidden form { margin: 0; }
+.zz-notice { align-self: center; margin: 2px 0; font-size: 12px; font-style: italic; color: var(--muted); }
 
 .zz-chat-form { display: flex; flex-direction: column; gap: 8px; }
 .zz-chat-form textarea {
@@ -101,3 +148,17 @@ body {
   font-family: inherit; font-size: 14px; resize: vertical;
 }
 .zz-chat-form button { align-self: flex-end; }
+.zz-chat-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
+.zz-model-picker { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+.zz-model-picker select {
+  padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px;
+  font-family: inherit; font-size: 13px; background: #fff;
+}
+.zz-so-form { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.zz-so-label { font-size: 13px; color: var(--muted); }
+.zz-so-select {
+  padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px;
+  font-family: inherit; font-size: 13px; background: #fff;
+}
+
+.zz-stalled { color: var(--attention); font-size: 13px; margin: 4px 0 12px; }

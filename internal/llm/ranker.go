@@ -3,9 +3,10 @@
 // not a model broker: the ranking model is called from the runtime, behind the
 // worklist.AxisRanker seam.
 //
-// It speaks the OpenAI-compatible chat-completions API, so any endpoint exposing
-// POST /chat/completions works (GitHub Copilot, OpenAI, Azure OpenAI, a
-// self-hosted gateway); the provider is a config value, not a code change.
+// It speaks two OpenAI-compatible transports, chosen per endpoint by its path:
+// chat-completions (POST /chat/completions) and the Responses API (POST /responses).
+// Either works against any endpoint that exposes it (GitHub Copilot, OpenAI, Azure
+// OpenAI, a self-hosted gateway); the provider and transport are config, not code.
 package llm
 
 import (
@@ -20,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackfrancis/gofer/internal/httpretry"
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
@@ -32,6 +34,19 @@ const (
 	copilotIntegrationID = "copilot-developer-cli"
 	maxBody              = 1 << 20 // 1 MiB; ranking responses are tiny
 )
+
+// defaultModelTimeout bounds a single model HTTP call. It is a SAFETY NET against a
+// hung connection, NOT the work budget: the caller's context — in the runtime, the
+// AEI run deadline — is what actually bounds a turn, and it is far larger (minutes).
+//
+// It is deliberately generous. A reasoning model re-reading a whole tool-call
+// transcript (up to maxToolIterations rounds, each carrying up to maxToolResultBytes
+// of tool output) routinely spends minutes on one round trip. A tight client timeout
+// here does not degrade gracefully: it aborts the turn while the run still has most
+// of its deadline left, and — because the client's transport is wrapped by httpretry,
+// so net/http cannot take its "known transport" path — it surfaces as a bare
+// "context deadline exceeded" that reads exactly like a run-deadline failure.
+const defaultModelTimeout = 5 * time.Minute
 
 // Config configures the chat-model ranker.
 type Config struct {
@@ -57,13 +72,23 @@ type Ranker struct {
 
 var _ worklist.AxisRanker = (*Ranker)(nil)
 
+// modelClient returns the HTTP client every model call shares: the caller's when it
+// supplied one, otherwise a default bounded by defaultModelTimeout. Either way it is
+// routed through httpretry, so a 429 (rate limit) is retried with Retry-After-aware,
+// jittered backoff instead of failing the run — and the jitter spreads a concurrent
+// burst (e.g. "Review all PRs") across the retry window.
+func modelClient(cfg Config) *http.Client {
+	c := cfg.Client
+	if c == nil {
+		c = &http.Client{Timeout: defaultModelTimeout}
+	}
+	return httpretry.Wrap(c)
+}
+
 // NewRanker builds a Ranker from an explicit endpoint + model (no defaults; the
 // caller validates them). A nil Client gets a default.
 func NewRanker(cfg Config) *Ranker {
-	if cfg.Client == nil {
-		cfg.Client = &http.Client{Timeout: 60 * time.Second}
-	}
-	return &Ranker{endpoint: cfg.Endpoint, model: cfg.Model, token: cfg.Token, client: cfg.Client}
+	return &Ranker{endpoint: cfg.Endpoint, model: cfg.Model, token: cfg.Token, client: modelClient(cfg)}
 }
 
 type chatMessage struct {
@@ -193,11 +218,16 @@ func chatComplete(ctx context.Context, httpClient *http.Client, endpoint, token 
 	return msg.Content, nil
 }
 
-// chat posts a chat-completions request and returns the assistant's message,
-// including any tool calls. Unlike chatComplete it does not require content,
-// since a tool-calling turn returns tool_calls with empty content. It always
-// sends the Copilot integration header (see copilotIntegrationID).
+// chat posts a request to the model and returns the assistant's message, including
+// any tool calls. Unlike chatComplete it does not require content, since a
+// tool-calling turn returns tool_calls with empty content. It dispatches on the
+// endpoint's API shape: an OpenAI Responses endpoint (path .../responses) is spoken
+// over the Responses transport, every other endpoint over OpenAI chat-completions.
+// Both send the Copilot integration header when the host is GitHub Copilot.
 func chat(ctx context.Context, httpClient *http.Client, endpoint, token string, body chatRequest) (chatMessage, error) {
+	if isResponsesEndpoint(endpoint) {
+		return responsesChat(ctx, httpClient, endpoint, token, body)
+	}
 	reqBody, err := json.Marshal(body)
 	if err != nil {
 		return chatMessage{}, fmt.Errorf("marshal request: %w", err)
@@ -206,14 +236,7 @@ func chat(ctx context.Context, httpClient *http.Client, endpoint, token string, 
 	if err != nil {
 		return chatMessage{}, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-	// GitHub Copilot requires this header; other OpenAI-compatible providers do
-	// not understand it, so send it only when actually targeting Copilot.
-	if targetsCopilot(endpoint) {
-		req.Header.Set("Copilot-Integration-Id", copilotIntegrationID)
-	}
+	setAuthHeaders(req, endpoint, token)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {

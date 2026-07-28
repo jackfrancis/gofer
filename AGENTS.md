@@ -61,6 +61,7 @@ Dockerfile           web-tier image (packages the prebuilt host binary)
 Dockerfile.runtime   agent-runtime image (cmd/runtime)
 deploy/k8s/base/     app manifests: namespace, SA, config, deployment, service
 deploy/k8s/overlays/dev/  base + AgentApp (gofer's AEI dispatch registration)
+deploy/kind/cluster.yaml  dev cluster topology (3 nodes; pod headroom for bulk fan-out)
 ```
 
 ## Cluster dev loop (kind)
@@ -82,6 +83,20 @@ AEI is the AEI project's job, never gofer's.
   are absent** — gofer is an AEI app and no longer runs standalone. `make
   dev-forward` port-forwards the web tier; `dev-down` / `dev-logs` / `cluster-up` /
   `cluster-down` round it out.
+- `cluster-up` creates a **three-node** cluster from `deploy/kind/cluster.yaml`
+  (`KIND_CONFIG` overrides it). One node is not enough headroom: a bulk action
+  ("Review all PRs", the review panel) dispatches one run per pull request, and on a
+  per-run substrate each run is its own sandbox pod — past the kubelet's default
+  110-pod ceiling, sandbox init starts failing with `procReady not received`. Raising
+  the ceiling is not a substitute for resource requests on the runtime pod — those
+  belong on the `AgentProviderClass`, which is AEI's side, not gofer's.
+  **Whoever creates the cluster owns its topology**, and AEI's `kind-up` usually wins:
+  it creates from its own `hack/kind/cluster.yaml` (one node) and, like gofer's target,
+  reuses an existing cluster untouched. To get the three nodes, hand AEI this config —
+  `make -C ../agent-execution-interface kind-up KIND_CLUSTER=gofer
+  KIND_CONFIG=$PWD/deploy/kind/cluster.yaml`. gofer's config is a deliberate **superset**
+  of AEI's (it copies the `ClusterTrustBundle*` / `PodCertificateRequest` gates Agent
+  Substrate's podcertcontroller needs, which are creation-time only); keep them in sync.
 - The web tier dispatches every run to the pre-installed controller through the
   `aeiapp` SDK and holds **no minting key** — only the verify-only public key. The
   `AgentApp` CR is gofer's app-side AEI contract (which SA may dispatch, the scope
@@ -129,7 +144,7 @@ AEI is the AEI project's job, never gofer's.
   runtime does.
 - The **chat-model token** (`AI_TOKEN`) is the same class of credential. It is
   **never** a web-pod secret: the web tier reads only the non-secret coordinates
-  (`AI_ENDPOINT`, `AI_MODEL`) to decide whether to offer the Discuss UI. The runtime
+  (`AI_CONNECTIONS`) to decide whether to offer the Discuss UI. The runtime
   runs the model and receives `AI_TOKEN` through its AEI provisioning (the
   `AgentProviderClass` / a runtime secret), never the web tier.
 - Least privilege: source scopes are READ; only gofer metadata is WRITE.

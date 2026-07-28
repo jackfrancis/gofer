@@ -103,15 +103,17 @@ func NewHandler(cfg *config.Config, sessions *session.Manager, vlt vault.Vault) 
 					return nil, fmt.Errorf("github: missing id")
 				}
 				email, _ := raw["email"].(string)
+				login, _ := raw["login"].(string)
 				name, _ := raw["name"].(string)
 				if name == "" {
-					name, _ = raw["login"].(string)
+					name = login
 				}
 				return &session.User{
 					ID:       "github:" + strconv.FormatInt(int64(id), 10),
 					Provider: "github",
 					Email:    email,
 					Name:     name,
+					Login:    login,
 				}, nil
 			},
 		}

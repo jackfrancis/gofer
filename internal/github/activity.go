@@ -52,6 +52,7 @@ type Activity struct {
 	Participants        int       // distinct people who commented or reviewed
 	InboundRefs         int       // cross-references from other issues/PRs (hub centrality)
 	OtherReviewers      int       // distinct reviewers other than login (someone else is engaged)
+	Commented           bool      // login themselves commented or reviewed — proves participation
 	AwaitingMeSince     time.Time // when login was asked to review with no engagement since; zero if none
 	AwaitingOthersSince time.Time // when the ball is in others' court; zero if none
 	RequestedByLogin    string    // who requested login's pending review (the actor); empty when none pending
@@ -116,6 +117,7 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 		}
 	}
 	a := Activity{Participants: len(participants), InboundRefs: inbound, OtherReviewers: len(otherReviewers)}
+	a.Commented = !myLastActivityAt.IsZero()
 
 	// Decide whose court the ball is in from the most recent court-changing event.
 	// Ball on login: a review was requested of them and they have not engaged

@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
@@ -64,10 +63,7 @@ var _ worklist.Conversationalist = (*Converser)(nil)
 // NewConverser builds a Converser from an explicit endpoint + model (no defaults;
 // the caller validates them). A nil Client gets a default.
 func NewConverser(cfg Config) *Converser {
-	if cfg.Client == nil {
-		cfg.Client = &http.Client{Timeout: 60 * time.Second}
-	}
-	return &Converser{endpoint: cfg.Endpoint, model: cfg.Model, token: cfg.Token, client: cfg.Client, log: cfg.Logger}
+	return &Converser{endpoint: cfg.Endpoint, model: cfg.Model, token: cfg.Token, client: modelClient(cfg), log: cfg.Logger}
 }
 
 // Reply produces the assistant's next turn from the item context, any freshly

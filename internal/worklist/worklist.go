@@ -44,6 +44,13 @@ const (
 	ReasonMentioned       Reason = "mentioned"
 	ReasonTeamMentioned   Reason = "team_mentioned"
 	ReasonCodeowner       Reason = "codeowner"
+	// ReasonInvolved is the honest fallback when the provider can only prove that the
+	// user is involved, not how: GitHub's involves: qualifier is a union (authored,
+	// assigned, mentioned, commented) and does not report which member matched. The
+	// specific relationships that the item payload proves are used instead where
+	// possible, and enrich upgrades this to ReasonCommented once the timeline shows the
+	// user actually spoke.
+	ReasonInvolved Reason = "involved"
 )
 
 // Origin records who set the metadata, so human overrides outrank agent values.
@@ -113,9 +120,9 @@ type WorkItem struct {
 	Source  string    `json:"source"` // "github"
 	Type    ItemType  `json:"type"`
 	GitHub  GitHubRef `json:"github"`
-	Signals Signals   `json:"signals"`             // observed facts that feed scoring
-	Meta    Metadata  `json:"gofer"`               // gofer's judgment derived from Signals
-	Thread  []Message `json:"thread,omitempty"`    // assistive conversation (ported later)
+	Signals Signals   `json:"signals"`          // observed facts that feed scoring
+	Meta    Metadata  `json:"gofer"`            // gofer's judgment derived from Signals
+	Thread  []Message `json:"thread,omitempty"` // assistive conversation (ported later)
 	// ThreadReadAt is when the owner last read the thread; zero means never. An
 	// agent reply newer than this is "unread", so the radar can flag threads with
 	// a response the user hasn't seen yet.

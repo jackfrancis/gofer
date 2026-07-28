@@ -21,12 +21,13 @@ import (
 // session) reaches it.
 type CredentialHandler struct {
 	vault   vault.Vault
-	aiToken string
+	aiToken string // shared chat-model bearer token, vended as provider "ai"
 }
 
-// NewCredentialHandler constructs a CredentialHandler over the vault. aiToken is
-// gofer's app-level chat-model token, brokered to runtimes as provider "ai"
-// (empty disables it); every other provider is a per-user vault credential.
+// NewCredentialHandler constructs a CredentialHandler over the vault. aiToken is the
+// shared chat-model token gofer brokers to runtimes as provider "ai" (every model on
+// the endpoint uses it; the model id travels as a run parameter). Every other
+// provider is a per-user vault credential. An empty aiToken disables the chat model.
 func NewCredentialHandler(v vault.Vault, aiToken string) *CredentialHandler {
 	return &CredentialHandler{vault: v, aiToken: aiToken}
 }
@@ -43,9 +44,11 @@ func (h *CredentialHandler) Vend(w http.ResponseWriter, r *http.Request) {
 	if provider == "" {
 		provider = "github"
 	}
-	// "ai" is gofer's app-level model token, not a per-user delegated credential:
-	// the web tier holds it and brokers it per run so the model secret is never a
-	// standing secret in the sandbox. Every other provider is a vault credential.
+	// "ai" is gofer's app-level chat-model token, not a per-user delegated
+	// credential: the web tier holds it and brokers it per run so the model secret is
+	// never a standing secret in the sandbox. Every model on the endpoint shares this
+	// one token; the model id travels as a run parameter. Every other provider is a
+	// vault credential.
 	if provider == "ai" {
 		if h.aiToken == "" {
 			writeError(w, http.StatusNotFound, "no credential for provider")

@@ -16,11 +16,20 @@ import (
 // a browser session) reaches them.
 type IngestHandler struct {
 	store worklist.Store
+	noter WritebackNoter
 }
 
-// NewIngestHandler constructs an IngestHandler.
-func NewIngestHandler(store worklist.Store) *IngestHandler {
-	return &IngestHandler{store: store}
+// WritebackNoter is notified when a runtime writes its result back, with the run's
+// id (the token's JobID). The batch tracker uses it to time a Review-all batch by
+// the exact instant each review lands. Optional; a nil noter disables the hook.
+type WritebackNoter interface {
+	NoteWriteback(runID string)
+}
+
+// NewIngestHandler constructs an IngestHandler. noter (optional; may be nil) is
+// notified of each write-back so a batch action can be timed to the last review.
+func NewIngestHandler(store worklist.Store, noter WritebackNoter) *IngestHandler {
+	return &IngestHandler{store: store, noter: noter}
 }
 
 type ingestRequest struct {
@@ -43,6 +52,11 @@ func (h *IngestHandler) Ingest(w http.ResponseWriter, r *http.Request) {
 	if err := h.store.Upsert(r.Context(), p.ActingUserID, body.Items...); err != nil {
 		writeError(w, http.StatusBadGateway, "could not persist work items")
 		return
+	}
+	// A workload write-back is a run reporting its result; let the batch tracker time
+	// Review-all by the instant each review lands (JobID is the run's id, ADR 0002).
+	if h.noter != nil && p.JobID != "" {
+		h.noter.NoteWriteback(p.JobID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ingested": len(body.Items)})
 }

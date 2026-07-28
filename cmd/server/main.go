@@ -55,7 +55,7 @@ func main() {
 	if cfg.ConversationEnabled {
 		log.Info("assistive conversation enabled (the runtime runs the model)")
 	} else {
-		log.Info("assistive conversation disabled (set AI_ENDPOINT and AI_MODEL to offer Discuss)")
+		log.Info("assistive conversation disabled (set AI_CONNECTIONS and AI_TOKEN to offer Discuss)")
 	}
 
 	handler, cleanup := server.New(cfg, log, engine, vlt, store)

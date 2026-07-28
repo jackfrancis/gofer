@@ -43,6 +43,16 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	if userText == "" {
 		return nil // the thread does not end on a user turn: nothing to answer
 	}
+	if p.Independent {
+		// An independent review answers blind: the model still sees the item and its
+		// live context, but not the prior thread (other reviewers), so it forms its
+		// own view before the consensus synthesis weighs them all.
+		history = nil
+	}
+	// The turn being answered is the thread's last message (a user turn, since
+	// userText is non-empty). Its kind tells us whether this reply is a consensus
+	// synthesis, whose leading verdict token we record as structured metadata.
+	triggerKind := item.Thread[len(item.Thread)-1].Kind
 
 	// Best-effort live context plus read-only GitHub tools: a vend failure (e.g.
 	// no credential) or an empty token leaves the assistant reasoning over the
@@ -76,9 +86,18 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	if err != nil {
 		return fmt.Errorf("converse: %w", err)
 	}
+	// A synthesis reply opens with a machine-readable verdict token (see
+	// synthesisPrompt): lift it into the structured Verdict field and strip it from the
+	// displayed content, so the radar can show agreement/disagreement deterministically.
+	content, verdict := reply, ""
+	if triggerKind == worklist.KindSynthesisRequest {
+		verdict, content = worklist.ParseVerdict(reply)
+	}
 	item.Thread = append(item.Thread, worklist.Message{
 		Role:    worklist.RoleAgent,
-		Content: reply,
+		Content: content,
+		Model:   p.Model,
+		Verdict: verdict,
 		At:      time.Now().UTC(),
 	})
 	// A completed conversation turn is fresh evidence: re-weight the item's ranking
@@ -103,7 +122,15 @@ func splitThread(thread []worklist.Message) (userText string, history []worklist
 	if n == 0 || thread[n-1].Role != worklist.RoleUser {
 		return "", nil
 	}
-	return thread[n-1].Content, thread[:n-1]
+	// Withhold hidden turns from the model: a turn the user hid is dropped from the
+	// history so it never rides along as context in a future turn.
+	for _, m := range thread[:n-1] {
+		if m.Hidden {
+			continue
+		}
+		history = append(history, m)
+	}
+	return thread[n-1].Content, history
 }
 
 // formatDiscussion renders a fetched GitHub discussion snapshot as compact plain

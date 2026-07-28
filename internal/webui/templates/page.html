@@ -52,35 +52,129 @@
         <div class="zz-meta">{{.Item.GitHub.Repo}}{{if .Item.GitHub.Number}} #{{.Item.GitHub.Number}}{{end}}</div>
       </div>
       <div class="zz-chat">
-        {{range .Item.Thread}}
-          <div class="zz-msg zz-msg--{{.Role}}">{{if eq .Role "agent"}}{{markdown .Content}}{{else}}{{.Content}}{{end}}</div>
+        {{range $i, $m := .Item.Thread}}
+          {{if isSynthesisRequest $m}}{{else if isSecondOpinionRequest $m}}
+          <div class="zz-notice">{{userHandle $.User}} has requested a 2nd review</div>
+          {{else if $m.Hidden}}
+          <div class="zz-hidden">
+            <span>Hidden {{if eq $m.Role "agent"}}reply{{else}}message{{end}}</span>
+            <form method="post" action="/items/thread/hide">
+              <input type="hidden" name="id" value="{{$.Item.ID}}">
+              <input type="hidden" name="msg" value="{{$i}}">
+              <input type="hidden" name="hidden" value="false">
+              <button class="zz-linkbtn" type="submit">Unhide</button>
+            </form>
+          </div>
+          {{else}}
+          <div class="zz-msg zz-msg--{{$m.Role}}">
+            {{if eq $m.Role "agent"}}{{markdown $m.Content}}{{else}}{{$m.Content}}{{end}}
+            <div class="zz-msgfoot">
+              {{if $m.Model}}<span class="zz-model">via {{$m.Model}}</span>{{end}}
+              <form method="post" action="/items/thread/hide">
+                <input type="hidden" name="id" value="{{$.Item.ID}}">
+                <input type="hidden" name="msg" value="{{$i}}">
+                <input type="hidden" name="hidden" value="true">
+                <button class="zz-linkbtn" type="submit" title="Hide this from the thread and from future model context">Hide</button>
+              </form>
+            </div>
+          </div>
+          {{end}}
         {{else}}
           <p class="zz-meta">Ask the assistant about this item &mdash; it can summarize the discussion, draft a review request, or suggest reviewers. It is read-only and never posts to GitHub.</p>
         {{end}}
       </div>
+      {{if .ReplyStalled}}
+      <p class="zz-stalled">The assistant hasn&rsquo;t responded &mdash; it may have been rate-limited or the run failed. Resend to try again.</p>
+      {{end}}
       {{if .ConvEnabled}}
       <form class="zz-chat-form" method="post" action="/items/thread">
         <input type="hidden" name="id" value="{{.Item.ID}}">
         <textarea name="content" rows="3" placeholder="e.g. draft a review request for this PR"></textarea>
-        <button class="btn btn-primary" type="submit">Send</button>
+        <div class="zz-chat-actions">
+          {{if gt (len .ModelOptions) 1}}
+          <label class="zz-model-picker">
+            <span class="zz-model-picker-label">Model</span>
+            <select name="choice">
+              {{range .ModelOptions}}<option value="{{.Value}}">{{.Label}}</option>{{end}}
+            </select>
+          </label>
+          {{end}}
+          <button class="btn btn-primary" type="submit">Send</button>
+        </div>
       </form>
+      {{if .SecondOpinionEnabled}}
+      <form class="zz-so-form" method="post" action="/items/second-opinion">
+        <input type="hidden" name="id" value="{{.Item.ID}}">
+        <label class="zz-so-label" for="zz-so-model">Review panel</label>
+        <select class="zz-so-select" id="zz-so-model" name="choice">
+          {{range .SecondOpinionOptions}}<option value="{{.Value}}">{{.Label}}</option>{{end}}
+        </select>
+        <button class="btn btn-sm" type="submit" title="An independent review by the selected model, then a consensus check by the default model">Run review panel</button>
+      </form>
+      {{end}}
       {{else}}
       <p class="zz-meta">The assistant is not configured.</p>
       {{end}}
 
     {{else}}
-      <p class="zz-count">{{len .Items}} item{{if ne (len .Items) 1}}s{{end}} on your radar</p>
+      <div class="zz-toolbar">
+        <p class="zz-count">{{len .Items}} item{{if ne (len .Items) 1}}s{{end}} on your radar</p>
+        <div class="zz-toolbar-actions">
+          <form method="post" action="/items/refresh">
+            <button class="btn btn-sm" type="submit" title="Pull in newly created or updated work from GitHub">Refresh</button>
+          </form>
+          {{if and .ConvEnabled .ReviewCount}}
+            {{if .ReviewModelOptions}}
+            <details class="zz-menu">
+              <summary class="btn btn-primary btn-sm">Review all PRs ({{.ReviewCount}})</summary>
+              <div class="zz-menu-list">
+                <div class="zz-menu-head">Review with&hellip;</div>
+                {{range .ReviewModelOptions}}
+                <form method="post" action="/items/review-all">
+                  <input type="hidden" name="choice" value="{{.Value}}">
+                  <button class="zz-menu-item" type="submit">{{.Label}}</button>
+                </form>
+                {{end}}
+              </div>
+            </details>
+            {{else}}
+            <form method="post" action="/items/review-all">
+              <button class="btn btn-primary btn-sm" type="submit" title="Review every pull request that hasn't been reviewed yet">Review all PRs{{if gt .ReviewCount 1}} ({{.ReviewCount}}){{end}}</button>
+            </form>
+            {{end}}
+          {{end}}
+          {{if eq .SecondOpinionMode "menu"}}
+          <details class="zz-menu">
+            <summary class="btn btn-sm">Get 2nd Opinion ({{.SecondOpinionCount}})</summary>
+            <div class="zz-menu-list">
+              <div class="zz-menu-head">2nd opinion with&hellip;</div>
+              {{range .SecondOpinionMenuOptions}}
+              <form method="post" action="/items/second-opinion-all">
+                <input type="hidden" name="choice" value="{{.Value}}">
+                <button class="zz-menu-item" type="submit">{{.Label}}</button>
+              </form>
+              {{end}}
+            </div>
+          </details>
+          {{else if eq .SecondOpinionMode "auto"}}
+          <form method="post" action="/items/second-opinion-all">
+            <button class="btn btn-sm" type="submit" title="The first reviews used different models — a different model is auto-picked per PR">Get 2nd Opinion ({{.SecondOpinionCount}})</button>
+          </form>
+          {{end}}
+          {{if .ResetCount}}
+          <form method="post" action="/items/reset-conversations">
+            <button class="btn btn-sm btn-danger" type="submit" title="Clear every Discuss thread so the review workflows can be run again from scratch. This cannot be undone; the work itself is untouched.">Reset Conversations ({{.ResetCount}})</button>
+          </form>
+          {{end}}
+        </div>
+      </div>
       {{range .Items}}
         <div class="zz-item">
           <div class="zz-item-head">
             <div class="zz-title"><a href="{{.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.GitHub.Title}}</a></div>
             {{if $.ConvEnabled}}
             <div class="zz-item-actions">
-              {{if .HasUnreadReply}}
-              <a class="btn btn-sm zz-discuss zz-discuss--unread" href="/items/thread?id={{.ID | urlquery}}" title="New assistant reply to read">&#10024; Discuss</a>
-              {{else}}
-              <a class="btn btn-sm zz-discuss" href="/items/thread?id={{.ID | urlquery}}">{{if .Thread}}&#10024; {{end}}Discuss</a>
-              {{end}}
+              <a class="btn btn-sm zz-discuss{{if .HasUnreadReply}} zz-discuss--unread{{end}}" href="/items/thread?id={{.ID | urlquery}}"{{with discussTitle .}} title="{{.}}"{{end}}>{{with discussBadge .}}{{.}} {{end}}Discuss</a>
             </div>
             {{end}}
           </div>

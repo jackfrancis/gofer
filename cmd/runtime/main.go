@@ -86,13 +86,15 @@ func run(ctx context.Context, rt *aeiruntime.Runtime) error {
 	}
 
 	return agent.Run(ctx, agent.Params{
-		JobType:    spec.TaskRef,
-		Provider:   "github",
-		ItemID:     spec.Parameters["item"],
-		Ranker:     ranker,
-		Converser:  converser,
-		Researcher: researcher,
-		Logger:     log,
+		JobType:     spec.TaskRef,
+		Provider:    "github",
+		ItemID:      spec.Parameters["item"],
+		Model:       aiModel,
+		Ranker:      ranker,
+		Converser:   converser,
+		Independent: strings.TrimSpace(spec.Parameters["independent"]) == "true",
+		Researcher:  researcher,
+		Logger:      log,
 	}, vendor, sink)
 }
 

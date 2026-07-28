@@ -11,10 +11,12 @@
 package agent
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -57,9 +59,11 @@ type Params struct {
 	Ranker        worklist.AxisRanker        // llm-rank ranker; nil uses the stub
 	RankLimit     int                        // max items to rank; 0 uses the default
 	ItemID        string                     // target item for a per-item job (github-converse/research)
+	Model         string                     // chat-model identifier stamped on agent replies (converse)
 	Converser     worklist.Conversationalist // github-converse assistant; required for that job
+	Independent   bool                       // converse: answer blind — omit prior thread turns (independent review)
 	Researcher    worklist.ResearchRanker    // github-research re-ranker; required for that job
-	EnrichLimit   int                        // max items to enrich/rank; 0 uses the default
+	EnrichLimit   int                        // optional cap on items to enrich; 0 enriches every item
 	Logger        *slog.Logger               // phase logger; nil uses slog.Default()
 }
 
@@ -72,9 +76,43 @@ func (p Params) logger() *slog.Logger {
 }
 
 const (
-	defaultRankLimit = 50
+	// defaultRankLimit is a SPEND ceiling, not a correctness bound: ranking costs one
+	// model call per item, so a very large worklist stops short rather than running up
+	// an unbounded bill. Unlike enrich it can afford to — it refines axes the
+	// deterministic baseline already computed for every item.
+	defaultRankLimit = 200
 	rankConcurrency  = 8
+	// rankReserve is the slice of the run's remaining time ranking leaves for writing
+	// its proposals back.
+	rankReserve = 30 * time.Second
+	// writeBackChunk bounds how many items one write-back carries. The agent sink caps
+	// a request body at 8 MiB and every item carries its whole conversation thread, so
+	// a large worklist is written in batches: no single request approaches the limit,
+	// and a failure part-way still lands the earlier batches.
+	writeBackChunk = 25
 )
+
+// hasBudget reports whether the run has more than reserve left before its deadline; a
+// context without a deadline always has budget. Every stage that fans out inside a
+// deadline-bounded run consults it, because an expired run persists NOTHING — a
+// partial pass that lands always beats a complete one that never returns.
+func hasBudget(ctx context.Context, reserve time.Duration) bool {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return true
+	}
+	return time.Until(deadline) > reserve
+}
+
+// writeBack persists items through the sink in bounded batches (writeBackChunk).
+func writeBack(ctx context.Context, sink Sink, items []worklist.WorkItem) error {
+	for start := 0; start < len(items); start += writeBackChunk {
+		if err := sink.Ingest(ctx, items[start:min(start+writeBackChunk, len(items))]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // Run executes the job selected by p.JobType against the given seams. The
 // in-process launcher and the standalone runtime both call it, so the runtime
@@ -124,7 +162,18 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	if len(items) == 0 {
 		return nil
 	}
-	if err := sink.Ingest(ctx, items); err != nil {
+	// Reconcile with what gofer already persists so a re-ingest (a Refresh, or an
+	// empty-worklist backfill) never clobbers per-item state GitHub cannot supply —
+	// the conversation thread and its read cursor, and the user/agent metadata
+	// overrides. The fresh GitHub fields and base signals come from the fetch; the
+	// chained enrich+rank re-derive the score. If the existing items cannot be read we
+	// proceed unreconciled rather than skip the refresh — a rare case, logged loudly.
+	if existing, lerr := sink.List(ctx); lerr == nil {
+		items = reconcileFetched(items, existing)
+	} else {
+		log.Warn("ingest: could not read existing items to reconcile; threads may reset", "err", lerr)
+	}
+	if err := writeBack(ctx, sink, items); err != nil {
 		return fmt.Errorf("ingest: %w", err)
 	}
 	// The backfill continues into enrich (per-item timeline signals) then rank
@@ -139,6 +188,34 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	}
 	log.Info("ingest: backfill complete", "items", len(items))
 	return nil
+}
+
+// reconcileFetched carries gofer-owned per-item state that GitHub cannot supply — the
+// conversation thread and its read cursor, the user/agent metadata overrides (hidden,
+// completed), and the original creation time — from the persisted items onto the
+// freshly fetched ones, keyed by ID. Fetched items with no persisted counterpart (new
+// work) pass through unchanged. This makes a re-ingest reconcile in place instead of
+// wiping the conversation, which is what a github-ingest write-back would otherwise do
+// (the fetch has no thread, and the store upsert replaces the whole item).
+func reconcileFetched(fetched, existing []worklist.WorkItem) []worklist.WorkItem {
+	prior := make(map[string]worklist.WorkItem, len(existing))
+	for _, it := range existing {
+		prior[it.ID] = it
+	}
+	for i := range fetched {
+		old, ok := prior[fetched[i].ID]
+		if !ok {
+			continue
+		}
+		fetched[i].Thread = old.Thread
+		fetched[i].ThreadReadAt = old.ThreadReadAt
+		fetched[i].Meta.HiddenAt = old.Meta.HiddenAt
+		fetched[i].Meta.CompletedAt = old.Meta.CompletedAt
+		if !old.CreatedAt.IsZero() {
+			fetched[i].CreatedAt = old.CreatedAt
+		}
+	}
+	return fetched
 }
 
 // runRank reads the user's persisted work, asks the AxisRanker to propose the
@@ -162,6 +239,17 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 		limit = defaultRankLimit
 	}
 	if len(items) > limit {
+		// Spend the model budget on the items the cheap, deterministic scorer already
+		// rates highest rather than on an arbitrary slice. enrich has just run, so those
+		// baselines are computed from complete signals.
+		now := time.Now().UTC()
+		baseline := make(map[string]float64, len(items))
+		for _, it := range items {
+			baseline[it.ID] = worklist.Score(it, now).Rank
+		}
+		slices.SortStableFunc(items, func(a, b worklist.WorkItem) int {
+			return cmp.Compare(baseline[b.ID], baseline[a.ID])
+		})
 		items = items[:limit]
 	}
 	log.Info("rank: proposing axes", "items", len(items), "stub", stub)
@@ -171,8 +259,13 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 		changed []worklist.WorkItem
 		wg      sync.WaitGroup
 		sem     = make(chan struct{}, rankConcurrency)
+		skipped int
 	)
 	for i := range items {
+		if !hasBudget(ctx, rankReserve) {
+			skipped = len(items) - i
+			break
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(i int) {
@@ -189,11 +282,11 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 		}(i)
 	}
 	wg.Wait()
-	log.Info("rank: applied proposals", "changed", len(changed))
+	log.Info("rank: applied proposals", "changed", len(changed), "skipped_out_of_time", skipped)
 	if len(changed) == 0 {
 		return nil
 	}
-	if err := sink.Ingest(ctx, changed); err != nil {
+	if err := writeBack(ctx, sink, changed); err != nil {
 		return fmt.Errorf("ingest: %w", err)
 	}
 	return nil

@@ -32,7 +32,7 @@ func TestAgentIngestWithRunToken(t *testing.T) {
 	)
 
 	store := worklist.NewMemoryStore()
-	h := NewIngestHandler(store)
+	h := NewIngestHandler(store, nil)
 	ingest := auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Ingest))
 
 	body, _ := json.Marshal(map[string]any{"items": []worklist.WorkItem{

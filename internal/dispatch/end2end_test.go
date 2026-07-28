@@ -41,7 +41,7 @@ func TestOneCredentialBothPlanes(t *testing.T) {
 		session.NewManager([]byte("test-session-secret-0123456789ab"), false),
 		authn.NewIdentityValidator(identity.NewEd25519Verifier(pub, "gofer-agent")),
 	)
-	ingestHandler := api.NewIngestHandler(store)
+	ingestHandler := api.NewIngestHandler(store, nil)
 	credentialHandler := api.NewCredentialHandler(vlt, "")
 
 	mux := http.NewServeMux()

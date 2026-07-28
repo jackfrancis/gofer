@@ -46,10 +46,7 @@ var _ worklist.ResearchRanker = (*ResearchRanker)(nil)
 // NewResearchRanker builds a ResearchRanker from an explicit endpoint + model (no
 // defaults; the caller validates them). A nil Client gets a default.
 func NewResearchRanker(cfg Config) *ResearchRanker {
-	if cfg.Client == nil {
-		cfg.Client = &http.Client{Timeout: 60 * time.Second}
-	}
-	return &ResearchRanker{endpoint: cfg.Endpoint, model: cfg.Model, token: cfg.Token, client: cfg.Client}
+	return &ResearchRanker{endpoint: cfg.Endpoint, model: cfg.Model, token: cfg.Token, client: modelClient(cfg)}
 }
 
 // researchDoc parses the model's multipliers with pointer fields so an OMITTED key

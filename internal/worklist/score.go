@@ -119,6 +119,7 @@ func relevanceScore(s Signals, c *[]Contribution) float64 {
 		ReasonAuthor:          0.6,
 		ReasonCommented:       0.5,
 		ReasonMentioned:       0.5,
+		ReasonInvolved:        0.5,
 		ReasonTeamMentioned:   0.4,
 	}
 	var best float64
@@ -301,6 +302,8 @@ func humanReason(r Reason) string {
 		return "a comment you left"
 	case ReasonMentioned:
 		return "a mention"
+	case ReasonInvolved:
+		return "work you are involved in"
 	case ReasonTeamMentioned:
 		return "a team mention"
 	default:

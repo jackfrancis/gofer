@@ -30,6 +30,7 @@ type User struct {
 	Provider string `json:"provider"` // google | github | microsoft
 	Email    string `json:"email"`
 	Name     string `json:"name"`
+	Login    string `json:"login,omitempty"` // provider handle (e.g. GitHub login), for @-mentions; may be empty
 }
 
 // data is the server-side payload associated with a session ID.
