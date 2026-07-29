@@ -17,6 +17,13 @@ ordered by that metadata.
 
 > **Project context & design:** [AGENTS.md](AGENTS.md).
 
+> **This branch selects a backend: [agentsessions](https://github.com/jackfrancis/agentsessions).**
+> `internal/runtime/agentsessions` implements `ingest.Dispatcher` by running each gofer
+> run as a durable agentsessions session: the run intent is journaled to a hash-chained
+> event log, an `api.Harness` executes gofer's workload (`internal/agent`) for that
+> turn, and `Status` is read back from the journal. Selecting it cost one wiring line in
+> `cmd/server` plus the dependency — no change to any gofer interface.
+
 ## The socket: where an agent runtime slots in
 
 gofer builds the full *intent* of every agent action (a `RunSpec`) and hands it to a

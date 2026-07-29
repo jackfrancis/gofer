@@ -21,10 +21,22 @@ no change to gofer's interfaces (see `internal/runtime` for the contract).
 A parallel branch `gofer-aei` keeps the previous, functional implementation whose
 dispatch layer was the Agent Execution Interface (AEI), as a reference.
 
+**This branch (`aei-agentsessions`) selects the agentsessions backend.**
+`internal/runtime/agentsessions` runs each gofer run as a durable agentsessions session
+(journaled run intent, an `api.Harness` executing `agent.Run`, `Status` read from the
+journal), wired by one line in `cmd/server`. It runs the workload IN-PROCESS against
+the vault and store, so it does not exercise the `/agent/*` plane or run-credential
+minting; and gofer's workload makes its own model calls rather than host-mediated ones
+(the converse tool loop needs a live ToolBox, and rank/enrich fan out concurrently
+while an agentsessions journal is single-writer), so replay/fork determinism is not
+claimed — the harness declares `ForkSafe: false`.
+
 ## Tech & layout
 
-- Go 1.26.0. No external agent-runtime dependency: gofer imports only its own
-  packages plus a few libraries (goldmark, bluemonday, prometheus, oauth2).
+- Go 1.26.0. gofer's own code depends only on its packages plus a few libraries
+  (goldmark, bluemonday, prometheus, oauth2); the SELECTED BACKEND brings its own
+  dependency — on this branch that is agentsessions (a local sibling checkout via a
+  `replace`), reached only from `internal/runtime/agentsessions`.
 - Module: `github.com/jackfrancis/gofer`.
 
 ```
@@ -34,7 +46,8 @@ internal/principal/  Principal{Kind, Subject, ActingUserID, Scopes}
 internal/identity/   run-credential authority (Ed25519); web verifies, a backend mints
 internal/vault/      delegated provider tokens; vended via internal/api credential broker
 internal/ingest/     Dispatcher seam + NoopDispatcher (THE runtime socket)
-internal/agent/      agent-runtime WORKLOAD (a backend runs it per run)
+internal/runtime/    the backend contract (doc.go) + agentsessions/ (this branch's backend)
+internal/agent/      agent-runtime WORKLOAD (a backend runs it per run) + Vendor/Sink adapters
 internal/worklist/   WorkItem + Metadata, Store + Ingestor seams, sort, scoring
 internal/auth/       OAuth provider wiring + login/callback
 internal/authn/      RequireAuth / RequireScope (cookie OR bearer)
