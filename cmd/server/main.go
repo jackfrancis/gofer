@@ -41,11 +41,12 @@ func main() {
 	}
 
 	// Select the agent-runtime backend. This is the ONE wiring point that changes to
-	// swap runtimes: a concrete backend (AEI, agent-sandbox, …) constructs its own
-	// ingest.Dispatcher and assigns it here, and nothing in gofer's interfaces or the
-	// web tier changes (see internal/runtime for the full backend contract). The
-	// default is NoopDispatcher, which accepts and drops runs, so the worklist stays
-	// empty until a backend that executes runs is selected.
+	// swap runtimes: a concrete backend constructs its own ingest.Dispatcher
+	// and is assigned here, and nothing in gofer's interfaces or the web tier changes.
+	// A backend owns its own configuration, so nothing backend-specific belongs above
+	// this line; see internal/runtime for the full backend contract.
+	//
+	// The no-op default accepts and drops runs, so the worklist stays empty.
 	var dispatcher ingest.Dispatcher = ingest.NoopDispatcher{}
 
 	handler, cleanup := server.New(cfg, log, dispatcher, vlt, store)

@@ -60,6 +60,10 @@
 //     whatever launches agent.Run under its substrate);
 //   - one line in cmd/server assigning that dispatcher.
 //
+// A backend reads its OWN configuration (env vars, files, credentials) inside its
+// package, never in cmd/server, so the wiring point stays backend-agnostic: selecting
+// a backend is a code change there, not a comment change.
+//
 // Never:
 //   - gofer's interfaces (ingest.Dispatcher, agent.Vendor/Sink, identity.Authority,
 //     worklist.Store/Ingestor) or its domain packages.
