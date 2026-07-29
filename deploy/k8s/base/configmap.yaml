@@ -17,6 +17,13 @@ data:
   # Binds a run credential to gofer's agent plane; a runtime's token must carry this
   # audience to authenticate there.
   AGENT_AUDIENCE: "gofer-agent"
+  # The selected agent-runtime backend's own configuration (internal/runtime/aei): the
+  # AEI dispatch API (the pre-installed aei-controller), which gofer POSTs runs to
+  # through the app SDK authenticating with its projected ServiceAccount token, and
+  # the AgentApp it dispatches as (must match the AgentApp metadata.name). The control
+  # plane bounds every run by that app's policy and fixes the credential's audience.
+  AEI_DISPATCH_ENDPOINT: "http://aei-controller.aei-system.svc:8080"
+  AEI_APP: "gofer"
   # The in-cluster URL a runtime would call back to reach gofer's agent plane
   # (/agent/credential to vend the user's GitHub token, /agent/worklist to read and
   # write results). Distinct from BASE_URL: the runtime resolves gofer's Service,
