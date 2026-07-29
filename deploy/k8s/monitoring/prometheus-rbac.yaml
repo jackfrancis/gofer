@@ -1,6 +1,6 @@
 # Prometheus discovers scrape targets through the Kubernetes API (pod service
 # discovery), so it needs cluster-wide read on pods/services/endpoints. This is dev
-# observability tooling; it reads nothing from gofer's or AEI's app data.
+# observability tooling; it reads nothing from gofer's app data.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

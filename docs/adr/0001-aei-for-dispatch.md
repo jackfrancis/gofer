@@ -1,6 +1,8 @@
 # ADR 0001 — AEI is gofer's agent-dispatch layer
 
-Status: accepted
+Status: superseded — the `gofer-clean` prototype removes AEI and replaces dispatch
+with a no-op socket (`ingest.Dispatcher` / `NoopDispatcher`). Retained for history;
+the `gofer-aei` branch keeps the AEI implementation this ADR describes.
 Date: 2026-07-15
 
 ## Context

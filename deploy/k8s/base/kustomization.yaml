@@ -1,8 +1,7 @@
-# gofer's application base: the web tier and its config. gofer is an AEI app and
-# depends on a pre-installed AEI control plane (the aei-controller); the web tier
-# dispatches every run there. The AEI dispatch registration (AgentApp) lives in the
-# dev overlay because it needs the agents.x-k8s.io CRDs. secret.example.yaml is a
-# template and is deliberately not listed (make dev-up creates the Secret).
+# gofer's application base: the web tier and its config. The web tier runs standalone;
+# any control-plane dependency comes with a concrete agent-runtime backend.
+# secret.example.yaml is a template and is deliberately not listed (make dev-up creates
+# the Secret).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:

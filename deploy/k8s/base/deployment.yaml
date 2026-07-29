@@ -20,9 +20,9 @@ spec:
       annotations:
         # gofer serves app-level Prometheus metrics at /metrics on the http port:
         # the "Review all PRs" batch wall-clock (gofer_review_all_*), the aggregate
-        # only the web tier can see. Per-run execution timing is AEI's, scraped from
-        # the aei-controller. Annotation-based scrape config; a ServiceMonitor works
-        # equally against the http port.
+        # only the web tier can see. Per-run execution timing would be the agent
+        # runtime's. Annotation-based scrape config; a ServiceMonitor works equally
+        # against the http port.
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
         prometheus.io/path: /metrics

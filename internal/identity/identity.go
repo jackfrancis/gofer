@@ -2,24 +2,13 @@
 // mints and verifies the per-run, capability-scoped, short-TTL, audience-bound
 // token an agent runtime carries (the "job token").
 //
-// WHY THIS LIVES IN GOFER, NOT AEI. AEI deliberately keeps identity a *seam*
-// (design tenet #4): its reference control plane mints an HMAC token and its
-// roadmap defers a hardened, attestation-backed profile (SPIFFE/SPIRE) to a later
-// phase. gofer needs zumble-zay's stronger posture *today* — an ASYMMETRIC issuer
-// where the dispatch/control tier holds the private key and is the sole minter,
-// while the web tier holds only the public key and can only VERIFY, so a web-tier
-// compromise can never forge a job token — plus AUDIENCE binding so a runtime
-// credential can never be replayed on the interactive user API.
-//
-// The right long-term shape is not "asymmetric mint hardcoded in AEI." It is a
-// small TokenAuthority seam in AEI's control plane (mirroring the CredentialSource
-// seam it already exposes for POST /vend), behind which a platform supplies its
-// own authority: gofer plugs in this Ed25519 authority; a Kubernetes-native
-// orchestrator like orka plugs in its kontxt TxToken transaction-token service
-// (audience-bound, scope-narrowing delegation, fail-closed brokering); a
-// production profile plugs in SPIFFE/SPIRE. Keeping crypto/policy in the platform
-// and only the seam in AEI is the CRI/CSI precedent AEI models itself on. See
-// docs/adr/0002-identity-authority-seam.md.
+// It is an ASYMMETRIC issuer by design: a runtime's control plane holds the private
+// key and is the sole minter, while gofer's web tier holds only the public key and can
+// only VERIFY — so a web-tier compromise can never forge a job token — plus AUDIENCE
+// binding so a runtime credential can never be replayed on the interactive user API.
+// gofer wires only the verifier; a backend supplies the minting half (this Ed25519
+// authority, or another — a transaction-token service, SPIFFE/SPIRE), keeping crypto
+// and policy in the platform behind this seam.
 package identity
 
 import (

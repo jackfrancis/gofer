@@ -1,10 +1,8 @@
-// Command server is gofer's web tier: it authenticates users, renders the
-// worklist ordered by gofer metadata, and dispatches agentic backfills to the AEI
-// control plane. gofer is an AEI *app*: it holds no dispatch engine, no launcher,
-// and no provider client — it POSTs runs to the pre-installed aei-controller
-// through the app SDK. The run credential it verifies is minted there with gofer's
-// Ed25519 authority (ADR 0002), so the web tier holds only the public key and can
-// never mint one.
+// Command server is gofer's web tier: it authenticates users and renders the
+// worklist ordered by gofer metadata. It selects the agent-runtime backend (an
+// ingest.Dispatcher) and wires the web handler; see internal/runtime for the backend
+// contract. The web tier verifies a runtime's run credential on its agent plane with
+// a public key only — it never mints one.
 package main
 
 import (
@@ -18,7 +16,7 @@ import (
 	"time"
 
 	"github.com/jackfrancis/gofer/internal/config"
-	"github.com/jackfrancis/gofer/internal/dispatch"
+	"github.com/jackfrancis/gofer/internal/ingest"
 	"github.com/jackfrancis/gofer/internal/server"
 	"github.com/jackfrancis/gofer/internal/vault"
 	"github.com/jackfrancis/gofer/internal/worklist"
@@ -33,32 +31,24 @@ func main() {
 		os.Exit(1)
 	}
 
-	if cfg.DispatchEndpoint == "" {
-		log.Error("AEI_DISPATCH_ENDPOINT must be set: gofer dispatches runs to the pre-installed AEI control plane")
-		os.Exit(1)
-	}
-
 	vlt := vault.NewMemoryVault()
 	store := worklist.NewMemoryStore()
 
-	// gofer dispatches to the AEI control plane (the aei-controller data plane) as
-	// its AgentApp, authenticating with the pod's projected ServiceAccount token.
-	// The control plane mints the run credential with gofer's Ed25519 authority and
-	// launches the runtime; the web tier only verifies that credential (with the
-	// public key from config) on its agent plane — it never mints and never embeds
-	// a control plane, launcher, or provider client.
-	engine := dispatch.New(dispatch.Config{
-		Endpoint: cfg.DispatchEndpoint,
-		App:      cfg.App,
-	})
-
 	if cfg.ConversationEnabled {
-		log.Info("assistive conversation enabled (the runtime runs the model)")
+		log.Info("assistive conversation enabled (the agent-runtime backend runs the model)")
 	} else {
 		log.Info("assistive conversation disabled (set AI_CONNECTIONS and AI_TOKEN to offer Discuss)")
 	}
 
-	handler, cleanup := server.New(cfg, log, engine, vlt, store)
+	// Select the agent-runtime backend. This is the ONE wiring point that changes to
+	// swap runtimes: a concrete backend (AEI, agent-sandbox, …) constructs its own
+	// ingest.Dispatcher and assigns it here, and nothing in gofer's interfaces or the
+	// web tier changes (see internal/runtime for the full backend contract). The
+	// default is NoopDispatcher, which accepts and drops runs, so the worklist stays
+	// empty until a backend that executes runs is selected.
+	var dispatcher ingest.Dispatcher = ingest.NoopDispatcher{}
+
+	handler, cleanup := server.New(cfg, log, dispatcher, vlt, store)
 	defer cleanup()
 
 	srv := &http.Server{
@@ -68,7 +58,7 @@ func main() {
 	}
 
 	go func() {
-		log.Info("gofer web tier listening", "addr", cfg.Addr, "dispatch", cfg.DispatchEndpoint, "app", cfg.App, "audience", cfg.Audience)
+		log.Info("gofer web tier listening", "addr", cfg.Addr, "audience", cfg.Audience)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("server error", "err", err)
 			os.Exit(1)

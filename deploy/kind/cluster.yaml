@@ -1,43 +1,8 @@
-# The gofer dev cluster topology: one control-plane node plus two workers.
+# The gofer dev cluster topology for `make cluster-up`: a single node.
 #
-# WHY THREE NODES. gofer's bulk actions fan out WIDE: "Review all PRs" and the
-# review panel dispatch one AEI run per pull request (dozens), and on a per-run
-# substrate — the `isolated` / agent-sandbox provider class — each run is its own
-# sandbox pod. A single node caps out at the kubelet's default 110-pod ceiling and
-# starves container init, which surfaces as "procReady not received" start failures
-# partway through a batch. Three nodes give roughly 330 pod slots and spread the
-# startup cost across three kubelets. That raises the CEILING, not a guarantee: the
-# runtime pods carry no resource requests, so the scheduler still packs them freely
-# (resource requests belong on the AgentProviderClass — AEI's side, not gofer's).
-#
-# WHO ACTUALLY USES THIS FILE. Whichever installer creates the cluster owns its
-# topology, and in practice AEI's `kind-up` usually wins that race: it creates the
-# cluster from its OWN config (KIND_CONFIG, default hack/kind/cluster.yaml — a single
-# node) and reuses an existing cluster untouched. gofer's `make cluster-up` only
-# creates a cluster when none exists. To make AEI build this topology instead:
-#
-#   make -C ../agent-execution-interface kind-up \
-#       KIND_CLUSTER=gofer KIND_CONFIG=$PWD/deploy/kind/cluster.yaml
-#
-# KEEP THE FEATURE GATES IN SYNC WITH AEI. The gates and runtimeConfig below are
-# copied from AEI's hack/kind/cluster.yaml: Agent Substrate's podcertcontroller
-# requires them, and they can only be set at cluster CREATION. A cluster built from
-# this file without them comes up healthy and then fails the durable path in
-# confusing ways, so this file is deliberately a SUPERSET of AEI's — topology added,
-# nothing removed. They need a Kubernetes v1.36+ node image; kind rejects unknown
-# feature gates outright.
-#
-# kind leaves the control-plane node schedulable, so all three carry workload, and
-# `kind load` publishes images to every node — no image or manifest change needed.
+# The web tier is a single pod, so one node is plenty. A backend that fans out one pod
+# per run may want a wider topology; point KIND_CONFIG at your own file for that.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
-  - role: worker
-  - role: worker
-featureGates:
-  ClusterTrustBundle: true
-  ClusterTrustBundleProjection: true
-  PodCertificateRequest: true
-runtimeConfig:
-  "certificates.k8s.io/v1beta1": "true"

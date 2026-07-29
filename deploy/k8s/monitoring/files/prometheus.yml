@@ -1,9 +1,6 @@
-# Prometheus scrape config for the gofer dev stack. It scrapes two targets:
-#   - gofer's web tier, discovered by the prometheus.io/scrape pod annotations
-#     (deploy/k8s/base/deployment.yaml) — the gofer_review_all_* batch metrics.
-#   - the aei-controller, a static target at the same service gofer dispatches to —
-#     the aei_run_* per-run timing. Its pods carry no annotations, so it is listed
-#     explicitly; a wrong name here just shows the target down, it breaks nothing.
+# Prometheus scrape config for the gofer dev stack. It scrapes gofer's web tier,
+# discovered by the prometheus.io/scrape pod annotations
+# (deploy/k8s/base/deployment.yaml) — the gofer_review_all_* app-level batch metrics.
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
@@ -33,8 +30,3 @@ scrape_configs:
       - source_labels: [__meta_kubernetes_pod_name]
         action: replace
         target_label: pod
-
-  - job_name: aei-controller
-    metrics_path: /metrics
-    static_configs:
-      - targets: ["aei-controller.aei-system.svc:8080"]

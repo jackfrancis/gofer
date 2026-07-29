@@ -1,6 +1,7 @@
 // Package server wires together routing, middleware, and handlers for the web
-// tier. It holds no substrate client and no launcher: agent dispatch is the AEI
-// dispatch engine, injected as *dispatch.Engine.
+// tier. It holds no substrate client and no launcher: the agent-runtime backend is
+// injected as an ingest.Dispatcher (see internal/runtime), and the /agent/* plane is
+// the runtime-facing contract a backend authenticates against.
 package server
 
 import (
@@ -12,7 +13,6 @@ import (
 	"github.com/jackfrancis/gofer/internal/auth"
 	"github.com/jackfrancis/gofer/internal/authn"
 	"github.com/jackfrancis/gofer/internal/config"
-	"github.com/jackfrancis/gofer/internal/dispatch"
 	"github.com/jackfrancis/gofer/internal/identity"
 	"github.com/jackfrancis/gofer/internal/ingest"
 	"github.com/jackfrancis/gofer/internal/metrics"
@@ -24,15 +24,17 @@ import (
 )
 
 // New builds the fully wired HTTP handler for the web tier over injected
-// dependencies. The dispatch engine backs ingestion (an empty worklist GET
-// triggers an agentic backfill) and serves the runtime-facing AEI ABI. The vault
-// holds delegated provider tokens the auth handler writes at login. The returned
-// cleanup is a no-op today (reserved for the staleness reconciler).
-func New(cfg *config.Config, log *slog.Logger, engine *dispatch.Engine, vlt vault.Vault, store worklist.Store) (http.Handler, func()) {
+// dependencies. The agent-runtime backend is injected as an ingest.Dispatcher, so
+// swapping backends (a no-op, AEI, agent-sandbox, …) never changes this package: the
+// web tier speaks only gofer's neutral dispatch seam. The vault holds delegated
+// provider tokens the auth handler writes at login. The returned cleanup is a no-op
+// today (reserved for the staleness reconciler).
+func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt vault.Vault, store worklist.Store) (http.Handler, func()) {
 	sessions := session.NewManager(cfg.SessionSecret, cfg.CookieSecure)
 	authH := auth.NewHandler(cfg, sessions, vlt)
-	// The web tier holds only the job-token verification key: it authenticates a
-	// runtime's bearer but cannot mint one (ADR 0002).
+	// The web tier holds only the run-credential verification key: it authenticates a
+	// runtime's bearer but cannot mint one. Minting is a runtime/control-plane concern;
+	// gofer keeps only the verifier.
 	authenticator := authn.New(sessions, authn.NewIdentityValidator(
 		identity.NewEd25519Verifier(cfg.MintPublicKey, cfg.Audience)))
 
@@ -45,7 +47,11 @@ func New(cfg *config.Config, log *slog.Logger, engine *dispatch.Engine, vlt vaul
 	conn := cfg.DefaultConnection()
 	aiEndpoint := conn.Endpoint
 	aiModel := conn.Default()
-	ingestor := ingest.New(engine, cfg.Audience, cfg.SinkURL, log, aiEndpoint, aiModel)
+	// The agent-runtime backend is injected (dispatcher); cmd/server selects it. The
+	// default NoopDispatcher accepts and drops runs (worklist stays empty); a backend
+	// that executes runs brings gofer to life without touching this package (see
+	// internal/runtime for the contract).
+	ingestor := ingest.New(dispatcher, cfg.Audience, cfg.SinkURL, log, aiEndpoint, aiModel)
 	// The thread's model picker spans every configured connection's models (default
 	// first). A model id offered by more than one connection is disambiguated with the
 	// connection label; the selected option carries the connection endpoint the turn
@@ -61,15 +67,10 @@ func New(cfg *config.Config, log *slog.Logger, engine *dispatch.Engine, vlt vaul
 			})
 		}
 	}
-	// gofer's own Prometheus metrics: app-level aggregates AEI cannot see. The
-	// ingestor reports the "Review all PRs" batch wall-clock here; per-run timing is
-	// AEI's, scraped from the control plane.
+	// gofer's own Prometheus metrics (app-level aggregates). Batch wall-clock timing is
+	// driven by run write-backs (NoteWriteback), so it is populated once a backend that
+	// writes results back is selected.
 	metric := metrics.New()
-	ingestor.SetBatchObserver(metric)
-	// After a review-panel's independent (blind) review writes back, the ingestor
-	// chains a consensus synthesis turn by the default model; it appends that prompt to
-	// the item's thread through the store before dispatching.
-	ingestor.SetThreadAppender(ingest.StoreThreadAppender(store))
 	worklistHandler := api.NewWorklistHandler(store, ingestor)
 	// The runtime write-back sink also notifies the batch tracker (NoteWriteback), so
 	// a Review-all batch is timed to the instant its last review lands.
@@ -148,17 +149,16 @@ func New(cfg *config.Config, log *slog.Logger, engine *dispatch.Engine, vlt vaul
 	// Worklist: the ordered set of work for the landing page.
 	mux.Handle("GET /api/worklist", authenticator.RequireAuth(http.HandlerFunc(worklistHandler.List)))
 
-	// Agent plane (workload tokens only, RequireScope). A runtime writes the items
-	// it produced, reads the acting user's persisted work, and vends the user's
-	// delegated provider token. The run credential is gofer's audience-bound Ed25519
-	// token (ADR 0002) — minted by the AEI control plane, verified here with only
-	// the public key — so a browser session can never reach these and a runtime
-	// credential can never reach /api/*.
+	// Agent plane — the RUNTIME-FACING CONTRACT (workload tokens only, RequireScope).
+	// An agent-runtime backend authenticates here with its audience-bound run
+	// credential to: write the items it produced, read the acting user's persisted
+	// work, and vend the user's delegated provider token. The two planes stay disjoint
+	// (a browser session can never reach these; a run credential can never reach
+	// /api/*).
 	mux.Handle("POST /agent/worklist", authenticator.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(ingestHandler.Ingest)))
 	mux.Handle("GET /agent/worklist", authenticator.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(ingestHandler.List)))
 	// The credential broker: a runtime vends the acting user's delegated provider
-	// token here. This replaces AEI's POST /vend for gofer's own tokens — the
-	// control plane runs on the aei-controller, which has no access to gofer's vault.
+	// token here, so it never holds a standing secret.
 	mux.Handle("GET /agent/credential", authenticator.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(credentialHandler.Vend)))
 
 	// Global middleware chain (outermost first).

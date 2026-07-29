@@ -4,7 +4,7 @@
 *.test
 *.tar
 .env
-# The generated run-credential keypair (ADR 0002): public half -> gofer secret,
-# private half -> the AEI controller. Kept out of git; stable across dev-up runs.
+# The generated run-credential keypair: public half -> gofer secret (verify-only);
+# the private half a runtime's minter would hold is unused here. Kept out of git.
 .gofer-agent-key.env
 /server
