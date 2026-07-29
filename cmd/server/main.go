@@ -17,6 +17,7 @@ import (
 
 	"github.com/jackfrancis/gofer/internal/config"
 	"github.com/jackfrancis/gofer/internal/ingest"
+	"github.com/jackfrancis/gofer/internal/runtime/agentsessions"
 	"github.com/jackfrancis/gofer/internal/server"
 	"github.com/jackfrancis/gofer/internal/vault"
 	"github.com/jackfrancis/gofer/internal/worklist"
@@ -46,8 +47,19 @@ func main() {
 	// A backend owns its own configuration, so nothing backend-specific belongs above
 	// this line; see internal/runtime for the full backend contract.
 	//
-	// The no-op default accepts and drops runs, so the worklist stays empty.
-	var dispatcher ingest.Dispatcher = ingest.NoopDispatcher{}
+	// This build runs the workload on agentsessions.
+	runtimeBackend, err := agentsessions.New(agentsessions.Config{
+		Vault:   vlt,
+		Store:   store,
+		AIToken: cfg.DefaultConnection().Token,
+		Logger:  log,
+	})
+	if err != nil {
+		log.Error("agent runtime backend error", "err", err)
+		os.Exit(1)
+	}
+	defer func() { _ = runtimeBackend.Close() }()
+	var dispatcher ingest.Dispatcher = runtimeBackend
 
 	handler, cleanup := server.New(cfg, log, dispatcher, vlt, store)
 	defer cleanup()
