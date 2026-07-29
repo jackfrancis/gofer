@@ -1,7 +1,9 @@
-# Dev overlay for `make dev-up`. The web app needs no dispatch registration, so the
-# overlay is just the application base. A concrete agent-runtime backend adds its own
-# registration here (e.g. a CR binding gofer's ServiceAccount to a runtime/provider).
+# Dev overlay for `make dev-up`: gofer's application base plus the dispatch
+# registration its selected agent-runtime backend needs. It assumes AEI is already
+# installed on the cluster (the agents.x-k8s.io CRDs, the aei-controller in aei-system,
+# and an AgentProviderClass — see agentapp.yaml).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - ../../base
+  - agentapp.yaml
