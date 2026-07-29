@@ -34,13 +34,27 @@ type BackfillProber interface {
 	BackfillFailure(ctx context.Context, ownerID string) (failed bool, message string, err error)
 }
 
+// BackfillCompleter optionally reports that an owner's most recent backfill run
+// finished SUCCESSFULLY. Resolve consults it (when the ingestor implements it) so an
+// empty worklist a completed run genuinely produced — a user with no open work — reads
+// as StatusReady with no items, instead of spinning on StatusProcessing forever.
+// Without it, "finished and found nothing" is indistinguishable from "still working".
+type BackfillCompleter interface {
+	// BackfillSucceeded reports whether ownerID's most recent backfill run completed
+	// successfully. A run still in flight, one that failed, or no tracked run at all
+	// reports false.
+	BackfillSucceeded(ctx context.Context, ownerID string) (bool, error)
+}
+
 // Resolve is the shared read model for a user's worklist, used by both the JSON
 // API and the HTML UI so the two cannot drift. It loads the owner's items, and:
 //
 //   - if there are none, triggers an idempotent backfill and returns
-//     StatusProcessing with no items — unless the ingestor is a BackfillProber and
-//     reports the backfill run has failed, in which case it returns StatusFailed
-//     with the run's message so the failure is visible instead of a stuck spinner;
+//     StatusProcessing with no items — unless the ingestor reports the backfill has
+//     reached a terminal state: a FAILED run returns StatusFailed with the run's
+//     message so the failure is visible instead of a stuck spinner, and a SUCCEEDED
+//     run returns StatusReady with no items, because the radar is genuinely empty
+//     rather than still being discovered;
 //   - otherwise rescores agent-derived items against now (time-dependent axes
 //     decay between writes), preserving human overrides (OriginUser), sorts by
 //     key/desc, and returns StatusReady.
@@ -59,6 +73,15 @@ func Resolve(ctx context.Context, store Store, ingestor Ingestor, now time.Time,
 		if prober, ok := ingestor.(BackfillProber); ok {
 			if failed, msg, perr := prober.BackfillFailure(ctx, ownerID); perr == nil && failed {
 				return Resolution{Status: StatusFailed, Message: msg}, nil
+			}
+		}
+		// A backfill that COMPLETED and still left the worklist empty means the user
+		// genuinely has no open work — not that discovery is still running. Report it
+		// as ready-and-empty so the radar shows its empty state instead of spinning
+		// forever (the run is not re-dispatched until it goes stale).
+		if completer, ok := ingestor.(BackfillCompleter); ok {
+			if done, cerr := completer.BackfillSucceeded(ctx, ownerID); cerr == nil && done {
+				return Resolution{Status: StatusReady, Items: []WorkItem{}}, nil
 			}
 		}
 		return Resolution{Status: StatusProcessing}, nil

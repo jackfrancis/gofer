@@ -79,14 +79,18 @@ const (
 )
 
 // backfill is the most recent ingest run tracked for one owner, so a run that fails
-// can be surfaced (BackfillFailure) instead of leaving the worklist spinning, and a
-// healthy run is not re-dispatched by every poll of an empty worklist.
+// can be surfaced (BackfillFailure) instead of leaving the worklist spinning, a run
+// that succeeds without producing work can be reported as genuinely empty
+// (BackfillSucceeded), and a healthy run is not re-dispatched by every poll of an
+// empty worklist. A terminal outcome is cached here, so the backend is probed once
+// per run rather than once per page render.
 type backfill struct {
-	id      string
-	at      time.Time
-	failed  bool
-	message string
-	logged  bool
+	id        string
+	at        time.Time
+	failed    bool
+	succeeded bool
+	message   string
+	logged    bool
 }
 
 // Ingestor turns web-tier actions into agent run requests and submits them through a
@@ -104,8 +108,9 @@ type Ingestor struct {
 }
 
 var (
-	_ worklist.Ingestor       = (*Ingestor)(nil)
-	_ worklist.BackfillProber = (*Ingestor)(nil)
+	_ worklist.Ingestor          = (*Ingestor)(nil)
+	_ worklist.BackfillProber    = (*Ingestor)(nil)
+	_ worklist.BackfillCompleter = (*Ingestor)(nil)
 )
 
 // New builds an Ingestor that submits runs through d. audience binds a run's
@@ -178,44 +183,78 @@ func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string) error {
 	return nil
 }
 
-// BackfillFailure reports whether ownerID's most recent backfill run has failed, with
-// the run's failure message, by reading its lifecycle from the backend
-// (Dispatcher.Status). The failure is logged once. A run still in flight, one that
-// succeeded, or a transient status-read error reports failed=false so the caller keeps
-// waiting. With a backend that runs nothing (NoopDispatcher) no run can fail, so this
-// always reports "not failed".
-func (i *Ingestor) BackfillFailure(ctx context.Context, ownerID string) (bool, string, error) {
+// probeRun reports the lifecycle of ownerID's tracked backfill run, reading it from
+// the backend (Dispatcher.Status) only while the run is still in flight: once a run is
+// observed terminal the outcome is cached on the run, so the empty-worklist poll costs
+// one status read per RUN rather than one per page render. A transient read error is
+// returned so the caller keeps waiting rather than declaring an outcome.
+func (i *Ingestor) probeRun(ctx context.Context, ownerID string) (failed, succeeded bool, message string, err error) {
 	i.mu.Lock()
 	cur := i.runs[ownerID]
 	i.mu.Unlock()
-	if cur == nil {
-		return false, "", nil
-	}
-	if cur.failed {
-		return true, cur.message, nil
-	}
-	if cur.id == "" {
-		return false, "", nil // the backend reported no run to probe
+	switch {
+	case cur == nil:
+		return false, false, "", nil // nothing dispatched yet
+	case cur.failed:
+		return true, false, cur.message, nil
+	case cur.succeeded:
+		return false, true, "", nil
+	case cur.id == "":
+		return false, false, "", nil // the backend reported no run to probe
 	}
 	res, err := i.d.Status(ctx, cur.id)
 	if err != nil {
-		return false, "", err // transient; keep waiting
+		return false, false, "", err // transient; keep waiting
 	}
-	if res.Phase != "Failed" {
-		return false, "", nil
-	}
-	i.mu.Lock()
-	// Record on the run we probed; a concurrent EnsureBackfill may have moved on.
-	if latest := i.runs[ownerID]; latest != nil && latest.id == cur.id {
-		latest.failed = true
-		latest.message = res.Message
-		if !latest.logged {
-			i.log.Warn("backfill run failed", "owner", ownerID, "run_id", cur.id, "error", res.Message)
-			latest.logged = true
+	switch res.Phase {
+	case "Failed":
+		i.mu.Lock()
+		// Record on the run we probed; a concurrent EnsureBackfill may have moved on.
+		if latest := i.runs[ownerID]; latest != nil && latest.id == cur.id {
+			latest.failed = true
+			latest.message = res.Message
+			if !latest.logged {
+				i.log.Warn("backfill run failed", "owner", ownerID, "run_id", cur.id, "error", res.Message)
+				latest.logged = true
+			}
 		}
+		i.mu.Unlock()
+		return true, false, res.Message, nil
+	case "Succeeded":
+		i.mu.Lock()
+		if latest := i.runs[ownerID]; latest != nil && latest.id == cur.id {
+			latest.succeeded = true
+		}
+		i.mu.Unlock()
+		return false, true, "", nil
 	}
-	i.mu.Unlock()
-	return true, res.Message, nil
+	return false, false, "", nil // still running
+}
+
+// BackfillFailure reports whether ownerID's most recent backfill run has failed, with
+// the run's failure message, by reading its lifecycle from the backend. The failure is
+// logged once. A run still in flight, one that succeeded, or a transient status-read
+// error reports failed=false so the caller keeps waiting. With a backend that runs
+// nothing (NoopDispatcher) no run can fail, so this always reports "not failed".
+func (i *Ingestor) BackfillFailure(ctx context.Context, ownerID string) (bool, string, error) {
+	failed, _, message, err := i.probeRun(ctx, ownerID)
+	if err != nil {
+		return false, "", err
+	}
+	return failed, message, nil
+}
+
+// BackfillSucceeded reports whether ownerID's most recent backfill run completed
+// successfully. The read model uses it to tell "finished and found nothing" apart from
+// "still discovering", so a user with no open work sees an empty radar rather than a
+// permanent spinner. A backend that runs nothing (NoopDispatcher) reports no run id, so
+// this stays false and the worklist keeps its "Discovering…" state.
+func (i *Ingestor) BackfillSucceeded(ctx context.Context, ownerID string) (bool, error) {
+	_, succeeded, _, err := i.probeRun(ctx, ownerID)
+	if err != nil {
+		return false, err
+	}
+	return succeeded, nil
 }
 
 // Converse requests a github-converse run: an assistant answers the user's latest

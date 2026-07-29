@@ -19,6 +19,19 @@ func renderPage(t *testing.T, data pageData) string {
 	return buf.String()
 }
 
+// A backfill that completed and found nothing resolves as ready-with-no-items, which
+// must render the radar's empty state — not the "Discovering…" spinner a user with no
+// open work would otherwise stare at forever.
+func TestWorklistEmptyStateAfterCompletedBackfill(t *testing.T) {
+	out := renderPage(t, pageData{View: "worklist", Items: nil})
+	if !strings.Contains(out, "Nothing on your radar right now.") {
+		t.Fatalf("expected the empty state, got:\n%s", out)
+	}
+	if strings.Contains(out, "Discovering your work") {
+		t.Fatal("a completed-but-empty backfill must not render the discovering spinner")
+	}
+}
+
 // The "Review all PRs" toolbar button appears only when the assistant is
 // configured and the radar holds at least one pull request, and posts to the
 // concurrent-review endpoint.

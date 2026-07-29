@@ -51,6 +51,31 @@ func (f *failingIngestor) BackfillFailure(context.Context, string) (bool, string
 	return true, f.msg, nil
 }
 
+// completedIngestor implements BackfillCompleter and reports a backfill that finished
+// successfully — the case where the user genuinely has no open work.
+type completedIngestor struct{}
+
+func (c *completedIngestor) EnsureBackfill(context.Context, string) error { return nil }
+func (c *completedIngestor) BackfillSucceeded(context.Context, string) (bool, error) {
+	return true, nil
+}
+
+// A backfill that completed and still produced nothing means the radar is genuinely
+// empty, so the read model reports ready-with-no-items instead of spinning on
+// "processing" forever.
+func TestResolveCompletedEmptyBackfillIsReady(t *testing.T) {
+	res, err := Resolve(context.Background(), NewMemoryStore(), &completedIngestor{}, time.Now(), "u1", DefaultSort, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != StatusReady {
+		t.Fatalf("status = %q, want %q (a completed backfill that found nothing)", res.Status, StatusReady)
+	}
+	if len(res.Items) != 0 {
+		t.Fatalf("want no items, got %d", len(res.Items))
+	}
+}
+
 func TestResolveEmptyTriggersBackfill(t *testing.T) {
 	store := NewMemoryStore()
 	ing := &fakeIngestor{}

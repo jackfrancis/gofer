@@ -94,6 +94,55 @@ func (d *failingDispatcher) Status(context.Context, string) (RunStatus, error) {
 	return RunStatus{Phase: "Failed", Message: "boom"}, nil
 }
 
+// countingDispatcher records how many times the backend's Status is read, so a test can
+// assert the empty-worklist poll does not re-probe a run whose outcome is already known.
+type countingDispatcher struct {
+	recordDispatcher
+	statusCalls int
+}
+
+func (d *countingDispatcher) Status(context.Context, string) (RunStatus, error) {
+	d.statusCalls++
+	return RunStatus{Phase: "Succeeded"}, nil
+}
+
+// A backfill that finished successfully is reported as such, so the read model can tell
+// "found nothing" apart from "still discovering". The outcome is cached, so repeated
+// polls cost one status read per run rather than one per render.
+func TestBackfillSucceededIsReportedAndCached(t *testing.T) {
+	d := &countingDispatcher{}
+	ig := New(d, "", "", nil, "", "")
+	if err := ig.EnsureBackfill(context.Background(), "github:1"); err != nil {
+		t.Fatalf("EnsureBackfill: %v", err)
+	}
+	for range 3 {
+		done, err := ig.BackfillSucceeded(context.Background(), "github:1")
+		if err != nil || !done {
+			t.Fatalf("BackfillSucceeded = (%v, %v), want (true, nil)", done, err)
+		}
+	}
+	// A succeeded run is not a failure.
+	if failed, _, err := ig.BackfillFailure(context.Background(), "github:1"); err != nil || failed {
+		t.Fatalf("BackfillFailure = (%v, %v), want (false, nil)", failed, err)
+	}
+	if d.statusCalls != 1 {
+		t.Fatalf("probed the backend %d times, want 1 (a terminal outcome is cached)", d.statusCalls)
+	}
+}
+
+// With no backend executing runs there is no run id to probe, so success is never
+// claimed and the worklist keeps its "Discovering…" state.
+func TestBackfillSucceededFalseWithoutRuntime(t *testing.T) {
+	ig := New(NoopDispatcher{}, "", "", nil, "", "")
+	if err := ig.EnsureBackfill(context.Background(), "github:1"); err != nil {
+		t.Fatalf("EnsureBackfill: %v", err)
+	}
+	done, err := ig.BackfillSucceeded(context.Background(), "github:1")
+	if err != nil || done {
+		t.Fatalf("BackfillSucceeded = (%v, %v), want (false, nil)", done, err)
+	}
+}
+
 // A failed backfill must reach the read model, instead of leaving the worklist
 // spinning on "Discovering…" forever.
 func TestBackfillFailureSurfacesFailedRun(t *testing.T) {
