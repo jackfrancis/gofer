@@ -30,9 +30,12 @@
 //     llm-rank, github-converse, github-research) against two small seams:
 //     - agent.Vendor: vend the acting user's delegated provider token for the run.
 //     - agent.Sink:   read and write the user's worklist.
-//     These seams support BOTH shapes with no change to the workload:
-//     - in-process: back Vendor/Sink with gofer's vault + store directly.
-//     - out-of-process: back them with HTTP clients to gofer's /agent/* plane.
+//     gofer SUPPLIES both shapes, so a backend writes no plumbing of its own
+//     (internal/agent/adapters.go):
+//     - in-process:     agent.NewVaultVendor + agent.NewStoreSink (vault + store).
+//     - out-of-process: agent.NewPlaneClient (one client that is both Vendor and
+//     Sink over /agent/credential and /agent/worklist, authenticating
+//     with the run credential).
 //     A backend supplies whatever launches agent.Run under its substrate (a binary, a
 //     pod, an in-process goroutine); the workload code is gofer's and is reused as-is.
 //

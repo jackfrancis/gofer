@@ -62,3 +62,55 @@ func TestBackfillNeverFailsWithoutRuntime(t *testing.T) {
 		t.Fatalf("BackfillFailure = (%v, %q, %v), want (false, \"\", nil)", failed, msg, err)
 	}
 }
+
+// The empty-worklist view polls EnsureBackfill on every render, so a healthy in-flight
+// run must NOT be re-dispatched: against a backend that really executes runs, that
+// would be a run storm.
+func TestEnsureBackfillDoesNotPileOnRuns(t *testing.T) {
+	d := &recordDispatcher{}
+	ig := New(d, "", "", nil, "", "")
+	for range 3 {
+		if err := ig.EnsureBackfill(context.Background(), "github:1"); err != nil {
+			t.Fatalf("EnsureBackfill: %v", err)
+		}
+	}
+	if len(d.specs) != 1 {
+		t.Fatalf("dispatched %d runs, want 1 (the in-flight run gates the rest)", len(d.specs))
+	}
+	// Refresh is the explicit user action, so it always dispatches.
+	if err := ig.Refresh(context.Background(), "github:1"); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if len(d.specs) != 2 {
+		t.Fatalf("dispatched %d runs, want 2 (Refresh forces one)", len(d.specs))
+	}
+}
+
+// failingDispatcher accepts a run and then reports it failed — the lifecycle a backend
+// surfaces through Status.
+type failingDispatcher struct{ recordDispatcher }
+
+func (d *failingDispatcher) Status(context.Context, string) (RunStatus, error) {
+	return RunStatus{Phase: "Failed", Message: "boom"}, nil
+}
+
+// A failed backfill must reach the read model, instead of leaving the worklist
+// spinning on "Discovering…" forever.
+func TestBackfillFailureSurfacesFailedRun(t *testing.T) {
+	d := &failingDispatcher{}
+	ig := New(d, "", "", nil, "", "")
+	if err := ig.EnsureBackfill(context.Background(), "github:1"); err != nil {
+		t.Fatalf("EnsureBackfill: %v", err)
+	}
+	failed, msg, err := ig.BackfillFailure(context.Background(), "github:1")
+	if err != nil || !failed || msg != "boom" {
+		t.Fatalf("BackfillFailure = (%v, %q, %v), want (true, \"boom\", nil)", failed, msg, err)
+	}
+	// A failed run is not treated as in-flight, so the next poll retries it.
+	if err := ig.EnsureBackfill(context.Background(), "github:1"); err != nil {
+		t.Fatalf("EnsureBackfill (retry): %v", err)
+	}
+	if len(d.specs) != 2 {
+		t.Fatalf("dispatched %d runs, want 2 (a failed run retries)", len(d.specs))
+	}
+}

@@ -72,7 +72,22 @@ const (
 	converseDeadline = 15 * time.Minute
 	// reviewConcurrency bounds how many review turns a bulk action dispatches at once.
 	reviewConcurrency = 8
+	// retryAfter bounds how long a tracked backfill run is treated as in-flight before
+	// EnsureBackfill dispatches a fresh one. It matches the ingest run deadline, so a
+	// healthy run is never piled on while a lost or stuck run eventually retries.
+	retryAfter = ingestDeadline
 )
+
+// backfill is the most recent ingest run tracked for one owner, so a run that fails
+// can be surfaced (BackfillFailure) instead of leaving the worklist spinning, and a
+// healthy run is not re-dispatched by every poll of an empty worklist.
+type backfill struct {
+	id      string
+	at      time.Time
+	failed  bool
+	message string
+	logged  bool
+}
 
 // Ingestor turns web-tier actions into agent run requests and submits them through a
 // Dispatcher. It implements worklist.Ingestor and worklist.BackfillProber.
@@ -83,6 +98,9 @@ type Ingestor struct {
 	aiEndpoint string
 	aiModel    string
 	log        *slog.Logger
+
+	mu   sync.Mutex
+	runs map[string]*backfill // ownerID -> most recent ingest run
 }
 
 var (
@@ -98,7 +116,7 @@ func New(d Dispatcher, audience, sinkURL string, log *slog.Logger, aiEndpoint, a
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log}
+	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log, runs: map[string]*backfill{}}
 }
 
 // runParams builds the parameters shared by every dispatched run: the owner, the sink
@@ -118,9 +136,19 @@ func (i *Ingestor) runParams(ownerID string) map[string]string {
 }
 
 // EnsureBackfill requests a github-ingest run for ownerID so an empty worklist gets
-// populated. The default NoopDispatcher accepts and drops it, so the worklist stays
-// empty (Discovering…) until a backend that executes runs is selected.
+// populated. It dispatches at most one run at a time per owner: while a recent,
+// non-failed run is still tracked this is a no-op, so the empty-worklist poll that
+// drives the "Discovering…" view cannot pile up runs against a backend that really
+// executes them. A failed or stale run (older than retryAfter) is re-dispatched, so a
+// reload retries after a failure or a lost run.
 func (i *Ingestor) EnsureBackfill(ctx context.Context, ownerID string) error {
+	i.mu.Lock()
+	cur := i.runs[ownerID]
+	inFlight := cur != nil && !cur.failed && time.Since(cur.at) < retryAfter
+	i.mu.Unlock()
+	if inFlight {
+		return nil
+	}
 	return i.dispatchIngest(ctx, ownerID)
 }
 
@@ -130,9 +158,10 @@ func (i *Ingestor) Refresh(ctx context.Context, ownerID string) error {
 	return i.dispatchIngest(ctx, ownerID)
 }
 
-// dispatchIngest submits a github-ingest run for ownerID.
+// dispatchIngest submits a github-ingest run for ownerID and tracks it, so
+// BackfillFailure can report its outcome and EnsureBackfill can gate on it.
 func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string) error {
-	_, err := i.d.Submit(ctx, RunSpec{
+	id, err := i.d.Submit(ctx, RunSpec{
 		TaskRef:    "github-ingest",
 		Parameters: i.runParams(ownerID),
 		Subject:    ownerID,
@@ -140,14 +169,53 @@ func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string) error {
 		Audience:   i.audience,
 		Deadline:   ingestDeadline,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	i.mu.Lock()
+	i.runs[ownerID] = &backfill{id: id, at: time.Now()}
+	i.mu.Unlock()
+	return nil
 }
 
-// BackfillFailure reports whether ownerID's most recent backfill failed. The default
-// NoopDispatcher runs nothing, so none can fail and it reports "not failed"; a backend
-// that executes runs surfaces genuine failures through Dispatcher.Status.
+// BackfillFailure reports whether ownerID's most recent backfill run has failed, with
+// the run's failure message, by reading its lifecycle from the backend
+// (Dispatcher.Status). The failure is logged once. A run still in flight, one that
+// succeeded, or a transient status-read error reports failed=false so the caller keeps
+// waiting. With a backend that runs nothing (NoopDispatcher) no run can fail, so this
+// always reports "not failed".
 func (i *Ingestor) BackfillFailure(ctx context.Context, ownerID string) (bool, string, error) {
-	return false, "", nil
+	i.mu.Lock()
+	cur := i.runs[ownerID]
+	i.mu.Unlock()
+	if cur == nil {
+		return false, "", nil
+	}
+	if cur.failed {
+		return true, cur.message, nil
+	}
+	if cur.id == "" {
+		return false, "", nil // the backend reported no run to probe
+	}
+	res, err := i.d.Status(ctx, cur.id)
+	if err != nil {
+		return false, "", err // transient; keep waiting
+	}
+	if res.Phase != "Failed" {
+		return false, "", nil
+	}
+	i.mu.Lock()
+	// Record on the run we probed; a concurrent EnsureBackfill may have moved on.
+	if latest := i.runs[ownerID]; latest != nil && latest.id == cur.id {
+		latest.failed = true
+		latest.message = res.Message
+		if !latest.logged {
+			i.log.Warn("backfill run failed", "owner", ownerID, "run_id", cur.id, "error", res.Message)
+			latest.logged = true
+		}
+	}
+	i.mu.Unlock()
+	return true, res.Message, nil
 }
 
 // Converse requests a github-converse run: an assistant answers the user's latest
