@@ -14,16 +14,10 @@ data:
   BASE_URL: "http://localhost:8080"
   # false because the dev port-forward is plain http; set true behind TLS.
   COOKIE_SECURE: "false"
-  # Binds run credentials to the agent plane (ADR 0002); must match the AgentApp
-  # spec.identity.audience. The AEI control plane stamps this on the token it mints.
-  AEI_AUDIENCE: "gofer-agent"
-  # The AEI dispatch API (the pre-installed aei-controller): gofer POSTs runs here
-  # through the app SDK, authenticating with its projected ServiceAccount token.
-  AEI_DISPATCH_ENDPOINT: "http://aei-controller.aei-system.svc:8080"
-  # The AgentApp gofer dispatches as (must match the AgentApp metadata.name). The
-  # control plane bounds every run by that app's policy and fixes the audience.
-  AEI_APP: "gofer"
-  # The in-cluster URL a runtime calls back to reach gofer's agent plane
+  # Binds a run credential to gofer's agent plane; a runtime's token must carry this
+  # audience to authenticate there.
+  AGENT_AUDIENCE: "gofer-agent"
+  # The in-cluster URL a runtime would call back to reach gofer's agent plane
   # (/agent/credential to vend the user's GitHub token, /agent/worklist to read and
   # write results). Distinct from BASE_URL: the runtime resolves gofer's Service,
   # not the browser port-forward.

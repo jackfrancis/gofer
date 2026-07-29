@@ -1,8 +1,5 @@
 # gofer web tier. The binary is built on the HOST (`make image` -> `build-linux`),
-# not inside this stage, because gofer consumes the AEI modules through local
-# `replace` directives to a sibling checkout (../agent-execution-interface) that
-# lies outside any single-module Docker build context; a host build resolves them
-# natively. This image only packages the prebuilt static binary.
+# not inside this stage; this image only packages the prebuilt static binary.
 #
 # distroless/static: no shell, non-root by default, ships CA certs for the
 # outbound HTTPS to the OAuth providers, GitHub, and the chat model.

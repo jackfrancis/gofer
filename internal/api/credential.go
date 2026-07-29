@@ -11,9 +11,8 @@ import (
 
 // CredentialHandler is the agent-plane credential broker: a runtime fetches the
 // acting user's delegated provider token (GET /agent/credential?provider=github)
-// to call the provider directly. It replaces AEI's POST /vend for gofer's own
-// delegated tokens — the control plane runs on the aei-controller, which has no
-// access to gofer's vault, so gofer vends from its own domain plane instead.
+// to call the provider directly. gofer vends from its own domain plane so a runtime
+// never needs access to gofer's vault.
 //
 // The token is scoped to the caller's ActingUserID (from the verified run
 // credential), held by the runtime for the run only, and never a standing secret.

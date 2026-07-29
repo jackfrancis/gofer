@@ -1,13 +1,13 @@
-// Package agent is the ephemeral agent runtime pipeline. Its entrypoint Run
-// dispatches on job type (github-ingest, github-enrich, llm-rank, github-converse,
-// github-research) and works against small seams (Vendor, Sink), so the runtime
-// behaves identically no matter which AEI substrate runs it.
+// Package agent is the agent-runtime WORKLOAD: the work an agent runtime executes on
+// gofer's behalf. Its entrypoint Run dispatches on job type (github-ingest,
+// github-enrich, llm-rank, github-converse, github-research) and works against small
+// seams (Vendor, Sink), so it behaves identically no matter what substrate runs it —
+// an agent-runtime backend calls Run behind its Dispatcher (see internal/runtime).
 //
-// It runs only in the agent runtime (cmd/runtime), never the web tier: gofer is a
-// credential broker, not a data broker, so the agent vends the user's credential
-// and connects to GitHub directly, then writes results back through the Sink — it
-// never sees the user's raw token until it is vended, and never writes anywhere but
-// gofer.
+// It is deliberately provider-direct: gofer is a credential broker, not a data broker,
+// so the workload vends the user's credential and connects to GitHub directly, then
+// writes results back through the Sink — it never sees the user's raw token until it
+// is vended, and never writes anywhere but gofer.
 package agent
 
 import (
@@ -36,8 +36,8 @@ const (
 )
 
 // Vendor exchanges a run's authorization for the acting user's delegated provider
-// credential. In-process it reads the vault; out-of-process it calls the AEI
-// broker (POST /vend). The runtime never holds a standing secret.
+// credential. In-process it reads the vault; out-of-process it calls gofer's
+// credential broker (GET /agent/credential). The runtime never holds a standing secret.
 type Vendor interface {
 	Vend(ctx context.Context, provider string) (accessToken string, err error)
 }

@@ -16,10 +16,10 @@ import (
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
-// A gofer run credential — the audience-bound Ed25519 token the control plane now
-// mints via gofer's TokenAuthority — authenticates gofer's own agent plane: the
-// runtime writes results to /agent/worklist with the same token it uses for the
-// AEI ABI. This proves the token unification (ADR 0002).
+// A gofer run credential — an audience-bound Ed25519 token a runtime's control plane
+// mints via gofer's authority — authenticates gofer's own agent plane: a runtime
+// writes results to /agent/worklist with that token. This exercises the agent-plane
+// verifier (the token is minted in the test to stand in for a backend's minter).
 func TestAgentIngestWithRunToken(t *testing.T) {
 	pub, priv, err := identity.GenerateEd25519()
 	if err != nil {

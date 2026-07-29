@@ -23,24 +23,14 @@ type Config struct {
 	CookieSecure   bool
 	Providers      Providers
 
-	// DispatchEndpoint is the AEI dispatch API base URL (the pre-installed
-	// aei-controller), e.g. "http://aei-controller.aei-system.svc:8080". gofer POSTs
-	// runs there through the app SDK (AEI_DISPATCH_ENDPOINT).
-	DispatchEndpoint string
-
-	// App is the AgentApp name gofer dispatches as (AEI_APP). The control plane
-	// bounds every run by that app's policy and fixes the credential's audience.
-	App string
-
-	// SinkURL is the in-cluster URL a runtime calls back to reach gofer's agent
-	// plane (/agent/worklist, /agent/credential). It differs from BaseURL (the
-	// browser-facing URL): a runtime Job pod resolves gofer's Service, not the
-	// port-forward. Carried to each run in its parameters (GOFER_SINK_URL).
+	// SinkURL is the in-cluster URL an agent runtime would call back to reach gofer's
+	// agent plane (/agent/worklist, /agent/credential). It differs from BaseURL (the
+	// browser-facing URL): a runtime pod resolves gofer's Service, not the
+	// port-forward. Carried to each run in its parameters as gofer_url (GOFER_SINK_URL).
 	SinkURL string
 
-	// Audience binds run credentials to the agent plane (ADR 0002); it must match
-	// the AgentApp's spec.identity.audience so the token the control plane mints
-	// verifies here.
+	// Audience binds a run credential to gofer's agent plane; a runtime's token must
+	// carry this audience to authenticate there (AGENT_AUDIENCE).
 	Audience string
 
 	// BotReviewers are GitHub logins whose review requests are automated rather
@@ -63,10 +53,10 @@ type Config struct {
 	// will grow this list, so callers read element 0 for now.
 	AIConnections []AIConnection
 
-	// MintPublicKey verifies run credentials. gofer's web tier holds ONLY this: the
-	// AEI control plane (configured with gofer's Ed25519 authority) is the sole
-	// minter, so the web tier authenticates a runtime's token but can never forge
-	// one (ADR 0002). Provisioned explicitly via MINT_PUBLIC_KEY.
+	// MintPublicKey verifies run credentials on the agent plane. gofer's web tier
+	// holds ONLY the public half: a runtime's control plane is the sole minter, so the
+	// web tier authenticates a runtime's token but can never forge one. Provisioned
+	// explicitly via MINT_PUBLIC_KEY.
 	MintPublicKey ed25519.PublicKey
 }
 
@@ -316,10 +306,8 @@ func Load() (*Config, error) {
 			},
 			MicrosoftTenant: getEnv("MICROSOFT_TENANT", "common"),
 		},
-		DispatchEndpoint:    os.Getenv("AEI_DISPATCH_ENDPOINT"),
-		App:                 getEnv("AEI_APP", "gofer"),
 		SinkURL:             getEnv("GOFER_SINK_URL", "http://gofer.gofer.svc.cluster.local:8080"),
-		Audience:            getEnv("AEI_AUDIENCE", "gofer-agent"),
+		Audience:            getEnv("AGENT_AUDIENCE", "gofer-agent"),
 		BotReviewers:        botReviewers,
 		ConversationEnabled: len(conns) > 0,
 		// The ordered list of chat-model connections from AI_CONNECTIONS, each sharing
@@ -330,14 +318,14 @@ func Load() (*Config, error) {
 }
 
 // loadVerifyKey resolves the Ed25519 public key the web tier uses to verify run
-// credentials (ADR 0002). gofer's web tier is verify-only: the AEI control plane
-// holds the private key and is the sole minter, so MINT_PUBLIC_KEY is required and
-// there is deliberately no private-key or derived-key path here — a web tier that
-// could derive the private key would not be verify-only.
+// credentials on the agent plane. gofer's web tier is verify-only: a runtime's
+// control plane holds the private key and is the sole minter, so MINT_PUBLIC_KEY is
+// required and there is deliberately no private-key or derived-key path here — a web
+// tier that could derive the private key would not be verify-only.
 func loadVerifyKey() (ed25519.PublicKey, error) {
 	s := os.Getenv("MINT_PUBLIC_KEY")
 	if s == "" {
-		return nil, fmt.Errorf("MINT_PUBLIC_KEY must be set: the web tier verifies run credentials with the AEI control plane's gofer public key (base64-encoded %d-byte Ed25519 public key)", ed25519.PublicKeySize)
+		return nil, fmt.Errorf("MINT_PUBLIC_KEY must be set: the web tier verifies a runtime's run credentials with this public key (base64-encoded %d-byte Ed25519 public key)", ed25519.PublicKeySize)
 	}
 	raw, err := base64.StdEncoding.DecodeString(s)
 	if err != nil || len(raw) != ed25519.PublicKeySize {

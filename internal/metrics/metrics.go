@@ -1,9 +1,10 @@
 // Package metrics exposes gofer's Prometheus metrics: app-level aggregates that
-// only the web tier can see. Per-run execution timing is AEI's to report — it owns
-// dispatch and holds the authoritative run timestamps (aeiapp.Result.Timing). gofer
-// measures what AEI structurally cannot: the wall-clock of a whole app action, such
-// as the "Review all PRs" batch, which is one gofer action fanned out to many
-// independent AEI runs. Handler serves the metrics at /metrics for Prometheus.
+// only the web tier can see, such as the wall-clock of a whole app action (the
+// "Review all PRs" batch — one gofer action fanned out to many runs). Batch timing is
+// driven by run write-backs, so it is populated once a backend that writes results
+// back is selected. Per-run execution timing is the agent runtime's to report; gofer
+// measures only what the app tier structurally can. Handler serves the metrics at
+// /metrics for Prometheus.
 package metrics
 
 import (

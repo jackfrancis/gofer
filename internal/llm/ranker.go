@@ -37,7 +37,7 @@ const (
 
 // defaultModelTimeout bounds a single model HTTP call. It is a SAFETY NET against a
 // hung connection, NOT the work budget: the caller's context — in the runtime, the
-// AEI run deadline — is what actually bounds a turn, and it is far larger (minutes).
+// run deadline — is what actually bounds a turn, and it is far larger (minutes).
 //
 // It is deliberately generous. A reasoning model re-reading a whole tool-call
 // transcript (up to maxToolIterations rounds, each carrying up to maxToolResultBytes

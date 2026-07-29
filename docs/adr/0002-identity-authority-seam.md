@@ -1,6 +1,8 @@
 # ADR 0002 — Identity is a pluggable authority seam (Ed25519 by default)
 
-Status: accepted
+Status: partially superseded — in the `gofer-clean` prototype no runtime mints run
+credentials, so only the verify-only half of this seam is wired. The authority
+design below is retained for when a runtime is added.
 Date: 2026-07-15
 
 ## Context
