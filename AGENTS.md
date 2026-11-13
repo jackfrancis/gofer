@@ -53,6 +53,7 @@ internal/api/        JSON handlers: worklist, agent sink, credential broker
 internal/server/     web-tier router + middleware
 internal/webui/      landing page
 internal/github/     GitHub client (workload-only)
+internal/checkout/   unpack a repo tarball safely; search/list/read it (workload-only)
 internal/llm/        LLM ranking / converse (workload-only)
 internal/markdown/   render + sanitize assistant Markdown
 internal/metrics/    Prometheus metrics
@@ -126,7 +127,11 @@ Wired on the web-tier side; they define what a runtime must respect:
   workload-only change (`internal/agent`, `internal/llm`, `internal/github`) to the
   kind cluster without that restart, use `make kind-load-runtime`.
 - The conversation's tool loop is capped at `maxToolIterations` rounds
-  (`internal/llm/converse.go`); the model's GitHub tools are in `internal/agent/tools.go`.
+  (`internal/llm/converse.go`); the model's GitHub tools are in `internal/agent/tools.go`,
+  and the whole-repository tools (`repo_checkout`/`repo_search`/`repo_list`/`repo_read`)
+  in `internal/agent/repotools.go`. A checkout is the ref's tarball unpacked into the
+  sandbox's temp directory for that run only, under gofer-side size caps (AEI's pod
+  has no scratch volume or storage limit) — see `docs/adr/0003-repository-checkout-tools.md`.
 - `go test` binds httptest sockets; run it outside a restrictive sandbox.
 
 ## Build / test / run

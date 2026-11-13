@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/base64"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -196,5 +197,58 @@ func TestDiscussionIssueSkipsPRFetches(t *testing.T) {
 	}
 	if d.Body != "an issue" || d.HeadSHA != "" || len(d.ChangedFiles) != 0 {
 		t.Fatalf("unexpected issue discussion: %+v", d)
+	}
+}
+
+// Tarball authenticates to the API, follows the redirect to the archive, escapes the
+// ref per path segment, and never surfaces the (pre-signed) download URL in an error.
+func TestTarball(t *testing.T) {
+	var gotAuth, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/repos/o/r/tarball"):
+			gotAuth, gotPath = r.Header.Get("Authorization"), r.URL.EscapedPath()
+			http.Redirect(w, r, "/dl?token=presigned", http.StatusFound)
+		case r.URL.Path == "/dl":
+			_, _ = w.Write([]byte("archive-bytes"))
+		case r.URL.Path == "/repos/o/gone/tarball":
+			http.Redirect(w, r, "http://127.0.0.1:1/dl?token=presigned", http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := NewClient(srv.Client(), srv.URL)
+	ctx := context.Background()
+
+	body, err := c.Tarball(ctx, "tok", "o/r", "release/v1#x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(body)
+	body.Close()
+	if string(b) != "archive-bytes" || gotAuth != "Bearer tok" || gotPath != "/repos/o/r/tarball/release/v1%23x" {
+		t.Errorf("body=%q auth=%q path=%q", b, gotAuth, gotPath)
+	}
+
+	for _, bad := range []struct{ repo, ref, want string }{
+		{"o", "", "owner/name"},
+		{"o/r/x", "", "owner/name"},
+		{"o/r?x=1", "", "owner/name"},
+		{"o/..", "", "owner/name"},
+		{"o/r", "a/../b", "invalid ref"},
+		{"o/r", "a//b", "invalid ref"},
+		{"o/r", "a b", "invalid ref"},
+		{"o/missing", "v1", "not found"},
+	} {
+		if _, err := c.Tarball(ctx, "tok", bad.repo, bad.ref); err == nil || !strings.Contains(err.Error(), bad.want) {
+			t.Errorf("Tarball(%q, %q) err = %v, want %q", bad.repo, bad.ref, err, bad.want)
+		}
+	}
+
+	// A transport failure on the redirected (pre-signed) URL must not echo that URL.
+	_, err = c.Tarball(ctx, "tok", "o/gone", "")
+	if err == nil || strings.Contains(err.Error(), "presigned") || strings.Contains(err.Error(), "tok") {
+		t.Errorf("error must not carry the download URL or token: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 // Read-only GitHub tools for the assistive conversation. The runtime injects
 // these behind the neutral worklist.ToolBox seam so the model can look up live
-// data — a file at a ref, a PR/issue's state and discussion, a search — while gofer core imports
+// data — a file at a ref, a PR/issue's state and discussion, a search, and a whole
+// repository checked out at a ref (repotools.go) — while gofer core imports
 // no provider client. Every tool only ever reads, with the user's vended
 // credential; access is bounded by that token's own scopes, and reach spans any
 // repository the token can see.
@@ -20,7 +21,8 @@ import (
 type githubToolBox struct {
 	gh          *github.Client
 	token       string
-	defaultRepo string // the item's repo, used when a call omits "repo"
+	defaultRepo string         // the item's repo, used when a call omits "repo"
+	repos       *repoCheckouts // this run's repository checkouts (repotools.go)
 }
 
 var _ worklist.ToolBox = (*githubToolBox)(nil)
@@ -29,7 +31,15 @@ var _ worklist.ToolBox = (*githubToolBox)(nil)
 // token. defaultRepo is the conversation item's repo, used when a tool call
 // omits an explicit repo.
 func newGitHubToolBox(gh *github.Client, token, defaultRepo string) *githubToolBox {
-	return &githubToolBox{gh: gh, token: token, defaultRepo: defaultRepo}
+	return &githubToolBox{gh: gh, token: token, defaultRepo: defaultRepo, repos: newRepoCheckouts(gh, token)}
+}
+
+// Close deletes the run's repository checkouts. The run calls it once the turn is
+// answered; nothing fetched outlives the run.
+func (t *githubToolBox) Close() {
+	if t.repos != nil {
+		t.repos.Close()
+	}
 }
 
 // JSON Schemas for each tool's arguments. repo defaults to the item's repo, so
@@ -59,10 +69,10 @@ var (
 
 // Definitions advertises the read-only GitHub tools to the model.
 func (t *githubToolBox) Definitions() []worklist.ToolDef {
-	return []worklist.ToolDef{
+	return append([]worklist.ToolDef{
 		{
 			Name:        "github_read_file",
-			Description: "Read a file's contents from a GitHub repository at a given ref (branch, tag, or commit SHA). Use to check current dependency versions, config, or code on a branch such as master/main — e.g. whether go.mod already bumped a dependency. Returns up to a 32 KB window; if the file is larger, the result reports the file size and a follow-up offset — call again with that offset to read further. Generated and vendored files (zz_generated.*, *.pb.go, anything under vendor/ or testdata/, and lockfiles) are large and low-signal for triage — read them only if the user specifically asks.",
+			Description: "Read one file's contents from a GitHub repository at a given ref (branch, tag, or commit SHA), without checking the repository out. Use for a single known file — to find code across a repository use repo_search instead. Use to check current dependency versions, config, or code on a branch such as master/main — e.g. whether go.mod already bumped a dependency. Returns up to a 32 KB window; if the file is larger, the result reports the file size and a follow-up offset — call again with that offset to read further. Generated and vendored files (zz_generated.*, *.pb.go, anything under vendor/ or testdata/, and lockfiles) are large and low-signal for triage — read them only if the user specifically asks.",
 			Parameters:  schemaReadFile,
 		},
 		{
@@ -77,16 +87,19 @@ func (t *githubToolBox) Definitions() []worklist.ToolDef {
 		},
 		{
 			Name:        "github_search",
-			Description: "Search GitHub issues and pull requests with the GitHub search syntax. Use to find whether another PR or commit already addressed something (e.g. a dependency bump or a CVE). Returns the top matches as titles and states only — to read a match's description or comments, follow up with github_get_issue or github_get_pull_request.",
+			Description: "Search GitHub issues and pull requests (not code — use repo_search for code) with the GitHub search syntax. Use to find whether another PR or commit already addressed something (e.g. a dependency bump or a CVE). Returns the top matches as titles and states only — to read a match's description or comments, follow up with github_get_issue or github_get_pull_request.",
 			Parameters:  schemaSearch,
 		},
-	}
+	}, repoToolDefs()...)
 }
 
 // Invoke executes a named tool with JSON arguments and returns a text result for
 // the model. Unknown tools and malformed arguments return an error, which the
 // converser relays to the model as a tool error.
 func (t *githubToolBox) Invoke(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	if out, ok, err := t.invokeRepoTool(ctx, name, args); ok {
+		return out, err
+	}
 	switch name {
 	case "github_read_file":
 		var a struct {
