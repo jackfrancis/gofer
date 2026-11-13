@@ -1,15 +1,28 @@
+# The web tier is a single-replica StatefulSet: its state (sessions, the vault of
+# delegated tokens, the worklist and its threads) is one SQLite database on the
+# "data" volume. See docs/adr/0004-sqlite-persistent-storage.md and
+# docs/backup-restore.md.
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: gofer
   namespace: gofer
   labels:
     app.kubernetes.io/name: gofer
 spec:
-  # replicas: 1 — the dev deployment keeps its state (vault + worklist store) in
-  # memory in this pod, so a second replica would not share it. Persistence /
-  # horizontal scale is a later concern.
+  # Exactly one. SQLite is a single-node database and the volume is ReadWriteOnce,
+  # so a second replica would have its own, separate state. A StatefulSet update
+  # stops the old pod before starting the new one, so two pods never share the
+  # database file.
   replicas: 1
+  # A StatefulSet names a governing Service. gofer needs no per-pod DNS, so this is
+  # the ordinary ClusterIP Service rather than an extra headless one.
+  serviceName: gofer
+  # Keep the claim (and so the data) when the StatefulSet is scaled to zero or
+  # deleted. This is the default; it is stated because restore depends on it.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
   selector:
     matchLabels:
       app.kubernetes.io/name: gofer
@@ -28,12 +41,21 @@ spec:
         prometheus.io/path: /metrics
     spec:
       serviceAccountName: gofer
+      # The server drains HTTP for up to 10s on SIGTERM, then checkpoints and closes
+      # the database. 30s (the default, stated) leaves ample margin, and SQLite is
+      # crash-safe if the pod is killed anyway.
+      terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
         # distroless "nonroot" is UID/GID 65532; set it numerically so the kubelet
         # can verify non-root (a non-numeric image USER fails the runAsNonRoot check).
         runAsUser: 65532
         runAsGroup: 65532
+        # The data volume is group-owned by 65532 so the non-root user can write it.
+        # OnRootMismatch skips the recursive chown when the volume root is already
+        # right, which is every start after the first.
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -50,6 +72,11 @@ spec:
                 name: gofer-config
             - secretRef:
                 name: gofer-secrets
+          volumeMounts:
+            # Must match DATA_DIR in gofer-config. The root filesystem stays
+            # read-only; this is the only writable path.
+            - name: data
+              mountPath: /var/lib/gofer
           readinessProbe:
             httpGet:
               path: /healthz
@@ -73,3 +100,14 @@ spec:
               memory: 64Mi
             limits:
               memory: 256Mi
+  volumeClaimTemplates:
+    # Creates the claim "data-gofer-0". No storageClassName, so the cluster default
+    # is used (local-path on kind, the managed CSI disk on AKS). 1Gi is far more than
+    # the database needs: a busy user's worklist with its threads is a few MiB.
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

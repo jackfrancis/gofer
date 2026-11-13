@@ -172,7 +172,7 @@ cluster-down:
 # run-credential signing authority (AEI owns the keypair as sole minter; gofer's web
 # tier verifies with AEI's public key, MINT_PUBLIC_KEY — it holds no minting key).
 #
-# SESSION_SECRET is generated; MINT_PUBLIC_KEY is AEI's published verify key (read from
+# SESSION_SECRET and VAULT_ENCRYPTION_KEY are generated; MINT_PUBLIC_KEY is AEI's published verify key (read from
 # the cluster's aei-signing secret, or passed explicitly); GITHUB_CLIENT_ID /
 # GITHUB_CLIENT_SECRET and AI_TOKEN (the chat-model token gofer brokers to runtimes;
 # unset = stub ranker, no LLM) are seeded from your shell env when set. AI_CONNECTIONS
@@ -197,6 +197,7 @@ dev-up: cluster-up kind-load kind-load-runtime
 		kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) get secret gofer-secrets >/dev/null 2>&1 || \
 			kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) create secret generic gofer-secrets \
 				--from-literal=SESSION_SECRET="$$(openssl rand -base64 48)" \
+				--from-literal=VAULT_ENCRYPTION_KEY="$$(openssl rand -base64 32)" \
 				--from-literal=MINT_PUBLIC_KEY="$$mpk" \
 				--from-literal=GITHUB_CLIENT_ID="$${GITHUB_CLIENT_ID:-}" \
 				--from-literal=GITHUB_CLIENT_SECRET="$${GITHUB_CLIENT_SECRET:-}" \
@@ -206,6 +207,14 @@ dev-up: cluster-up kind-load kind-load-runtime
 	@[ -z "$$GITHUB_CLIENT_ID" ] || kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"GITHUB_CLIENT_ID\":\"$$GITHUB_CLIENT_ID\"}}"
 	@[ -z "$$GITHUB_CLIENT_SECRET" ] || kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"GITHUB_CLIENT_SECRET\":\"$$GITHUB_CLIENT_SECRET\"}}"
 	@[ -z "$$AI_TOKEN" ] || kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"AI_TOKEN\":\"$$AI_TOKEN\"}}"
+	@# A gofer-secrets created before persistent storage has no token-encryption key.
+	@# Add one if it is missing; never replace an existing key (it seals stored tokens).
+	@kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) get secret gofer-secrets -o jsonpath='{.data.VAULT_ENCRYPTION_KEY}' | grep -q . || \
+		kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) patch secret gofer-secrets --type=merge \
+			-p "{\"stringData\":{\"VAULT_ENCRYPTION_KEY\":\"$$(openssl rand -base64 32)\"}}"
+	@# The web tier was a Deployment before it had a volume. Remove a leftover one so it
+	@# does not keep serving, in memory, beside the StatefulSet behind the same Service.
+	kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) delete deployment gofer --ignore-not-found
 	kubectl --context $(KUBE_CONTEXT) apply -k deploy/k8s/base
 	@[ -z "$$AI_CONNECTIONS" ] || kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$$AI_CONNECTIONS" '{data:{AI_CONNECTIONS:$$v}}')"
 	kubectl --context $(KUBE_CONTEXT) apply -f deploy/k8s/overlays/dev/agentapp.yaml
@@ -237,8 +246,8 @@ dev-up: cluster-up kind-load kind-load-runtime
 		kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) patch agentapp gofer --type=merge \
 			-p "{\"spec\":{\"image\":\"$(SUBSTRATE_REGISTRY)/gofer-runtime@$$digest\"}}"; \
 	fi
-	kubectl --context $(KUBE_CONTEXT) rollout restart deploy/gofer -n $(KUBE_NS)
-	kubectl --context $(KUBE_CONTEXT) rollout status deploy/gofer -n $(KUBE_NS) --timeout=120s
+	kubectl --context $(KUBE_CONTEXT) rollout restart statefulset/gofer -n $(KUBE_NS)
+	kubectl --context $(KUBE_CONTEXT) rollout status statefulset/gofer -n $(KUBE_NS) --timeout=120s
 
 # Tear down gofer's app components (leaves the cluster + AEI in place).
 dev-down:
