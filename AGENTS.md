@@ -149,6 +149,7 @@ make run     # run the web tier alone (local UI/OAuth; dispatch needs an aei-con
 make genkey  # an Ed25519 keypair for local runs (in-cluster, AEI's public key is used)
 make dev-up  # deploy web + runtime images and the AgentApp to kind (AEI must be installed first)
 make kind-load-runtime  # rebuild + load only the runtime image
+make push IMAGE=... RUNTIME_IMAGE=... PLATFORM=linux/amd64  # build both images for a platform and push them
 make deploy KUBECONFIG=<file> IMAGE=... RUNTIME_IMAGE=...  # apply to any cluster (no kind, no secret creation); dev-up shares its apply step
 ```
 

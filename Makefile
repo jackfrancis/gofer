@@ -7,7 +7,7 @@
 # aei-controller, and the runtime is gofer's own image, launched per run.
 
 .PHONY: build test vet tidy run runtime genkey clean \
-        engine build-linux image image-runtime kind-load kind-load-runtime push-runtime \
+        engine build-linux image image-runtime push-check push kind-load kind-load-runtime push-runtime \
         cluster-up cluster-down dev-up dev-down dev-forward dev-logs \
         deploy deploy-target deploy-apply aei-check secrets-check dev-secrets \
         monitoring-load dev-monitoring dev-monitoring-down dev-forward-grafana dev-forward-prometheus
@@ -99,8 +99,12 @@ PROMETHEUS_IMAGE ?= docker.io/prom/prometheus:v3.1.0
 GRAFANA_IMAGE ?= docker.io/grafana/grafana:11.4.0
 GRAFANA_LOCAL_PORT ?= 3000
 PROM_LOCAL_PORT ?= 9090
-# The kind nodes are linux; the arch matches the container engine (arm64 on Apple Silicon).
-GOARCH ?= $(shell go env GOARCH)
+# The platform the images are built for, e.g. PLATFORM=linux/amd64 for a cloud cluster
+# built from an arm64 laptop. Empty builds for the host's architecture, which is what
+# the kind nodes run (arm64 on Apple Silicon).
+PLATFORM ?=
+PLATFORM_FLAG = $(if $(PLATFORM),--platform $(PLATFORM))
+GOARCH ?= $(if $(PLATFORM),$(word 2,$(subst /, ,$(PLATFORM))),$(shell go env GOARCH))
 
 ifeq ($(findstring podman,$(CONTAINER_ENGINE)),podman)
 export KIND_EXPERIMENTAL_PROVIDER = podman
@@ -120,11 +124,23 @@ build-linux:
 
 # Build the web-tier image (packages the prebuilt bin/linux/server).
 image: engine build-linux
-	$(CONTAINER_ENGINE) build -f Dockerfile -t $(IMAGE) .
+	$(CONTAINER_ENGINE) build $(PLATFORM_FLAG) -f Dockerfile -t $(IMAGE) .
 
 # Build the agent-runtime image (packages the prebuilt bin/linux/runtime).
 image-runtime: engine build-linux
-	$(CONTAINER_ENGINE) build -f Dockerfile.runtime -t $(RUNTIME_IMAGE) .
+	$(CONTAINER_ENGINE) build $(PLATFORM_FLAG) -f Dockerfile.runtime -t $(RUNTIME_IMAGE) .
+
+# A non-kind cluster pulls both images from a registry, so they need registry names and
+# the nodes' platform. The dev defaults (localhost/...) are not pushable. Log in to the
+# registry first; `make deploy` then takes the same IMAGE / RUNTIME_IMAGE.
+#     make push IMAGE=<registry>/gofer:<tag> RUNTIME_IMAGE=<registry>/gofer-runtime:<tag> PLATFORM=linux/amd64
+push-check:
+	@for i in "$(IMAGE)" "$(RUNTIME_IMAGE)"; do case "$$i" in localhost/*) \
+		echo "ERROR: $$i is a kind dev tag. Set IMAGE=<registry>/gofer:<tag> and RUNTIME_IMAGE=<registry>/gofer-runtime:<tag>."; exit 1;; esac; done
+
+push: push-check image image-runtime  ## build + push the web and runtime images
+	$(CONTAINER_ENGINE) push $(IMAGE)
+	$(CONTAINER_ENGINE) push $(RUNTIME_IMAGE)
 
 # Load the web image into kind via an engine-agnostic archive (podman + docker).
 kind-load: image

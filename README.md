@@ -114,9 +114,12 @@ keeps logins and the worklist. See
 ### Deploy to another cluster
 
 `make dev-up` is the kind loop. To deploy to any other cluster, the way a CI job
-would, pass a kubeconfig file:
+would, push both images for the nodes' platform (log in to the registry first), then
+pass a kubeconfig file:
 
 ```sh
+make push IMAGE=ghcr.io/you/gofer:v1 RUNTIME_IMAGE=ghcr.io/you/gofer-runtime:v1 \
+    PLATFORM=linux/amd64
 make deploy KUBECONFIG=/path/to/kubeconfig \
     IMAGE=ghcr.io/you/gofer:v1 RUNTIME_IMAGE=ghcr.io/you/gofer-runtime:v1
 ```
@@ -128,7 +131,7 @@ kind, pass `AGENT_PROVIDER_CLASS=k8s-job` here unless the cluster has a `gvisor`
 RuntimeClass for the `isolated` class.
 
 `deploy` only applies: it does not create or manage the cluster, build or push
-images, or create secrets. It expects AEI installed, the `gofer-secrets` Secret in
+images (that is `make push`), or create secrets. It expects AEI installed, the `gofer-secrets` Secret in
 place (template: `deploy/k8s/base/secret.example.yaml`), and both images pullable
 by the cluster. It uses the kubeconfig's current context unless `KUBE_CONTEXT`
 names another, and refuses to run without an explicit target. `dev-up` runs the
