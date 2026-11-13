@@ -49,6 +49,7 @@ internal/vault/        delegated provider tokens; vended via internal/api creden
 internal/ingest/       Dispatcher seam: turns actions into run requests
 internal/agent/        agent-runtime WORKLOAD (the runtime runs it per run)
 internal/worklist/     WorkItem + Metadata, Store + Ingestor seams, sort, scoring
+internal/storage/      SQLite persistence for the web tier: worklist, encrypted vault, sessions
 internal/{auth,authn,session,api,server,webui,github,llm,markdown,metrics}/
 ```
 
@@ -100,8 +101,18 @@ preferred when both are installed); a GitHub OAuth app whose callback is
 
 After a code change to the workload only (`internal/agent`, `internal/llm`,
 `internal/github`), `make kind-load-runtime` reloads the runtime image without
-restarting the web pod — which matters because sessions, delegated tokens, and the
-worklist are held in the web pod's memory.
+restarting the web pod.
+
+Web-tier state (sessions, delegated tokens, the worklist and its threads) is durable:
+the web tier is a single-replica StatefulSet with one SQLite database on a
+PersistentVolume (`DATA_DIR`), and delegated tokens are encrypted at rest with
+`VAULT_ENCRYPTION_KEY`, which `dev-up` generates into `gofer-secrets`. A pod restart
+keeps logins and the worklist. See
+[ADR 0004](docs/adr/0004-sqlite-persistent-storage.md) for the design and
+[docs/backup-restore.md](docs/backup-restore.md) for volume snapshots and restore.
 
 `make run` starts the web tier alone for UI/OAuth work; without a reachable
-aei-controller, sign-in works but dispatch fails and the worklist stays empty.
+aei-controller, sign-in works but dispatch fails and the worklist stays empty. It
+leaves `DATA_DIR` unset, so state is in memory; to persist locally, run it with
+`DATA_DIR=./data VAULT_ENCRYPTION_KEY="$(openssl rand -base64 32)"` (reuse the same
+key on later runs).
