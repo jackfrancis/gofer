@@ -76,8 +76,10 @@ KIND_CONFIG ?= deploy/kind/cluster.yaml
 # The AgentProviderClass gofer's runs dispatch to — a well-known, admin-published name
 # (e.g. "isolated", "durable", "k8s-job"). gofer is substrate-agnostic: it names a
 # capability, not a platform. Empty selects the cluster default. `make dev-up` patches
-# the AgentApp to this value, so the class must already exist on the AEI side.
-AGENT_PROVIDER_CLASS ?= gofer
+# the AgentApp to this value, so the class must already exist on the AEI side. The
+# default, "isolated", is AEI's agent-sandbox class (pods under gVisor); use "k8s-job"
+# for a cluster with no extra substrate installed.
+AGENT_PROVIDER_CLASS ?= isolated
 WEB_LOCAL_PORT ?= 8080
 # Optional monitoring stack (opt-in; see `make dev-monitoring`).
 MONITORING_NS ?= gofer-monitoring

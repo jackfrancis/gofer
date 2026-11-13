@@ -10,31 +10,41 @@ a user's GitHub work (issues, PRs, comments, reviews), persists it, and decorate
 each item with agent-derived metadata (relevance, impact, engagement, urgency →
 rank). A landing page renders the user's work ordered by that metadata.
 
-**A starting point for an agent-runtime backend (branch `gofer-clean`).** gofer is an
-opinionated application stack for its mission with the agent-runtime layer factored out
-behind a single seam. The web tier, worklist model, scoring, UI, OAuth, and all the
-interface seams are fully implemented; the default backend is a no-op, so the worklist
-stays empty until a backend that executes runs is selected. Adding one is net-new code
-— a package under `internal/runtime/<name>` plus one wiring line in `cmd/server`, with
-no change to gofer's interfaces (see `internal/runtime` for the contract).
+**Agent runs execute on AEI.** gofer is an opinionated application stack for its
+mission with the agent-runtime layer factored out behind a single seam
+(`ingest.Dispatcher`). The selected backend is the Agent Execution Interface (AEI,
+`github.com/jackfrancis/agent-execution-interface`), in `internal/runtime/aei`: the web
+tier dispatches each run to a pre-installed AEI control plane, which launches gofer's
+runtime image (`cmd/runtime`) per run on the substrate the app's provider class names.
+gofer needs AEI on the cluster and does not run standalone. A backend is still purely
+additive — a package under `internal/runtime/<name>` plus one wiring line in
+`cmd/server`, with no change to gofer's interfaces (see `internal/runtime` for the
+contract).
 
-A parallel branch `gofer-aei` keeps the previous, functional implementation whose
-dispatch layer was the Agent Execution Interface (AEI), as a reference.
+The `gofer-clean` branch keeps the backend-less prototype (no-op dispatcher wired), as
+a reference for the seam with nothing plugged in.
 
 ## Tech & layout
 
-- Go 1.26.0. No external agent-runtime dependency: gofer imports only its own
-  packages plus a few libraries (goldmark, bluemonday, prometheus, oauth2).
+- Go 1.26.0. gofer imports its own packages, a few libraries (goldmark, bluemonday,
+  prometheus, oauth2), and AEI's two stdlib-only SDK modules (the app SDK
+  `sdks/go/aeiapp` to dispatch, the runtime SDK `aeiruntime` for the agent binary).
+  Those are consumed through `replace` directives in `go.mod` pointing at a SIBLING
+  checkout (`../agent-execution-interface`), so the build needs that checkout present
+  until AEI is published. gofer imports no provider and no client-go.
 - Module: `github.com/jackfrancis/gofer`.
 
 ```
-cmd/server/          web tier entrypoint (HTTP, UI)
+cmd/server/          web tier entrypoint (HTTP, UI); selects the backend
+cmd/runtime/         agent runtime entrypoint (one-line shim over internal/runtime/aei)
+internal/runtime/    the backend contract (doc.go)
+internal/runtime/aei/  the AEI backend: dispatcher (aei.go) + workload entrypoint (workload.go)
 internal/config/     env configuration
 internal/principal/  Principal{Kind, Subject, ActingUserID, Scopes}
-internal/identity/   run-credential authority (Ed25519); web verifies, a backend mints
+internal/identity/   run-credential authority (Ed25519); web verifies, AEI mints
 internal/vault/      delegated provider tokens; vended via internal/api credential broker
-internal/ingest/     Dispatcher seam + NoopDispatcher (THE runtime socket)
-internal/agent/      agent-runtime WORKLOAD (a backend runs it per run)
+internal/ingest/     Dispatcher seam (THE runtime socket) + the reference NoopDispatcher
+internal/agent/      agent-runtime WORKLOAD (the runtime runs it per run)
 internal/worklist/   WorkItem + Metadata, Store + Ingestor seams, sort, scoring
 internal/auth/       OAuth provider wiring + login/callback
 internal/authn/      RequireAuth / RequireScope (cookie OR bearer)
@@ -47,28 +57,33 @@ internal/llm/        LLM ranking / converse (workload-only)
 internal/markdown/   render + sanitize assistant Markdown
 internal/metrics/    Prometheus metrics
 Dockerfile           web-tier image
+Dockerfile.runtime   agent-runtime image (AEI launches it per run)
 deploy/k8s/base/     app manifests: namespace, SA, config, deployment, service
-deploy/k8s/overlays/dev/  base (a backend adds its dispatch registration)
+deploy/k8s/overlays/dev/  base + agentapp.yaml (gofer's AEI dispatch registration)
 ```
 
-## The runtime socket (what a real agent runtime plugs into)
+## The runtime socket (what the agent runtime plugs into)
 
-gofer builds the full *intent* of every agent action and hands it to a seam. The
-default is a no-op backend:
+gofer builds the full *intent* of every agent action and hands it to a seam. The AEI
+backend fills each one:
 
-| Seam | Default (no-op) | What a backend provides |
+| Seam | gofer's side | The AEI backend |
 | --- | --- | --- |
-| `ingest.Dispatcher` (`Submit`/`Status`) | `ingest.NoopDispatcher` (accept + drop) | dispatch each `RunSpec` to an execution substrate |
-| `agent.Vendor` / `agent.Sink` | HTTP clients to gofer's `/agent/*` plane | the workload's view of gofer (vend a credential, read/write the worklist) |
-| `agent.Run` (`internal/agent`) | present, uncalled | the workload a runtime executes per run |
-| `identity.Authority` | verify-only (`internal/identity`) | the minting half (a control plane) |
+| `ingest.Dispatcher` (`Submit`/`Status`) | constructs each `RunSpec` | `aei.Dispatcher` POSTs it to the aei-controller (`AEI_DISPATCH_ENDPOINT`) as the `AgentApp` named by `AEI_APP`, authenticating with the web pod's projected ServiceAccount token |
+| `agent.Vendor` / `agent.Sink` | `agent.NewPlaneClient`: one HTTP client to the `/agent/*` plane | the runtime uses it with its run credential (vend a credential, read/write the worklist) |
+| `agent.Run` (`internal/agent`) | the workload | `aei.RunWorkload` (`cmd/runtime`) executes it per run, out-of-process |
+| `identity.Authority` | verify-only (`internal/identity`, `MINT_PUBLIC_KEY`) | AEI's control plane owns the keypair and is the sole minter |
 
 `ingest.RunSpec` is the provider-neutral run intent (task ref, parameters, scoped
 identity, deadline). gofer constructs one for `github-ingest` (backfill/refresh) and
-`github-converse` (Discuss / review) and submits it to the `Dispatcher`. Implement a
-real `Dispatcher`, run `agent.Run` behind it, and have it write back through the
-`/agent/*` plane to bring gofer to life. Start from the contract in `internal/runtime`
-and the selection point in `cmd/server`.
+`github-converse` (Discuss / review) and submits it to the `Dispatcher`. The backend
+contract is in `internal/runtime`; the selection point is in `cmd/server`.
+
+AEI itself (the aei-controller in `aei-system`, the `agents.x-k8s.io` CRDs, the signing
+authority, and an `AgentProviderClass`) is installed from the AEI repository, not by
+gofer. gofer's `AgentApp` (`deploy/k8s/overlays/dev/agentapp.yaml`) names a provider
+class by capability; the default is `isolated` (agent-sandbox pods under gVisor, run in
+the `gofer-runtime` namespace), and `k8s-job` is the lighter alternative.
 
 ## The domain (100% gofer's own, unaffected by the runtime)
 
@@ -97,14 +112,21 @@ Wired on the web-tier side; they define what a runtime must respect:
 ## Conventions & gotchas
 
 - Each `.go` file has exactly one `package` clause.
-- gofer imports no client-go and no agent-runtime SDK. The runtime socket is the
-  `ingest.Dispatcher` interface; the only implementation is `NoopDispatcher`.
+- gofer imports no client-go and no provider. The runtime socket is the
+  `ingest.Dispatcher` interface; `cmd/server` wires `aei.Dispatcher`, and
+  `NoopDispatcher` remains as the reference no-op (used by tests).
 - Interfaces are the extension seams: `identity.Authority`, `worklist.Store` /
   `worklist.Ingestor`, `ingest.Dispatcher`, and the workload's `agent.Vendor` /
   `agent.Sink`.
-- The web tier boots and serves the UI standalone; the worklist stays "Discovering…"
-  because the default no-op dispatcher fetches nothing — expected until a backend that
-  executes runs is selected.
+- The web tier fails fast at startup without `AEI_DISPATCH_ENDPOINT` and `AEI_APP`.
+  With them set but no reachable aei-controller (e.g. `make run`), sign-in works but
+  dispatch fails, so the worklist stays empty.
+- All web-tier state (sessions, delegated tokens in the vault, the worklist and its
+  threads) is in memory in the single web pod: a restart loses it. To ship a
+  workload-only change (`internal/agent`, `internal/llm`, `internal/github`) to the
+  kind cluster without that restart, use `make kind-load-runtime`.
+- The conversation's tool loop is capped at `maxToolIterations` rounds
+  (`internal/llm/converse.go`); the model's GitHub tools are in `internal/agent/tools.go`.
 - `go test` binds httptest sockets; run it outside a restrictive sandbox.
 
 ## Build / test / run
@@ -112,6 +134,10 @@ Wired on the web-tier side; they define what a runtime must respect:
 ```
 make build   # go build ./...
 make test    # go test ./...
-make run     # run the web tier (local UI/OAuth)
-make genkey  # run-credential keypair (verify key + unused private half)
+make run     # run the web tier alone (local UI/OAuth; dispatch needs an aei-controller)
+make genkey  # an Ed25519 keypair for local runs (in-cluster, AEI's public key is used)
+make dev-up  # deploy web + runtime images and the AgentApp to kind (AEI must be installed first)
+make kind-load-runtime  # rebuild + load only the runtime image
 ```
+
+See README.md for the kind walkthrough, including the AEI-side install.

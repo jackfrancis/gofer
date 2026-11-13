@@ -38,5 +38,8 @@ data:
   # AI_CONNECTIONS is a JSON array of {endpoint, models} in priority order: element 0
   # is the default connection and each connection's models[0] is its default model.
   # Every connection shares AI_TOKEN (fanned out at load); connections carry no token.
-  # Reorder the array to change the default. Example (one connection, two models):
-  AI_CONNECTIONS: '[{"endpoint":"https://api.githubcopilot.com/chat/completions","models":["claude-opus-4.8","gpt-5.4"]}]'
+  # Reorder the array to change the default. The endpoint PATH selects the API a
+  # connection speaks: .../chat/completions or .../responses. A model listed under an
+  # endpoint that does not serve it fails at call time, not at startup. Model ids go
+  # stale; list the current ones with GET https://api.githubcopilot.com/models.
+  AI_CONNECTIONS: '[{"endpoint":"https://api.githubcopilot.com/chat/completions","models":["claude-opus-5.5","gemini-4-carbon"]},{"endpoint":"https://api.githubcopilot.com/responses","models":["gpt-6-astra"]}]'

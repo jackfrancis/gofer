@@ -23,10 +23,11 @@ metadata:
   namespace: gofer
 spec:
   # The well-known, admin-published AgentProviderClass name this app's runs dispatch
-  # to (cluster-scoped, admin-owned). This is the committed default; `make dev-up`
-  # overrides it with AGENT_PROVIDER_CLASS (e.g. "isolated"). Empty selects the
-  # cluster default. gofer names a capability, never a substrate.
-  providerClassName: gofer
+  # to (cluster-scoped, admin-owned). This is the committed default — AEI's
+  # agent-sandbox class (pods under gVisor); `make dev-up` overrides it with
+  # AGENT_PROVIDER_CLASS (e.g. "k8s-job"). Empty selects the cluster default. gofer
+  # names a capability, never a substrate.
+  providerClassName: isolated
   # gofer's runtime (agent) container image — the app brings it; the class stays
   # generic (a substrate binding, not app-specific).
   image: localhost/gofer-runtime:dev
