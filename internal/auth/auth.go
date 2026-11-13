@@ -254,7 +254,11 @@ func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	h.sessions.Authenticate(w, r, user)
+	if err := h.sessions.Authenticate(w, r, user); err != nil {
+		slog.Default().Error("session could not be stored", "provider", p.name, "err", err)
+		http.Error(w, "could not start session", http.StatusInternalServerError)
+		return
+	}
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
