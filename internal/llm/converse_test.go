@@ -274,3 +274,106 @@ func TestConverserReplyToolError(t *testing.T) {
 		t.Fatalf("tool error not relayed to model: %q", relayed)
 	}
 }
+
+// TestConverserReplyFallsBackWhenForcedRoundIsEmpty: a model that ignores
+// tool_choice="none" and answers the forced round with more tool calls (no text) is
+// re-asked once without any tool schema, its tool results flattened into the user
+// message — so the user gets an answer built on the research, not the canned note.
+func TestConverserReplyFallsBackWhenForcedRoundIsEmpty(t *testing.T) {
+	const toolCallTurn = `{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"github_search","arguments":"{\"query\":\"grpc\"}"}}]},"finish_reason":"tool_calls"}]}`
+	var (
+		sawBudgetNote, sawLastRoundNote, fallbackHadResearch bool
+		fallbackCalls                                        int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ToolChoice string            `json:"tool_choice"`
+			Tools      []json.RawMessage `json:"tools"`
+			Messages   []struct {
+				Role      string            `json:"role"`
+				Content   string            `json:"content"`
+				ToolCalls []json.RawMessage `json:"tool_calls"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if len(req.Messages) > 0 && strings.Contains(req.Messages[0].Content, "rounds of tool calls") {
+			sawBudgetNote = true
+		}
+		switch {
+		case len(req.Tools) == 0:
+			// The fallback: no tool schema, no tool turns, research inline in the user message.
+			fallbackCalls++
+			last := req.Messages[len(req.Messages)-1]
+			fallbackHadResearch = last.Role == "user" &&
+				strings.Contains(last.Content, "is it fixed?") &&
+				strings.Contains(last.Content, "github_search") &&
+				strings.Contains(last.Content, "3 result(s)") &&
+				!strings.Contains(last.Content, "last round of tool calls")
+			for _, m := range req.Messages {
+				if m.Role == "tool" || len(m.ToolCalls) > 0 {
+					t.Errorf("fallback request carries a %s tool turn; it must be tool-free", m.Role)
+				}
+			}
+			_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Not fixed on 1.35."},"finish_reason":"stop"}]}`))
+		case req.ToolChoice == "none":
+			// The forced round: the last tool result must carry the in-band notice.
+			sawLastRoundNote = strings.Contains(req.Messages[len(req.Messages)-1].Content, "last round of tool calls")
+			_, _ = w.Write([]byte(toolCallTurn)) // ignore tool_choice, like the model that prompted this
+		default:
+			_, _ = w.Write([]byte(toolCallTurn))
+		}
+	}))
+	defer srv.Close()
+
+	box := &fakeToolBox{result: "3 result(s) (showing 3):"}
+	c := NewConverser(Config{Endpoint: srv.URL, Token: "t", Client: srv.Client()})
+	item := worklist.WorkItem{GitHub: worklist.GitHubRef{Repo: "o/r", Title: "CVE"}, Type: worklist.TypeIssue}
+	reply, err := c.Reply(context.Background(), item, "alice", "", nil, "is it fixed?", box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(reply, "Not fixed on 1.35.") {
+		t.Fatalf("fallback answer not returned: %q", reply)
+	}
+	if !strings.Contains(reply, "incomplete investigation") {
+		t.Errorf("a fallback answer should carry the partial-research note: %q", reply)
+	}
+	if fallbackCalls != 1 {
+		t.Errorf("fallback requests = %d, want 1", fallbackCalls)
+	}
+	if !fallbackHadResearch {
+		t.Error("fallback request did not fold the question and the tool results into the user message")
+	}
+	if !sawBudgetNote {
+		t.Error("system prompt did not state the tool-round budget")
+	}
+	if !sawLastRoundNote {
+		t.Error("the last tool result did not tell the model its tool rounds were used up")
+	}
+}
+
+// TestConverserReplyNoBudgetNoteWithoutTools: the budget sentence is about tools, so
+// a tool-less turn's system prompt does not carry it.
+func TestConverserReplyNoBudgetNoteWithoutTools(t *testing.T) {
+	var system string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		system = req.Messages[0].Content
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewConverser(Config{Endpoint: srv.URL, Token: "t", Client: srv.Client()})
+	item := worklist.WorkItem{GitHub: worklist.GitHubRef{Repo: "o/r", Title: "T"}, Type: worklist.TypeIssue}
+	if _, err := c.Reply(context.Background(), item, "", "", nil, "hi", nil); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(system, "rounds of tool calls") {
+		t.Errorf("tool-less system prompt mentions a tool budget: %q", system)
+	}
+}
