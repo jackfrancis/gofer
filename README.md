@@ -121,6 +121,12 @@ make deploy KUBECONFIG=/path/to/kubeconfig \
     IMAGE=ghcr.io/you/gofer:v1 RUNTIME_IMAGE=ghcr.io/you/gofer-runtime:v1
 ```
 
+Install AEI on that cluster first, with the same pattern from the AEI checkout
+(`make push IMG=...`, then `make deploy KUBECONFIG=... IMG=... PROVIDERS=k8s-job`);
+its `make public-key KUBECONFIG=...` prints the value for `MINT_PUBLIC_KEY`. Off
+kind, pass `AGENT_PROVIDER_CLASS=k8s-job` here unless the cluster has a `gvisor`
+RuntimeClass for the `isolated` class.
+
 `deploy` only applies: it does not create or manage the cluster, build or push
 images, or create secrets. It expects AEI installed, the `gofer-secrets` Secret in
 place (template: `deploy/k8s/base/secret.example.yaml`), and both images pullable
