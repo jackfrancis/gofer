@@ -49,6 +49,7 @@ internal/vault/        delegated provider tokens; vended via internal/api creden
 internal/ingest/       Dispatcher seam: turns actions into run requests
 internal/agent/        agent-runtime WORKLOAD (the runtime runs it per run)
 internal/worklist/     WorkItem + Metadata, Store + Ingestor seams, sort, scoring
+internal/storage/      SQLite persistence for the web tier: worklist, encrypted vault, sessions
 internal/{auth,authn,session,api,server,webui,github,llm,markdown,metrics}/
 ```
 
@@ -100,8 +101,45 @@ preferred when both are installed); a GitHub OAuth app whose callback is
 
 After a code change to the workload only (`internal/agent`, `internal/llm`,
 `internal/github`), `make kind-load-runtime` reloads the runtime image without
-restarting the web pod — which matters because sessions, delegated tokens, and the
-worklist are held in the web pod's memory.
+restarting the web pod.
+
+Web-tier state (sessions, delegated tokens, the worklist and its threads) is durable:
+the web tier is a single-replica StatefulSet with one SQLite database on a
+PersistentVolume (`DATA_DIR`), and delegated tokens are encrypted at rest with
+`VAULT_ENCRYPTION_KEY`, which `dev-up` generates into `gofer-secrets`. A pod restart
+keeps logins and the worklist. See
+[ADR 0004](docs/adr/0004-sqlite-persistent-storage.md) for the design and
+[docs/backup-restore.md](docs/backup-restore.md) for volume snapshots and restore.
+
+### Deploy to another cluster
+
+`make dev-up` is the kind loop. To deploy to any other cluster, the way a CI job
+would, push both images for the nodes' platform (log in to the registry first), then
+pass a kubeconfig file:
+
+```sh
+make push IMAGE=ghcr.io/you/gofer:v1 RUNTIME_IMAGE=ghcr.io/you/gofer-runtime:v1 \
+    PLATFORM=linux/amd64
+make deploy KUBECONFIG=/path/to/kubeconfig \
+    IMAGE=ghcr.io/you/gofer:v1 RUNTIME_IMAGE=ghcr.io/you/gofer-runtime:v1
+```
+
+Install AEI on that cluster first, with the same pattern from the AEI checkout
+(`make push IMG=...`, then `make deploy KUBECONFIG=... IMG=... PROVIDERS=k8s-job`);
+its `make public-key KUBECONFIG=...` prints the value for `MINT_PUBLIC_KEY`. Off
+kind, pass `AGENT_PROVIDER_CLASS=k8s-job` here unless the cluster has a `gvisor`
+RuntimeClass for the `isolated` class.
+
+`deploy` only applies: it does not create or manage the cluster, build or push
+images (that is `make push`), or create secrets. It expects AEI installed, the `gofer-secrets` Secret in
+place (template: `deploy/k8s/base/secret.example.yaml`), and both images pullable
+by the cluster. It uses the kubeconfig's current context unless `KUBE_CONTEXT`
+names another, and refuses to run without an explicit target. `dev-up` runs the
+same apply step after its kind-specific setup. The other kubectl targets
+(`dev-forward`, `dev-logs`, `dev-down`) accept `KUBECONFIG=` the same way.
 
 `make run` starts the web tier alone for UI/OAuth work; without a reachable
-aei-controller, sign-in works but dispatch fails and the worklist stays empty.
+aei-controller, sign-in works but dispatch fails and the worklist stays empty. It
+leaves `DATA_DIR` unset, so state is in memory; to persist locally, run it with
+`DATA_DIR=./data VAULT_ENCRYPTION_KEY="$(openssl rand -base64 32)"` (reuse the same
+key on later runs).

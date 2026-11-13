@@ -8,5 +8,5 @@ resources:
   - namespace.yaml
   - serviceaccount.yaml
   - configmap.yaml
-  - deployment.yaml
+  - statefulset.yaml
   - service.yaml

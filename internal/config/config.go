@@ -58,6 +58,17 @@ type Config struct {
 	// web tier authenticates a runtime's token but can never forge one. Provisioned
 	// explicitly via MINT_PUBLIC_KEY.
 	MintPublicKey ed25519.PublicKey
+
+	// DataDir is the directory holding gofer's SQLite database (DATA_DIR). Empty
+	// means no persistent storage: the web tier keeps its state in memory and loses
+	// it on restart, which is what `make run` and the tests use. When set,
+	// VaultKey is required.
+	DataDir string
+
+	// VaultKey is the 32-byte AES-256 key that encrypts delegated provider tokens
+	// at rest in the database (VAULT_ENCRYPTION_KEY, base64). It is only loaded,
+	// and only required, when DataDir is set.
+	VaultKey []byte
 }
 
 // DefaultConnection returns the default chat-model connection: the first configured.
@@ -285,7 +296,15 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	dataDir := strings.TrimSpace(os.Getenv("DATA_DIR"))
+	vaultKey, err := loadVaultKey(dataDir, os.Getenv)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
+		DataDir:        dataDir,
+		VaultKey:       vaultKey,
 		Addr:           getEnv("ADDR", ":8080"),
 		BaseURL:        strings.TrimRight(getEnv("BASE_URL", "http://localhost:8080"), "/"),
 		AllowedOrigins: splitAndTrim(os.Getenv("ALLOWED_ORIGINS")),
@@ -332,6 +351,29 @@ func loadVerifyKey() (ed25519.PublicKey, error) {
 		return nil, fmt.Errorf("MINT_PUBLIC_KEY must be a base64-encoded %d-byte Ed25519 public key", ed25519.PublicKeySize)
 	}
 	return ed25519.PublicKey(raw), nil
+}
+
+// vaultKeySize is the AES-256 key size VAULT_ENCRYPTION_KEY must decode to.
+const vaultKeySize = 32
+
+// loadVaultKey resolves the key that encrypts delegated provider tokens at rest.
+// Persistent storage without it fails fast: tokens must never be written to disk
+// in the clear, and a key generated on the fly would be lost with the pod. With no
+// data directory the vault is in memory and the key is not read at all.
+func loadVaultKey(dataDir string, getenv func(string) string) ([]byte, error) {
+	if dataDir == "" {
+		return nil, nil
+	}
+	s := strings.TrimSpace(getenv("VAULT_ENCRYPTION_KEY"))
+	if s == "" {
+		return nil, fmt.Errorf("VAULT_ENCRYPTION_KEY must be set when DATA_DIR is set: delegated provider tokens are encrypted at rest with it (base64-encoded %d random bytes, e.g. `openssl rand -base64 %d`)", vaultKeySize, vaultKeySize)
+	}
+	raw, err := base64.StdEncoding.DecodeString(s)
+	if err != nil || len(raw) != vaultKeySize {
+		// Never echo the value: it is a secret even when malformed.
+		return nil, fmt.Errorf("VAULT_ENCRYPTION_KEY must be base64-encoded %d random bytes (e.g. `openssl rand -base64 %d`)", vaultKeySize, vaultKeySize)
+	}
+	return raw, nil
 }
 
 func getEnv(key, fallback string) string {

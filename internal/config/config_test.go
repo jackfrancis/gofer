@@ -160,3 +160,43 @@ func TestModelChoices(t *testing.T) {
 		}
 	})
 }
+
+func TestLoadVaultKey(t *testing.T) {
+	// base64 of 32 bytes.
+	const good = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+
+	t.Run("not read without a data directory", func(t *testing.T) {
+		key, err := loadVaultKey("", env(map[string]string{"VAULT_ENCRYPTION_KEY": "not base64"}))
+		if err != nil || key != nil {
+			t.Fatalf("in-memory mode must ignore the key: key=%v err=%v", key, err)
+		}
+	})
+
+	t.Run("required with a data directory", func(t *testing.T) {
+		if _, err := loadVaultKey("/data", env(nil)); err == nil {
+			t.Fatal("expected an error: persistent storage without an encryption key")
+		}
+	})
+
+	t.Run("decodes a 32-byte key", func(t *testing.T) {
+		key, err := loadVaultKey("/data", env(map[string]string{"VAULT_ENCRYPTION_KEY": good + "\n"}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(key) != 32 || key[31] != 31 {
+			t.Fatalf("unexpected key: % x", key)
+		}
+	})
+
+	t.Run("rejects a malformed key without echoing it", func(t *testing.T) {
+		for _, bad := range []string{"not-base64!", "c2hvcnQ="} {
+			_, err := loadVaultKey("/data", env(map[string]string{"VAULT_ENCRYPTION_KEY": bad}))
+			if err == nil {
+				t.Fatalf("expected an error for %q", bad)
+			}
+			if strings.Contains(err.Error(), bad) {
+				t.Fatalf("error echoes the key material: %v", err)
+			}
+		}
+	})
+}

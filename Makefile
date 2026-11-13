@@ -7,8 +7,9 @@
 # aei-controller, and the runtime is gofer's own image, launched per run.
 
 .PHONY: build test vet tidy run runtime genkey clean \
-        engine build-linux image image-runtime kind-load kind-load-runtime push-runtime \
+        engine build-linux image image-runtime push-check push kind-load kind-load-runtime push-runtime \
         cluster-up cluster-down dev-up dev-down dev-forward dev-logs \
+        deploy deploy-target deploy-apply aei-check secrets-check dev-secrets \
         monitoring-load dev-monitoring dev-monitoring-down dev-forward-grafana dev-forward-prometheus
 
 build:
@@ -71,7 +72,15 @@ SUBSTRATE_REGISTRY ?= localhost:5001
 RUNTIME_REGISTRY_IMAGE := $(SUBSTRATE_REGISTRY)/gofer-runtime:dev
 KIND_CLUSTER ?= gofer
 KUBE_NS ?= gofer
-KUBE_CONTEXT ?= kind-$(KIND_CLUSTER)
+# Which cluster the kubectl targets act on. By default, the kind dev cluster's context
+# in your usual kubeconfig. To act on any other cluster, pass a kubeconfig file on the
+# command line: `make deploy KUBECONFIG=/path/to/kubeconfig`; that file's current
+# context is then used unless KUBE_CONTEXT names another. A KUBECONFIG that is merely
+# exported in your shell does not change the default context, so the dev targets keep
+# pointing at kind.
+KUBECONFIG_GIVEN := $(filter command line,$(origin KUBECONFIG))
+KUBE_CONTEXT ?= $(if $(KUBECONFIG_GIVEN),,kind-$(KIND_CLUSTER))
+KUBECTL = kubectl $(if $(KUBECONFIG_GIVEN),--kubeconfig "$(abspath $(KUBECONFIG))") $(if $(KUBE_CONTEXT),--context $(KUBE_CONTEXT))
 KIND_CONFIG ?= deploy/kind/cluster.yaml
 # The AgentProviderClass gofer's runs dispatch to — a well-known, admin-published name
 # (e.g. "isolated", "durable", "k8s-job"). gofer is substrate-agnostic: it names a
@@ -81,14 +90,21 @@ KIND_CONFIG ?= deploy/kind/cluster.yaml
 # for a cluster with no extra substrate installed.
 AGENT_PROVIDER_CLASS ?= isolated
 WEB_LOCAL_PORT ?= 8080
+# How long deploy waits for the web tier. A first rollout on a cloud cluster also
+# provisions and attaches the data disk.
+ROLLOUT_TIMEOUT ?= 180s
 # Optional monitoring stack (opt-in; see `make dev-monitoring`).
 MONITORING_NS ?= gofer-monitoring
 PROMETHEUS_IMAGE ?= docker.io/prom/prometheus:v3.1.0
 GRAFANA_IMAGE ?= docker.io/grafana/grafana:11.4.0
 GRAFANA_LOCAL_PORT ?= 3000
 PROM_LOCAL_PORT ?= 9090
-# The kind nodes are linux; the arch matches the container engine (arm64 on Apple Silicon).
-GOARCH ?= $(shell go env GOARCH)
+# The platform the images are built for, e.g. PLATFORM=linux/amd64 for a cloud cluster
+# built from an arm64 laptop. Empty builds for the host's architecture, which is what
+# the kind nodes run (arm64 on Apple Silicon).
+PLATFORM ?=
+PLATFORM_FLAG = $(if $(PLATFORM),--platform $(PLATFORM))
+GOARCH ?= $(if $(PLATFORM),$(word 2,$(subst /, ,$(PLATFORM))),$(shell go env GOARCH))
 
 ifeq ($(findstring podman,$(CONTAINER_ENGINE)),podman)
 export KIND_EXPERIMENTAL_PROVIDER = podman
@@ -108,11 +124,23 @@ build-linux:
 
 # Build the web-tier image (packages the prebuilt bin/linux/server).
 image: engine build-linux
-	$(CONTAINER_ENGINE) build -f Dockerfile -t $(IMAGE) .
+	$(CONTAINER_ENGINE) build $(PLATFORM_FLAG) -f Dockerfile -t $(IMAGE) .
 
 # Build the agent-runtime image (packages the prebuilt bin/linux/runtime).
 image-runtime: engine build-linux
-	$(CONTAINER_ENGINE) build -f Dockerfile.runtime -t $(RUNTIME_IMAGE) .
+	$(CONTAINER_ENGINE) build $(PLATFORM_FLAG) -f Dockerfile.runtime -t $(RUNTIME_IMAGE) .
+
+# A non-kind cluster pulls both images from a registry, so they need registry names and
+# the nodes' platform. The dev defaults (localhost/...) are not pushable. Log in to the
+# registry first; `make deploy` then takes the same IMAGE / RUNTIME_IMAGE.
+#     make push IMAGE=<registry>/gofer:<tag> RUNTIME_IMAGE=<registry>/gofer-runtime:<tag> PLATFORM=linux/amd64
+push-check:
+	@for i in "$(IMAGE)" "$(RUNTIME_IMAGE)"; do case "$$i" in localhost/*) \
+		echo "ERROR: $$i is a kind dev tag. Set IMAGE=<registry>/gofer:<tag> and RUNTIME_IMAGE=<registry>/gofer-runtime:<tag>."; exit 1;; esac; done
+
+push: push-check image image-runtime  ## build + push the web and runtime images
+	$(CONTAINER_ENGINE) push $(IMAGE)
+	$(CONTAINER_ENGINE) push $(RUNTIME_IMAGE)
 
 # Load the web image into kind via an engine-agnostic archive (podman + docker).
 kind-load: image
@@ -148,7 +176,7 @@ push-runtime: image-runtime  ## build + push the runtime image to SUBSTRATE_REGI
 cluster-up:
 	@command -v kind >/dev/null || { echo "kind not installed (https://kind.sigs.k8s.io)"; exit 1; }
 	@kind get clusters 2>/dev/null | grep -qx $(KIND_CLUSTER) || kind create cluster --name $(KIND_CLUSTER) --config $(KIND_CONFIG)
-	@nodes=$$(kubectl --context $(KUBE_CONTEXT) get nodes --no-headers 2>/dev/null | wc -l | tr -d ' '); \
+	@nodes=$$($(KUBECTL) get nodes --no-headers 2>/dev/null | wc -l | tr -d ' '); \
 		want=$$(grep -c '^  - role:' $(KIND_CONFIG)); \
 		[ "$${nodes:-0}" -ge "$$want" ] || { \
 			echo "NOTE: cluster '$(KIND_CLUSTER)' already exists with $$nodes node(s); $(KIND_CONFIG) asks for $$want."; \
@@ -162,58 +190,121 @@ cluster-up:
 cluster-down:
 	-kind delete cluster --name $(KIND_CLUSTER)
 
-# Install gofer's app components onto the cluster: require AEI, ensure the kind
-# cluster + images, the run-credential verify key, the namespace, and the secret, apply
-# the web app + the AgentApp, then wait for rollout.
+# ---- deploy ---------------------------------------------------------------------
 #
-# With AEI selected as the agent-runtime backend, gofer CANNOT run standalone: dev-up
-# fails fast if the AEI CRDs are absent. AEI (its controller, CRDs, and an
+# Two entry points share one apply path (deploy-apply):
+#
+#   make dev-up                       the kind dev loop: create the cluster, build and
+#                                     load the images, generate the Secret, then apply.
+#   make deploy KUBECONFIG=<file>     what a CI job runs against a real cluster: apply
+#                                     only. gofer does not create, size or manage the
+#                                     cluster; it needs a kubeconfig that reaches one.
+#
+# `deploy` expects, already in place: AEI installed on the cluster, the gofer-secrets
+# Secret (see deploy/k8s/base/secret.example.yaml), and IMAGE / RUNTIME_IMAGE pushed
+# to a registry the cluster can pull from, for example:
+#
+#   make deploy KUBECONFIG=$$HOME/.kube/aks-prod \
+#       IMAGE=ghcr.io/you/gofer:v1 RUNTIME_IMAGE=ghcr.io/you/gofer-runtime:v1 \
+#       AGENT_PROVIDER_CLASS=isolated
+#
+# With AEI selected as the agent-runtime backend, gofer CANNOT run standalone: both
+# entry points fail fast if the AEI CRDs are absent. AEI (its controller, CRDs, and an
 # AgentProviderClass) is installed separately on the AEI side, including its
 # run-credential signing authority (AEI owns the keypair as sole minter; gofer's web
 # tier verifies with AEI's public key, MINT_PUBLIC_KEY — it holds no minting key).
-#
-# SESSION_SECRET is generated; MINT_PUBLIC_KEY is AEI's published verify key (read from
+
+# `deploy` must be told which cluster: a kubeconfig file or an explicit context. It
+# never falls back to the kind default, so a bare `make deploy` cannot land somewhere
+# unintended.
+deploy-target:
+	@[ -n "$(KUBECONFIG_GIVEN)" ] || [ "$(origin KUBE_CONTEXT)" != "file" ] || { \
+		echo "ERROR: 'make deploy' needs an explicit target cluster:"; \
+		echo "         make deploy KUBECONFIG=/path/to/kubeconfig [KUBE_CONTEXT=name]"; \
+		echo "       (for the kind dev cluster, use 'make dev-up')."; \
+		exit 1; }
+	@[ -z "$(KUBECONFIG_GIVEN)" ] || [ -f "$(abspath $(KUBECONFIG))" ] || { \
+		echo "ERROR: kubeconfig not found: $(abspath $(KUBECONFIG))"; exit 1; }
+	@echo "deploying to context '$$($(KUBECTL) config current-context 2>/dev/null)' at $$($(KUBECTL) config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+
+aei-check:
+	@$(KUBECTL) get crd agentapps.agents.x-k8s.io >/dev/null 2>&1 || { \
+		echo "ERROR: AEI is not installed (agents.x-k8s.io CRDs missing). This build dispatches to"; \
+		echo "       the aei-controller and cannot run without it. Install AEI, then re-run."; \
+		exit 1; }
+
+# `deploy` does not create secrets: a real cluster's keys come from your secret manager,
+# not from a make target. It only checks that the ones the server refuses to start
+# without are present.
+secrets-check:
+	@for k in SESSION_SECRET VAULT_ENCRYPTION_KEY MINT_PUBLIC_KEY; do \
+		$(KUBECTL) -n $(KUBE_NS) get secret gofer-secrets -o jsonpath="{.data.$$k}" 2>/dev/null | grep -q . || { \
+			echo "ERROR: Secret $(KUBE_NS)/gofer-secrets is missing or has no $$k."; \
+			echo "       Create it before deploying (template: deploy/k8s/base/secret.example.yaml)."; \
+			exit 1; }; \
+	done
+
+deploy: deploy-target aei-check secrets-check deploy-apply
+
+# The kind dev loop. SESSION_SECRET and VAULT_ENCRYPTION_KEY are generated;
+# MINT_PUBLIC_KEY is AEI's published verify key (read from
 # the cluster's aei-signing secret, or passed explicitly); GITHUB_CLIENT_ID /
 # GITHUB_CLIENT_SECRET and AI_TOKEN (the chat-model token gofer brokers to runtimes;
 # unset = stub ranker, no LLM) are seeded from your shell env when set. AI_CONNECTIONS
 # defaults from the configmap but can likewise be overridden from the shell.
 # The GitHub OAuth callback for the port-forward is http://localhost:$(WEB_LOCAL_PORT)/auth/github/callback.
-dev-up: cluster-up kind-load kind-load-runtime
-	@kubectl --context $(KUBE_CONTEXT) get crd agentapps.agents.x-k8s.io >/dev/null 2>&1 || { \
-		echo "ERROR: AEI is not installed (agents.x-k8s.io CRDs missing). This build dispatches to"; \
-		echo "       the aei-controller and cannot run without it. Install AEI, then re-run 'make dev-up'."; \
-		exit 1; }
-	@kubectl --context $(KUBE_CONTEXT) create namespace $(KUBE_NS) --dry-run=client -o yaml | kubectl --context $(KUBE_CONTEXT) apply -f -
+dev-secrets:
+	@$(KUBECTL) create namespace $(KUBE_NS) --dry-run=client -o yaml | $(KUBECTL) apply -f -
 	@# AEI owns the run-credential keypair and is the sole minter; gofer's web tier only
 	@# VERIFIES, with AEI's PUBLIC key. Provide it via MINT_PUBLIC_KEY, or let dev-up read
 	@# AEI's published key from the cluster (both share one kind cluster in dev). gofer
 	@# feeds AEI nothing secret.
-	@mpk="$${MINT_PUBLIC_KEY:-$$(kubectl --context $(KUBE_CONTEXT) -n aei-system get secret aei-signing -o jsonpath='{.data.AEI_ED25519_PUBLIC_KEY}' 2>/dev/null | base64 -d)}"; \
+	@mpk="$${MINT_PUBLIC_KEY:-$$($(KUBECTL) -n aei-system get secret aei-signing -o jsonpath='{.data.AEI_ED25519_PUBLIC_KEY}' 2>/dev/null | base64 -d)}"; \
 		test -n "$$mpk" || { \
 			echo "ERROR: no AEI run-credential verify key found. On the AEI side run 'make authority'"; \
 			echo "       (provisions the platform keypair), then 'make public-key', and re-run this with"; \
 			echo "       MINT_PUBLIC_KEY=<that key>."; \
 			exit 1; }; \
-		kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) get secret gofer-secrets >/dev/null 2>&1 || \
-			kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) create secret generic gofer-secrets \
+		$(KUBECTL) -n $(KUBE_NS) get secret gofer-secrets >/dev/null 2>&1 || \
+			$(KUBECTL) -n $(KUBE_NS) create secret generic gofer-secrets \
 				--from-literal=SESSION_SECRET="$$(openssl rand -base64 48)" \
+				--from-literal=VAULT_ENCRYPTION_KEY="$$(openssl rand -base64 32)" \
 				--from-literal=MINT_PUBLIC_KEY="$$mpk" \
 				--from-literal=GITHUB_CLIENT_ID="$${GITHUB_CLIENT_ID:-}" \
 				--from-literal=GITHUB_CLIENT_SECRET="$${GITHUB_CLIENT_SECRET:-}" \
 				--from-literal=AI_TOKEN="$${AI_TOKEN:-}"; \
-		kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) patch secret gofer-secrets --type=merge \
+		$(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge \
 			-p "{\"stringData\":{\"MINT_PUBLIC_KEY\":\"$$mpk\"}}"
-	@[ -z "$$GITHUB_CLIENT_ID" ] || kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"GITHUB_CLIENT_ID\":\"$$GITHUB_CLIENT_ID\"}}"
-	@[ -z "$$GITHUB_CLIENT_SECRET" ] || kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"GITHUB_CLIENT_SECRET\":\"$$GITHUB_CLIENT_SECRET\"}}"
-	@[ -z "$$AI_TOKEN" ] || kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"AI_TOKEN\":\"$$AI_TOKEN\"}}"
-	kubectl --context $(KUBE_CONTEXT) apply -k deploy/k8s/base
-	@[ -z "$$AI_CONNECTIONS" ] || kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$$AI_CONNECTIONS" '{data:{AI_CONNECTIONS:$$v}}')"
-	kubectl --context $(KUBE_CONTEXT) apply -f deploy/k8s/overlays/dev/agentapp.yaml
+	@[ -z "$$GITHUB_CLIENT_ID" ] || $(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"GITHUB_CLIENT_ID\":\"$$GITHUB_CLIENT_ID\"}}"
+	@[ -z "$$GITHUB_CLIENT_SECRET" ] || $(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"GITHUB_CLIENT_SECRET\":\"$$GITHUB_CLIENT_SECRET\"}}"
+	@[ -z "$$AI_TOKEN" ] || $(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"AI_TOKEN\":\"$$AI_TOKEN\"}}"
+	@# A gofer-secrets created before persistent storage has no token-encryption key.
+	@# Add one if it is missing; never replace an existing key (it seals stored tokens).
+	@$(KUBECTL) -n $(KUBE_NS) get secret gofer-secrets -o jsonpath='{.data.VAULT_ENCRYPTION_KEY}' | grep -q . || \
+		$(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge \
+			-p "{\"stringData\":{\"VAULT_ENCRYPTION_KEY\":\"$$(openssl rand -base64 32)\"}}"
+
+# The shared apply path: the web tier, its config, and the AgentApp, with the images
+# set to IMAGE / RUNTIME_IMAGE, then a rollout. Cluster-agnostic.
+deploy-apply:
+	@$(KUBECTL) create namespace $(KUBE_NS) --dry-run=client -o yaml | $(KUBECTL) apply -f -
+	@# The web tier was a Deployment before it had a volume. Remove a leftover one so it
+	@# does not keep serving, in memory, beside the StatefulSet behind the same Service.
+	$(KUBECTL) -n $(KUBE_NS) delete deployment gofer --ignore-not-found
+	@# The manifests name the kind-loaded dev images; substitute the ones being deployed
+	@# (a no-op for the dev defaults).
+	$(KUBECTL) kustomize deploy/k8s/base | sed 's|image: localhost/gofer:dev$$|image: $(IMAGE)|' | $(KUBECTL) apply -f -
+	@[ -z "$$AI_CONNECTIONS" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$$AI_CONNECTIONS" '{data:{AI_CONNECTIONS:$$v}}')"
+	sed 's|image: localhost/gofer-runtime:dev$$|image: $(RUNTIME_IMAGE)|' deploy/k8s/overlays/dev/agentapp.yaml | $(KUBECTL) apply -f -
 	@# Point the AgentApp at the well-known class name the admin published on the AEI side
 	@# (AGENT_PROVIDER_CLASS). gofer references a capability by name, not a substrate — an
 	@# empty value would select the cluster-default class.
-	kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) patch agentapp gofer --type=merge \
+	$(KUBECTL) -n $(KUBE_NS) patch agentapp gofer --type=merge \
 		-p '{"spec":{"providerClassName":"$(AGENT_PROVIDER_CLASS)"}}'
+	$(KUBECTL) rollout restart statefulset/gofer -n $(KUBE_NS)
+	$(KUBECTL) rollout status statefulset/gofer -n $(KUBE_NS) --timeout=$(ROLLOUT_TIMEOUT)
+
+dev-up: cluster-up kind-load kind-load-runtime aei-check dev-secrets deploy-apply
 	@# Durable pulls actor images from a registry BY DIGEST (a tag invalidates ate's golden
 	@# snapshot; kind-loaded images are not registry-pullable). So for the durable class,
 	@# push the runtime to the substrate registry and pin the AgentApp image to the pushed
@@ -234,25 +325,23 @@ dev-up: cluster-up kind-load kind-load-runtime
 			awk 'tolower($$1) ~ /docker-content-digest/ {print $$2}' | tr -d '\r' | tail -1); \
 		test -n "$$digest" || { echo "ERROR: could not read the pushed image digest from $(SUBSTRATE_REGISTRY)"; exit 1; }; \
 		echo "durable: pinning AgentApp image to $(SUBSTRATE_REGISTRY)/gofer-runtime@$$digest"; \
-		kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) patch agentapp gofer --type=merge \
+		$(KUBECTL) -n $(KUBE_NS) patch agentapp gofer --type=merge \
 			-p "{\"spec\":{\"image\":\"$(SUBSTRATE_REGISTRY)/gofer-runtime@$$digest\"}}"; \
 	fi
-	kubectl --context $(KUBE_CONTEXT) rollout restart deploy/gofer -n $(KUBE_NS)
-	kubectl --context $(KUBE_CONTEXT) rollout status deploy/gofer -n $(KUBE_NS) --timeout=120s
 
 # Tear down gofer's app components (leaves the cluster + AEI in place).
 dev-down:
-	-kubectl --context $(KUBE_CONTEXT) delete -f deploy/k8s/overlays/dev/agentapp.yaml --ignore-not-found
-	-kubectl --context $(KUBE_CONTEXT) delete -k deploy/k8s/base
-	-kubectl --context $(KUBE_CONTEXT) delete namespace $(KUBE_NS)
+	-$(KUBECTL) delete -f deploy/k8s/overlays/dev/agentapp.yaml --ignore-not-found
+	-$(KUBECTL) delete -k deploy/k8s/base
+	-$(KUBECTL) delete namespace $(KUBE_NS)
 
 # Port-forward the web tier to the host.
 dev-forward:
-	kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) port-forward svc/gofer $(WEB_LOCAL_PORT):8080
+	$(KUBECTL) -n $(KUBE_NS) port-forward svc/gofer $(WEB_LOCAL_PORT):8080
 
 # Tail the web tier logs.
 dev-logs:
-	kubectl --context $(KUBE_CONTEXT) -n $(KUBE_NS) logs -l app.kubernetes.io/name=gofer -f
+	$(KUBECTL) -n $(KUBE_NS) logs -l app.kubernetes.io/name=gofer -f
 
 # ---- optional monitoring stack (Prometheus + Grafana) ------------------------
 # Scrapes gofer's own /metrics (app-level aggregates) and the aei-controller's
@@ -262,15 +351,15 @@ monitoring-load: engine
 	$(CONTAINER_ENGINE) pull $(GRAFANA_IMAGE) && $(CONTAINER_ENGINE) save $(GRAFANA_IMAGE) -o graf.tar && kind load image-archive graf.tar --name $(KIND_CLUSTER) && rm -f graf.tar
 
 dev-monitoring: cluster-up monitoring-load
-	kubectl --context $(KUBE_CONTEXT) apply -k deploy/k8s/monitoring
-	kubectl --context $(KUBE_CONTEXT) -n $(MONITORING_NS) rollout status deploy/prometheus --timeout=120s
-	kubectl --context $(KUBE_CONTEXT) -n $(MONITORING_NS) rollout status deploy/grafana --timeout=120s
+	$(KUBECTL) apply -k deploy/k8s/monitoring
+	$(KUBECTL) -n $(MONITORING_NS) rollout status deploy/prometheus --timeout=120s
+	$(KUBECTL) -n $(MONITORING_NS) rollout status deploy/grafana --timeout=120s
 
 dev-monitoring-down:
-	-kubectl --context $(KUBE_CONTEXT) delete -k deploy/k8s/monitoring
+	-$(KUBECTL) delete -k deploy/k8s/monitoring
 
 dev-forward-grafana:
-	kubectl --context $(KUBE_CONTEXT) -n $(MONITORING_NS) port-forward svc/grafana $(GRAFANA_LOCAL_PORT):3000
+	$(KUBECTL) -n $(MONITORING_NS) port-forward svc/grafana $(GRAFANA_LOCAL_PORT):3000
 
 dev-forward-prometheus:
-	kubectl --context $(KUBE_CONTEXT) -n $(MONITORING_NS) port-forward svc/prometheus $(PROM_LOCAL_PORT):9090
+	$(KUBECTL) -n $(MONITORING_NS) port-forward svc/prometheus $(PROM_LOCAL_PORT):9090

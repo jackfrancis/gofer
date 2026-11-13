@@ -19,6 +19,8 @@ import (
 	"github.com/jackfrancis/gofer/internal/ingest"
 	"github.com/jackfrancis/gofer/internal/runtime/aei"
 	"github.com/jackfrancis/gofer/internal/server"
+	"github.com/jackfrancis/gofer/internal/session"
+	"github.com/jackfrancis/gofer/internal/storage"
 	"github.com/jackfrancis/gofer/internal/vault"
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
@@ -32,8 +34,44 @@ func main() {
 		os.Exit(1)
 	}
 
-	vlt := vault.NewMemoryVault()
-	store := worklist.NewMemoryStore()
+	// Web-tier state: the worklist, the vault of delegated provider tokens, and
+	// sessions. With DATA_DIR set they live in one SQLite database there (tokens
+	// encrypted with VAULT_ENCRYPTION_KEY) and survive a restart; without it they are
+	// in memory. See docs/adr/0004-sqlite-persistent-storage.md.
+	var (
+		vlt          vault.Vault    = vault.NewMemoryVault()
+		store        worklist.Store = worklist.NewMemoryStore()
+		sessionStore session.Store  // nil: the session manager keeps sessions in memory
+		closeStorage = func() {}
+	)
+	if cfg.DataDir == "" {
+		log.Warn("persistent storage disabled: sessions, delegated tokens and the worklist are in memory and will be lost on restart (set DATA_DIR and VAULT_ENCRYPTION_KEY to persist them)")
+	} else {
+		openCtx, cancelOpen := context.WithTimeout(context.Background(), 30*time.Second)
+		db, err := storage.Open(openCtx, cfg.DataDir)
+		cancelOpen()
+		if err != nil {
+			log.Error("storage error", "err", err)
+			os.Exit(1)
+		}
+		keys, err := storage.NewKeyring(cfg.VaultKey)
+		if err != nil {
+			log.Error("storage error", "err", err)
+			os.Exit(1)
+		}
+		vlt, store, sessionStore = db.Vault(keys), db.Worklist(), db.Sessions()
+		closeStorage = func() {
+			if err := db.Close(); err != nil {
+				log.Error("closing storage failed", "err", err)
+				return
+			}
+			log.Info("storage closed")
+		}
+		log.Info("persistent storage enabled", "data_dir", cfg.DataDir, "vault_key_id", keys.PrimaryKeyID())
+	}
+	// Runs on the way out of main, after the HTTP server has drained (below), so no
+	// request is mid-write when the database closes.
+	defer closeStorage()
 
 	if cfg.ConversationEnabled {
 		log.Info("assistive conversation enabled (the agent-runtime backend runs the model)")
@@ -55,7 +93,7 @@ func main() {
 	}
 	var dispatcher ingest.Dispatcher = runtimeBackend
 
-	handler, cleanup := server.New(cfg, log, dispatcher, vlt, store)
+	handler, cleanup := server.New(cfg, log, dispatcher, vlt, store, sessionStore)
 	defer cleanup()
 
 	srv := &http.Server{

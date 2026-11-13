@@ -27,7 +27,7 @@ a reference for the seam with nothing plugged in.
 ## Tech & layout
 
 - Go 1.26.0. gofer imports its own packages, a few libraries (goldmark, bluemonday,
-  prometheus, oauth2), and AEI's two stdlib-only SDK modules (the app SDK
+  prometheus, oauth2, modernc.org/sqlite — pure Go, so `CGO_ENABLED=0` holds), and AEI's two stdlib-only SDK modules (the app SDK
   `sdks/go/aeiapp` to dispatch, the runtime SDK `aeiruntime` for the agent binary).
   Those are consumed through `replace` directives in `go.mod` pointing at a SIBLING
   checkout (`../agent-execution-interface`), so the build needs that checkout present
@@ -48,7 +48,8 @@ internal/agent/      agent-runtime WORKLOAD (the runtime runs it per run)
 internal/worklist/   WorkItem + Metadata, Store + Ingestor seams, sort, scoring
 internal/auth/       OAuth provider wiring + login/callback
 internal/authn/      RequireAuth / RequireScope (cookie OR bearer)
-internal/session/    HMAC-signed cookie sessions
+internal/session/    HMAC-signed cookie sessions; Store seam for authenticated sessions
+internal/storage/    SQLite persistence: worklist, encrypted vault, sessions (web tier only)
 internal/api/        JSON handlers: worklist, agent sink, credential broker
 internal/server/     web-tier router + middleware
 internal/webui/      landing page
@@ -59,7 +60,7 @@ internal/markdown/   render + sanitize assistant Markdown
 internal/metrics/    Prometheus metrics
 Dockerfile           web-tier image
 Dockerfile.runtime   agent-runtime image (AEI launches it per run)
-deploy/k8s/base/     app manifests: namespace, SA, config, deployment, service
+deploy/k8s/base/     app manifests: namespace, SA, config, statefulset (+ data PVC), service
 deploy/k8s/overlays/dev/  base + agentapp.yaml (gofer's AEI dispatch registration)
 ```
 
@@ -117,15 +118,25 @@ Wired on the web-tier side; they define what a runtime must respect:
   `ingest.Dispatcher` interface; `cmd/server` wires `aei.Dispatcher`, and
   `NoopDispatcher` remains as the reference no-op (used by tests).
 - Interfaces are the extension seams: `identity.Authority`, `worklist.Store` /
-  `worklist.Ingestor`, `ingest.Dispatcher`, and the workload's `agent.Vendor` /
+  `worklist.Ingestor`, `vault.Vault`, `session.Store`, `ingest.Dispatcher`, and the workload's `agent.Vendor` /
   `agent.Sink`.
 - The web tier fails fast at startup without `AEI_DISPATCH_ENDPOINT` and `AEI_APP`.
   With them set but no reachable aei-controller (e.g. `make run`), sign-in works but
   dispatch fails, so the worklist stays empty.
-- All web-tier state (sessions, delegated tokens in the vault, the worklist and its
-  threads) is in memory in the single web pod: a restart loses it. To ship a
-  workload-only change (`internal/agent`, `internal/llm`, `internal/github`) to the
-  kind cluster without that restart, use `make kind-load-runtime`.
+- Web-tier state (sessions, delegated tokens in the vault, the worklist and its
+  threads) is durable when `DATA_DIR` is set: one SQLite database
+  (`internal/storage`, pure-Go `modernc.org/sqlite`) on the StatefulSet's
+  PersistentVolume, with tokens sealed by `VAULT_ENCRYPTION_KEY` (required with
+  `DATA_DIR`; startup fails without it). With `DATA_DIR` unset (`make run`, tests) the
+  in-memory stores are used and a restart loses the state. The web tier is a single
+  replica by construction. Pre-auth OAuth flow state and the ingest backfill tracker
+  are always in memory. See `docs/adr/0004-sqlite-persistent-storage.md` and
+  `docs/backup-restore.md`.
+- Schema changes are a new numbered file in `internal/storage/migrations/`; never
+  edit an applied one.
+- To ship a workload-only change (`internal/agent`, `internal/llm`,
+  `internal/github`) to the kind cluster without restarting the web pod, use
+  `make kind-load-runtime`.
 - The conversation's tool loop is capped at `maxToolIterations` rounds
   (`internal/llm/converse.go`); the model's GitHub tools are in `internal/agent/tools.go`,
   and the whole-repository tools (`repo_checkout`/`repo_search`/`repo_list`/`repo_read`)
@@ -143,6 +154,8 @@ make run     # run the web tier alone (local UI/OAuth; dispatch needs an aei-con
 make genkey  # an Ed25519 keypair for local runs (in-cluster, AEI's public key is used)
 make dev-up  # deploy web + runtime images and the AgentApp to kind (AEI must be installed first)
 make kind-load-runtime  # rebuild + load only the runtime image
+make push IMAGE=... RUNTIME_IMAGE=... PLATFORM=linux/amd64  # build both images for a platform and push them
+make deploy KUBECONFIG=<file> IMAGE=... RUNTIME_IMAGE=...  # apply to any cluster (no kind, no secret creation); dev-up shares its apply step
 ```
 
 See README.md for the kind walkthrough, including the AEI-side install.

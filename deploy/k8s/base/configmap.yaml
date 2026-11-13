@@ -1,5 +1,5 @@
-# Non-secret configuration for the web tier. Secrets (SESSION_SECRET, the OAuth
-# client secret) and the verify-only run-credential public key (MINT_PUBLIC_KEY)
+# Non-secret configuration for the web tier. Secrets (SESSION_SECRET,
+# VAULT_ENCRYPTION_KEY, the OAuth client secret) and the verify-only run-credential public key (MINT_PUBLIC_KEY)
 # live in the gofer-secrets Secret (see secret.example.yaml); `make dev-up` creates
 # it imperatively.
 apiVersion: v1
@@ -9,6 +9,10 @@ metadata:
   namespace: gofer
 data:
   ADDR: ":8080"
+  # Where the web tier keeps its SQLite database (gofer.db): the mount path of the
+  # StatefulSet's "data" volume. With DATA_DIR set, VAULT_ENCRYPTION_KEY (in
+  # gofer-secrets) is required. Unset, state is in memory and lost on restart.
+  DATA_DIR: "/var/lib/gofer"
   # The browser-facing base URL. For the dev port-forward this is localhost; the
   # GitHub OAuth callback is BASE_URL + /auth/github/callback.
   BASE_URL: "http://localhost:8080"
