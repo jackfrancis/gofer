@@ -1,0 +1,10 @@
+# gofer agent runtime (cmd/runtime), packaged from a prebuilt HOST binary (see the
+# note in Dockerfile). An AEI provider runs this image per dispatched run — as a
+# one-shot Job, a sandbox pod, or a durable actor, whichever the app's provider class
+# names. It makes outbound HTTPS to GitHub, the chat model, and gofer's own agent
+# plane, so the distroless/static base (with CA certs) suffices.
+FROM gcr.io/distroless/static:nonroot
+COPY bin/linux/runtime /runtime
+# Numeric UID/GID (distroless nonroot) so a runAsNonRoot pod can verify non-root.
+USER 65532:65532
+ENTRYPOINT ["/runtime"]
