@@ -10,8 +10,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -384,4 +388,56 @@ func (c *Client) Search(ctx context.Context, token, query string) (string, error
 		fmt.Fprintf(&b, "- %s %s#%d %q [%s] %s\n", kind, repo, it.Number, it.Title, it.State, it.HTMLURL)
 	}
 	return b.String(), nil
+}
+
+// repoName is the only shape of "owner/name" the tarball fetch will put in a URL.
+var repoName = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+
+// Tarball opens the gzip'd tar archive of a repository's source at ref (a branch,
+// tag, or commit SHA; "" selects the default branch). It is how the conversation
+// analyses a repository as a whole at a specific ref: GitHub's code search indexes
+// default branches only. The caller bounds and unpacks the stream and must close it.
+//
+// GitHub answers with a redirect to a short-lived, pre-signed download URL on another
+// host. net/http drops the Authorization header on that cross-host hop, so the user's
+// token goes to the API host only. The pre-signed URL is itself a credential, so a
+// transport error is returned WITHOUT the URL net/http would embed in it.
+func (c *Client) Tarball(ctx context.Context, token, repo, ref string) (io.ReadCloser, error) {
+	if !repoName.MatchString(repo) || strings.Contains(repo, "..") {
+		return nil, fmt.Errorf("repo must be owner/name")
+	}
+	p := "/repos/" + repo + "/tarball"
+	if ref != "" {
+		for _, seg := range strings.Split(ref, "/") {
+			if seg == "" || seg == "." || seg == ".." || strings.ContainsAny(seg, "\x00\r\n ") {
+				return nil, fmt.Errorf("invalid ref %q", ref)
+			}
+			p += "/" + url.PathEscape(seg)
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+p, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build archive request")
+	}
+	setHeaders(req, token)
+	// The shared client's overall timeout is sized for small JSON calls; an archive
+	// download is bounded by the caller's context instead.
+	hc := *c.http
+	hc.Timeout = 0
+	resp, err := hc.Do(req)
+	if err != nil {
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		return nil, fmt.Errorf("download archive: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("repository or ref not found (status 404)")
+		}
+		return nil, fmt.Errorf("download archive: status %d", resp.StatusCode)
+	}
+	return resp.Body, nil
 }

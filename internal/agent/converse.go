@@ -79,7 +79,10 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		if disc, derr := gh.Discussion(ctx, token, item.GitHub.Repo, item.GitHub.Number, isPR); derr == nil {
 			sourceContext = formatDiscussion(disc)
 		}
-		tools = newGitHubToolBox(gh, token, item.GitHub.Repo)
+		box := newGitHubToolBox(gh, token, item.GitHub.Repo)
+		// Repository checkouts live on the sandbox's scratch disk for this turn only.
+		defer box.Close()
+		tools = box
 	}
 
 	reply, err := p.Converser.Reply(ctx, item, viewerLogin, sourceContext, history, userText, tools)
