@@ -111,6 +111,24 @@ keeps logins and the worklist. See
 [ADR 0004](docs/adr/0004-sqlite-persistent-storage.md) for the design and
 [docs/backup-restore.md](docs/backup-restore.md) for volume snapshots and restore.
 
+### Deploy to another cluster
+
+`make dev-up` is the kind loop. To deploy to any other cluster, the way a CI job
+would, pass a kubeconfig file:
+
+```sh
+make deploy KUBECONFIG=/path/to/kubeconfig \
+    IMAGE=ghcr.io/you/gofer:v1 RUNTIME_IMAGE=ghcr.io/you/gofer-runtime:v1
+```
+
+`deploy` only applies: it does not create or manage the cluster, build or push
+images, or create secrets. It expects AEI installed, the `gofer-secrets` Secret in
+place (template: `deploy/k8s/base/secret.example.yaml`), and both images pullable
+by the cluster. It uses the kubeconfig's current context unless `KUBE_CONTEXT`
+names another, and refuses to run without an explicit target. `dev-up` runs the
+same apply step after its kind-specific setup. The other kubectl targets
+(`dev-forward`, `dev-logs`, `dev-down`) accept `KUBECONFIG=` the same way.
+
 `make run` starts the web tier alone for UI/OAuth work; without a reachable
 aei-controller, sign-in works but dispatch fails and the worklist stays empty. It
 leaves `DATA_DIR` unset, so state is in memory; to persist locally, run it with
