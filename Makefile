@@ -9,7 +9,8 @@
 .PHONY: build test vet tidy run runtime genkey clean \
         engine build-linux image image-runtime push-check push kind-load kind-load-runtime push-runtime \
         cluster-up cluster-down dev-up dev-down dev-forward dev-logs \
-        deploy deploy-target deploy-apply aei-check secrets-check dev-secrets \
+        deploy deploy-target deploy-apply deploy-public public-address public-down \
+        aei-check secrets-check dev-secrets \
         monitoring-load dev-monitoring dev-monitoring-down dev-forward-grafana dev-forward-prometheus
 
 build:
@@ -90,6 +91,23 @@ KIND_CONFIG ?= deploy/kind/cluster.yaml
 # for a cluster with no extra substrate installed.
 AGENT_PROVIDER_CLASS ?= isolated
 WEB_LOCAL_PORT ?= 8080
+# An address outside the cluster (deploy/k8s/public/service.yaml): PUBLIC_SERVICE=true
+# adds the gofer-public Service of type LoadBalancer, with any PUBLIC_SERVICE_ANNOTATIONS
+# (comma-separated key=value, e.g. the cloud's static-IP annotations; a piece with no
+# "=" continues the previous value, so a=x,y,b=z gives a: "x,y" and b: "z") and
+# PUBLIC_SOURCE_RANGES (comma-separated CIDRs allowed to connect; empty = anyone).
+# PUBLIC_SERVICE=false (the default) leaves an existing one alone; `make public-down`
+# removes it.
+PUBLIC_SERVICE ?= false
+PUBLIC_SERVICE_ANNOTATIONS ?=
+PUBLIC_SOURCE_RANGES ?=
+# The browser-facing base URL, written into gofer-config on every deploy when set
+# (the OAuth callback is BASE_URL/auth/github/callback). Empty keeps the configmap's
+# value (http://localhost:8080, the port-forward). With a public Service it is the
+# address `make public-address` prints, or the static IP's DNS name.
+BASE_URL ?=
+# How long public-address waits for the cloud to assign the address, in seconds.
+PUBLIC_ADDRESS_TIMEOUT ?= 300
 # How long deploy waits for the web tier. A first rollout on a cloud cluster also
 # provisions and attaches the data disk.
 ROLLOUT_TIMEOUT ?= 180s
@@ -295,6 +313,8 @@ deploy-apply:
 	@# (a no-op for the dev defaults).
 	$(KUBECTL) kustomize deploy/k8s/base | sed 's|image: localhost/gofer:dev$$|image: $(IMAGE)|' | $(KUBECTL) apply -f -
 	@[ -z "$$AI_CONNECTIONS" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$$AI_CONNECTIONS" '{data:{AI_CONNECTIONS:$$v}}')"
+	@[ -z "$(BASE_URL)" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$(BASE_URL)" '{data:{BASE_URL:$$v}}')"
+	@[ "$(PUBLIC_SERVICE)" != true ] || $(MAKE) --no-print-directory deploy-public
 	sed 's|image: localhost/gofer-runtime:dev$$|image: $(RUNTIME_IMAGE)|' deploy/k8s/overlays/dev/agentapp.yaml | $(KUBECTL) apply -f -
 	@# Point the AgentApp at the well-known class name the admin published on the AEI side
 	@# (AGENT_PROVIDER_CLASS). gofer references a capability by name, not a substrate — an
@@ -303,6 +323,30 @@ deploy-apply:
 		-p '{"spec":{"providerClassName":"$(AGENT_PROVIDER_CLASS)"}}'
 	$(KUBECTL) rollout restart statefulset/gofer -n $(KUBE_NS)
 	$(KUBECTL) rollout status statefulset/gofer -n $(KUBE_NS) --timeout=$(ROLLOUT_TIMEOUT)
+
+# The public Service, rendered with its annotations and source ranges, then applied.
+# Re-applying with a different PUBLIC_SERVICE_ANNOTATIONS replaces the set.
+deploy-public:
+	kubectl patch --local -o yaml -f deploy/k8s/public/service.yaml --type=merge -p "$$(jq -nc \
+		--arg a "$(PUBLIC_SERVICE_ANNOTATIONS)" --arg r "$(PUBLIC_SOURCE_RANGES)" \
+		'{metadata: {annotations: (reduce ($$a | split(",")[] | select(. != "")) as $$t ([]; \
+			if ($$t | test("=")) then . + [$$t] else .[:-1] + [.[-1] + "," + $$t] end) \
+			| map({key: (split("=")[0]), value: (split("=")[1:] | join("="))}) | from_entries)}, \
+		  spec: {loadBalancerSourceRanges: (if $$r == "" then null else ($$r | split(",")) end)}}')" | \
+		$(KUBECTL) apply -f -
+
+# Wait for the public Service's external address and print it as a URL (the value for
+# BASE_URL when there is no DNS name), or fail after PUBLIC_ADDRESS_TIMEOUT seconds.
+public-address:
+	@i=0; while :; do \
+		a="$$($(KUBECTL) -n $(KUBE_NS) get service gofer-public -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)"; \
+		[ -z "$$a" ] || { echo "http://$$a"; exit 0; }; \
+		[ $$i -lt $(PUBLIC_ADDRESS_TIMEOUT) ] || { echo "ERROR: service $(KUBE_NS)/gofer-public has no external address after $(PUBLIC_ADDRESS_TIMEOUT)s:" >&2; \
+			$(KUBECTL) -n $(KUBE_NS) describe service gofer-public 2>&1 | tail -15 >&2; exit 1; }; \
+		sleep 5; i=$$((i + 5)); done
+
+public-down:
+	$(KUBECTL) -n $(KUBE_NS) delete service gofer-public --ignore-not-found
 
 dev-up: cluster-up kind-load kind-load-runtime aei-check dev-secrets deploy-apply
 	@# Durable pulls actor images from a registry BY DIGEST (a tag invalidates ate's golden
