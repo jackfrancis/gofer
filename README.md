@@ -127,8 +127,9 @@ make deploy KUBECONFIG=/path/to/kubeconfig \
 Install AEI on that cluster first, with the same pattern from the AEI checkout
 (`make push IMG=...`, then `make deploy KUBECONFIG=... IMG=... PROVIDERS=k8s-job`);
 its `make public-key KUBECONFIG=...` prints the value for `MINT_PUBLIC_KEY`. Off
-kind, pass `AGENT_PROVIDER_CLASS=k8s-job` here unless the cluster has a `gvisor`
-RuntimeClass for the `isolated` class.
+kind, pass `AGENT_PROVIDER_CLASS=k8s-job` here unless AEI's `isolated` class is
+installed with a RuntimeClass the cluster has (`ISOLATION_CLASS` on the AEI side,
+e.g. `kata-vm-isolation` on AKS; see the AKS example below).
 
 `deploy` only applies: it does not create or manage the cluster, build or push
 images (that is `make push`), or create secrets. It expects AEI installed, the `gofer-secrets` Secret in
@@ -137,6 +138,79 @@ by the cluster. It uses the kubeconfig's current context unless `KUBE_CONTEXT`
 names another, and refuses to run without an explicit target. `dev-up` runs the
 same apply step after its kind-specific setup. The other kubectl targets
 (`dev-forward`, `dev-logs`, `dev-down`) accept `KUBECONFIG=` the same way.
+
+### Example: AKS, end to end
+
+From nothing to gofer at a stable public address with its database on an Azure
+Disk. The cluster comes from AEI's `make create-aks` (in the AEI checkout; see its
+README); everything after that is the ordinary any-cluster flow above. Each step is
+a make command, so a CI job can run the same sequence. The cluster bills while it
+exists (about $0.40/hour with the defaults).
+
+```sh
+# --- in the AEI checkout -----------------------------------------------------------
+# A cluster with a Kata pool for runs, a registry, and a static public IP for gofer.
+# The DNS label (unique in the region) names the address before it exists, so the
+# GitHub OAuth app's callback can be registered up front:
+#   http://<label>.westus2.cloudapp.azure.com/auth/github/callback
+make create-aks AKS_PUBLIC_IP=gofer AKS_PUBLIC_IP_DNS_LABEL=<label>
+# then the install commands create-aks prints (az acr login, make push,
+# make install-agent-sandbox, make deploy ... ISOLATION_CLASS=kata-vm-isolation ...)
+
+# --- in this checkout ----------------------------------------------------------------
+KC=~/.kube/aei-aks-aei.kubeconfig  REG=<registry>.azurecr.io  TAG=$(git rev-parse --short HEAD)
+make push IMAGE=$REG/gofer:$TAG RUNTIME_IMAGE=$REG/gofer-runtime:$TAG PLATFORM=linux/amd64
+# First time only: gofer-secrets, from GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET /
+# AI_TOKEN in the environment, AEI's verify key read from the cluster, and generated
+# SESSION_SECRET / VAULT_ENCRYPTION_KEY (back the latter up; docs/backup-restore.md).
+make dev-secrets KUBECONFIG=$KC
+A=service.beta.kubernetes.io
+make deploy KUBECONFIG=$KC IMAGE=$REG/gofer:$TAG RUNTIME_IMAGE=$REG/gofer-runtime:$TAG \
+    PUBLIC_SERVICE=true \
+    PUBLIC_SERVICE_ANNOTATIONS=$A/azure-load-balancer-resource-group=aei,$A/azure-pip-name=gofer,$A/azure-allowed-ip-ranges=<your-ip>/32 \
+    BASE_URL=http://<label>.westus2.cloudapp.azure.com
+make public-address KUBECONFIG=$KC      # waits for the load balancer; prints http://<ip>
+curl http://<label>.westus2.cloudapp.azure.com/healthz
+
+# --- when done, in the AEI checkout ----------------------------------------------------
+make delete-aks AKS_PUBLIC_IP=gofer AKS_CONFIRM_DELETE=aei
+```
+
+What each piece is, and why:
+
+- **Address.** `PUBLIC_SERVICE=true` adds `gofer-public`
+  ([deploy/k8s/public/service.yaml](deploy/k8s/public/service.yaml)), a Service of
+  type `LoadBalancer` on port 80, next to the in-cluster `gofer` Service that
+  runtimes call. The two annotations bind it to the static IP `create-aks` made in
+  its resource group, so the address (and its DNS name) stays the same across
+  redeploys and even if `gofer-public` is deleted and re-created; without them, AKS
+  picks an address that goes away with the Service. The DNS name lets you register
+  the OAuth callback before the address exists.
+- **Who can connect.** On AKS, limit access with the annotations
+  `azure-allowed-ip-ranges` (CIDRs) and `azure-allowed-service-tags` (Azure service
+  tags, e.g. a corporate VPN's tag, comma-separated), which the cloud provider writes
+  into the cluster's network security group. Do not combine a service tag with
+  `PUBLIC_SOURCE_RANGES` (`spec.loadBalancerSourceRanges`): kube-proxy also enforces
+  that list on every node, so traffic the NSG admits through the tag is dropped
+  there. `PUBLIC_SOURCE_RANGES` is for clouds without such annotations.
+- **No TLS.** The address serves plain HTTP and `COOKIE_SECURE` stays `false`. Put
+  TLS in front (an ingress controller with cert-manager, or Azure Application
+  Gateway) before using it for anything beyond a test, and before registering a
+  GitHub webhook to it.
+- **Disk.** The StatefulSet's `data` claim uses the cluster's default StorageClass
+  (on AKS, `default`: Azure Disk CSI, Standard SSD LRS, `WaitForFirstConsumer`), so
+  a 1Gi Azure Disk is provisioned on first deploy in the cluster's node resource
+  group and attached to whichever node runs `gofer-0`. A disk attaches to one node
+  at a time; the single replica and the StatefulSet's stop-before-start update
+  respect that, and a move to another node waits for the detach (about 30 seconds).
+  `create-aks` taints the Kata pool for agent runs, so `gofer-0` and its disk are on
+  the system pool; its nodes are not zonal, so the disk is not either and can attach
+  to any of them. The claim outlives the pod and the StatefulSet
+  (`persistentVolumeClaimRetentionPolicy: Retain`); the disk is deleted with the
+  cluster, so back it up first (docs/backup-restore.md) if the data matters.
+- **Isolation.** `AGENT_PROVIDER_CLASS` defaults to `isolated`, which on this cluster
+  is AEI's agent-sandbox class with `kata-vm-isolation`: each run in its own Kata VM
+  on the Kata pool.
 
 `make run` starts the web tier alone for UI/OAuth work; without a reachable
 aei-controller, sign-in works but dispatch fails and the worklist stays empty. It
