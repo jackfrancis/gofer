@@ -1,0 +1,40 @@
+# The web tier's address outside the cluster, applied only by
+# `make deploy PUBLIC_SERVICE=true` (not part of the base, so kind and port-forward
+# setups are unchanged).
+#
+# It is a second Service next to the ClusterIP "gofer" one rather than a change to
+# it: runtimes keep calling the agent plane in-cluster (GOFER_SINK_URL), and deleting
+# or changing this one never touches that path.
+#
+# Cloud-specific settings are added at deploy time, not written here:
+#   PUBLIC_SERVICE_ANNOTATIONS  e.g. on AKS, a static IP made in advance (AEI's
+#                               `make create-aks AKS_PUBLIC_IP=<name>` prints the pair):
+#                               service.beta.kubernetes.io/azure-load-balancer-resource-group=<group>,
+#                               service.beta.kubernetes.io/azure-pip-name=<name>
+#                               Without one, the cloud assigns an address that is freed
+#                               when this Service is deleted.
+#                               On AKS, restrict access with the annotations
+#                               service.beta.kubernetes.io/azure-allowed-ip-ranges=<cidr>,...
+#                               service.beta.kubernetes.io/azure-allowed-service-tags=<tag>,...
+#   PUBLIC_SOURCE_RANGES        CIDRs allowed to connect (spec.loadBalancerSourceRanges);
+#                               empty allows everyone. kube-proxy enforces this list on
+#                               the nodes too, so on AKS it must not be combined with
+#                               azure-allowed-service-tags (tagged sources are dropped).
+#
+# Plain HTTP on port 80: there is no TLS here. Set BASE_URL to the address so the
+# OAuth callback matches, and keep COOKIE_SECURE=false until TLS terminates in front.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gofer-public
+  namespace: gofer
+  labels:
+    app.kubernetes.io/name: gofer
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: gofer
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
