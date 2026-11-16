@@ -7,7 +7,7 @@
 # aei-controller, and the runtime is gofer's own image, launched per run.
 
 .PHONY: build test vet tidy run runtime genkey clean \
-        engine build-linux image image-runtime push-check push kind-load kind-load-runtime push-runtime \
+        engine kind-engine build-linux image image-runtime push-check push kind-load kind-load-runtime push-runtime \
         cluster-up cluster-down dev-up dev-down dev-forward dev-logs \
         deploy deploy-target deploy-apply deploy-public public-address public-down \
         aei-check secrets-check dev-secrets \
@@ -60,8 +60,27 @@ clean:
 # backend's AEI dependencies are local `replace` directives to a sibling checkout that
 # is outside any Docker build context (see Dockerfile).
 
-# Container engine autodetection: prefer podman (common on macOS), fall back to docker.
+# Two container engines, because two jobs need different things:
+#
+#   CONTAINER_ENGINE  builds and pushes the images a REAL cluster pulls (`make push`).
+#                     On macOS the default is Apple's `container` CLI
+#                     (https://github.com/apple/container; `brew install container`,
+#                     then `container system start --enable-kernel-install` once),
+#                     which needs no podman or Docker VM. Elsewhere, or without it:
+#                     podman, then docker.
+#   KIND_ENGINE       runs the kind dev cluster's nodes and loads images into them. kind
+#                     supports only podman and docker as node providers, so the whole
+#                     kind loop (dev-up, kind-load*, push-runtime, monitoring-load) uses
+#                     this one and is unaffected by CONTAINER_ENGINE.
+#
+# Either can be overridden, e.g. CONTAINER_ENGINE=podman to push with podman.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+CONTAINER_ENGINE ?= $(shell command -v container 2>/dev/null || command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+else
 CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+endif
+KIND_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 IMAGE ?= localhost/gofer:dev
 RUNTIME_IMAGE ?= localhost/gofer-runtime:dev
 # The registry the DURABLE substrate (ate) pulls actor images from, by digest. In dev
@@ -124,16 +143,39 @@ PLATFORM ?=
 PLATFORM_FLAG = $(if $(PLATFORM),--platform $(PLATFORM))
 GOARCH ?= $(if $(PLATFORM),$(word 2,$(subst /, ,$(PLATFORM))),$(shell go env GOARCH))
 
-ifeq ($(findstring podman,$(CONTAINER_ENGINE)),podman)
+# Image commands for CONTAINER_ENGINE. Apple's CLI groups them under `image`
+# (`container image push`); podman and docker take them at the top level.
+ifeq ($(notdir $(CONTAINER_ENGINE)),container)
+ENGINE_PUSH = $(CONTAINER_ENGINE) image push
+else
+ENGINE_PUSH = $(CONTAINER_ENGINE) push
+endif
+
+# kind drives podman only when told to; derive it from KIND_ENGINE so a podman-only
+# machine does not fail with "docker: executable file not found".
+ifeq ($(notdir $(KIND_ENGINE)),podman)
 export KIND_EXPERIMENTAL_PROVIDER = podman
 # podman needs --tls-verify=false to push to the local HTTP registry; docker treats
 # localhost registries as insecure by default and needs no flag.
 RUNTIME_PUSH_FLAGS = --tls-verify=false
 endif
 
+# Check the image engine is installed and, for Apple's CLI, that its services run.
 engine:
-	@test -n "$(CONTAINER_ENGINE)" || { echo "no container engine found (install podman or docker)"; exit 1; }
+	@test -n "$(CONTAINER_ENGINE)" || { echo "no container engine found (on macOS: brew install container; otherwise install podman or docker)"; exit 1; }
+	@if [ "$(notdir $(CONTAINER_ENGINE))" = container ]; then \
+		$(CONTAINER_ENGINE) system status >/dev/null 2>&1 || { \
+			echo "ERROR: Apple container services are not running. Start them with: container system start"; \
+			echo "       (the first time: container system start --enable-kernel-install)"; exit 1; }; \
+	fi
 	@echo "using container engine: $(CONTAINER_ENGINE)"
+
+# Check the kind loop's engine: kind needs podman or docker, never Apple's CLI.
+kind-engine:
+	@test -n "$(KIND_ENGINE)" || { echo "the kind dev loop needs podman or docker (kind supports no other node provider)"; exit 1; }
+	@case "$(notdir $(KIND_ENGINE))" in podman|docker) ;; *) \
+		echo "ERROR: KIND_ENGINE=$(KIND_ENGINE): kind supports only podman or docker."; exit 1;; esac
+	@echo "using kind engine: $(KIND_ENGINE)"
 
 # Cross-compile the web + runtime binaries for the kind nodes (static, stripped).
 build-linux:
@@ -157,19 +199,23 @@ push-check:
 		echo "ERROR: $$i is a kind dev tag. Set IMAGE=<registry>/gofer:<tag> and RUNTIME_IMAGE=<registry>/gofer-runtime:<tag>."; exit 1;; esac; done
 
 push: push-check image image-runtime  ## build + push the web and runtime images
-	$(CONTAINER_ENGINE) push $(IMAGE)
-	$(CONTAINER_ENGINE) push $(RUNTIME_IMAGE)
+	$(ENGINE_PUSH) $(IMAGE)
+	$(ENGINE_PUSH) $(RUNTIME_IMAGE)
 
-# Load the web image into kind via an engine-agnostic archive (podman + docker).
-kind-load: image
-	$(CONTAINER_ENGINE) save $(IMAGE) -o gofer-image.tar
+# Load the web image into kind via an engine-agnostic archive. Built with KIND_ENGINE,
+# not CONTAINER_ENGINE: the image has to be in the store kind loads from, and an
+# archive from Apple's CLI is not a format kind is known to import.
+kind-load: kind-engine
+	@$(MAKE) --no-print-directory image CONTAINER_ENGINE=$(KIND_ENGINE)
+	$(KIND_ENGINE) save $(IMAGE) -o gofer-image.tar
 	kind load image-archive gofer-image.tar --name $(KIND_CLUSTER)
 	rm -f gofer-image.tar
 
 # Load the runtime image into kind so a per-run launcher resolves it without a
 # registry pull.
-kind-load-runtime: image-runtime
-	$(CONTAINER_ENGINE) save $(RUNTIME_IMAGE) -o gofer-runtime-image.tar
+kind-load-runtime: kind-engine
+	@$(MAKE) --no-print-directory image-runtime CONTAINER_ENGINE=$(KIND_ENGINE)
+	$(KIND_ENGINE) save $(RUNTIME_IMAGE) -o gofer-runtime-image.tar
 	kind load image-archive gofer-runtime-image.tar --name $(KIND_CLUSTER)
 	rm -f gofer-runtime-image.tar
 
@@ -178,9 +224,11 @@ kind-load-runtime: image-runtime
 # golden snapshot, and kind-loaded images are not registry-pullable — so `make dev-up`
 # with AGENT_PROVIDER_CLASS=durable pushes here and pins the AgentApp image to the
 # pushed digest automatically. This target is the manual build+push half.
-push-runtime: image-runtime  ## build + push the runtime image to SUBSTRATE_REGISTRY (for durable)
-	$(CONTAINER_ENGINE) tag $(RUNTIME_IMAGE) $(RUNTIME_REGISTRY_IMAGE)
-	$(CONTAINER_ENGINE) push $(RUNTIME_PUSH_FLAGS) $(RUNTIME_REGISTRY_IMAGE)
+# Part of the kind loop (the registry is the kind-side one), so it uses KIND_ENGINE.
+push-runtime: kind-engine  ## build + push the runtime image to SUBSTRATE_REGISTRY (for durable)
+	@$(MAKE) --no-print-directory image-runtime CONTAINER_ENGINE=$(KIND_ENGINE)
+	$(KIND_ENGINE) tag $(RUNTIME_IMAGE) $(RUNTIME_REGISTRY_IMAGE)
+	$(KIND_ENGINE) push $(RUNTIME_PUSH_FLAGS) $(RUNTIME_REGISTRY_IMAGE)
 
 # Create the kind cluster if it does not already exist. Install AEI separately (its
 # own targets) before `make dev-up`.
@@ -361,8 +409,8 @@ dev-up: cluster-up kind-load kind-load-runtime aei-check dev-secrets deploy-appl
 			echo "       or set SUBSTRATE_REGISTRY=<a registry ate can pull>."; \
 			exit 1; }; \
 		echo "durable: pushing $(RUNTIME_IMAGE) -> $(RUNTIME_REGISTRY_IMAGE)"; \
-		$(CONTAINER_ENGINE) tag $(RUNTIME_IMAGE) $(RUNTIME_REGISTRY_IMAGE); \
-		$(CONTAINER_ENGINE) push $(RUNTIME_PUSH_FLAGS) $(RUNTIME_REGISTRY_IMAGE); \
+		$(KIND_ENGINE) tag $(RUNTIME_IMAGE) $(RUNTIME_REGISTRY_IMAGE); \
+		$(KIND_ENGINE) push $(RUNTIME_PUSH_FLAGS) $(RUNTIME_REGISTRY_IMAGE); \
 		digest=$$(curl -sSf -D - -o /dev/null \
 			-H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
 			http://$(SUBSTRATE_REGISTRY)/v2/gofer-runtime/manifests/dev | \
@@ -390,9 +438,9 @@ dev-logs:
 # ---- optional monitoring stack (Prometheus + Grafana) ------------------------
 # Scrapes gofer's own /metrics (app-level aggregates) and the aei-controller's
 # /metrics (the aei_run_* per-run timing). Opt-in; not part of dev-up.
-monitoring-load: engine
-	$(CONTAINER_ENGINE) pull $(PROMETHEUS_IMAGE) && $(CONTAINER_ENGINE) save $(PROMETHEUS_IMAGE) -o prom.tar && kind load image-archive prom.tar --name $(KIND_CLUSTER) && rm -f prom.tar
-	$(CONTAINER_ENGINE) pull $(GRAFANA_IMAGE) && $(CONTAINER_ENGINE) save $(GRAFANA_IMAGE) -o graf.tar && kind load image-archive graf.tar --name $(KIND_CLUSTER) && rm -f graf.tar
+monitoring-load: kind-engine
+	$(KIND_ENGINE) pull $(PROMETHEUS_IMAGE) && $(KIND_ENGINE) save $(PROMETHEUS_IMAGE) -o prom.tar && kind load image-archive prom.tar --name $(KIND_CLUSTER) && rm -f prom.tar
+	$(KIND_ENGINE) pull $(GRAFANA_IMAGE) && $(KIND_ENGINE) save $(GRAFANA_IMAGE) -o graf.tar && kind load image-archive graf.tar --name $(KIND_CLUSTER) && rm -f graf.tar
 
 dev-monitoring: cluster-up monitoring-load
 	$(KUBECTL) apply -k deploy/k8s/monitoring
