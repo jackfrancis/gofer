@@ -366,7 +366,7 @@ func (c *Client) IssueStatus(ctx context.Context, token, repo string, number int
 // Search runs a GitHub issues/PRs search and returns the top matches as compact
 // text. It accepts the full GitHub search syntax (e.g. "repo:owner/name otel").
 func (c *Client) Search(ctx context.Context, token, query string) (string, error) {
-	items, err := c.searchIssues(ctx, token, query)
+	items, _, err := c.searchIssues(ctx, token, query)
 	if err != nil {
 		return "", err
 	}

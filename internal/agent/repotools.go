@@ -391,24 +391,35 @@ func (c *repoCheckout) formatSearch(pattern string, res checkout.SearchResult) s
 		fmt.Fprintf(&b, " INCOMPLETE: %s — narrow the search with path or glob.", res.Incomplete)
 	}
 	b.WriteString("\n")
+	// Only counts go on gofer's own summary line. The skipped directories' NAMES come
+	// from the repository, so they are listed inside the untrusted frame below: a
+	// directory named like an instruction must never read as gofer's text.
 	if res.SkippedDirsN > 0 || res.Generated > 0 {
 		b.WriteString("Not searched by default:")
 		if res.SkippedDirsN > 0 {
-			fmt.Fprintf(&b, " %d vendored/fixture directories (%s", res.SkippedDirsN, strings.Join(res.SkippedDirs, ", "))
-			if res.SkippedDirsN > len(res.SkippedDirs) {
-				b.WriteString(", …")
-			}
-			b.WriteString(")")
+			fmt.Fprintf(&b, " %d vendored/fixture directories", res.SkippedDirsN)
+		}
+		if res.SkippedDirsN > 0 && res.Generated > 0 {
+			b.WriteString(" and")
 		}
 		if res.Generated > 0 {
 			fmt.Fprintf(&b, " %d generated or lock files", res.Generated)
 		}
 		b.WriteString(". Set include_vendored, or give a path inside one, to search them.\n")
 	}
-	if len(res.Matches) == 0 {
+	if len(res.Matches) == 0 && len(res.SkippedDirs) == 0 {
 		return strings.TrimRight(b.String(), "\n")
 	}
 	b.WriteString("\n" + untrustedOpen)
+	if len(res.SkippedDirs) > 0 {
+		b.WriteString("not searched by default:\n")
+		for _, d := range res.SkippedDirs {
+			fmt.Fprintf(&b, "  %s\n", d) // already ends in "/"
+		}
+		if res.SkippedDirsN > len(res.SkippedDirs) {
+			b.WriteString("  … and more directories\n")
+		}
+	}
 	for _, m := range res.Matches {
 		for i, l := range m.Before {
 			fmt.Fprintf(&b, "%s-%d- %s\n", m.Path, m.Line-len(m.Before)+i, l)
