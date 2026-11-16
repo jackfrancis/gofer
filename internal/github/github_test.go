@@ -34,7 +34,7 @@ func TestFetchWorklistMapsAndDedups(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.Client(), srv.URL)
-	items, err := c.FetchWorklist(context.Background(), "tok")
+	items, _, err := c.FetchWorklist(context.Background(), "tok")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestFetchWorklistDerivesReasons(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.Client(), srv.URL)
-	items, err := c.FetchWorklist(context.Background(), "tok")
+	items, _, err := c.FetchWorklist(context.Background(), "tok")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestFetchWorklistOrdersByRecency(t *testing.T) {
 
 	c := NewClient(srv.Client(), srv.URL)
 	for attempt := 0; attempt < 3; attempt++ { // map order varies per iteration; the result must not
-		items, err := c.FetchWorklist(context.Background(), "tok")
+		items, _, err := c.FetchWorklist(context.Background(), "tok")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -178,12 +178,15 @@ func TestSearchIssuesPaginates(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.Client(), srv.URL)
-	items, err := c.searchIssues(context.Background(), "tok", "is:open commenter:@me")
+	items, whole, err := c.searchIssues(context.Background(), "tok", "is:open commenter:@me")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(items) != 2 {
 		t.Fatalf("want both pages merged (2 items), got %d", len(items))
+	}
+	if !whole {
+		t.Error("a walk that reached the last page should report the set as whole")
 	}
 	if len(pages) != 2 || pages[0] != "1" || pages[1] != "2" {
 		t.Fatalf("want pages 1 then 2, got %v", pages)
@@ -253,14 +256,56 @@ func TestSearchIssuesStopsOnBudget(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	c := NewClient(srv.Client(), srv.URL)
-	items, err := c.searchIssues(ctx, "tok", "is:open commenter:@me")
+	items, whole, err := c.searchIssues(ctx, "tok", "is:open commenter:@me")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if whole {
+		t.Error("a walk the budget cut short must not report the set as whole")
 	}
 	if calls != 1 {
 		t.Fatalf("want a single page when out of budget, got %d requests", calls)
 	}
 	if len(items) != 1 {
 		t.Fatalf("want the fetched page returned, got %d items", len(items))
+	}
+}
+
+// GitHub's own incomplete_results flag (a server-side search timeout) means the page
+// is not the full match set, even when it is the last page.
+func TestSearchIssuesHonoursIncompleteResults(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"incomplete_results":true,"items":[{"number":1,"repository_url":"https://api.github.com/repos/o/r","state":"open"}]}`))
+	}))
+	defer srv.Close()
+	c := NewClient(srv.Client(), srv.URL)
+	items, whole, err := c.searchIssues(context.Background(), "tok", "is:open involves:@me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || whole {
+		t.Fatalf("items=%d whole=%v; want 1 item and whole=false", len(items), whole)
+	}
+}
+
+// The 1,000-result ceiling ends the walk with pages still advertised: partial.
+func TestSearchIssuesResultCeilingIsPartial(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Link", `<`+r.URL.String()+`>; rel="next"`)
+		_, _ = w.Write([]byte(`{"items":[{"number":1,"repository_url":"https://api.github.com/repos/o/r","state":"open"}]}`))
+	}))
+	defer srv.Close()
+	c := NewClient(srv.Client(), srv.URL)
+	_, whole, err := c.searchIssues(context.Background(), "tok", "is:open involves:@me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != searchResultCap/searchPerPage {
+		t.Fatalf("calls = %d, want %d (the ceiling)", calls, searchResultCap/searchPerPage)
+	}
+	if whole {
+		t.Error("a walk ended by the result ceiling must not report the set as whole")
 	}
 }

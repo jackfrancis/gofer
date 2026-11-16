@@ -96,21 +96,29 @@ var signals = []struct {
 // page silently drops work off the radar. See searchIssues for the two bounds GitHub
 // imposes on that walk (a per-query result ceiling and a small per-minute request
 // budget).
-func (c *Client) FetchWorklist(ctx context.Context, token string) ([]worklist.WorkItem, error) {
+//
+// complete reports that every query was walked to its last page with no early stop
+// and GitHub did not flag the results as incomplete — so the result is the WHOLE open
+// set, and an item missing from it is genuinely no longer open (merged, closed, or no
+// longer involving the user). The ingest relies on that to retire stale items; on a
+// partial walk it must not, since a missing item may simply not have been reached.
+func (c *Client) FetchWorklist(ctx context.Context, token string) (items []worklist.WorkItem, complete bool, err error) {
 	now := time.Now().UTC()
 	// The relationship a union query cannot report is derived from each item's payload,
 	// which needs the viewer's own login to compare against.
 	viewer, err := c.Login(ctx, token)
 	if err != nil {
-		return nil, fmt.Errorf("github login: %w", err)
+		return nil, false, fmt.Errorf("github login: %w", err)
 	}
 	seen := make(map[string]worklist.WorkItem)
+	complete = true
 	for _, s := range signals {
-		items, err := c.searchIssues(ctx, token, s.query)
+		found, whole, err := c.searchIssues(ctx, token, s.query)
 		if err != nil {
-			return nil, fmt.Errorf("github %s search: %w", s.reason, err)
+			return nil, false, fmt.Errorf("github %s search: %w", s.reason, err)
 		}
-		for _, it := range items {
+		complete = complete && whole
+		for _, it := range found {
 			wi, ok := it.toWorkItem(s.reason, viewer, now)
 			if !ok {
 				continue
@@ -140,7 +148,7 @@ func (c *Client) FetchWorklist(ctx context.Context, token string) ([]worklist.Wo
 		}
 		return strings.Compare(a.ID, b.ID)
 	})
-	return out, nil
+	return out, complete, nil
 }
 
 // appendReason adds r to rs if not already present, keeping reasons unique and in
@@ -182,6 +190,9 @@ func reasonsFor(from worklist.Reason, it searchItem, viewer string) []worklist.R
 
 type searchResponse struct {
 	Items []searchItem `json:"items"`
+	// IncompleteResults is GitHub's own flag that the search timed out server-side
+	// and the items are not the full match set.
+	IncompleteResults bool `json:"incomplete_results"`
 }
 
 type searchItem struct {
@@ -259,8 +270,11 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 	}, true
 }
 
-func (c *Client) searchIssues(ctx context.Context, token, q string) ([]searchItem, error) {
-	var out []searchItem
+// searchIssues walks a search query page by page. whole reports that the walk reached
+// the last page with no early stop (time budget, rate-limit wait, or the 1,000-result
+// ceiling) and that GitHub never flagged a page as incomplete.
+func (c *Client) searchIssues(ctx context.Context, token, q string) (out []searchItem, whole bool, err error) {
+	incomplete := false
 	for page := 1; page*searchPerPage <= searchResultCap; page++ {
 		// Never spend the time the rest of the run still needs. The first page is always
 		// attempted (an empty fetch is worse than a late one); every page after it is a
@@ -275,13 +289,13 @@ func (c *Client) searchIssues(ctx context.Context, token, q string) ([]searchIte
 			c.baseURL, searchPerPage, page, url.QueryEscape(q))
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		setHeaders(req, token)
 
 		resp, err := c.http.Do(req)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		body, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 		// Record the budget and the next-page link before the body is discarded; the
@@ -291,21 +305,25 @@ func (c *Client) searchIssues(ctx context.Context, token, q string) ([]searchIte
 		status := resp.StatusCode
 		resp.Body.Close()
 		if rerr != nil {
-			return nil, rerr
+			return nil, false, rerr
 		}
 		if status != http.StatusOK {
-			return nil, fmt.Errorf("status %d", status)
+			return nil, false, fmt.Errorf("status %d", status)
 		}
 		var sr searchResponse
 		if err := json.Unmarshal(body, &sr); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		out = append(out, sr.Items...)
+		incomplete = incomplete || sr.IncompleteResults
 		if !more || len(sr.Items) == 0 {
-			break
+			// The last page: the walk saw everything GitHub had for this query.
+			return out, !incomplete, nil
 		}
 	}
-	return out, nil
+	// Left the loop early: the budget broke it, or the result ceiling ended it with
+	// pages still to come. Either way the set is partial.
+	return out, false, nil
 }
 
 // hasNextPage reports whether a response's Link header advertises a further page.

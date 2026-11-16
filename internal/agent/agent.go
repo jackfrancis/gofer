@@ -154,24 +154,37 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 		return fmt.Errorf("vend credential: %w", err)
 	}
 	gh := github.NewClient(p.Client, p.GitHubBaseURL)
-	items, err := gh.FetchWorklist(ctx, token)
+	items, complete, err := gh.FetchWorklist(ctx, token)
 	if err != nil {
 		return fmt.Errorf("fetch github: %w", err)
 	}
-	log.Info("ingest: fetched work items", "count", len(items))
-	if len(items) == 0 {
-		return nil
-	}
+	log.Info("ingest: fetched work items", "count", len(items), "complete", complete)
 	// Reconcile with what gofer already persists so a re-ingest (a Refresh, or an
 	// empty-worklist backfill) never clobbers per-item state GitHub cannot supply —
 	// the conversation thread and its read cursor, and the user/agent metadata
 	// overrides. The fresh GitHub fields and base signals come from the fetch; the
 	// chained enrich+rank re-derive the score. If the existing items cannot be read we
 	// proceed unreconciled rather than skip the refresh — a rare case, logged loudly.
-	if existing, lerr := sink.List(ctx); lerr == nil {
-		items = reconcileFetched(items, existing)
-	} else {
+	existing, lerr := sink.List(ctx)
+	if lerr != nil {
 		log.Warn("ingest: could not read existing items to reconcile; threads may reset", "err", lerr)
+		existing = nil
+	}
+	items = reconcileFetched(items, existing)
+	// Retire what left the open set. Only a COMPLETE fetch proves an item is gone: a
+	// partial walk (time budget, rate limit, result ceiling) simply may not have
+	// reached it, and retiring it then would hide open work.
+	if complete {
+		retired := retireMissing(items, existing, time.Now().UTC())
+		if len(retired) > 0 {
+			log.Info("ingest: retired items no longer open on GitHub", "count", len(retired))
+			items = append(items, retired...)
+		}
+	} else if len(existing) > 0 {
+		log.Info("ingest: fetch was partial; not retiring items missing from it")
+	}
+	if len(items) == 0 {
+		return nil
 	}
 	if err := writeBack(ctx, sink, items); err != nil {
 		return fmt.Errorf("ingest: %w", err)
@@ -210,12 +223,35 @@ func reconcileFetched(fetched, existing []worklist.WorkItem) []worklist.WorkItem
 		fetched[i].Thread = old.Thread
 		fetched[i].ThreadReadAt = old.ThreadReadAt
 		fetched[i].Meta.HiddenAt = old.Meta.HiddenAt
-		fetched[i].Meta.CompletedAt = old.Meta.CompletedAt
+		// CompletedAt is deliberately NOT carried over: the item was just fetched from
+		// the open set, so it is open, and a reopened item resurfaces (see Metadata).
 		if !old.CreatedAt.IsZero() {
 			fetched[i].CreatedAt = old.CreatedAt
 		}
 	}
 	return fetched
+}
+
+// retireMissing returns the persisted GitHub items that are absent from a complete
+// fetch and not yet marked completed, each stamped with CompletedAt = now. The fetch
+// covers every open item that involves the user or awaits their review, so absence
+// means the item was merged or closed, or no longer involves them. Retiring rather
+// than deleting keeps the thread: resolve drops completed items from the radar, an
+// agent can still see them, and a reopened item is fetched again and resurfaces.
+func retireMissing(fetched, existing []worklist.WorkItem, now time.Time) []worklist.WorkItem {
+	open := make(map[string]bool, len(fetched))
+	for _, it := range fetched {
+		open[it.ID] = true
+	}
+	var retired []worklist.WorkItem
+	for _, it := range existing {
+		if it.Source != "github" || open[it.ID] || !it.Meta.CompletedAt.IsZero() {
+			continue
+		}
+		it.Meta.CompletedAt = now
+		retired = append(retired, it)
+	}
+	return retired
 }
 
 // runRank reads the user's persisted work, asks the AxisRanker to propose the
@@ -230,9 +266,16 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 	if ranker == nil {
 		ranker = worklist.NewStubRanker()
 	}
-	items, err := sink.List(ctx)
+	all, err := sink.List(ctx)
 	if err != nil {
 		return fmt.Errorf("list worklist: %w", err)
+	}
+	// Retired items are off the radar; a model proposal for one is wasted spend.
+	items := all[:0:0]
+	for _, it := range all {
+		if it.Meta.CompletedAt.IsZero() {
+			items = append(items, it)
+		}
 	}
 	limit := p.RankLimit
 	if limit <= 0 {

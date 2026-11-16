@@ -392,7 +392,14 @@ func clipLine(s string, col int) string {
 		for from > 0 && from < len(s) && !utf8.RuneStart(s[from]) {
 			from++
 		}
-		for to < len(s) && !utf8.RuneStart(s[to]) {
+		// A window made entirely of continuation bytes (invalid UTF-8 with no rune start
+		// in it) can push from past to, and would walk to below zero: keep to >= from
+		// so the slice below is always in range. Such a window clips to nothing plus the
+		// ellipses, which is the honest result for bytes that are not text.
+		if to < from {
+			to = from
+		}
+		for to > from && to < len(s) && !utf8.RuneStart(s[to]) {
 			to--
 		}
 		clipped := s[from:to]

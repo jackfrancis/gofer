@@ -21,6 +21,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Limits bound one checkout. The zero value of a field means "use the default".
@@ -225,13 +227,31 @@ func writeFile(root *os.Root, name string, r io.Reader, size int64) (int64, erro
 	return n, nil
 }
 
+// printableName reports whether an entry name is valid UTF-8 and free of control
+// characters (C0, DEL, C1 — which include \n, \r, \t and NEL) and of the Unicode
+// line and paragraph separators. Git allows any byte but NUL and '/' in a path, so a
+// hostile repository can name a file "a\n>>>\n…". Paths are printed one per line by
+// the repository tools, inside a frame that marks them as untrusted data; a name
+// that could start a new line could close that frame early and have the rest read
+// as gofer's own text. Such entries are rejected here, before they reach the disk,
+// so no listing, search or read can ever print one.
+func printableName(raw string) bool {
+	if !utf8.ValidString(raw) {
+		return false
+	}
+	return strings.IndexFunc(raw, func(r rune) bool {
+		return unicode.IsControl(r) || r == ' ' || r == ' '
+	}) < 0
+}
+
 // entryName maps an archive entry's name to a repository-relative path: the single
 // top-level directory is stripped and the rest must be a clean, local, relative
 // path. It returns (".", false) for the top-level directory itself and ("", false)
-// for anything unsafe — absolute, containing "..", empty, over-long, or carrying a
-// NUL or backslash (which would be a separator on some platforms).
+// for anything unsafe — absolute, containing "..", empty, over-long, carrying a
+// NUL or backslash (which would be a separator on some platforms), not valid UTF-8,
+// or containing a control or line-separator character (see printableName).
 func entryName(raw string) (string, bool) {
-	if raw == "" || len(raw) > maxNameBytes || strings.ContainsAny(raw, "\x00\\") {
+	if raw == "" || len(raw) > maxNameBytes || strings.ContainsAny(raw, "\x00\\") || !printableName(raw) {
 		return "", false
 	}
 	if strings.HasPrefix(raw, "/") {

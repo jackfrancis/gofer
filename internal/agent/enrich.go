@@ -61,7 +61,9 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 		skipped int
 	)
 	for i := range items {
-		if items[i].Source != "github" {
+		// Retired items (closed, merged, no longer involving the user) are off the radar:
+		// spending a timeline call on each would grow with every item ever seen.
+		if items[i].Source != "github" || !items[i].Meta.CompletedAt.IsZero() {
 			continue
 		}
 		// Yield to the run clock: stop starting new lookups once what remains must be
