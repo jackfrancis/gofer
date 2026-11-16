@@ -71,8 +71,9 @@ gofer consumes AEI's two stdlib-only SDK modules through `replace` directives in
 ## Run on kind
 
 Prerequisites: `kind`, `kubectl`, `jq`, `openssl`, and podman or docker (podman is
-preferred when both are installed); a GitHub OAuth app whose callback is
-`http://localhost:8080/auth/github/callback`.
+preferred when both are installed; kind supports no other node provider, so the kind
+loop uses `KIND_ENGINE` and is unaffected by Apple's `container` CLI); a GitHub OAuth
+app whose callback is `http://localhost:8080/auth/github/callback`.
 
 1. Install AEI and a provider class on a kind cluster named `gofer`, from the AEI
    checkout. For the default class (`isolated`: agent-sandbox pods under gVisor):
@@ -115,7 +116,14 @@ keeps logins and the worklist. See
 
 `make dev-up` is the kind loop. To deploy to any other cluster, the way a CI job
 would, push both images for the nodes' platform (log in to the registry first), then
-pass a kubeconfig file:
+pass a kubeconfig file. Neither step needs podman: `make deploy` uses only `kubectl`,
+`jq`, `sed` and `openssl`, and `make push` builds with `CONTAINER_ENGINE`, which on
+macOS defaults to Apple's [`container`](https://github.com/apple/container) CLI when it
+is installed (`brew install container`, then `container system start
+--enable-kernel-install` once, which also downloads its Linux kernel; Apple silicon and
+macOS 26 or later). It keeps registry credentials in the macOS Keychain, so the first
+push may show a Keychain access prompt: allow it, or the push fails with Keychain
+error -128. Override the engine with `CONTAINER_ENGINE=podman` or `docker`.
 
 ```sh
 make push IMAGE=ghcr.io/you/gofer:v1 RUNTIME_IMAGE=ghcr.io/you/gofer-runtime:v1 \
@@ -159,6 +167,10 @@ make create-aks AKS_PUBLIC_IP=gofer AKS_PUBLIC_IP_DNS_LABEL=<label>
 
 # --- in this checkout ----------------------------------------------------------------
 KC=~/.kube/aei-aks-aei.kubeconfig  REG=<registry>.azurecr.io  TAG=$(git rev-parse --short HEAD)
+# Log the image engine in to the registry. With Apple's container CLI (az acr login
+# assumes docker):
+#   az acr login -n <registry> --expose-token --query accessToken -o tsv | \
+#     container registry login -u 00000000-0000-0000-0000-000000000000 --password-stdin $REG
 make push IMAGE=$REG/gofer:$TAG RUNTIME_IMAGE=$REG/gofer-runtime:$TAG PLATFORM=linux/amd64
 # First time only: gofer-secrets, from GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET /
 # AI_TOKEN in the environment, AEI's verify key read from the cluster, and generated
