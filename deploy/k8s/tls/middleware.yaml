@@ -1,0 +1,13 @@
+# Who may reach gofer through the HTTPS ingress: Traefik's ipAllowList, attached to
+# gofer's route only (the ACME challenge route stays open, as Let's Encrypt must reach
+# it). sourceRange is filled in at deploy time from ALLOWED_SOURCE_RANGES; empty allows
+# everyone. Traefik sees each client's real address because `make install-ingress`
+# sets externalTrafficPolicy: Local on its Service.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: gofer-allowlist
+  namespace: gofer
+spec:
+  ipAllowList:
+    sourceRange: []

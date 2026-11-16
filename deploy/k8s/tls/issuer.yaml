@@ -1,0 +1,28 @@
+# The ACME (Let's Encrypt) issuer for gofer's certificate, applied only by
+# `make deploy TLS_HOST=<name>`. Namespaced (an Issuer, not a ClusterIssuer), so gofer
+# configures nothing cluster-wide beyond what `make install-ingress` installs.
+#
+# __ACME_SERVER__ is filled in at deploy time: Let's Encrypt production by default, or
+# staging with ACME_ENV=staging (untrusted certificates, generous rate limits; use it
+# to prove the setup before asking production for a real certificate).
+#
+# No contact email is registered: Let's Encrypt no longer sends expiry mail, and
+# cert-manager renews well ahead of expiry on its own.
+#
+# HTTP-01 validation: Let's Encrypt fetches http://<host>/.well-known/acme-challenge/...
+# from the internet, so the ingress must accept port 80 from everywhere (it does; the
+# IP allow-list is enforced per route by Traefik, and the challenge route has none).
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: gofer-acme
+  namespace: gofer
+spec:
+  acme:
+    server: __ACME_SERVER__
+    privateKeySecretRef:
+      name: gofer-acme-account
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: traefik

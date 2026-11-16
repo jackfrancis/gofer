@@ -62,6 +62,7 @@ Dockerfile           web-tier image
 Dockerfile.runtime   agent-runtime image (AEI launches it per run)
 deploy/k8s/base/     app manifests: namespace, SA, config, statefulset (+ data PVC), service
 deploy/k8s/overlays/dev/  base + agentapp.yaml (gofer's AEI dispatch registration)
+deploy/k8s/tls/      HTTPS: ACME Issuer, Traefik allow-list, Ingress (make deploy TLS_HOST=...)
 ```
 
 ## The runtime socket (what the agent runtime plugs into)
@@ -156,6 +157,8 @@ make dev-up  # deploy web + runtime images and the AgentApp to kind (AEI must be
 make kind-load-runtime  # rebuild + load only the runtime image
 make push IMAGE=... RUNTIME_IMAGE=... PLATFORM=linux/amd64  # build both images for a platform and push them
 make deploy KUBECONFIG=<file> IMAGE=... RUNTIME_IMAGE=...  # apply to any cluster (no kind, no secret creation); dev-up shares its apply step
+make install-ingress KUBECONFIG=<file>  # once per cluster: Traefik + cert-manager (pinned charts) for HTTPS
+make deploy ... TLS_HOST=<dns name> [ALLOWED_SOURCE_RANGES=...]  # serve over HTTPS with a Let's Encrypt certificate; make tls-status to watch it
 ```
 
 See README.md for the kind walkthrough, including the AEI-side install.
