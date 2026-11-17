@@ -43,11 +43,20 @@ type Vendor interface {
 }
 
 // Sink is the runtime's view of gofer's worklist store: read the acting user's
-// persisted work, and write items back. In-process it is the store directly;
+// persisted work, and write results back. In-process it is the store directly;
 // out-of-process it is an HTTP client to gofer's agent sink.
+//
+// A write-back is merged into the item as stored when it lands (see
+// worklist.MergeRunItems): Ingest updates what a run derives — GitHub fields,
+// signals, scoring — and never the conversation thread, so work the owner did
+// while the run was busy survives. Reply is the only way a run adds to a thread.
 type Sink interface {
 	List(ctx context.Context) ([]worklist.WorkItem, error)
 	Ingest(ctx context.Context, items []worklist.WorkItem) error
+	// Reply appends an agent turn to itemID's thread, answering the user turn
+	// stamped inReplyTo (see worklist.AppendReply). It is dropped, without error, if
+	// that turn is gone or the item is.
+	Reply(ctx context.Context, itemID string, inReplyTo time.Time, reply worklist.Message) error
 }
 
 // Params configures a single runtime invocation.
@@ -207,9 +216,10 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 // conversation thread and its read cursor, the user/agent metadata overrides (hidden,
 // completed), and the original creation time — from the persisted items onto the
 // freshly fetched ones, keyed by ID. Fetched items with no persisted counterpart (new
-// work) pass through unchanged. This makes a re-ingest reconcile in place instead of
-// wiping the conversation, which is what a github-ingest write-back would otherwise do
-// (the fetch has no thread, and the store upsert replaces the whole item).
+// work) pass through unchanged. The agent plane also keeps the stored thread, read
+// cursor, hidden flag and creation time on every write-back (worklist.MergeRunItems),
+// which is what protects a change made after this run read the items; carrying them
+// here keeps the run's own view of each item whole.
 func reconcileFetched(fetched, existing []worklist.WorkItem) []worklist.WorkItem {
 	prior := make(map[string]worklist.WorkItem, len(existing))
 	for _, it := range existing {

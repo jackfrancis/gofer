@@ -133,6 +133,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   replica by construction. Pre-auth OAuth flow state and the ingest backfill tracker
   are always in memory. See `docs/adr/0004-sqlite-persistent-storage.md` and
   `docs/backup-restore.md`.
+- Change an existing work item with `worklist.Store.Update` (one atomic
+  read-modify-write), never `List` then `Upsert`, which overwrites anything written
+  in between. A run's write-back is merged into the stored item
+  (`worklist.MergeRunItems`): runs own the GitHub fields, signals and scoring; the
+  thread, read cursor, hidden flag and creation time always come from the store. A
+  run adds a thread turn only through `POST /agent/worklist/reply`
+  (`worklist.AppendReply`). The web and runtime images must ship together: a runtime
+  from before this rule posts its reply inside the item, where it is now ignored.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

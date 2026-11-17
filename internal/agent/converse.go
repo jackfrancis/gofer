@@ -52,7 +52,8 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	// The turn being answered is the thread's last message (a user turn, since
 	// userText is non-empty). Its kind tells us whether this reply is a consensus
 	// synthesis, whose leading verdict token we record as structured metadata.
-	triggerKind := item.Thread[len(item.Thread)-1].Kind
+	trigger := item.Thread[len(item.Thread)-1]
+	triggerKind := trigger.Kind
 
 	// Best-effort live context plus read-only GitHub tools: a vend failure (e.g.
 	// no credential) or an empty token leaves the assistant reasoning over the
@@ -96,23 +97,30 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	if triggerKind == worklist.KindSynthesisRequest {
 		verdict, content = worklist.ParseVerdict(reply)
 	}
-	item.Thread = append(item.Thread, worklist.Message{
+	msg := worklist.Message{
 		Role:    worklist.RoleAgent,
 		Content: content,
 		Model:   p.Model,
 		Verdict: verdict,
 		At:      time.Now().UTC(),
-	})
+	}
+	// Append the reply to the thread as stored now, not to the copy read above: the
+	// owner may have posted, hidden or cleared turns while the model was answering.
+	if err := sink.Reply(ctx, item.ID, trigger.At, msg); err != nil {
+		return fmt.Errorf("reply: %w", err)
+	}
 	// A completed conversation turn is fresh evidence: re-weight the item's ranking
 	// from the thread (best-effort). The GitHub-metadata foundation stays
-	// authoritative — research only nuances it.
+	// authoritative — research only nuances it. The write-back carries only the
+	// signal; the plane keeps the stored thread.
 	if p.Researcher != nil {
+		item.Thread = append(item.Thread, msg)
 		if adj, rerr := p.Researcher.Research(ctx, item); rerr == nil {
 			item.Signals.Research = &adj
+			if err := sink.Ingest(ctx, []worklist.WorkItem{item}); err != nil {
+				return fmt.Errorf("ingest: %w", err)
+			}
 		}
-	}
-	if err := sink.Ingest(ctx, []worklist.WorkItem{item}); err != nil {
-		return fmt.Errorf("ingest: %w", err)
 	}
 	return nil
 }

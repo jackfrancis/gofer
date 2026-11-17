@@ -71,3 +71,124 @@ func TestAgentIngestWithRunToken(t *testing.T) {
 		t.Fatalf("want 401 for no credential, got %d", rec3.Code)
 	}
 }
+
+// planeFixture is an agent plane with a memory store and a minter for run tokens.
+type planeFixture struct {
+	store  *worklist.MemoryStore
+	ingest http.Handler
+	reply  http.Handler
+	mint   func(scopes ...string) string
+}
+
+func newPlane(t *testing.T) planeFixture {
+	t.Helper()
+	pub, priv, err := identity.GenerateEd25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := identity.NewEd25519Authority(priv, "gofer-agent", time.Minute)
+	auth := authn.New(
+		session.NewManager([]byte("test-session-secret-0123456789ab"), false),
+		authn.NewIdentityValidator(identity.NewEd25519Verifier(pub, "gofer-agent")),
+	)
+	store := worklist.NewMemoryStore()
+	h := NewIngestHandler(store, nil)
+	return planeFixture{
+		store:  store,
+		ingest: auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Ingest)),
+		reply:  auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Reply)),
+		mint: func(scopes ...string) string {
+			tok, err := authority.Mint(identity.Claims{RunID: "run", Subject: "u1", Scopes: scopes})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return tok
+		},
+	}
+}
+
+func (f planeFixture) post(t *testing.T, h http.Handler, path, token string, body any) int {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(b))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+// A run that read an item before the owner posted a message, and writes back its
+// stale copy, updates the signals and leaves the owner's newer message in place.
+func TestAgentWriteBackKeepsStoredThread(t *testing.T) {
+	f := newPlane(t)
+	t0 := time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)
+	f.store.Seed("u1", worklist.WorkItem{ID: "a", Thread: []worklist.Message{
+		{Role: worklist.RoleUser, Content: "q", At: t0},
+		{Role: worklist.RoleAgent, Content: "r", At: t0.Add(time.Minute)},
+		{Role: worklist.RoleUser, Content: "posted while the run worked", At: t0.Add(2 * time.Minute)},
+	}})
+	stale := worklist.WorkItem{ID: "a", Signals: worklist.Signals{Comments: 9}, Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "q", At: t0}}}
+	if code := f.post(t, f.ingest, "/agent/worklist", f.mint("signals:read", "metadata:write"), map[string]any{"items": []worklist.WorkItem{stale}}); code != http.StatusOK {
+		t.Fatalf("want 200, got %d", code)
+	}
+	got, _ := f.store.List(context.Background(), "u1")
+	if got[0].Signals.Comments != 9 {
+		t.Fatalf("the run's signals must land, got %+v", got[0].Signals)
+	}
+	if len(got[0].Thread) != 3 || got[0].Thread[2].Content != "posted while the run worked" {
+		t.Fatalf("the stored thread must survive the write-back, got %+v", got[0].Thread)
+	}
+}
+
+func TestAgentReply(t *testing.T) {
+	f := newPlane(t)
+	t0 := time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)
+	f.store.Seed("u1", worklist.WorkItem{ID: "a", Thread: []worklist.Message{
+		{Role: worklist.RoleUser, Content: "q", At: t0},
+		{Role: worklist.RoleUser, Content: "q2", At: t0.Add(time.Minute)},
+	}})
+	full := f.mint("signals:read", "metadata:write")
+	reply := map[string]any{
+		"item_id":     "a",
+		"in_reply_to": t0,
+		"message":     worklist.Message{Role: worklist.RoleAgent, Content: "answer", Model: "m", At: t0.Add(2 * time.Minute)},
+	}
+	thread := func() []worklist.Message {
+		got, _ := f.store.List(context.Background(), "u1")
+		return got[0].Thread
+	}
+
+	if code := f.post(t, f.reply, "/agent/worklist/reply", full, reply); code != http.StatusOK {
+		t.Fatalf("want 200, got %d", code)
+	}
+	if th := thread(); len(th) != 3 || th[2].Content != "answer" || th[1].Content != "q2" {
+		t.Fatalf("reply must be appended after the newer turn, got %+v", th)
+	}
+
+	// A repeat (a resend after a lost response) is not added twice.
+	if code := f.post(t, f.reply, "/agent/worklist/reply", full, reply); code != http.StatusOK {
+		t.Fatalf("want 200 on repeat, got %d", code)
+	}
+	if n := len(thread()); n != 3 {
+		t.Fatalf("a repeated reply must not duplicate, got %d turns", n)
+	}
+
+	// A reply to a turn that is gone (cleared, re-stamped) is accepted and dropped.
+	gone := map[string]any{"item_id": "a", "in_reply_to": t0.Add(-time.Hour), "message": worklist.Message{Content: "late", At: t0.Add(3 * time.Minute)}}
+	if code := f.post(t, f.reply, "/agent/worklist/reply", full, gone); code != http.StatusOK {
+		t.Fatalf("want 200 for a dropped reply, got %d", code)
+	}
+	if n := len(thread()); n != 3 {
+		t.Fatalf("a reply to a missing turn must be dropped, got %d turns", n)
+	}
+
+	// Malformed requests are rejected.
+	if code := f.post(t, f.reply, "/agent/worklist/reply", full, map[string]any{"item_id": "a"}); code != http.StatusBadRequest {
+		t.Fatalf("want 400 for a request missing fields, got %d", code)
+	}
+
+	// A token without metadata:write cannot reply.
+	if code := f.post(t, f.reply, "/agent/worklist/reply", f.mint("signals:read"), reply); code != http.StatusForbidden {
+		t.Fatalf("want 403 without metadata:write, got %d", code)
+	}
+}

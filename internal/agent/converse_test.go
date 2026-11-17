@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
@@ -111,5 +112,60 @@ func TestRunConverseSynthesisVerdict(t *testing.T) {
 	}
 	if th[1].Content != "Both reviews say it's ready." {
 		t.Fatalf("verdict token should be stripped from content, got %q", th[1].Content)
+	}
+}
+
+// sideEffectConverser runs during() while the "model" is answering, to stand in for
+// what the owner does in the web tier meanwhile.
+type sideEffectConverser struct {
+	reply  string
+	during func()
+}
+
+func (f *sideEffectConverser) Reply(context.Context, worklist.WorkItem, string, string, []worklist.Message, string, worklist.ToolBox) (string, error) {
+	f.during()
+	return f.reply, nil
+}
+
+// The owner posts a follow-up while the run is answering. The reply lands, and the
+// follow-up is not overwritten by the run's stale copy of the thread — including the
+// write-back of the research signal that follows the reply.
+func TestRunConverseKeepsTurnsPostedMeanwhile(t *testing.T) {
+	t0 := time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)
+	sink := &memSink{items: []worklist.WorkItem{{
+		ID:     "github:o/r#1",
+		Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "first question", At: t0}},
+	}}}
+	fc := &sideEffectConverser{reply: "answer to the first", during: func() {
+		sink.items[0].Thread = append(sink.items[0].Thread, worklist.Message{Role: worklist.RoleUser, Content: "follow-up", At: t0.Add(time.Minute)})
+	}}
+	err := Run(context.Background(),
+		Params{JobType: JobConverse, ItemID: "github:o/r#1", Converser: fc, Researcher: &fakeResearcher{}},
+		fakeVendor{}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	th := sink.items[0].Thread
+	if len(th) != 3 || th[1].Content != "follow-up" || th[2].Content != "answer to the first" || th[2].Role != worklist.RoleAgent {
+		t.Fatalf("want [question, follow-up, reply], got %+v", th)
+	}
+	if sink.items[0].Signals.Research == nil {
+		t.Fatal("the research signal should still be written")
+	}
+}
+
+// The owner clears the conversation while the run is answering: the reply to the
+// cleared question is dropped rather than resurrecting a one-sided thread.
+func TestRunConverseDropsReplyToClearedThread(t *testing.T) {
+	sink := &memSink{items: []worklist.WorkItem{{
+		ID:     "github:o/r#1",
+		Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "q", At: time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)}},
+	}}}
+	fc := &sideEffectConverser{reply: "too late", during: func() { sink.items[0].Thread = nil }}
+	if err := Run(context.Background(), Params{JobType: JobConverse, ItemID: "github:o/r#1", Converser: fc}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(sink.items[0].Thread); n != 0 {
+		t.Fatalf("a reply to a cleared thread must be dropped, got %d turns", n)
 	}
 }
