@@ -391,3 +391,41 @@ func TestWorklistUpdateSemantics(t *testing.T) {
 		})
 	}
 }
+
+// Neither store shares memory with its callers: a failed update leaves nested fields
+// (slices, pointers) untouched, and mutating what List returned changes nothing.
+func TestWorklistNestedFieldsAreCopies(t *testing.T) {
+	for name, s := range worklistImpls(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			a := item("a", "A")
+			a.Signals.Proposed = &worklist.AxisProposal{Relevance: 0.5}
+			if err := s.Upsert(ctx, "u1", a); err != nil {
+				t.Fatal(err)
+			}
+			check := func(when string) {
+				t.Helper()
+				got, _ := s.List(ctx, "u1")
+				if got[0].Signals.Reasons[0] != worklist.ReasonReviewRequested || got[0].Signals.Proposed.Relevance != 0.5 || got[0].Thread[0].Content != a.Thread[0].Content {
+					t.Fatalf("%s: stored nested fields changed: %+v %+v %+v", when, got[0].Signals.Reasons, got[0].Signals.Proposed, got[0].Thread[0])
+				}
+			}
+
+			_ = s.Update(ctx, "u1", func(cur []worklist.WorkItem) ([]worklist.WorkItem, error) {
+				cur[0].Signals.Reasons[0] = worklist.ReasonAuthor
+				cur[0].Signals.Proposed.Relevance = 0.9
+				cur[0].Thread[0].Content = "changed"
+				return nil, fmt.Errorf("reject")
+			})
+			check("after a failed update")
+
+			got, _ := s.List(ctx, "u1")
+			got[0].Signals.Reasons[0] = worklist.ReasonAuthor
+			got[0].Signals.Proposed.Relevance = 0.9
+			check("after mutating a List result")
+
+			a.Signals.Reasons[0] = worklist.ReasonAuthor // the caller's own copy, after Upsert
+			check("after mutating the upserted value")
+		})
+	}
+}
