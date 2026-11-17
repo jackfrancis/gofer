@@ -283,21 +283,22 @@ func (h *Handler) ThreadPost(w http.ResponseWriter, r *http.Request) {
 	// The thread's model picker selects which configured connection+model answers this
 	// turn; an unknown or missing value falls back to the default.
 	opt, _ := h.resolveOption(strings.TrimSpace(r.FormValue("choice")))
-	items, err := h.store.List(r.Context(), user.ID)
-	if err != nil {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
-	for _, it := range items {
-		if it.ID == id {
-			// Append the user's turn first, so the spawned converse runtime reads it
-			// from the stored thread; the message never rides the run's environment.
-			it.Thread = append(it.Thread, worklist.Message{Role: worklist.RoleUser, Content: content, At: h.now().UTC()})
-			if err := h.store.Upsert(r.Context(), user.ID, it); err == nil {
-				_ = h.pipeline.Converse(r.Context(), user.ID, id, opt.Endpoint, opt.Model)
+	// Append the user's turn first, so the spawned converse runtime reads it from the
+	// stored thread; the message never rides the run's environment. The append is
+	// atomic, so a run's reply landing at the same moment is not lost.
+	found := false
+	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		for i := range current {
+			if current[i].ID == id {
+				current[i].Thread = append(current[i].Thread, worklist.Message{Role: worklist.RoleUser, Content: content, At: h.now().UTC()})
+				found = true
+				return current[i : i+1], nil
 			}
-			break
 		}
+		return nil, nil
+	})
+	if err == nil && found {
+		_ = h.pipeline.Converse(r.Context(), user.ID, id, opt.Endpoint, opt.Model)
 	}
 	http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
 }
@@ -332,27 +333,20 @@ func (h *Handler) ResetConversations(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	items, err := h.store.List(r.Context(), user.ID)
-	if err != nil {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
-	// Range yields a copy of each item, so dropping the Thread reference here cannot
-	// race a concurrent reader of the store's backing array; the store persists the
-	// copy under its own lock. Only items that actually carry conversation state are
-	// written back.
-	var cleared []worklist.WorkItem
-	for _, it := range items {
-		if len(it.Thread) == 0 && it.ThreadReadAt.IsZero() {
-			continue
+	// One atomic update, so a run's write-back cannot restore a thread mid-clear. Only
+	// items that actually carry conversation state are written back.
+	_ = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		var cleared []worklist.WorkItem
+		for _, it := range current {
+			if len(it.Thread) == 0 && it.ThreadReadAt.IsZero() {
+				continue
+			}
+			it.Thread = nil
+			it.ThreadReadAt = time.Time{}
+			cleared = append(cleared, it)
 		}
-		it.Thread = nil
-		it.ThreadReadAt = time.Time{}
-		cleared = append(cleared, it)
-	}
-	if len(cleared) > 0 {
-		_ = h.store.Upsert(r.Context(), user.ID, cleared...)
-	}
+		return cleared, nil
+	})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -374,26 +368,22 @@ func (h *Handler) HideMessage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
 		return
 	}
-	items, lerr := h.store.List(r.Context(), user.ID)
-	if lerr != nil {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
-	for _, it := range items {
-		if it.ID == id {
-			if idx < len(it.Thread) {
-				// Clone the thread before mutating: List returns items whose Thread slice
-				// still aliases the store's backing array, so an in-place write would race a
-				// concurrent reader. The store persists the clone under its own lock.
-				thread := make([]worklist.Message, len(it.Thread))
-				copy(thread, it.Thread)
-				thread[idx].Hidden = hidden
-				it.Thread = thread
-				_ = h.store.Upsert(r.Context(), user.ID, it)
+	// Update hands over copies, so flipping the flag in place cannot touch what other
+	// readers hold. Turns are only ever appended, so idx still names the turn the page
+	// showed (a cleared thread just makes it out of range).
+	_ = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		for i := range current {
+			if current[i].ID != id {
+				continue
 			}
-			break
+			if idx >= len(current[i].Thread) {
+				return nil, nil
+			}
+			current[i].Thread[idx].Hidden = hidden
+			return current[i : i+1], nil
 		}
-	}
+		return nil, nil
+	})
 	http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
 }
 
@@ -412,9 +402,9 @@ const independentReviewPrompt = "Give an independent review of this PR. There ma
 // treated as plausibly in-flight. Past it, the converse run has almost certainly
 // finished or failed (a rate-limited converse dies fast), so the thread stops
 // spinning and shows a retry hint, and "Review all PRs" re-dispatches the item —
-// making the button self-healing. It is a heuristic, not run-status tracking: a
-// genuinely slow run re-dispatched here just yields a duplicate reply, which is
-// harmless.
+// making the button self-healing. It is a heuristic, not run-status tracking: when a
+// genuinely slow run is re-dispatched here, the retry re-stamps the prompt, so the
+// slow run's late reply is dropped and the new run's reply stands.
 const reviewStaleAfter = 5 * time.Minute
 
 // ReviewAllPRs handles POST /items/review-all. For every pull request on the
@@ -428,47 +418,44 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	items, err := h.store.List(r.Context(), user.ID)
-	if err != nil {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
 	at := h.now().UTC()
-	var (
-		changed []worklist.WorkItem
-		ids     []string
-	)
-	for _, it := range items {
-		if it.Type != worklist.TypePullRequest {
-			continue
-		}
-		if it.HasReview() {
-			continue // already reviewed at least once — a first-review is no longer needed
-		}
-		if n := len(it.Thread); n > 0 && it.Thread[n-1].Role == worklist.RoleUser {
-			// A reply is pending. Skip it only while still plausibly in-flight; once the
-			// pending prompt is older than reviewStaleAfter the prior run has finished or
-			// failed, so retry it — reusing the existing prompt (just refresh its
-			// timestamp) rather than stacking a second one. This is what makes the button
-			// self-healing after a rate-limited batch.
-			if at.Sub(it.Thread[n-1].At) < reviewStaleAfter {
+	var ids []string
+	// Choose and stamp the PRs in one atomic update, against the threads as stored.
+	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		var changed []worklist.WorkItem
+		ids = ids[:0]
+		for _, it := range current {
+			if it.Type != worklist.TypePullRequest {
 				continue
 			}
-			it.Thread[n-1].At = at
-		} else {
-			it.Thread = append(it.Thread, worklist.Message{Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, At: at})
+			if it.HasReview() {
+				continue // already reviewed at least once — a first-review is no longer needed
+			}
+			if n := len(it.Thread); n > 0 && it.Thread[n-1].Role == worklist.RoleUser {
+				// A reply is pending. Skip it only while still plausibly in-flight; once the
+				// pending prompt is older than reviewStaleAfter the prior run has finished or
+				// failed, so retry it — reusing the existing prompt (just refresh its
+				// timestamp) rather than stacking a second one. This is what makes the button
+				// self-healing after a rate-limited batch. A late reply from the earlier run
+				// answers the old timestamp and is dropped (worklist.AppendReply).
+				if at.Sub(it.Thread[n-1].At) < reviewStaleAfter {
+					continue
+				}
+				it.Thread[n-1].At = at
+			} else {
+				it.Thread = append(it.Thread, worklist.Message{Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, At: at})
+			}
+			changed = append(changed, it)
+			ids = append(ids, it.ID)
 		}
-		changed = append(changed, it)
-		ids = append(ids, it.ID)
-	}
-	if len(changed) > 0 {
-		// Persist every appended prompt first, so each spawned converse runtime reads
-		// its request from the stored thread; then launch the runs concurrently with the
+		return changed, nil
+	})
+	if err == nil && len(ids) > 0 {
+		// Every prompt is persisted first, so each spawned converse runtime reads its
+		// request from the stored thread; then launch the runs concurrently with the
 		// model picked from the button's dropdown (an empty choice uses the default).
-		if err := h.store.Upsert(r.Context(), user.ID, changed...); err == nil {
-			opt, _ := h.resolveOption(strings.TrimSpace(r.FormValue("choice")))
-			_ = h.pipeline.ReviewAll(r.Context(), user.ID, ids, opt.Endpoint, opt.Model)
-		}
+		opt, _ := h.resolveOption(strings.TrimSpace(r.FormValue("choice")))
+		_ = h.pipeline.ReviewAll(r.Context(), user.ID, ids, opt.Endpoint, opt.Model)
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
@@ -491,22 +478,22 @@ func (h *Handler) SecondOpinion(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	items, err := h.store.List(r.Context(), user.ID)
-	if err != nil {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
-	for _, it := range items {
-		if it.ID == id {
-			// Append the independent-review prompt first, so the spawned converse runtime
-			// reads it from the stored thread; then dispatch the blind review by the chosen
-			// model. The consensus synthesis is chained by the ingestor after it lands.
-			it.Thread = append(it.Thread, worklist.Message{Role: worklist.RoleUser, Content: independentReviewPrompt, Kind: worklist.KindReviewRequest, At: h.now().UTC()})
-			if err := h.store.Upsert(r.Context(), user.ID, it); err == nil {
-				_ = h.pipeline.SecondOpinion(r.Context(), user.ID, id, opt.Endpoint, opt.Model)
+	// Append the independent-review prompt first (atomically), so the spawned converse
+	// runtime reads it from the stored thread; then dispatch the blind review by the
+	// chosen model. The consensus synthesis is chained by the ingestor after it lands.
+	found := false
+	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		for i := range current {
+			if current[i].ID == id {
+				current[i].Thread = append(current[i].Thread, worklist.Message{Role: worklist.RoleUser, Content: independentReviewPrompt, Kind: worklist.KindReviewRequest, At: h.now().UTC()})
+				found = true
+				return current[i : i+1], nil
 			}
-			break
 		}
+		return nil, nil
+	})
+	if err == nil && found {
+		_ = h.pipeline.SecondOpinion(r.Context(), user.ID, id, opt.Endpoint, opt.Model)
 	}
 	http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
 }
@@ -556,25 +543,33 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Append the independent-review prompt to each eligible PR, then persist so each
-	// spawned converse runtime reads its request from the stored thread.
+	// Append the independent-review prompt to each PR that is still eligible against
+	// the threads as stored, in one atomic update, so each spawned converse runtime
+	// reads its request from the stored thread.
 	var (
-		changed []worklist.WorkItem
 		ids     []string
+		stamped []worklist.WorkItem
 	)
-	for _, it := range eligible {
-		it.Thread = append(it.Thread, worklist.Message{Role: worklist.RoleUser, Content: independentReviewPrompt, Kind: worklist.KindReviewRequest, At: now})
-		changed = append(changed, it)
-		ids = append(ids, it.ID)
-	}
-	if err := h.store.Upsert(r.Context(), user.ID, changed...); err != nil {
+	err = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		ids, stamped = ids[:0], stamped[:0]
+		for _, it := range current {
+			if !it.NeedsSecondOpinion(now, reviewStaleAfter) {
+				continue
+			}
+			it.Thread = append(it.Thread, worklist.Message{Role: worklist.RoleUser, Content: independentReviewPrompt, Kind: worklist.KindReviewRequest, At: now})
+			stamped = append(stamped, it)
+			ids = append(ids, it.ID)
+		}
+		return stamped, nil
+	})
+	if err != nil || len(ids) == 0 {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 
 	if heterogeneous {
 		// Per PR, dispatch a review by a model different from that PR's first review.
-		for _, it := range eligible {
+		for _, it := range stamped {
 			if opt, ok := h.pickDifferentModel(it.FirstReviewModel()); ok {
 				_ = h.pipeline.SecondOpinion(r.Context(), user.ID, it.ID, opt.Endpoint, opt.Model)
 			}
