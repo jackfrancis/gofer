@@ -26,11 +26,16 @@ development cluster.
 `backup-apply`, an on-demand `snapshot` (ready in about 15 seconds), pruning
 (including the stored snapshot itself), a full `restore` (about 40 seconds, gofer down
 for about 25) and [going back](#going-back-to-the-previous-volume) to the previous
-volume. Not yet rehearsed: [restoring into a new cluster or
-namespace](#restoring-into-a-new-cluster-or-namespace). Rehearse a restore on your
-own cluster before relying on it. The additional restore preflight, backup-pause,
-and failure-recovery safeguards are covered by fake-kubectl tests; they have not yet
-been re-rehearsed against a live cluster.
+volume. [Restoring into a new cluster](#restoring-into-a-new-cluster-or-namespace) was
+rehearsed too: a stored snapshot bound into a freshly created cluster through a
+pre-provisioned VolumeSnapshotContent, `data-gofer-0` created from it, then
+`make deploy`; gofer reopened the database with the same key ID and every item,
+thread and stored token intact. The new cluster's identity needed the same snapshot
+role as the old one. Rehearse a restore on your own cluster before relying on it.
+
+The additional restore preflight, backup-pause, and failure-recovery safeguards are
+covered by fake-kubectl tests; they have not yet been re-rehearsed against a live
+cluster.
 
 ## Protection that needs no setup
 
