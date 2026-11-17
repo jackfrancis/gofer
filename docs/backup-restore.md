@@ -210,19 +210,34 @@ claim deletion. An already-suspended schedule stays suspended; a missing CronJob
 allowed for manually created snapshots. If shutdown or the second preflight fails
 before deletion is attempted, gofer's previous replica count is restored too.
 
-If PVC deletion, replacement creation, or rollout fails **after deletion was
-attempted**, backups stay suspended and the command prints the retained old PV and
-recovery guidance. A failed DELETE response can still mean the claim is terminating,
-so restore does not automatically restart the StatefulSet against a possibly missing
-claim. Inspect the claim and follow [Going back](#going-back-to-the-previous-volume)
-where necessary; only resume backups using the printed, cluster-qualified command
-once the app and its intended data volume are healthy. The script never force-removes
-storage finalizers or deletes an unfinished snapshot on your behalf.
+Failure handling distinguishes replacement/startup from post-restore finalization:
+
+- **Before a restored rollout is confirmed:** failed PVC deletion, replacement
+  creation, startup, or rollout leaves backups suspended and prints the retained old
+  PV and recovery guidance. The message distinguishes an unconfirmed replacement from
+  a successfully created claim whose rollout is not yet confirmed. A failed DELETE
+  response can still mean the claim is terminating, so cleanup never automatically
+  starts the StatefulSet against a possibly missing claim. Inspect the PVC, pod and
+  rollout; follow [Going back](#going-back-to-the-previous-volume) where necessary.
+  Resume backups using the printed, cluster-qualified command only after recovery.
+- **After the restored rollout succeeds:** a later PVC read or reclaim-policy error
+  is reported as incomplete finalization, not failed application recovery. The command
+  still exits nonzero, but does not stop or roll back the restored app and restores
+  the prior backup-schedule state. Verify and repair the restored PV's requested
+  reclaim policy; do not repeat the restore solely to repair volume protection. If
+  resuming backups also fails, that is reported separately with a manual resume
+  command. An already-paused or absent CronJob remains untouched.
+
+The script never force-removes storage finalizers or deletes an unfinished snapshot
+on your behalf. Automatic cleanup of abandoned snapshot attempts is a separate
+snapshot-lifecycle follow-up; this restore preflight remains strict.
 
 The restore operator needs read access to Jobs and VolumeSnapshots and get/patch
 access to the backup CronJob, in addition to the existing PVC/PV/StatefulSet rights.
 Failure-injection tests run with `go test ./hack/restore` (also part of `go test ./...`)
 using a fake kubectl; they require `make`, Bash, and `jq`, and never access a cluster.
+The child process uses a minimal environment and pinned Make configuration so exported
+deployment settings, Make includes/overrides, and shell startup hooks cannot alter it.
 
 **Before restoring, check the encryption key.** `VAULT_ENCRYPTION_KEY` in
 `gofer-secrets` must be the key in use when the snapshot was taken. If the Secret was

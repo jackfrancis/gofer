@@ -16,42 +16,68 @@ case "$policy" in Retain|Delete) ;; *) echo "ERROR: invalid DATA_RECLAIM_POLICY:
 
 fail() { echo "ERROR: $*" >&2; exit 1; }
 kube() { "${kubectl[@]}" "$@"; }
+resume_args=(-n "$namespace" patch cronjob gofer-snapshot --type=merge -p '{"spec":{"suspend":false}}')
 resume_command() {
     printf '  ' >&2
-    printf '%q ' "${kubectl[@]}" -n "$namespace" patch cronjob gofer-snapshot --type=merge -p '{"spec":{"suspend":false}}' >&2
+    printf '%q ' "${kubectl[@]}" "${resume_args[@]}" >&2
     printf '\n' >&2
 }
 
 tmp=$(mktemp -d)
 resume_backups=false
 stop_attempted=false
-delete_attempted=false
+restore_phase=preflight
 pv=
 replicas=1
 cleanup() {
     local status=$?
     trap - EXIT
-    # Once DELETE has been sent, even an error may mean the claim is terminating.
-    # Never restart the StatefulSet in that state: it could create an empty claim.
-    if [[ $status -ne 0 && $delete_attempted == true ]]; then
-        echo "ERROR: restore stopped after attempting claim deletion. Original volume $pv is retained." >&2
-        echo "Inspect PVC $namespace/$claim; see 'Going back' in docs/backup-restore.md before restarting gofer." >&2
-        if [[ $resume_backups == true ]]; then
-            echo "Scheduled backups remain suspended. After recovery, resume them with:" >&2
-            resume_command
-        fi
-    else
-        if [[ $status -ne 0 && $stop_attempted == true ]]; then
-            echo "The claim was not deleted; restoring gofer's previous replica count ($replicas)." >&2
-            kube -n "$namespace" scale statefulset/gofer --replicas="$replicas" >/dev/null || \
-                echo "ERROR: could not restore gofer's replica count; check the StatefulSet." >&2
-        fi
-        if [[ $resume_backups == true ]]; then
-            if ! kube -n "$namespace" patch cronjob gofer-snapshot --type=merge -p '{"spec":{"suspend":false}}' >/dev/null; then
+    local may_resume_backups=false
+    case "$restore_phase" in
+        preflight|rollout_complete) may_resume_backups=true;;
+    esac
+    if [[ $status -ne 0 ]]; then
+        case "$restore_phase" in
+            preflight)
+                if [[ $stop_attempted == true ]]; then
+                    echo "The claim was not deleted; restoring gofer's previous replica count ($replicas)." >&2
+                    kube -n "$namespace" scale statefulset/gofer --replicas="$replicas" >/dev/null || \
+                        echo "ERROR: could not restore gofer's replica count; check the StatefulSet." >&2
+                fi
+                ;;
+            deleting_claim|claim_created)
+                # A DELETE or CREATE error can have an ambiguous outcome. Even
+                # after a confirmed CREATE, startup may not have succeeded. Do
+                # not restart or take backups until the restored rollout is known.
+                if [[ $restore_phase == claim_created ]]; then
+                    echo "ERROR: replacement claim $namespace/$claim was created, but gofer's rollout was not confirmed." >&2
+                    echo "Inspect the PVC, pod and rollout; see 'Going back' in docs/backup-restore.md if recovery is needed." >&2
+                else
+                    echo "ERROR: restore stopped after attempting claim deletion; replacement creation was not confirmed." >&2
+                    echo "Inspect PVC $namespace/$claim; see 'Going back' in docs/backup-restore.md before restarting gofer." >&2
+                fi
+                echo "Original volume $pv is retained." >&2
+                ;;
+            rollout_complete)
+                # Once rollout succeeded, a later read/policy failure concerns
+                # finalization, not claim replacement or application startup.
+                echo "ERROR: gofer's restored rollout succeeded, but post-restore finalization is incomplete." >&2
+                echo "Verify the bound PV for $namespace/$claim and its requested reclaim policy ($policy)." >&2
+                echo "No rollback or additional stop was attempted. Do not repeat restore solely to repair volume protection." >&2
+                echo "Original volume $pv is retained." >&2
+                ;;
+        esac
+    fi
+    if [[ $resume_backups == true ]]; then
+        if [[ $may_resume_backups == true ]]; then
+            if ! kube "${resume_args[@]}" >/dev/null; then
                 echo "ERROR: could not resume scheduled backups. Resume them with:" >&2
                 resume_command
                 status=1
             fi
+        else
+            echo "Scheduled backups remain suspended. After recovery, resume them with:" >&2
+            resume_command
         fi
     fi
     rm -rf "$tmp"
@@ -143,13 +169,15 @@ kube -n "$namespace" wait --for=delete pod/gofer-0 --timeout="$wait_timeout"
 # Recheck after shutdown in case a previously dispatched/manual backup started.
 check_quiet
 echo "3/5 replacing $claim"
-delete_attempted=true
+restore_phase=deleting_claim
 kube -n "$namespace" delete pvc "$claim" --wait=true --timeout="$wait_timeout"
 kube create -f "$tmp/claim.json" >/dev/null
+restore_phase=claim_created
 # A successful create is the only point at which starting the StatefulSet is safe.
 echo "4/5 starting gofer on the restored volume"
 kube -n "$namespace" scale statefulset/gofer --replicas=1 >/dev/null
 kube -n "$namespace" rollout status statefulset/gofer --timeout="$rollout_timeout"
+restore_phase=rollout_complete
 new=$(kube -n "$namespace" get pvc "$claim" -o jsonpath='{.spec.volumeName}')
 [[ -n "$new" ]] || fail "the restored PVC has no bound volume"
 echo "5/5 setting the restored volume $new to reclaim policy $policy"

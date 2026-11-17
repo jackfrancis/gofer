@@ -141,9 +141,11 @@ Wired on the web-tier side; they define what a runtime must respect:
 - Recovery: `make deploy` sets the data volume's reclaim policy to `Retain`;
   `make backup-apply SNAPSHOT_CLASS=<class>` schedules snapshots and `make restore`
   swaps the claim for one restored from a snapshot. The restore script validates the
-  claim before downtime and pauses/checks backup activity; failures after attempted
-  claim deletion leave backups paused for manual recovery. Never strip storage
-  finalizers to force a restore. Never write an environment's
+  claim before downtime and pauses/checks backup activity. Replacement/startup
+  failures after attempted claim deletion leave backups paused for manual recovery.
+  Once the restored rollout is confirmed, finalization errors are reported separately
+  and the prior backup schedule is restored without restarting or rolling back the app.
+  Never strip storage finalizers to force a restore. Never write an environment's
   names (cloud resource groups, registries, hostnames, snapshot classes) into this
   repository: they are make parameters or live with the cluster.
 - Change an existing work item with `worklist.Store.Update` (one atomic

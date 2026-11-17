@@ -44,16 +44,23 @@ func runRestore(t *testing.T, scenario string, confirm bool) result {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "make", "--no-print-directory", "restore", "KUBE_CONTEXT=review-fake",
-		"KUBECTL="+wrapper+" --context review-fake --kubeconfig 'review kubeconfig'", "SNAPSHOT=backup", "RESTORE_TIMEOUT=1s")
+	cmd := exec.CommandContext(ctx, "make", "--no-print-directory", "restore", "SHELL=/bin/sh",
+		"KUBE_NS=gofer", "DATA_CLAIM=data-gofer-0", "KUBE_CONTEXT=review-fake",
+		"KUBECTL="+wrapper+" --context review-fake --kubeconfig 'review kubeconfig'", "SNAPSHOT=backup",
+		"DATA_RECLAIM_POLICY=Retain", "RESTORE_TIMEOUT=1s", "ROLLOUT_TIMEOUT=1s")
 	if confirm {
 		cmd.Args = append(cmd.Args, "CONFIRM=backup")
 	} else {
 		cmd.Args = append(cmd.Args, "CONFIRM=")
 	}
 	cmd.Dir = filepath.Clean(filepath.Join(packageDir, "../.."))
-	cmd.Env = append(os.Environ(), "MOCK_TEST_BINARY="+exe, "MOCK_DIR="+dir, "MOCK_SCENARIO="+scenario,
-		"MAKEFLAGS=", "MFLAGS=", "GORACE=atexit_sleep_ms=0")
+	// Keep only the host tool search path. In particular, do not inherit Make
+	// overrides/includes, shell startup hooks, or deployment configuration.
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "TMPDIR=" + dir, "LC_ALL=C",
+		"MOCK_TEST_BINARY=" + exe, "MOCK_DIR=" + dir, "MOCK_SCENARIO=" + scenario,
+		"GORACE=atexit_sleep_ms=0",
+	}
 	out, err := cmd.CombinedOutput()
 	r := result{output: string(out), err: err, calls: readCalls(dir)}
 	if data, readErr := os.ReadFile(filepath.Join(dir, "created.json")); readErr == nil {
@@ -133,7 +140,7 @@ func TestRestoreAbortsBeforeDeletionAndRestartsOriginalApp(t *testing.T) {
 }
 
 func TestRestoreLeavesBackupsPausedAfterDestructiveFailure(t *testing.T) {
-	for _, scenario := range []string{"delete_timeout", "create_error", "rollout_error"} {
+	for _, scenario := range []string{"delete_timeout", "create_error", "start_error", "rollout_error"} {
 		t.Run(scenario, func(t *testing.T) {
 			r := runRestore(t, scenario, true)
 			if r.err == nil || !r.has("delete", "pvc", "data-gofer-0", "--wait=true", "--timeout=1s") {
@@ -142,11 +149,97 @@ func TestRestoreLeavesBackupsPausedAfterDestructiveFailure(t *testing.T) {
 			if r.has("patch", "cronjob", "gofer-snapshot", "--type=merge", "-p", `{"spec":{"suspend":false}}`) {
 				t.Fatal("backups must stay paused while the claim needs recovery")
 			}
-			if scenario != "rollout_error" && r.has("scale", "statefulset/gofer", "--replicas=1") {
+			if (scenario == "delete_timeout" || scenario == "create_error") && r.has("scale", "statefulset/gofer", "--replicas=1") {
 				t.Fatal("must not start gofer without a successfully created replacement claim")
 			}
 			if !strings.Contains(r.output, "Original volume original-pv is retained") || !strings.Contains(r.output, "Scheduled backups remain suspended") {
 				t.Fatalf("missing recovery instructions: %s", r.output)
+			}
+			phaseMessage := "replacement creation was not confirmed"
+			if scenario == "start_error" || scenario == "rollout_error" {
+				phaseMessage = "replacement claim gofer/data-gofer-0 was created, but gofer's rollout was not confirmed"
+			}
+			if !strings.Contains(r.output, phaseMessage) || strings.Contains(r.output, "post-restore finalization is incomplete") {
+				t.Fatalf("incorrect restore phase reported: %s", r.output)
+			}
+		})
+	}
+}
+
+func TestRestoreReportsPostRolloutFinalizationFailures(t *testing.T) {
+	for _, scenario := range []string{"restored_pvc_read_error", "restored_pvc_unbound", "reclaim_policy_error", "reclaim_policy_resume_error", "paused_reclaim_policy_error", "no_cronjob_reclaim_policy_error"} {
+		t.Run(scenario, func(t *testing.T) {
+			r := runRestore(t, scenario, true)
+			if r.err == nil || r.created == nil || !r.has("rollout", "status", "statefulset/gofer", "--timeout=1s") {
+				t.Fatalf("expected failure after a confirmed restored rollout: %v\n%s", r.calls, r.output)
+			}
+			if !strings.Contains(r.output, "restored rollout succeeded, but post-restore finalization is incomplete") || !strings.Contains(r.output, "requested reclaim policy (Retain)") {
+				t.Fatalf("missing finalization guidance: %s", r.output)
+			}
+			for _, misleading := range []string{"before restarting gofer", "Going back", "Scheduled backups remain suspended"} {
+				if strings.Contains(r.output, misleading) {
+					t.Errorf("unexpected failed-replacement guidance %q: %s", misleading, r.output)
+				}
+			}
+			var scales, deletes int
+			for _, call := range r.calls {
+				if call[0] == "scale" {
+					scales++
+				}
+				if call[0] == "delete" {
+					deletes++
+				}
+			}
+			if scales != 2 || deletes != 1 {
+				t.Fatalf("cleanup must not restart or roll back the restored app: %v", r.calls)
+			}
+			shouldResume := !strings.HasPrefix(scenario, "paused_") && !strings.HasPrefix(scenario, "no_cronjob_")
+			resumeAttempted := r.has("patch", "cronjob", "gofer-snapshot", "--type=merge", "-p", `{"spec":{"suspend":false}}`)
+			if resumeAttempted != shouldResume {
+				t.Fatalf("did not preserve the original schedule state: %v", r.calls)
+			}
+			if !shouldResume && r.has("patch", "cronjob") {
+				t.Fatalf("must not change an absent or already-paused CronJob: %v", r.calls)
+			}
+			if scenario == "reclaim_policy_resume_error" && !strings.Contains(r.output, "could not resume scheduled backups") {
+				t.Fatalf("must report both finalization and schedule-resume failures: %s", r.output)
+			}
+		})
+	}
+}
+
+func TestRestoreIgnoresCallerConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	makefile := filepath.Join(dir, "caller.mk")
+	startup := filepath.Join(dir, "caller.sh")
+	if err := os.WriteFile(makefile, []byte("$(error caller Makefile must not be loaded)\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(startup, []byte("echo 'caller shell startup must not be loaded' >&2\nexit 99\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for name, env := range map[string]map[string]string{
+		"deployment": {
+			"KUBE_NS": "caller-namespace", "DATA_CLAIM": "caller-claim", "KUBE_CONTEXT": "caller-context",
+			"KUBECONFIG": "caller-missing-kubeconfig", "KUBECTL": "caller-kubectl",
+			"SNAPSHOT": "caller-snapshot", "CONFIRM": "caller-confirmation",
+			"DATA_RECLAIM_POLICY": "invalid", "RESTORE_TIMEOUT": "invalid", "ROLLOUT_TIMEOUT": "invalid",
+		},
+		"make-and-shell": {
+			"MAKEFILES": makefile, "MAKEFLAGS": "-e", "MFLAGS": "-n", "MAKEOVERRIDES": "KUBE_NS=caller-namespace",
+			"SHELL": "/caller-missing-shell", "BASH_ENV": startup, "ENV": startup,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for key, value := range env {
+				t.Setenv(key, value)
+			}
+			r := runRestore(t, "normal", true)
+			if r.err != nil {
+				t.Fatalf("caller configuration affected restore: %v\n%s", r.err, r.output)
+			}
+			if !r.has("patch", "pv", "restored-pv", "-p", `{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}`) || !r.has("rollout", "status", "statefulset/gofer", "--timeout=1s") {
+				t.Fatalf("test configuration was not pinned: %v", r.calls)
 			}
 		})
 	}
@@ -174,7 +267,7 @@ func TestRestoreSuccess(t *testing.T) {
 			if scenario == "no_restore_size" {
 				wantSize = "4Gi"
 			}
-			if spec["storageClassName"] != "managed-csi" || spec["volumeMode"] != "Filesystem" || spec["accessModes"].([]any)[0] != "ReadWriteOnce" || spec["volumeName"] != nil || spec["dataSource"].(map[string]any)["name"] != "backup" || spec["resources"].(map[string]any)["requests"].(map[string]any)["storage"] != wantSize {
+			if spec["storageClassName"] != "test-storage-class" || spec["volumeMode"] != "Filesystem" || spec["accessModes"].([]any)[0] != "ReadWriteOnce" || spec["volumeName"] != nil || spec["dataSource"].(map[string]any)["name"] != "backup" || spec["resources"].(map[string]any)["requests"].(map[string]any)["storage"] != wantSize {
 				t.Fatalf("incorrect replacement claim: %v", spec)
 			}
 			meta := r.created["metadata"].(map[string]any)
@@ -215,10 +308,11 @@ func readCalls(dir string) [][]string {
 // through to the real kubectl. Normal test runs never enter helper mode.
 func TestKubectlHelper(t *testing.T) {
 	dir := os.Getenv("MOCK_DIR")
-	if dir == "" {
+	separator := slices.Index(os.Args, "--")
+	if dir == "" || separator < 0 {
 		return
 	}
-	args := os.Args[slices.Index(os.Args, "--")+1:]
+	args := os.Args[separator+1:]
 	if len(args) < 4 || !slices.Equal(args[:4], []string{"--context", "review-fake", "--kubeconfig", "review kubeconfig"}) {
 		fmt.Fprintln(os.Stderr, "lost cluster-selection arguments", args)
 		os.Exit(1)
@@ -239,7 +333,8 @@ func TestKubectlHelper(t *testing.T) {
 	calls := readCalls(dir)
 	scenario := os.Getenv("MOCK_SCENARIO")
 	paused := strings.HasPrefix(scenario, "paused_") || scenario == "already_suspended"
-	scenario = strings.TrimPrefix(scenario, "paused_")
+	noCronjob := strings.HasPrefix(scenario, "no_cronjob_") || scenario == "no_cronjob"
+	scenario = strings.TrimPrefix(strings.TrimPrefix(scenario, "paused_"), "no_cronjob_")
 	is := func(parts ...string) bool { return slices.Equal(args[:min(len(parts), len(args))], parts) }
 	count := func(parts ...string) int {
 		n := 0
@@ -273,7 +368,7 @@ func TestKubectlHelper(t *testing.T) {
 			os.Exit(0)
 		}
 		var pvc map[string]any
-		_ = json.Unmarshal([]byte(`{"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"data-gofer-0","namespace":"gofer","uid":"pvc-uid","labels":{"app":"gofer"},"finalizers":["kubernetes.io/pvc-protection"]},"spec":{"volumeName":"original-pv","storageClassName":"managed-csi","accessModes":["ReadWriteOnce"],"volumeMode":"Filesystem","resources":{"requests":{"storage":"4Gi"}}},"status":{"phase":"Bound"}}`), &pvc)
+		_ = json.Unmarshal([]byte(`{"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"data-gofer-0","namespace":"gofer","uid":"pvc-uid","labels":{"app":"gofer"},"finalizers":["kubernetes.io/pvc-protection"]},"spec":{"volumeName":"original-pv","storageClassName":"test-storage-class","accessModes":["ReadWriteOnce"],"volumeMode":"Filesystem","resources":{"requests":{"storage":"4Gi"}}},"status":{"phase":"Bound"}}`), &pvc)
 		if scenario == "claim_no_access" {
 			delete(pvc["spec"].(map[string]any), "accessModes")
 		}
@@ -286,6 +381,12 @@ func TestKubectlHelper(t *testing.T) {
 		emit(pvc)
 	case is("get", "pvc", "data-gofer-0", "-o"):
 		if _, err := os.Stat(filepath.Join(dir, "created.json")); err == nil {
+			if scenario == "restored_pvc_read_error" {
+				fail()
+			}
+			if scenario == "restored_pvc_unbound" {
+				os.Exit(0)
+			}
 			fmt.Println("restored-pv")
 		} else {
 			fmt.Println("original-pv")
@@ -321,7 +422,7 @@ func TestKubectlHelper(t *testing.T) {
 		if scenario == "cronjob_read_error" {
 			fail()
 		}
-		if scenario != "no_cronjob" {
+		if !noCronjob {
 			emit(map[string]any{"spec": map[string]any{"suspend": paused}})
 		}
 	case is("get", "jobs"):
@@ -361,14 +462,20 @@ func TestKubectlHelper(t *testing.T) {
 		}
 		emit(map[string]any{"items": items})
 	case is("patch", "cronjob"):
-		if scenario == "resume_error" && strings.Contains(args[len(args)-1], "false") {
+		if (scenario == "resume_error" || scenario == "reclaim_policy_resume_error") && strings.Contains(args[len(args)-1], "false") {
 			fail()
 		}
 		if scenario == "suspend_error" && strings.Contains(args[len(args)-1], "true") {
 			fail()
 		}
 	case is("patch", "pv"):
+		if (scenario == "reclaim_policy_error" || scenario == "reclaim_policy_resume_error") && args[2] == "restored-pv" {
+			fail()
+		}
 	case is("scale", "statefulset/gofer"):
+		if scenario == "start_error" && slices.Contains(args, "--replicas=1") {
+			fail()
+		}
 		if scenario == "scale_error" && slices.Contains(args, "--replicas=0") {
 			fail()
 		}
