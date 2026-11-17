@@ -12,6 +12,7 @@
         deploy deploy-target deploy-apply deploy-public public-address public-down \
         install-ingress deploy-tls tls-status \
         aei-check secrets-check dev-secrets \
+        backup-apply backup-down snapshot snapshots restore \
         monitoring-load dev-monitoring dev-monitoring-down dev-forward-grafana dev-forward-prometheus
 
 build:
@@ -160,6 +161,25 @@ HELM = helm $(if $(KUBECONFIG_GIVEN),--kubeconfig "$(abspath $(KUBECONFIG))") $(
 # How long deploy waits for the web tier. A first rollout on a cloud cluster also
 # provisions and attaches the data disk.
 ROLLOUT_TIMEOUT ?= 180s
+# ---- data protection (docs/backup-restore.md) ----
+# The claim that holds gofer's database.
+DATA_CLAIM := data-gofer-0
+# The reclaim policy deploy sets on the data volume once it is bound. Retain keeps the
+# disk if the claim or the gofer namespace is ever deleted (a restore depends on
+# this too); storage classes default to Delete. The kind loop uses Delete, so
+# `make dev-down` leaves nothing behind.
+DATA_RECLAIM_POLICY ?= Retain
+# Scheduled snapshots (`make backup-apply`). SNAPSHOT_CLASS names a VolumeSnapshotClass
+# the cluster's administrator created; it decides where snapshots are stored, so it is
+# never written into this repository. The schedule is cron syntax, in UTC.
+SNAPSHOT_CLASS ?=
+SNAPSHOT_SCHEDULE ?= 0 */6 * * *
+SNAPSHOT_KEEP ?= 28
+# `make snapshot` waits this long for an on-demand snapshot, in seconds.
+SNAPSHOT_TIMEOUT ?= 900
+# `make restore SNAPSHOT=<name> CONFIRM=<name>`: the snapshot to restore, named twice.
+SNAPSHOT ?=
+CONFIRM ?=
 # Optional monitoring stack (opt-in; see `make dev-monitoring`).
 MONITORING_NS ?= gofer-monitoring
 PROMETHEUS_IMAGE ?= docker.io/prom/prometheus:v3.1.0
@@ -211,8 +231,9 @@ kind-engine:
 build-linux:
 	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w" -o bin/linux/server ./cmd/server
 	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w" -o bin/linux/runtime ./cmd/runtime
+	CGO_ENABLED=0 GOOS=linux GOARCH=$(GOARCH) go build -trimpath -ldflags="-s -w" -o bin/linux/snapshot ./cmd/snapshot
 
-# Build the web-tier image (packages the prebuilt bin/linux/server).
+# Build the web-tier image (packages the prebuilt bin/linux/server and bin/linux/snapshot).
 image: engine build-linux
 	$(CONTAINER_ENGINE) build $(PLATFORM_FLAG) -f Dockerfile -t $(IMAGE) .
 
@@ -313,15 +334,16 @@ cluster-down:
 # `deploy` must be told which cluster: a kubeconfig file or an explicit context. It
 # never falls back to the kind default, so a bare `make deploy` cannot land somewhere
 # unintended.
+# The backup and restore targets use the same guard.
 deploy-target:
 	@[ -n "$(KUBECONFIG_GIVEN)" ] || [ "$(origin KUBE_CONTEXT)" != "file" ] || { \
-		echo "ERROR: 'make deploy' needs an explicit target cluster:"; \
-		echo "         make deploy KUBECONFIG=/path/to/kubeconfig [KUBE_CONTEXT=name]"; \
+		echo "ERROR: 'make $(firstword $(MAKECMDGOALS))' needs an explicit target cluster:"; \
+		echo "         make $(firstword $(MAKECMDGOALS)) KUBECONFIG=/path/to/kubeconfig [KUBE_CONTEXT=name]"; \
 		echo "       (for the kind dev cluster, use 'make dev-up')."; \
 		exit 1; }
 	@[ -z "$(KUBECONFIG_GIVEN)" ] || [ -f "$(abspath $(KUBECONFIG))" ] || { \
 		echo "ERROR: kubeconfig not found: $(abspath $(KUBECONFIG))"; exit 1; }
-	@echo "deploying to context '$$($(KUBECTL) config current-context 2>/dev/null)' at $$($(KUBECTL) config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+	@echo "cluster: context '$$($(KUBECTL) config current-context 2>/dev/null)' at $$($(KUBECTL) config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
 
 aei-check:
 	@$(KUBECTL) get crd agentapps.agents.x-k8s.io >/dev/null 2>&1 || { \
@@ -403,6 +425,16 @@ deploy-apply:
 		-p '{"spec":{"providerClassName":"$(AGENT_PROVIDER_CLASS)"}}'
 	$(KUBECTL) rollout restart statefulset/gofer -n $(KUBE_NS)
 	$(KUBECTL) rollout status statefulset/gofer -n $(KUBE_NS) --timeout=$(ROLLOUT_TIMEOUT)
+	@# Keep the data disk if its claim or the namespace is ever deleted. The volume is
+	@# bound by now (the pod that mounts it is ready).
+	@pv=$$($(KUBECTL) -n $(KUBE_NS) get pvc $(DATA_CLAIM) -o jsonpath='{.spec.volumeName}' 2>/dev/null); \
+		if [ -n "$$pv" ]; then \
+			$(KUBECTL) patch pv "$$pv" -p '{"spec":{"persistentVolumeReclaimPolicy":"$(DATA_RECLAIM_POLICY)"}}' >/dev/null && \
+			echo "data volume $$pv: reclaim policy $(DATA_RECLAIM_POLICY)"; \
+		else echo "WARNING: $(DATA_CLAIM) is not bound; its reclaim policy was not set."; fi
+	@# Keep the backup job, if set up, on the image just deployed.
+	@if $(KUBECTL) -n $(KUBE_NS) get cronjob gofer-snapshot >/dev/null 2>&1; then \
+		$(KUBECTL) -n $(KUBE_NS) set image cronjob/gofer-snapshot snapshot=$(IMAGE) >/dev/null; fi
 
 # The public Service, rendered with its annotations and source ranges, then applied.
 # Re-applying with a different PUBLIC_SERVICE_ANNOTATIONS replaces the set.
@@ -483,6 +515,7 @@ deploy-tls:
 tls-status:
 	@$(KUBECTL) -n $(KUBE_NS) get certificate,certificaterequest,order,challenge 2>&1
 
+dev-up: DATA_RECLAIM_POLICY = Delete
 dev-up: cluster-up kind-load kind-load-runtime aei-check dev-secrets deploy-apply
 	@# Durable pulls actor images from a registry BY DIGEST (a tag invalidates ate's golden
 	@# snapshot; kind-loaded images are not registry-pullable). So for the durable class,
@@ -507,6 +540,114 @@ dev-up: cluster-up kind-load kind-load-runtime aei-check dev-secrets deploy-appl
 		$(KUBECTL) -n $(KUBE_NS) patch agentapp gofer --type=merge \
 			-p "{\"spec\":{\"image\":\"$(SUBSTRATE_REGISTRY)/gofer-runtime@$$digest\"}}"; \
 	fi
+
+# ---- backup and restore (docs/backup-restore.md) ------------------------------
+#
+# Scheduled CSI snapshots of the data volume, and a guarded restore. Cluster-agnostic,
+# for any cluster with CSI snapshot support; not kind. Every target needs an explicit
+# cluster (KUBECONFIG=<file> or KUBE_CONTEXT=<name>), like `make deploy`.
+#
+#   make backup-apply SNAPSHOT_CLASS=<class> [SNAPSHOT_SCHEDULE="0 */6 * * *"] [SNAPSHOT_KEEP=28]
+#   make snapshot                                take one now and wait for it
+#   make snapshots                               list snapshots
+#   make restore SNAPSHOT=<name> CONFIRM=<name>  replace the data volume with a snapshot
+#   make backup-down                             stop scheduling (keeps every snapshot)
+
+# Install or update the snapshot CronJob, on the image the web tier runs.
+backup-apply: deploy-target
+	@[ -n "$(SNAPSHOT_CLASS)" ] || { echo "ERROR: set SNAPSHOT_CLASS=<a VolumeSnapshotClass> (see docs/backup-restore.md)."; exit 1; }
+	@case "$(SNAPSHOT_CLASS)" in *[!a-z0-9.-]*) echo "ERROR: SNAPSHOT_CLASS must be a Kubernetes object name."; exit 1;; esac
+	@case "$(SNAPSHOT_KEEP)" in ''|*[!0-9]*|0) echo "ERROR: SNAPSHOT_KEEP must be a positive integer."; exit 1;; esac
+	@case "$(SNAPSHOT_SCHEDULE)" in *[!0-9\ \*/,-]*|'') echo "ERROR: SNAPSHOT_SCHEDULE must be a five-field cron expression, e.g. \"0 */6 * * *\"."; exit 1;; esac
+	@$(KUBECTL) get crd volumesnapshots.snapshot.storage.k8s.io >/dev/null 2>&1 || { \
+		echo "ERROR: this cluster has no CSI snapshot support (the volumesnapshots CRD is missing)."; exit 1; }
+	@$(KUBECTL) get volumesnapshotclass "$(SNAPSHOT_CLASS)" >/dev/null 2>&1 || { \
+		echo "ERROR: VolumeSnapshotClass $(SNAPSHOT_CLASS) not found. Create it first (docs/backup-restore.md)."; exit 1; }
+	@policy=$$($(KUBECTL) get volumesnapshotclass "$(SNAPSHOT_CLASS)" -o jsonpath='{.deletionPolicy}'); \
+		[ "$$policy" = Retain ] || echo "WARNING: $(SNAPSHOT_CLASS) has deletionPolicy $$policy: deleting the gofer namespace would delete every stored snapshot. Retain is recommended."
+	@image=$$($(KUBECTL) -n $(KUBE_NS) get statefulset gofer -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null); \
+		[ -n "$$image" ] || { echo "ERROR: gofer is not deployed here; deploy it first."; exit 1; }; \
+		$(KUBECTL) kustomize deploy/k8s/backup | sed \
+			-e "s|image: localhost/gofer:dev$$|image: $$image|" \
+			-e 's|@SNAPSHOT_CLASS@|$(SNAPSHOT_CLASS)|' \
+			-e 's|@SNAPSHOT_KEEP@|$(SNAPSHOT_KEEP)|' \
+			-e 's|@SNAPSHOT_SCHEDULE@|$(SNAPSHOT_SCHEDULE)|' | $(KUBECTL) apply -f -
+	@echo "scheduled snapshots of $(DATA_CLAIM): '$(SNAPSHOT_SCHEDULE)' (UTC), keeping $(SNAPSHOT_KEEP). Take one now with 'make snapshot'."
+
+# Stop taking snapshots. Existing snapshots, and the storage behind them, stay.
+backup-down: deploy-target
+	$(KUBECTL) kustomize deploy/k8s/backup | $(KUBECTL) delete --ignore-not-found -f -
+
+# Take a snapshot now (through the CronJob, so it is labeled, waited for and pruned
+# like a scheduled one) and wait for the result.
+snapshot: deploy-target
+	@$(KUBECTL) -n $(KUBE_NS) get cronjob gofer-snapshot >/dev/null 2>&1 || { \
+		echo "ERROR: scheduled snapshots are not set up here; run 'make backup-apply' first."; exit 1; }
+	@job=gofer-snapshot-manual-$$(date -u +%Y%m%d%H%M%S); \
+		$(KUBECTL) -n $(KUBE_NS) create job "$$job" --from=cronjob/gofer-snapshot >/dev/null; \
+		echo "job $$job started; waiting up to $(SNAPSHOT_TIMEOUT)s"; \
+		end=$$(( $$(date +%s) + $(SNAPSHOT_TIMEOUT) )); state=; \
+		while [ $$(date +%s) -lt $$end ]; do \
+			state=$$($(KUBECTL) -n $(KUBE_NS) get job "$$job" -o jsonpath='{range .status.conditions[?(@.status=="True")]}{.type}{" "}{end}'); \
+			case "$$state" in *Complete*|*Failed*) break;; esac; sleep 5; \
+		done; \
+		$(KUBECTL) -n $(KUBE_NS) logs "job/$$job" --all-containers 2>/dev/null | tail -20; \
+		case "$$state" in *Complete*) echo "snapshot taken.";; \
+			*Failed*) echo "ERROR: the snapshot job failed (logs above)."; exit 1;; \
+			*) echo "ERROR: the snapshot job did not finish in $(SNAPSHOT_TIMEOUT)s; check 'kubectl -n $(KUBE_NS) get job $$job'."; exit 1;; esac
+
+# List the data volume's snapshots, oldest first.
+snapshots: deploy-target
+	@$(KUBECTL) -n $(KUBE_NS) get volumesnapshot --sort-by=.metadata.creationTimestamp \
+		-o custom-columns='NAME:.metadata.name,READY:.status.readyToUse,SIZE:.status.restoreSize,CREATED:.metadata.creationTimestamp,SOURCE:.spec.source.persistentVolumeClaimName'
+
+# The replacement claim: the current claim's name, labels, class and access, with the
+# snapshot as its data source and its size (one line: make would hand the shell a
+# backslash-newline inside the quoted jq program).
+RESTORE_CLAIM_JQ = {apiVersion: "v1", kind: "PersistentVolumeClaim", metadata: {name: .metadata.name, namespace: .metadata.namespace, labels: (.metadata.labels // {})}, spec: {accessModes: .spec.accessModes, storageClassName: .spec.storageClassName, volumeMode: .spec.volumeMode, resources: {requests: {storage: (if $$size != "" then $$size else .spec.resources.requests.storage end)}}, dataSource: {apiGroup: "snapshot.storage.k8s.io", kind: "VolumeSnapshot", name: $$snap}}}
+
+# Replace the data volume with one restored from a snapshot. Everything written after
+# the snapshot is rolled back. It stops gofer for the swap, and keeps the current
+# volume (reclaim policy Retain) so you can go back. CONFIRM must repeat the snapshot
+# name; without it, the target prints the plan and changes nothing.
+restore: deploy-target
+	@[ -n "$(SNAPSHOT)" ] || { echo "usage: make restore SNAPSHOT=<name> CONFIRM=<name>  (names: make snapshots)"; exit 1; }
+	@ready=$$($(KUBECTL) -n $(KUBE_NS) get volumesnapshot "$(SNAPSHOT)" -o jsonpath='{.status.readyToUse}' 2>/dev/null); \
+		[ "$$ready" = true ] || { echo "ERROR: snapshot $(SNAPSHOT) not found in namespace $(KUBE_NS), or not ready to use."; exit 1; }
+	@$(KUBECTL) -n $(KUBE_NS) get pvc $(DATA_CLAIM) >/dev/null 2>&1 || { \
+		echo "ERROR: there is no $(DATA_CLAIM) to replace. For a new cluster or namespace, see docs/backup-restore.md."; exit 1; }
+	@pv=$$($(KUBECTL) -n $(KUBE_NS) get pvc $(DATA_CLAIM) -o jsonpath='{.spec.volumeName}'); \
+		taken=$$($(KUBECTL) -n $(KUBE_NS) get volumesnapshot "$(SNAPSHOT)" -o jsonpath='{.status.creationTime}'); \
+		echo "This replaces $(DATA_CLAIM) (volume $$pv) with a new volume restored from $(SNAPSHOT), taken $$taken."; \
+		echo "gofer stops for the swap. Everything written after the snapshot is rolled back."; \
+		echo "The current volume $$pv is kept, so you can go back (the steps are printed at the end)."
+	@[ "$(CONFIRM)" = "$(SNAPSHOT)" ] || { echo; echo "Nothing changed. To proceed, repeat the snapshot name: CONFIRM=$(SNAPSHOT)"; exit 1; }
+	@set -e; \
+		pv=$$($(KUBECTL) -n $(KUBE_NS) get pvc $(DATA_CLAIM) -o jsonpath='{.spec.volumeName}'); \
+		size=$$($(KUBECTL) -n $(KUBE_NS) get volumesnapshot "$(SNAPSHOT)" -o jsonpath='{.status.restoreSize}'); \
+		claim=$$(mktemp); trap 'rm -f "$$claim"' EXIT; \
+		$(KUBECTL) -n $(KUBE_NS) get pvc $(DATA_CLAIM) -o json | jq --arg snap "$(SNAPSHOT)" --arg size "$$size" '$(RESTORE_CLAIM_JQ)' > "$$claim"; \
+		echo "1/5 keeping the current volume $$pv"; \
+		$(KUBECTL) patch pv "$$pv" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}' >/dev/null; \
+		echo "2/5 stopping gofer"; \
+		$(KUBECTL) -n $(KUBE_NS) scale statefulset/gofer --replicas=0 >/dev/null; \
+		$(KUBECTL) -n $(KUBE_NS) wait --for=delete pod/gofer-0 --timeout=120s 2>/dev/null || true; \
+		echo "3/5 replacing $(DATA_CLAIM)"; \
+		$(KUBECTL) -n $(KUBE_NS) delete pvc $(DATA_CLAIM) --wait=true >/dev/null; \
+		$(KUBECTL) apply -f "$$claim" >/dev/null || { \
+			echo "ERROR: could not create $(DATA_CLAIM) from $(SNAPSHOT). gofer is stopped; volume $$pv is intact."; \
+			echo "To go back to it, see 'Going back' in docs/backup-restore.md (volume $$pv)."; exit 1; }; \
+		echo "4/5 starting gofer on the restored volume"; \
+		$(KUBECTL) -n $(KUBE_NS) scale statefulset/gofer --replicas=1 >/dev/null; \
+		$(KUBECTL) -n $(KUBE_NS) rollout status statefulset/gofer --timeout=$(ROLLOUT_TIMEOUT); \
+		new=$$($(KUBECTL) -n $(KUBE_NS) get pvc $(DATA_CLAIM) -o jsonpath='{.spec.volumeName}'); \
+		echo "5/5 setting the restored volume $$new to reclaim policy $(DATA_RECLAIM_POLICY)"; \
+		$(KUBECTL) patch pv "$$new" -p '{"spec":{"persistentVolumeReclaimPolicy":"$(DATA_RECLAIM_POLICY)"}}' >/dev/null; \
+		$(KUBECTL) -n $(KUBE_NS) logs gofer-0 | grep -m1 'persistent storage' || true; \
+		echo; echo "Restored $(DATA_CLAIM) from $(SNAPSHOT). Check the app, then:"; \
+		echo "  keep it:  delete the old volume and its disk with"; \
+		echo "            kubectl patch pv $$pv -p '{\"spec\":{\"persistentVolumeReclaimPolicy\":\"Delete\"}}'"; \
+		echo "  undo it:  see 'Going back' in docs/backup-restore.md (old volume $$pv)."
 
 # Tear down gofer's app components (leaves the cluster + AEI in place).
 dev-down:

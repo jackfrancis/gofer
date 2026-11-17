@@ -1,0 +1,59 @@
+# The snapshotter's identity. It is separate from the web tier's ServiceAccount, so the
+# web tier gains no rights over snapshots.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gofer-snapshotter
+  namespace: gofer
+---
+# Take, read and prune VolumeSnapshots in gofer's namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gofer-snapshotter
+  namespace: gofer
+rules:
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["create", "get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gofer-snapshotter
+  namespace: gofer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gofer-snapshotter
+subjects:
+  - kind: ServiceAccount
+    name: gofer-snapshotter
+    namespace: gofer
+---
+# Pruning has to delete the stored snapshot, not just the object: the class keeps
+# stored snapshots (deletionPolicy Retain) so an accidental deletion loses nothing,
+# and pruning switches one content to Delete just before deleting its snapshot.
+# VolumeSnapshotContents are cluster-scoped, so this needs a ClusterRole. It can only
+# read and patch them, not create or delete them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gofer-snapshotter
+rules:
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotcontents"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gofer-snapshotter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gofer-snapshotter
+subjects:
+  - kind: ServiceAccount
+    name: gofer-snapshotter
+    namespace: gofer

@@ -6,23 +6,39 @@ gofer's web tier keeps all of its durable state in one SQLite database,
 sessions, the worklist with its conversation threads, and users' delegated provider
 tokens, which are encrypted.
 
-A complete backup is two things, kept in two places:
+Recovering gofer needs three things, kept in different places:
 
-| What | Where it lives | How to back it up |
+| What | Where it lives | How it is protected |
 | --- | --- | --- |
-| The data volume | PVC `data-gofer-0` | a CSI VolumeSnapshot (below), or Velero |
-| The token-encryption key | `VAULT_ENCRYPTION_KEY` in the `gofer-secrets` Secret | your secret manager, separately from the volume |
+| The data volume | PVC `data-gofer-0` | reclaim policy `Retain` (set by `make deploy`), scheduled CSI snapshots (`make backup-apply`) |
+| The token-encryption key | `VAULT_ENCRYPTION_KEY` in the `gofer-secrets` Secret | a copy in your secret manager, outside the cluster |
+| The deployment's settings | `gofer-config` (`BASE_URL`, `ALLOWED_GITHUB_LOGINS`, …) and the other `gofer-secrets` keys | wherever you keep per-environment configuration; not in this repository |
 
-**Status of this document.** The procedures follow from how StatefulSets, CSI
-snapshots and SQLite behave, and the manifests are valid, but snapshot and restore
-have not been run end to end: the kind development cluster has no snapshot support.
-Rehearse a restore on the target cluster before relying on it.
+Everything here is cluster-agnostic: which cloud, account, region or resource group
+holds a disk or a snapshot is decided by the cluster's storage and snapshot classes,
+which the cluster's administrator owns. The make targets take those names as
+parameters.
+
+kind has no snapshot support, so the snapshot and restore targets do not work on the
+development cluster.
+
+## Protection that needs no setup
+
+`make deploy` sets the data volume's reclaim policy to **`Retain`**
+(`DATA_RECLAIM_POLICY`). Storage classes usually default to `Delete`, which destroys
+the disk when its claim goes; with `Retain`, deleting the claim or the whole `gofer`
+namespace leaves the disk, as a `Released` PersistentVolume you can bind again (see
+[Going back](#going-back-to-the-previous-volume)). `make dev-up` uses `Delete`, so
+`make dev-down` leaves nothing behind on kind.
+
+Scaling the StatefulSet to zero, deleting it, deleting the pod, and
+`kubectl rollout restart` never touch the claim.
 
 ## The encryption key
 
 `VAULT_ENCRYPTION_KEY` is not on the volume, so a volume snapshot does not contain
-it. Store a copy wherever you keep other long-lived secrets (for example Azure Key
-Vault):
+it. Store a copy wherever you keep other long-lived secrets (a cloud key vault, a
+password manager), outside the cluster:
 
 ```sh
 kubectl -n gofer get secret gofer-secrets -o jsonpath='{.data.VAULT_ENCRYPTION_KEY}' | base64 -d
@@ -41,54 +57,76 @@ their stored token under the new key. Nothing else is lost. Set a new key with
 everyone signs in again. Back up the whole `gofer-secrets` Secret if you want a
 restore to be invisible to users.
 
-## Prerequisites for volume snapshots
+## Scheduled snapshots
 
-1. A CSI driver that supports snapshots, backing the storage class the claim uses.
-   On AKS the default class (`managed-csi`, Azure Disk CSI) does.
-2. The snapshot CRDs and snapshot controller. AKS installs them. Check with
-   `kubectl get crd volumesnapshots.snapshot.storage.k8s.io`.
-3. A `VolumeSnapshotClass` for that driver. AKS does not always create one for
-   Azure Disk; if `kubectl get volumesnapshotclass` shows none for
-   `disk.csi.azure.com`, create it:
+### 1. A VolumeSnapshotClass (cluster administrator, once)
 
-   ```yaml
-   apiVersion: snapshot.storage.k8s.io/v1
-   kind: VolumeSnapshotClass
-   metadata:
-     name: gofer-disk-snapshots
-   driver: disk.csi.azure.com
-   # Retain: deleting the VolumeSnapshot object (or the gofer namespace) keeps the
-   # underlying Azure snapshot. Use Delete if you want them garbage-collected.
-   deletionPolicy: Retain
-   parameters:
-     incremental: "true"
-   ```
+The cluster needs CSI snapshot support (the `volumesnapshots` CRD and the snapshot
+controller; managed Kubernetes services usually install both) and a
+`VolumeSnapshotClass` for the driver behind the data volume. The class decides where
+snapshots are stored, so it is per-cluster configuration and is not in this
+repository. Two settings matter:
 
-kind's default provisioner (local-path) has no snapshot support, so none of this
-works on the development cluster.
+- **`deletionPolicy: Retain`**, so that deleting the gofer namespace, or a
+  VolumeSnapshot object by mistake, keeps the stored snapshot. `make backup-apply`
+  warns if the class says `Delete`. Pruning still frees storage: it switches each
+  snapshot it removes to `Delete` first.
+- **Where snapshots are stored.** Put them somewhere that outlives the cluster. On
+  managed clusters, the default is often a resource group or project the cluster owns
+  and that is deleted along with it.
 
-## Take a snapshot
+For example, on AKS with the Azure Disk CSI driver (fill in the placeholder):
 
 ```yaml
 apiVersion: snapshot.storage.k8s.io/v1
-kind: VolumeSnapshot
+kind: VolumeSnapshotClass
 metadata:
-  name: gofer-data-20261113   # name it by date
-  namespace: gofer
-spec:
-  volumeSnapshotClassName: gofer-disk-snapshots
-  source:
-    persistentVolumeClaimName: data-gofer-0
+  name: gofer-snapshots
+driver: disk.csi.azure.com
+deletionPolicy: Retain
+parameters:
+  incremental: "true"
+  # A resource group that is NOT the cluster's node resource group (MC_...), which is
+  # deleted with the cluster. The cluster's identity must be allowed to create
+  # snapshots there.
+  resourceGroup: <resource-group>
 ```
+
+### 2. Schedule snapshots
 
 ```sh
-kubectl apply -f snapshot.yaml
-kubectl -n gofer get volumesnapshot gofer-data-20261113 -w   # wait for READYTOUSE=true
+make backup-apply KUBECONFIG=<file> SNAPSHOT_CLASS=<class> \
+    [SNAPSHOT_SCHEDULE="0 */6 * * *"] [SNAPSHOT_KEEP=28]
 ```
 
-gofer keeps running; no downtime is needed.
+This installs the `gofer-snapshot` CronJob (`deploy/k8s/backup`). It runs
+`/snapshot`, a second binary in the web image, on the schedule (cron syntax, UTC).
+Each run takes a VolumeSnapshot of `data-gofer-0` named `data-gofer-0-<UTC time>`,
+waits until it is ready to use, and then deletes the oldest beyond the newest
+`SNAPSHOT_KEEP` usable ones. The defaults keep a week of six-hourly snapshots.
 
-### Why a snapshot of the live database is safe
+- A run whose snapshot fails, or is not ready within ten minutes, fails the job and
+  prunes nothing, so a broken backup never deletes good ones. Watch for failed jobs
+  with `kubectl -n gofer get jobs`.
+- Pruning only touches snapshots of `data-gofer-0` that the job labeled. Snapshots
+  you make by hand are never pruned.
+- The job uses its own ServiceAccount, `gofer-snapshotter`: it can create, read,
+  list and delete VolumeSnapshots in the `gofer` namespace, and read and patch
+  VolumeSnapshotContents (cluster-scoped), which pruning needs. The web tier gains no
+  rights.
+- `make deploy` keeps the job on the image it deploys. Re-run `backup-apply` to
+  change the class, schedule or retention.
+
+Take one now, for instance before an upgrade, and list them:
+
+```sh
+make snapshot  KUBECONFIG=<file>
+make snapshots KUBECONFIG=<file>
+```
+
+`make backup-down` stops the schedule and keeps every snapshot.
+
+## Why a snapshot of the live database is safe
 
 A CSI snapshot of one volume is a point-in-time image of the whole disk, which is
 what the disk would contain if the node lost power at that instant. SQLite is built
@@ -109,123 +147,133 @@ This reasoning needs the snapshot to be atomic across the volume. That holds for
 single CSI disk snapshot. It does **not** hold for a file-by-file copy of a live
 volume (see Velero's file-system backup, below).
 
-If you want a snapshot with an empty WAL, for instance before an upgrade, scale to
-zero first. Shutdown checkpoints the WAL into `gofer.db`:
-
-```sh
-kubectl -n gofer scale statefulset/gofer --replicas=0
-kubectl -n gofer wait --for=delete pod/gofer-0 --timeout=60s
-kubectl apply -f snapshot.yaml    # then wait for READYTOUSE=true
-kubectl -n gofer scale statefulset/gofer --replicas=1
-```
+If you want a snapshot with an empty WAL, scale gofer to zero first: shutdown
+checkpoints the WAL into `gofer.db`. It is never required.
 
 ## Restore from a snapshot
 
-The StatefulSet's pod always mounts the claim named `data-gofer-0`. Restoring
-means replacing that claim with one created from the snapshot, while no pod is
-using it. Do the steps in this order.
+```sh
+make snapshots KUBECONFIG=<file>                                   # pick one
+make restore   KUBECONFIG=<file> SNAPSHOT=<name>                   # prints the plan
+make restore   KUBECONFIG=<file> SNAPSHOT=<name> CONFIRM=<name>    # does it
+```
 
-1. **Confirm the snapshot is usable.**
+Without `CONFIRM` repeating the snapshot name, `restore` prints what it would do and
+changes nothing. With it, it:
 
-   ```sh
-   kubectl -n gofer get volumesnapshot gofer-data-20261113
-   ```
+1. sets the current volume's reclaim policy to `Retain`, so it survives the swap;
+2. scales gofer to zero and waits for the pod to go (the volume is ReadWriteOnce);
+3. deletes the claim `data-gofer-0` and creates it again, with the same name,
+   labels, storage class and access mode, from the snapshot;
+4. scales gofer back to one; the StatefulSet adopts the restored claim;
+5. sets the restored volume to `DATA_RECLAIM_POLICY` and prints the old volume's
+   name, with how to delete it or go back to it.
 
-   `READYTOUSE` must be `true`. Note its `RESTORESIZE`.
+**Before restoring, check the encryption key.** `VAULT_ENCRYPTION_KEY` in
+`gofer-secrets` must be the key in use when the snapshot was taken. If the Secret was
+recreated since, put the backed-up key back first:
 
-2. **Confirm the encryption key in `gofer-secrets` is the one in use when the
-   snapshot was taken.** If the Secret was recreated, put the backed-up key back
-   first (see above for what happens otherwise):
+```sh
+kubectl -n gofer patch secret gofer-secrets --type=merge \
+  -p '{"stringData":{"VAULT_ENCRYPTION_KEY":"<the backed-up key>"}}'
+```
 
-   ```sh
-   kubectl -n gofer patch secret gofer-secrets --type=merge \
-     -p '{"stringData":{"VAULT_ENCRYPTION_KEY":"<the backed-up key>"}}'
-   ```
+**Verify** after the restore:
 
-3. **Stop gofer and wait for the pod to be gone.** The volume is ReadWriteOnce and
-   the claim cannot be deleted while a pod mounts it.
+```sh
+kubectl -n gofer logs gofer-0 | grep -E 'persistent storage enabled|storage error'
+```
 
-   ```sh
-   kubectl -n gofer scale statefulset/gofer --replicas=0
-   kubectl -n gofer wait --for=delete pod/gofer-0 --timeout=60s
-   ```
+Expect `persistent storage enabled`, with the same `vault_key_id` as before, and no
+`storage error`. Then load the landing page: you are still signed in if your session
+predates the snapshot, and the worklist and threads are as of the snapshot. Trigger a
+refresh to confirm the stored GitHub token still opens; a failure there with
+everything else intact means the encryption key does not match.
 
-4. **Optional but recommended: keep the current disk.** With the usual `Delete`
-   reclaim policy, deleting the claim in the next step deletes the disk. To be able
-   to go back, switch its PersistentVolume to `Retain` first:
+**What a restore rolls back:** everything written after the snapshot. Users who
+signed in after it are signed out. A GitHub token refreshed after it may have been
+rotated at the provider, in which case that user signs in again. Worklist items come
+back on the next refresh; conversation turns after the snapshot are gone.
 
-   ```sh
-   PV=$(kubectl -n gofer get pvc data-gofer-0 -o jsonpath='{.spec.volumeName}')
-   kubectl patch pv "$PV" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
-   ```
+### Going back to the previous volume
 
-   The old disk then survives as a `Released` PV, to delete by hand once the
-   restore is confirmed.
+The old volume is kept as a `Released` PersistentVolume (`restore` prints its name).
+To return to it, bind a new `data-gofer-0` to it explicitly:
 
-5. **Delete the current claim.**
+```sh
+OLD=<the old volume's name>
+kubectl -n gofer scale statefulset/gofer --replicas=0
+kubectl -n gofer wait --for=delete pod/gofer-0 --timeout=120s
+NEW=$(kubectl -n gofer get pvc data-gofer-0 -o jsonpath='{.spec.volumeName}')
+kubectl patch pv "$NEW" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'   # or Delete to discard it
+kubectl -n gofer delete pvc data-gofer-0
+kubectl patch pv "$OLD" --type=json -p '[{"op":"remove","path":"/spec/claimRef"}]'
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-gofer-0
+  namespace: gofer
+  labels:
+    app.kubernetes.io/name: gofer
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: $(kubectl get pv "$OLD" -o jsonpath='{.spec.storageClassName}')
+  volumeName: $OLD
+  resources:
+    requests:
+      storage: $(kubectl get pv "$OLD" -o jsonpath='{.spec.capacity.storage}')
+EOF
+kubectl -n gofer scale statefulset/gofer --replicas=1
+```
 
-   ```sh
-   kubectl -n gofer delete pvc data-gofer-0
-   ```
+Once you are happy with whichever volume is in use, delete the other one, and its
+disk, by setting its reclaim policy to `Delete`:
 
-6. **Create the claim again, from the snapshot, with the same name.**
+```sh
+kubectl patch pv <volume> -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}'
+```
+
+### Restoring into a new cluster or namespace
+
+`make restore` replaces an existing claim. For a new cluster, or after the `gofer`
+namespace was deleted, the claim has to exist before gofer is deployed, or the
+StatefulSet creates an empty one:
+
+1. Create the namespace and `gofer-secrets`, with the backed-up
+   `VAULT_ENCRYPTION_KEY`.
+2. Make the snapshot visible there. In the same cluster, a retained
+   VolumeSnapshotContent can be bound to a new VolumeSnapshot. Otherwise create a
+   pre-provisioned one from the stored snapshot's handle (on AKS, the Azure snapshot's
+   resource ID):
 
    ```yaml
-   apiVersion: v1
-   kind: PersistentVolumeClaim
+   apiVersion: snapshot.storage.k8s.io/v1
+   kind: VolumeSnapshotContent
    metadata:
-     name: data-gofer-0          # must be exactly this
+     name: gofer-restore
+   spec:
+     driver: <csi-driver>
+     deletionPolicy: Retain
+     source:
+       snapshotHandle: <stored-snapshot-handle>
+     volumeSnapshotRef:
+       name: gofer-restore
+       namespace: gofer
+   ---
+   apiVersion: snapshot.storage.k8s.io/v1
+   kind: VolumeSnapshot
+   metadata:
+     name: gofer-restore
      namespace: gofer
    spec:
-     accessModes: ["ReadWriteOnce"]
-     # storageClassName: managed-csi   # set it if the snapshot's class is not the cluster default
-     resources:
-       requests:
-         storage: 1Gi             # at least the snapshot's RESTORESIZE
-     dataSource:
-       apiGroup: snapshot.storage.k8s.io
-       kind: VolumeSnapshot
-       name: gofer-data-20261113
+     source:
+       volumeSnapshotContentName: gofer-restore
    ```
 
-   ```sh
-   kubectl apply -f restore-pvc.yaml
-   ```
-
-   With a `WaitForFirstConsumer` storage class (the AKS default) the claim stays
-   `Pending` until the pod is scheduled. That is expected; continue.
-
-7. **Start gofer.** The StatefulSet adopts the existing claim instead of creating a
-   new one.
-
-   ```sh
-   kubectl -n gofer scale statefulset/gofer --replicas=1
-   kubectl -n gofer rollout status statefulset/gofer --timeout=180s
-   ```
-
-8. **Verify.**
-
-   ```sh
-   kubectl -n gofer logs gofer-0 | grep -E 'persistent storage enabled|storage error'
-   ```
-
-   Expect `persistent storage enabled` and no `storage error`. Then load the
-   landing page: you should still be signed in if your session predates the
-   snapshot, and the worklist and threads should be as of the snapshot. Trigger a
-   refresh to confirm the stored GitHub token still opens; a failure there with
-   everything else intact means the encryption key does not match.
-
-What a restore rolls back: everything written after the snapshot. Users who signed
-in after it are signed out. A GitHub token refreshed after it may have been rotated
-at the provider, in which case that user must sign in again. Worklist items are
-re-ingested on the next refresh; conversation turns after the snapshot are gone.
-
-**Restoring into a new cluster or namespace** is the same, with the order changed:
-create the namespace and `gofer-secrets` (with the backed-up key), make the snapshot
-available there (a pre-provisioned `VolumeSnapshotContent` pointing at the cloud
-snapshot), create `data-gofer-0` from it (step 6), and only then apply
-`deploy/k8s/base`. If the StatefulSet is applied first it creates an empty
-`data-gofer-0`, and you are back at step 3.
+3. Create `data-gofer-0` from it: a claim like the one `restore` creates, with
+   `dataSource` naming the VolumeSnapshot.
+4. Deploy gofer (`make deploy`). The StatefulSet adopts the claim.
 
 ## Velero: the whole-namespace alternative
 
@@ -261,8 +309,8 @@ in the `gofer` namespace and is not covered by a gofer backup.
 
 ## Things that delete the data
 
-- `make dev-down` deletes the `gofer` namespace, and the claim with it.
-- Deleting the claim `data-gofer-0`, with the default `Delete` reclaim policy.
-
-Scaling the StatefulSet to zero, deleting the StatefulSet, deleting the pod, and
-`kubectl rollout restart` do not: the claim is retained.
+- Deleting the claim `data-gofer-0` or the `gofer` namespace while the volume's
+  reclaim policy is `Delete`. `make deploy` sets `Retain`; `make dev-up` sets
+  `Delete`, and `make dev-down` deletes the namespace.
+- Setting a retained volume to `Delete`, which is how you delete one on purpose.
+- Pruning, for snapshots beyond `SNAPSHOT_KEEP`.

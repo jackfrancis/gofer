@@ -37,6 +37,7 @@ a reference for the seam with nothing plugged in.
 ```
 cmd/server/          web tier entrypoint (HTTP, UI); selects the backend
 cmd/runtime/         agent runtime entrypoint (one-line shim over internal/runtime/aei)
+cmd/snapshot/        takes and prunes data-volume snapshots (the backup CronJob runs it from the web image)
 internal/runtime/    the backend contract (doc.go)
 internal/runtime/aei/  the AEI backend: dispatcher (aei.go) + workload entrypoint (workload.go)
 internal/config/     env configuration
@@ -50,6 +51,7 @@ internal/auth/       OAuth provider wiring + login/callback
 internal/authn/      RequireAuth / RequireScope (cookie OR bearer)
 internal/session/    HMAC-signed cookie sessions; Store seam for authenticated sessions
 internal/storage/    SQLite persistence: worklist, encrypted vault, sessions (web tier only)
+internal/snapshot/   CSI VolumeSnapshot take/wait/prune over raw HTTP (no client-go)
 internal/api/        JSON handlers: worklist, agent sink, credential broker
 internal/server/     web-tier router + middleware
 internal/webui/      landing page
@@ -62,6 +64,7 @@ Dockerfile           web-tier image
 Dockerfile.runtime   agent-runtime image (AEI launches it per run)
 deploy/k8s/base/     app manifests: namespace, SA, config, statefulset (+ data PVC), service
 deploy/k8s/overlays/dev/  base + agentapp.yaml (gofer's AEI dispatch registration)
+deploy/k8s/backup/   optional snapshot CronJob + RBAC (`make backup-apply`)
 deploy/k8s/tls/      HTTPS: ACME Issuer, Traefik allow-list, Ingress (make deploy TLS_HOST=...)
 ```
 
@@ -133,6 +136,11 @@ Wired on the web-tier side; they define what a runtime must respect:
   replica by construction. Pre-auth OAuth flow state and the ingest backfill tracker
   are always in memory. See `docs/adr/0004-sqlite-persistent-storage.md` and
   `docs/backup-restore.md`.
+- Recovery: `make deploy` sets the data volume's reclaim policy to `Retain`;
+  `make backup-apply SNAPSHOT_CLASS=<class>` schedules snapshots and `make restore`
+  swaps the claim for one restored from a snapshot. Never write an environment's
+  names (cloud resource groups, registries, hostnames, snapshot classes) into this
+  repository: they are make parameters or live with the cluster.
 - Change an existing work item with `worklist.Store.Update` (one atomic
   read-modify-write), never `List` then `Upsert`, which overwrites anything written
   in between. A run's write-back is merged into the stored item
@@ -171,6 +179,7 @@ make dev-up  # deploy web + runtime images and the AgentApp to kind (AEI must be
 make kind-load-runtime  # rebuild + load only the runtime image
 make push IMAGE=... RUNTIME_IMAGE=... PLATFORM=linux/amd64  # build both images for a platform and push them
 make deploy KUBECONFIG=<file> IMAGE=... RUNTIME_IMAGE=...  # apply to any cluster (no kind, no secret creation); dev-up shares its apply step
+make backup-apply KUBECONFIG=<file> SNAPSHOT_CLASS=<class>  # scheduled data-volume snapshots (snapshot, snapshots, restore, backup-down)
 make install-ingress KUBECONFIG=<file>  # once per cluster: Traefik + cert-manager (pinned charts) for HTTPS
 make deploy ... TLS_HOST=<dns name> ALLOWED_GITHUB_LOGINS=<logins> [ALLOWED_SOURCE_RANGES=...]  # HTTPS with a Let's Encrypt certificate, sign-in limited to those GitHub logins; make tls-status to watch it
 ```
