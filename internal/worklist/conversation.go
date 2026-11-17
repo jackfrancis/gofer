@@ -2,7 +2,10 @@ package worklist
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -29,7 +32,20 @@ const (
 
 // Message is one turn in an item's assistive conversation thread, retained on
 // the WorkItem. Role is RoleUser or RoleAgent.
+//
+// Replies can land out of order: the owner may post a follow-up while a run is
+// still answering the previous turn, and every reply is appended at the end. So
+// position does not say which question an answer belongs to; ReplyTo does. Turns
+// stored before turns had IDs have neither field, and are read by their old
+// convention (see TurnKey and replies).
 type Message struct {
+	// ID identifies the turn for its lifetime (NewMessageID). Empty on turns stored
+	// before turns had IDs; their position stands in for it (WorkItem.TurnKey).
+	ID string `json:"id,omitempty"`
+	// ReplyTo is the key (WorkItem.TurnKey) of the user turn an agent turn answers. Empty on user turns
+	// and on agent turns stored before replies recorded it, which answer the user
+	// turn directly before them.
+	ReplyTo string `json:"reply_to,omitempty"`
 	Role    string `json:"role"`
 	Content string `json:"content"`
 	// Model names the chat model that produced an agent turn (empty for user turns
@@ -85,13 +101,93 @@ func (w WorkItem) HasUnreadReply() bool {
 	return false
 }
 
+// TurnRef names the thread turn a converse run answers: the item, and the key
+// (WorkItem.TurnKey) of the user turn on it. Dispatch carries it, so a run answers the turn it was
+// started for even after newer turns land.
+type TurnRef struct {
+	Item string
+	Turn string
+}
+
+// NewMessageID returns a random id for a new thread turn.
+func NewMessageID() string {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		panic("worklist: failed to read random bytes: " + err.Error())
+	}
+	return hex.EncodeToString(b)
+}
+
+// TurnKey identifies the turn at position i: its ID, or, for a turn stored before
+// turns had IDs, its position. Positions are stable because turns are only ever
+// appended (clearing a thread removes all of them), and unlike timestamps they
+// cannot collide. Dispatch, replies and the hide action all name a turn by its key.
+func (w WorkItem) TurnKey(i int) string {
+	if id := w.Thread[i].ID; id != "" {
+		return id
+	}
+	return "pos:" + strconv.Itoa(i)
+}
+
+// replies maps each answered user turn's key to the position of the first agent
+// turn answering it. An agent turn answers the turn its ReplyTo names; one stored
+// before replies recorded that answers the user turn directly before it.
+func (w WorkItem) replies() map[string]int {
+	out := make(map[string]int)
+	for i, m := range w.Thread {
+		if m.Role != RoleAgent {
+			continue
+		}
+		key := m.ReplyTo
+		if key == "" {
+			if i == 0 || w.Thread[i-1].Role != RoleUser {
+				continue
+			}
+			key = w.TurnKey(i - 1)
+		}
+		if _, seen := out[key]; !seen {
+			out[key] = i
+		}
+	}
+	return out
+}
+
+// Answered reports whether the user turn with key has a reply.
+func (w WorkItem) Answered(key string) bool {
+	_, ok := w.replies()[key]
+	return ok
+}
+
+// TurnIndex returns the position of the turn with key.
+func (w WorkItem) TurnIndex(key string) (int, bool) {
+	for i := range w.Thread {
+		if w.TurnKey(i) == key {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// LastUserTurn returns the position of the most recent user turn.
+func (w WorkItem) LastUserTurn() (int, bool) {
+	for i := len(w.Thread) - 1; i >= 0; i-- {
+		if w.Thread[i].Role == RoleUser {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
 // hasCompletedRequest reports whether some user request turn of the given kind is
 // answered by an agent reply — the deterministic "this review/synthesis actually ran"
 // signal, keyed off Message.Kind rather than prompt text.
 func (w WorkItem) hasCompletedRequest(kind string) bool {
+	answered := w.replies()
 	for i, m := range w.Thread {
-		if m.Role == RoleUser && m.Kind == kind && i+1 < len(w.Thread) && w.Thread[i+1].Role == RoleAgent {
-			return true
+		if m.Role == RoleUser && m.Kind == kind {
+			if _, ok := answered[w.TurnKey(i)]; ok {
+				return true
+			}
 		}
 	}
 	return false
@@ -102,13 +198,17 @@ func (w WorkItem) hasCompletedRequest(kind string) bool {
 func (w WorkItem) HasReview() bool { return w.hasCompletedRequest(KindReviewRequest) }
 
 // FirstReviewModel returns the chat model that produced the item's first completed
-// review — the Model stamped on the agent reply answering the first review request.
-// It is "" when there is no completed review, or when the reply predates model
-// stamping. It lets the bulk 2nd-opinion action always pick a different model.
+// review — the Model stamped on the first agent reply answering the first answered
+// review request. It is "" when there is no completed review, or when the reply
+// predates model stamping. It lets the bulk 2nd-opinion action always pick a
+// different model.
 func (w WorkItem) FirstReviewModel() string {
+	answered := w.replies()
 	for i, m := range w.Thread {
-		if m.Role == RoleUser && m.Kind == KindReviewRequest && i+1 < len(w.Thread) && w.Thread[i+1].Role == RoleAgent {
-			return w.Thread[i+1].Model
+		if m.Role == RoleUser && m.Kind == KindReviewRequest {
+			if j, ok := answered[w.TurnKey(i)]; ok {
+				return w.Thread[j].Model
+			}
 		}
 	}
 	return ""
@@ -140,26 +240,44 @@ func (w WorkItem) hasSynthesisRequest() bool {
 	return false
 }
 
-// replyPending reports whether the thread ends on a user turn whose reply is still
+// ReplyPending reports whether some user turn has no reply yet and is still
 // plausibly in flight (younger than staleAfter). Past that window the run has almost
 // certainly finished or failed, so the turn is eligible for a retry.
-func (w WorkItem) replyPending(now time.Time, staleAfter time.Duration) bool {
-	n := len(w.Thread)
-	return n > 0 && w.Thread[n-1].Role == RoleUser && now.Sub(w.Thread[n-1].At) < staleAfter
+func (w WorkItem) ReplyPending(now time.Time, staleAfter time.Duration) bool {
+	answered := w.replies()
+	for i, m := range w.Thread {
+		if m.Role != RoleUser || now.Sub(m.At) >= staleAfter {
+			continue
+		}
+		if _, ok := answered[w.TurnKey(i)]; !ok {
+			return true
+		}
+	}
+	return false
+}
+
+// ReplyStalled reports whether the most recent user turn has no reply and is past
+// staleAfter, so its run has almost certainly failed and the turn can be retried.
+func (w WorkItem) ReplyStalled(now time.Time, staleAfter time.Duration) bool {
+	i, ok := w.LastUserTurn()
+	if !ok {
+		return false
+	}
+	return now.Sub(w.Thread[i].At) >= staleAfter && !w.Answered(w.TurnKey(i))
 }
 
 // NeedsReview reports whether the pull request still needs a first review dispatched
 // now: it has no completed review and none is currently in flight (a stale pending
 // request is treated as failed, so it is eligible again).
 func (w WorkItem) NeedsReview(now time.Time, staleAfter time.Duration) bool {
-	return w.Type == TypePullRequest && !w.HasReview() && !w.replyPending(now, staleAfter)
+	return w.Type == TypePullRequest && !w.HasReview() && !w.ReplyPending(now, staleAfter)
 }
 
 // NeedsSecondOpinion reports whether the pull request has been reviewed once but has
 // no consensus synthesis yet (and none in flight) — the pool the bulk "Get 2nd
 // Opinion" action draws from.
 func (w WorkItem) NeedsSecondOpinion(now time.Time, staleAfter time.Duration) bool {
-	return w.Type == TypePullRequest && w.HasReview() && !w.hasSynthesisRequest() && !w.replyPending(now, staleAfter)
+	return w.Type == TypePullRequest && w.HasReview() && !w.hasSynthesisRequest() && !w.ReplyPending(now, staleAfter)
 }
 
 // ToolDef describes a read-only tool the assistant may call during a turn.

@@ -141,6 +141,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   run adds a thread turn only through `POST /agent/worklist/reply`
   (`worklist.AppendReply`). The web and runtime images must ship together: a runtime
   from before this rule posts its reply inside the item, where it is now ignored.
+- Replies can land out of order, so a turn's position does not say what it answers.
+  Every new turn gets an ID; an agent turn's `ReplyTo` names the user turn it
+  answers; dispatch carries the turn a run must answer (`worklist.TurnRef`, run
+  parameter `turn`). Review and pending state (`HasReview`, `ReplyPending`, …) follow
+  those links. Turns stored before IDs are keyed by position (`WorkItem.TurnKey`),
+  and a legacy reply answers the user turn directly before it.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

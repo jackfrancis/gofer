@@ -144,14 +144,14 @@ func TestAgentReply(t *testing.T) {
 	f := newPlane(t)
 	t0 := time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)
 	f.store.Seed("u1", worklist.WorkItem{ID: "a", Thread: []worklist.Message{
-		{Role: worklist.RoleUser, Content: "q", At: t0},
-		{Role: worklist.RoleUser, Content: "q2", At: t0.Add(time.Minute)},
+		{ID: "q1", Role: worklist.RoleUser, Content: "q", At: t0},
+		{ID: "q2", Role: worklist.RoleUser, Content: "q2", At: t0.Add(time.Minute)},
 	}})
 	full := f.mint("signals:read", "metadata:write")
 	reply := map[string]any{
 		"item_id":     "a",
-		"in_reply_to": t0,
-		"message":     worklist.Message{Role: worklist.RoleAgent, Content: "answer", Model: "m", At: t0.Add(2 * time.Minute)},
+		"in_reply_to": "q1",
+		"message":     worklist.Message{ID: "r1", Role: worklist.RoleAgent, Content: "answer", Model: "m", At: t0.Add(2 * time.Minute)},
 	}
 	thread := func() []worklist.Message {
 		got, _ := f.store.List(context.Background(), "u1")
@@ -161,8 +161,8 @@ func TestAgentReply(t *testing.T) {
 	if code := f.post(t, f.reply, "/agent/worklist/reply", full, reply); code != http.StatusOK {
 		t.Fatalf("want 200, got %d", code)
 	}
-	if th := thread(); len(th) != 3 || th[2].Content != "answer" || th[1].Content != "q2" {
-		t.Fatalf("reply must be appended after the newer turn, got %+v", th)
+	if th := thread(); len(th) != 3 || th[2].Content != "answer" || th[2].ReplyTo != "q1" || th[1].Content != "q2" {
+		t.Fatalf("reply must be appended after the newer turn, linked to q1, got %+v", th)
 	}
 
 	// A repeat (a resend after a lost response) is not added twice.
@@ -173,8 +173,8 @@ func TestAgentReply(t *testing.T) {
 		t.Fatalf("a repeated reply must not duplicate, got %d turns", n)
 	}
 
-	// A reply to a turn that is gone (cleared, re-stamped) is accepted and dropped.
-	gone := map[string]any{"item_id": "a", "in_reply_to": t0.Add(-time.Hour), "message": worklist.Message{Content: "late", At: t0.Add(3 * time.Minute)}}
+	// A reply to a turn that is gone (the thread was cleared) is accepted and dropped.
+	gone := map[string]any{"item_id": "a", "in_reply_to": "cleared", "message": worklist.Message{ID: "r2", Content: "late", At: t0.Add(3 * time.Minute)}}
 	if code := f.post(t, f.reply, "/agent/worklist/reply", full, gone); code != http.StatusOK {
 		t.Fatalf("want 200 for a dropped reply, got %d", code)
 	}

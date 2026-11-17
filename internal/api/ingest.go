@@ -3,7 +3,6 @@ package api
 import (
 	"encoding/json"
 	"net/http"
-	"time"
 
 	"github.com/jackfrancis/gofer/internal/principal"
 	"github.com/jackfrancis/gofer/internal/worklist"
@@ -70,7 +69,7 @@ func (h *IngestHandler) Ingest(w http.ResponseWriter, r *http.Request) {
 // replyRequest is the body of POST /agent/worklist/reply.
 type replyRequest struct {
 	ItemID    string           `json:"item_id"`
-	InReplyTo time.Time        `json:"in_reply_to"`
+	InReplyTo string           `json:"in_reply_to"` // the answered user turn's Key
 	Message   worklist.Message `json:"message"`
 }
 
@@ -79,7 +78,8 @@ const maxReplyBody = 1 << 20
 
 // Reply handles POST /agent/worklist/reply. A converse run appends its answer to an
 // item's thread here (worklist.ApplyReply): it is added as an agent turn to the thread
-// as stored now, only if the user turn it answers is still there, and at most once.
+// as stored now, linked to the user turn it answers, only if that turn is still
+// there, and at most once.
 // A reply to an item or turn that is gone is accepted and dropped.
 func (h *IngestHandler) Reply(w http.ResponseWriter, r *http.Request) {
 	p, ok := principal.FromContext(r.Context())
@@ -92,7 +92,7 @@ func (h *IngestHandler) Reply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if body.ItemID == "" || body.InReplyTo.IsZero() || body.Message.Content == "" || body.Message.At.IsZero() {
+	if body.ItemID == "" || body.InReplyTo == "" || body.Message.Content == "" || body.Message.At.IsZero() {
 		writeError(w, http.StatusBadRequest, "item_id, in_reply_to, message.content and message.at are required")
 		return
 	}

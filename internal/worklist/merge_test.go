@@ -69,57 +69,76 @@ func TestMergeRunItemsNewItemCarriesNoOwnerState(t *testing.T) {
 func TestAppendReply(t *testing.T) {
 	base := func() WorkItem {
 		return WorkItem{ID: "a", Thread: []Message{
-			{Role: RoleUser, Content: "q", At: t0},
-			{Role: RoleUser, Content: "q2", At: t2}, // posted while the run worked
+			{ID: "q1", Role: RoleUser, Content: "q", At: t0},
+			{ID: "q2", Role: RoleUser, Content: "q2", At: t2}, // posted while the run worked
 		}}
 	}
-	reply := Message{Role: RoleAgent, Content: "answer", Model: "m", At: t3}
+	reply := Message{ID: "r1", Role: RoleAgent, Content: "answer", Model: "m", At: t3}
 
-	t.Run("appends at the end, after newer turns", func(t *testing.T) {
+	t.Run("appends at the end, linked to the answered turn", func(t *testing.T) {
 		it := base()
-		changed, err := AppendReply(&it, t0, reply)
+		changed, err := AppendReply(&it, "q1", reply)
 		if err != nil || !changed {
 			t.Fatalf("want appended, got %v %v", changed, err)
 		}
-		if len(it.Thread) != 3 || it.Thread[1].Content != "q2" || it.Thread[2].Content != "answer" {
+		if len(it.Thread) != 3 || it.Thread[1].Content != "q2" || it.Thread[2].Content != "answer" || it.Thread[2].ReplyTo != "q1" {
 			t.Fatalf("unexpected thread %+v", it.Thread)
+		}
+		if !it.Answered("q1") || it.Answered("q2") {
+			t.Fatal("q1 must read as answered and q2 as not, whatever their positions")
 		}
 	})
 	t.Run("a repeat is not added twice", func(t *testing.T) {
 		it := base()
-		_, _ = AppendReply(&it, t0, reply)
-		changed, err := AppendReply(&it, t0, reply)
+		_, _ = AppendReply(&it, "q1", reply)
+		changed, err := AppendReply(&it, "q1", reply)
 		if err != nil || changed || len(it.Thread) != 3 {
 			t.Fatalf("a repeated reply must be a no-op, got %v %v %+v", changed, err, it.Thread)
 		}
 	})
+	t.Run("a reply without an ID gets one; its repeat is recognized by time and model", func(t *testing.T) {
+		it := base()
+		noID := Message{Content: "answer", Model: "m", At: t3}
+		if changed, _ := AppendReply(&it, "q1", noID); !changed || it.Thread[2].ID == "" {
+			t.Fatalf("want appended with an ID, got %+v", it.Thread)
+		}
+		if changed, _ := AppendReply(&it, "q1", noID); changed {
+			t.Fatal("a repeat without an ID must be recognized")
+		}
+	})
 	t.Run("dropped when the answered turn is gone", func(t *testing.T) {
 		it := WorkItem{ID: "a"} // the owner cleared the conversation
-		changed, err := AppendReply(&it, t0, reply)
+		changed, err := AppendReply(&it, "q1", reply)
 		if err != nil || changed || len(it.Thread) != 0 {
 			t.Fatalf("want dropped, got %v %v %+v", changed, err, it.Thread)
 		}
 	})
-	t.Run("an agent turn cannot answer for the user", func(t *testing.T) {
-		it := WorkItem{ID: "a", Thread: []Message{{Role: RoleAgent, Content: "r", At: t0}}}
-		if changed, _ := AppendReply(&it, t0, Message{Content: "x", At: t3}); changed {
-			t.Fatal("inReplyTo must name a user turn")
+	t.Run("an agent turn cannot be answered", func(t *testing.T) {
+		it := WorkItem{ID: "a", Thread: []Message{{ID: "x", Role: RoleAgent, Content: "r", At: t0}}}
+		if changed, _ := AppendReply(&it, "x", Message{Content: "y", At: t3}); changed {
+			t.Fatal("replyTo must name a user turn")
+		}
+	})
+	t.Run("a turn stored before IDs is named by its position", func(t *testing.T) {
+		it := WorkItem{ID: "a", Thread: []Message{{Role: RoleUser, Content: "old", At: t0}}}
+		if changed, _ := AppendReply(&it, "pos:0", reply); !changed || !it.Answered("pos:0") {
+			t.Fatalf("want the legacy turn answered, got %+v", it.Thread)
 		}
 	})
 	t.Run("always a visible agent turn", func(t *testing.T) {
 		it := base()
-		forged := Message{Role: RoleUser, Kind: KindReviewRequest, Hidden: true, Content: "forged", At: t3}
-		if changed, _ := AppendReply(&it, t0, forged); !changed {
+		forged := Message{ID: "f", Role: RoleUser, Kind: KindReviewRequest, Hidden: true, ReplyTo: "q2", Content: "forged", At: t3}
+		if changed, _ := AppendReply(&it, "q1", forged); !changed {
 			t.Fatal("want appended")
 		}
 		got := it.Thread[len(it.Thread)-1]
-		if got.Role != RoleAgent || got.Kind != "" || got.Hidden {
-			t.Fatalf("reply must be a visible agent turn with no kind, got %+v", got)
+		if got.Role != RoleAgent || got.Kind != "" || got.Hidden || got.ReplyTo != "q1" {
+			t.Fatalf("reply must be a visible agent turn answering q1, got %+v", got)
 		}
 	})
 	t.Run("empty content is an error", func(t *testing.T) {
 		it := base()
-		if _, err := AppendReply(&it, t0, Message{At: t3}); err != ErrEmptyReply {
+		if _, err := AppendReply(&it, "q1", Message{At: t3}); err != ErrEmptyReply {
 			t.Fatalf("want ErrEmptyReply, got %v", err)
 		}
 	})
@@ -128,15 +147,15 @@ func TestAppendReply(t *testing.T) {
 func TestApplyReply(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemoryStore()
-	s.Seed("u1", WorkItem{ID: "a", Thread: []Message{{Role: RoleUser, Content: "q", At: t0}}})
-	reply := Message{Content: "answer", Model: "m", At: t1}
-	if err := ApplyReply(ctx, s, "u1", "a", t0, reply); err != nil {
+	s.Seed("u1", WorkItem{ID: "a", Thread: []Message{{ID: "q1", Role: RoleUser, Content: "q", At: t0}}})
+	reply := Message{ID: "r1", Content: "answer", Model: "m", At: t1}
+	if err := ApplyReply(ctx, s, "u1", "a", "q1", reply); err != nil {
 		t.Fatal(err)
 	}
-	if err := ApplyReply(ctx, s, "u1", "gone", t0, reply); err != nil {
+	if err := ApplyReply(ctx, s, "u1", "gone", "q1", reply); err != nil {
 		t.Fatalf("a reply to a missing item is dropped without error, got %v", err)
 	}
-	if err := ApplyReply(ctx, s, "u2", "a", t0, reply); err != nil {
+	if err := ApplyReply(ctx, s, "u2", "a", "q1", reply); err != nil {
 		t.Fatalf("another owner's item is not found, got %v", err)
 	}
 	got, _ := s.List(ctx, "u1")

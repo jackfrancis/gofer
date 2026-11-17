@@ -106,8 +106,8 @@ func (s *StoreSink) Ingest(ctx context.Context, items []worklist.WorkItem) error
 }
 
 // Reply appends an agent turn to the owner's item, atomically (worklist.AppendReply).
-func (s *StoreSink) Reply(ctx context.Context, itemID string, inReplyTo time.Time, reply worklist.Message) error {
-	return worklist.ApplyReply(ctx, s.store, s.ownerID, itemID, inReplyTo, reply)
+func (s *StoreSink) Reply(ctx context.Context, itemID, replyTo string, reply worklist.Message) error {
+	return worklist.ApplyReply(ctx, s.store, s.ownerID, itemID, replyTo, reply)
 }
 
 // PlaneClient is the out-of-process Vendor and Sink: it reaches gofer's agent plane
@@ -195,16 +195,16 @@ func (c *PlaneClient) Ingest(ctx context.Context, items []worklist.WorkItem) err
 }
 
 // Reply appends an agent turn to an item's thread through the agent plane. The
-// request is idempotent (a repeat is recognized by the reply's time and model), so
-// resending it after a lost response cannot duplicate the turn.
-func (c *PlaneClient) Reply(ctx context.Context, itemID string, inReplyTo time.Time, reply worklist.Message) error {
-	return c.post(ctx, "/agent/worklist/reply", "reply", ReplyRequest{ItemID: itemID, InReplyTo: inReplyTo, Message: reply})
+// request is idempotent (a repeat is recognized by the reply's ID), so resending it
+// after a lost response cannot duplicate the turn.
+func (c *PlaneClient) Reply(ctx context.Context, itemID, replyTo string, reply worklist.Message) error {
+	return c.post(ctx, "/agent/worklist/reply", "reply", ReplyRequest{ItemID: itemID, InReplyTo: replyTo, Message: reply})
 }
 
 // ReplyRequest is the body of POST /agent/worklist/reply.
 type ReplyRequest struct {
 	ItemID    string           `json:"item_id"`
-	InReplyTo time.Time        `json:"in_reply_to"`
+	InReplyTo string           `json:"in_reply_to"` // the answered user turn's Key
 	Message   worklist.Message `json:"message"`
 }
 

@@ -54,36 +54,44 @@ func MergeRunItems(current, incoming []WorkItem) []WorkItem {
 var ErrEmptyReply = errors.New("worklist: reply has no content")
 
 // AppendReply adds an agent's reply to item's thread, answering the user turn
-// stamped inReplyTo. It reports whether the thread changed:
+// whose key (WorkItem.TurnKey) is replyTo, and records that link on the reply (Message.ReplyTo). It
+// reports whether the thread changed:
 //
 //   - The reply is always a visible agent turn with no request kind, whatever it
-//     claims, so a run cannot put words in the owner's mouth.
+//     claims, so a run cannot put words in the owner's mouth. It gets an ID if it has
+//     none.
 //   - If the answered turn is no longer in the thread (the owner cleared the
-//     conversation, or a retry re-stamped the prompt and a newer run will answer
-//     it), the reply is dropped.
-//   - A reply already in the thread (same time and model — a retried request) is
-//     not added twice.
+//     conversation), the reply is dropped.
+//   - A reply already in the thread (same ID, or for a reply without one the same
+//     time and model — a resent request) is not added twice.
 //
-// The reply goes at the end of the thread, so the positions of existing turns
-// never change (hiding a turn addresses it by position).
-func AppendReply(item *WorkItem, inReplyTo time.Time, reply Message) (bool, error) {
+// The reply goes at the end of the thread, after any turns posted while the run
+// worked; ReplyTo, not position, says which turn it answers.
+func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 	if reply.Content == "" {
 		return false, ErrEmptyReply
 	}
 	reply.Role = RoleAgent
 	reply.Kind = "" // request kinds mark user turns only
 	reply.Hidden = false
+	reply.ReplyTo = replyTo
 	answered := false
-	for _, m := range item.Thread {
-		if m.Role == RoleAgent && m.At.Equal(reply.At) && m.Model == reply.Model {
+	for i, m := range item.Thread {
+		if reply.ID != "" && m.ID == reply.ID {
 			return false, nil // already recorded
 		}
-		if m.Role == RoleUser && m.At.Equal(inReplyTo) {
+		if reply.ID == "" && m.Role == RoleAgent && m.At.Equal(reply.At) && m.Model == reply.Model {
+			return false, nil // already recorded
+		}
+		if m.Role == RoleUser && item.TurnKey(i) == replyTo {
 			answered = true
 		}
 	}
 	if !answered {
 		return false, nil
+	}
+	if reply.ID == "" {
+		reply.ID = NewMessageID()
 	}
 	item.Thread = append(item.Thread, reply)
 	return true, nil
@@ -93,13 +101,13 @@ func AppendReply(item *WorkItem, inReplyTo time.Time, reply Message) (bool, erro
 // AppendReply). It writes nothing, and returns no error, when the item or the
 // answered turn is gone. The agent plane's reply handler and the in-process sink
 // both use it.
-func ApplyReply(ctx context.Context, store Store, ownerID, itemID string, inReplyTo time.Time, reply Message) error {
+func ApplyReply(ctx context.Context, store Store, ownerID, itemID, replyTo string, reply Message) error {
 	return store.Update(ctx, ownerID, func(current []WorkItem) ([]WorkItem, error) {
 		for i := range current {
 			if current[i].ID != itemID {
 				continue
 			}
-			changed, err := AppendReply(&current[i], inReplyTo, reply)
+			changed, err := AppendReply(&current[i], replyTo, reply)
 			if err != nil || !changed {
 				return nil, err
 			}

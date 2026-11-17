@@ -43,11 +43,11 @@ type Providers interface {
 // turns for the "Review all PRs" action. It is the same Ingestor the JSON API uses.
 type Pipeline interface {
 	EnsureBackfill(ctx context.Context, ownerID string) error
-	Converse(ctx context.Context, ownerID, itemID, endpoint, model string) error
-	ReviewAll(ctx context.Context, ownerID string, itemIDs []string, endpoint, model string) error
+	Converse(ctx context.Context, ownerID string, ref worklist.TurnRef, endpoint, model string) error
+	ReviewAll(ctx context.Context, ownerID string, refs []worklist.TurnRef, endpoint, model string) error
 	Refresh(ctx context.Context, ownerID string) error
-	SecondOpinion(ctx context.Context, ownerID, itemID, endpoint, model string) error
-	SecondOpinionAll(ctx context.Context, ownerID string, itemIDs []string, endpoint, model string) error
+	SecondOpinion(ctx context.Context, ownerID string, ref worklist.TurnRef, endpoint, model string) error
+	SecondOpinionAll(ctx context.Context, ownerID string, refs []worklist.TurnRef, endpoint, model string) error
 }
 
 // ModelOption is one entry in the thread's model picker: an opaque Value that
@@ -233,9 +233,9 @@ func (h *Handler) Index(w http.ResponseWriter, r *http.Request) {
 }
 
 // Thread handles GET /items/thread?id=<item id>. It renders the per-item
-// assistive conversation for the signed-in owner. While the last turn is the
-// user's (a reply is pending), the page auto-refreshes so the assistant's answer
-// appears when the converse run lands.
+// assistive conversation for the signed-in owner. While a user turn awaits its reply,
+// the page auto-refreshes so the assistant's answer appears when the converse run
+// lands.
 func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
 	if user == nil {
@@ -251,12 +251,11 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 	for _, it := range items {
 		if it.ID == id {
 			data := pageData{View: "thread", User: user, Item: it, ConvEnabled: h.convEnabled, ModelOptions: h.options, SecondOpinionEnabled: h.secondOpinionEnabled(), SecondOpinionOptions: h.alternativeOptions()}
-			if n := len(it.Thread); n > 0 && it.Thread[n-1].Role == worklist.RoleUser {
-				if h.now().UTC().Sub(it.Thread[n-1].At) < reviewStaleAfter {
-					data.RefreshSecs = 3 // reply plausibly in-flight — poll for it
-				} else {
-					data.ReplyStalled = true // no reply within the window — show a retry hint, stop spinning
-				}
+			now := h.now().UTC()
+			if it.ReplyPending(now, reviewStaleAfter) {
+				data.RefreshSecs = 3 // a reply is plausibly in flight — poll for it
+			} else if it.ReplyStalled(now, reviewStaleAfter) {
+				data.ReplyStalled = true // no reply within the window — show a retry hint, stop spinning
 			}
 			h.render(w, http.StatusOK, data)
 			return
@@ -286,19 +285,9 @@ func (h *Handler) ThreadPost(w http.ResponseWriter, r *http.Request) {
 	// Append the user's turn first, so the spawned converse runtime reads it from the
 	// stored thread; the message never rides the run's environment. The append is
 	// atomic, so a run's reply landing at the same moment is not lost.
-	found := false
-	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
-		for i := range current {
-			if current[i].ID == id {
-				current[i].Thread = append(current[i].Thread, worklist.Message{Role: worklist.RoleUser, Content: content, At: h.now().UTC()})
-				found = true
-				return current[i : i+1], nil
-			}
-		}
-		return nil, nil
-	})
-	if err == nil && found {
-		_ = h.pipeline.Converse(r.Context(), user.ID, id, opt.Endpoint, opt.Model)
+	msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: content, At: h.now().UTC()}
+	if h.appendTurn(r.Context(), user.ID, id, msg) {
+		_ = h.pipeline.Converse(r.Context(), user.ID, worklist.TurnRef{Item: id, Turn: msg.ID}, opt.Endpoint, opt.Model)
 	}
 	http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
 }
@@ -351,9 +340,9 @@ func (h *Handler) ResetConversations(w http.ResponseWriter, r *http.Request) {
 }
 
 // HideMessage handles POST /items/thread/hide. It sets or clears the hidden flag on
-// one message of an item's thread (identified by its index), so the user can pare a
+// one message of an item's thread (identified by its key, WorkItem.TurnKey), so the user can pare a
 // long review thread down to the definitive turns. A hidden turn is also withheld from
-// the model as future context (see agent.splitThread). It redirects back to the thread
+// the model as future context (see agent.turnToAnswer). It redirects back to the thread
 // (Post/Redirect/Get). SameSite=Lax cookies give baseline CSRF protection.
 func (h *Handler) HideMessage(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
@@ -362,24 +351,25 @@ func (h *Handler) HideMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.FormValue("id")
-	idx, err := strconv.Atoi(r.FormValue("msg"))
+	key := r.FormValue("msg")
 	hidden := r.FormValue("hidden") == "true"
-	if id == "" || err != nil || idx < 0 {
+	if id == "" || key == "" {
 		http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
 		return
 	}
-	// Update hands over copies, so flipping the flag in place cannot touch what other
-	// readers hold. Turns are only ever appended, so idx still names the turn the page
-	// showed (a cleared thread just makes it out of range).
+	// The turn is named by its key, not its index, so a page rendered before newer
+	// turns landed still hides the turn it showed. A turn that is gone (the thread was
+	// cleared) is a no-op.
 	_ = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		for i := range current {
 			if current[i].ID != id {
 				continue
 			}
-			if idx >= len(current[i].Thread) {
+			j, ok := current[i].TurnIndex(key)
+			if !ok {
 				return nil, nil
 			}
-			current[i].Thread[idx].Hidden = hidden
+			current[i].Thread[j].Hidden = hidden
 			return current[i : i+1], nil
 		}
 		return nil, nil
@@ -402,9 +392,10 @@ const independentReviewPrompt = "Give an independent review of this PR. There ma
 // treated as plausibly in-flight. Past it, the converse run has almost certainly
 // finished or failed (a rate-limited converse dies fast), so the thread stops
 // spinning and shows a retry hint, and "Review all PRs" re-dispatches the item —
-// making the button self-healing. It is a heuristic, not run-status tracking: when a
-// genuinely slow run is re-dispatched here, the retry re-stamps the prompt, so the
-// slow run's late reply is dropped and the new run's reply stands.
+// making the button self-healing. It is a heuristic, not run-status tracking: a
+// genuinely slow run re-dispatched here may still reply, and the retry run then finds
+// the turn answered and does nothing (or, if both were already under way, the turn
+// gets two replies, which is harmless).
 const reviewStaleAfter = 5 * time.Minute
 
 // ReviewAllPRs handles POST /items/review-all. For every pull request on the
@@ -419,11 +410,11 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	at := h.now().UTC()
-	var ids []string
+	var refs []worklist.TurnRef
 	// Choose and stamp the PRs in one atomic update, against the threads as stored.
 	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		var changed []worklist.WorkItem
-		ids = ids[:0]
+		refs = refs[:0]
 		for _, it := range current {
 			if it.Type != worklist.TypePullRequest {
 				continue
@@ -431,31 +422,33 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 			if it.HasReview() {
 				continue // already reviewed at least once — a first-review is no longer needed
 			}
-			if n := len(it.Thread); n > 0 && it.Thread[n-1].Role == worklist.RoleUser {
-				// A reply is pending. Skip it only while still plausibly in-flight; once the
-				// pending prompt is older than reviewStaleAfter the prior run has finished or
-				// failed, so retry it — reusing the existing prompt (just refresh its
-				// timestamp) rather than stacking a second one. This is what makes the button
-				// self-healing after a rate-limited batch. A late reply from the earlier run
-				// answers the old timestamp and is dropped (worklist.AppendReply).
-				if at.Sub(it.Thread[n-1].At) < reviewStaleAfter {
-					continue
-				}
-				it.Thread[n-1].At = at
+			if it.ReplyPending(at, reviewStaleAfter) {
+				continue // a reply is plausibly in flight
+			}
+			var turn string
+			if it.ReplyStalled(at, reviewStaleAfter) {
+				// The last request's run has finished or failed, so retry it — reusing the
+				// prompt (refresh its timestamp) rather than stacking a second one. This is
+				// what makes the button self-healing after a rate-limited batch.
+				i, _ := it.LastUserTurn()
+				it.Thread[i].At = at
+				turn = it.TurnKey(i)
 			} else {
-				it.Thread = append(it.Thread, worklist.Message{Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, At: at})
+				msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, At: at}
+				it.Thread = append(it.Thread, msg)
+				turn = msg.ID
 			}
 			changed = append(changed, it)
-			ids = append(ids, it.ID)
+			refs = append(refs, worklist.TurnRef{Item: it.ID, Turn: turn})
 		}
 		return changed, nil
 	})
-	if err == nil && len(ids) > 0 {
+	if err == nil && len(refs) > 0 {
 		// Every prompt is persisted first, so each spawned converse runtime reads its
 		// request from the stored thread; then launch the runs concurrently with the
 		// model picked from the button's dropdown (an empty choice uses the default).
 		opt, _ := h.resolveOption(strings.TrimSpace(r.FormValue("choice")))
-		_ = h.pipeline.ReviewAll(r.Context(), user.ID, ids, opt.Endpoint, opt.Model)
+		_ = h.pipeline.ReviewAll(r.Context(), user.ID, refs, opt.Endpoint, opt.Model)
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
@@ -481,19 +474,9 @@ func (h *Handler) SecondOpinion(w http.ResponseWriter, r *http.Request) {
 	// Append the independent-review prompt first (atomically), so the spawned converse
 	// runtime reads it from the stored thread; then dispatch the blind review by the
 	// chosen model. The consensus synthesis is chained by the ingestor after it lands.
-	found := false
-	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
-		for i := range current {
-			if current[i].ID == id {
-				current[i].Thread = append(current[i].Thread, worklist.Message{Role: worklist.RoleUser, Content: independentReviewPrompt, Kind: worklist.KindReviewRequest, At: h.now().UTC()})
-				found = true
-				return current[i : i+1], nil
-			}
-		}
-		return nil, nil
-	})
-	if err == nil && found {
-		_ = h.pipeline.SecondOpinion(r.Context(), user.ID, id, opt.Endpoint, opt.Model)
+	msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: independentReviewPrompt, Kind: worklist.KindReviewRequest, At: h.now().UTC()}
+	if h.appendTurn(r.Context(), user.ID, id, msg) {
+		_ = h.pipeline.SecondOpinion(r.Context(), user.ID, worklist.TurnRef{Item: id, Turn: msg.ID}, opt.Endpoint, opt.Model)
 	}
 	http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
 }
@@ -511,73 +494,95 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	items, err := h.store.List(r.Context(), user.ID)
-	if err != nil {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
 	now := h.now().UTC()
-	var eligible []worklist.WorkItem
-	firstModels := map[string]struct{}{}
-	for _, it := range items {
-		if it.NeedsSecondOpinion(now, reviewStaleAfter) {
-			eligible = append(eligible, it)
-			firstModels[it.FirstReviewModel()] = struct{}{}
-		}
+	choice := strings.TrimSpace(r.FormValue("choice"))
+	type dispatch struct {
+		ref worklist.TurnRef
+		opt ModelOption
 	}
-	if len(eligible) == 0 {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
-	}
-
-	// Homogeneous first reviews -> the user picked one model (already excluding the
-	// first-review model); heterogeneous -> auto-pick a different model per PR below.
-	// Resolve the menu choice before mutating, so a degenerate setup bails cleanly.
-	heterogeneous := len(firstModels) > 1
-	var menuOpt ModelOption
-	if !heterogeneous {
-		var ok bool
-		if menuOpt, ok = h.resolveSecondOpinionChoice(strings.TrimSpace(r.FormValue("choice")), firstModels); !ok {
-			http.Redirect(w, r, "/", http.StatusSeeOther)
-			return
-		}
-	}
-
-	// Append the independent-review prompt to each PR that is still eligible against
-	// the threads as stored, in one atomic update, so each spawned converse runtime
-	// reads its request from the stored thread.
 	var (
-		ids     []string
-		stamped []worklist.WorkItem
+		plan  []dispatch
+		batch bool // every PR gets the same model: dispatch them as one batch
 	)
-	err = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
-		ids, stamped = ids[:0], stamped[:0]
+	// Decide which PRs are eligible AND which model reviews each one against the same
+	// snapshot, in one atomic update, so a PR whose first review lands meanwhile
+	// cannot be swept into a batch whose model was chosen without it.
+	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		plan = plan[:0]
+		var eligible []worklist.WorkItem
+		firstModels := map[string]struct{}{}
 		for _, it := range current {
-			if !it.NeedsSecondOpinion(now, reviewStaleAfter) {
-				continue
+			if it.NeedsSecondOpinion(now, reviewStaleAfter) {
+				eligible = append(eligible, it)
+				firstModels[it.FirstReviewModel()] = struct{}{}
 			}
-			it.Thread = append(it.Thread, worklist.Message{Role: worklist.RoleUser, Content: independentReviewPrompt, Kind: worklist.KindReviewRequest, At: now})
+		}
+		if len(eligible) == 0 {
+			return nil, nil
+		}
+		// Homogeneous first reviews -> the user's pick from the menu (resolved to a model
+		// that differs from the shared first-review model); heterogeneous -> a different
+		// model auto-picked per PR.
+		heterogeneous := len(firstModels) > 1
+		var menuOpt ModelOption
+		if !heterogeneous {
+			var ok bool
+			if menuOpt, ok = h.resolveSecondOpinionChoice(choice, firstModels); !ok {
+				return nil, nil // no different model exists: a degenerate setup
+			}
+		}
+		batch = !heterogeneous
+		var stamped []worklist.WorkItem
+		for _, it := range eligible {
+			opt := menuOpt
+			if heterogeneous {
+				var ok bool
+				if opt, ok = h.pickDifferentModel(it.FirstReviewModel()); !ok {
+					continue // never stamp a prompt no run will answer
+				}
+			}
+			msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: independentReviewPrompt, Kind: worklist.KindReviewRequest, At: now}
+			it.Thread = append(it.Thread, msg)
 			stamped = append(stamped, it)
-			ids = append(ids, it.ID)
+			plan = append(plan, dispatch{ref: worklist.TurnRef{Item: it.ID, Turn: msg.ID}, opt: opt})
 		}
 		return stamped, nil
 	})
-	if err != nil || len(ids) == 0 {
+	if err != nil || len(plan) == 0 {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
 
-	if heterogeneous {
-		// Per PR, dispatch a review by a model different from that PR's first review.
-		for _, it := range stamped {
-			if opt, ok := h.pickDifferentModel(it.FirstReviewModel()); ok {
-				_ = h.pipeline.SecondOpinion(r.Context(), user.ID, it.ID, opt.Endpoint, opt.Model)
-			}
+	// Dispatch outside the update, each prompt already persisted for its run to read.
+	if batch {
+		refs := make([]worklist.TurnRef, len(plan))
+		for i, d := range plan {
+			refs[i] = d.ref
 		}
+		_ = h.pipeline.SecondOpinionAll(r.Context(), user.ID, refs, plan[0].opt.Endpoint, plan[0].opt.Model)
 	} else {
-		_ = h.pipeline.SecondOpinionAll(r.Context(), user.ID, ids, menuOpt.Endpoint, menuOpt.Model)
+		for _, d := range plan {
+			_ = h.pipeline.SecondOpinion(r.Context(), user.ID, d.ref, d.opt.Endpoint, d.opt.Model)
+		}
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// appendTurn appends a new user turn to ownerID's item id in one atomic update,
+// reporting whether the item was found.
+func (h *Handler) appendTurn(ctx context.Context, ownerID, id string, msg worklist.Message) bool {
+	found := false
+	err := h.store.Update(ctx, ownerID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		for i := range current {
+			if current[i].ID == id {
+				current[i].Thread = append(current[i].Thread, msg)
+				found = true
+				return current[i : i+1], nil
+			}
+		}
+		return nil, nil
+	})
+	return err == nil && found
 }
 
 func (h *Handler) view(r *http.Request) (pageData, int) {

@@ -53,10 +53,10 @@ type Vendor interface {
 type Sink interface {
 	List(ctx context.Context) ([]worklist.WorkItem, error)
 	Ingest(ctx context.Context, items []worklist.WorkItem) error
-	// Reply appends an agent turn to itemID's thread, answering the user turn
-	// stamped inReplyTo (see worklist.AppendReply). It is dropped, without error, if
+	// Reply appends an agent turn to itemID's thread, answering the user turn whose
+	// Key is replyTo (see worklist.AppendReply). It is dropped, without error, if
 	// that turn is gone or the item is.
-	Reply(ctx context.Context, itemID string, inReplyTo time.Time, reply worklist.Message) error
+	Reply(ctx context.Context, itemID, replyTo string, reply worklist.Message) error
 }
 
 // Params configures a single runtime invocation.
@@ -68,6 +68,7 @@ type Params struct {
 	Ranker        worklist.AxisRanker        // llm-rank ranker; nil uses the stub
 	RankLimit     int                        // max items to rank; 0 uses the default
 	ItemID        string                     // target item for a per-item job (github-converse/research)
+	Turn          string                     // converse: Key of the user turn to answer; empty answers the latest unanswered one
 	Model         string                     // chat-model identifier stamped on agent replies (converse)
 	Converser     worklist.Conversationalist // github-converse assistant; required for that job
 	Independent   bool                       // converse: answer blind — omit prior thread turns (independent review)

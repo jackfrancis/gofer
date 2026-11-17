@@ -40,11 +40,11 @@ func (m *memSink) Ingest(_ context.Context, items []worklist.WorkItem) error {
 	return nil
 }
 
-func (m *memSink) Reply(_ context.Context, itemID string, inReplyTo time.Time, reply worklist.Message) error {
+func (m *memSink) Reply(_ context.Context, itemID, replyTo string, reply worklist.Message) error {
 	m.replies++
 	for i := range m.items {
 		if m.items[i].ID == itemID {
-			_, err := worklist.AppendReply(&m.items[i], inReplyTo, reply)
+			_, err := worklist.AppendReply(&m.items[i], replyTo, reply)
 			return err
 		}
 	}
