@@ -1,0 +1,9 @@
+# Scheduled snapshots of gofer's data volume (docs/backup-restore.md). Optional, and
+# only for clusters with CSI snapshot support. Applied by `make backup-apply`, which
+# fills in the image, the VolumeSnapshotClass, the schedule and the retention; nothing
+# here names a cloud or an environment.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - rbac.yaml
+  - cronjob.yaml

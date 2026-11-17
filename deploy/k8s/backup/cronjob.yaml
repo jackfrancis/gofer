@@ -1,0 +1,62 @@
+# Takes a snapshot of data-gofer-0 on a schedule, waits until it is usable, then
+# deletes the oldest beyond SNAPSHOT_KEEP (cmd/snapshot). A snapshot of the live
+# volume is safe to take while gofer runs (docs/backup-restore.md).
+#
+# The @...@ values are filled in by `make backup-apply`.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: gofer-snapshot
+  namespace: gofer
+  labels:
+    app.kubernetes.io/name: gofer-snapshot
+spec:
+  schedule: "@SNAPSHOT_SCHEDULE@"
+  timeZone: Etc/UTC
+  # One at a time; a run that is still going when the next is due wins.
+  concurrencyPolicy: Forbid
+  # A run missed by more than an hour (the cluster was down) is skipped, not queued.
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 1200
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: gofer-snapshot
+        spec:
+          serviceAccountName: gofer-snapshotter
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: snapshot
+              # The web image; it carries /snapshot beside /server.
+              image: localhost/gofer:dev
+              imagePullPolicy: IfNotPresent
+              command: ["/snapshot"]
+              env:
+                - name: SNAPSHOT_CLASS
+                  value: "@SNAPSHOT_CLASS@"
+                - name: SNAPSHOT_KEEP
+                  value: "@SNAPSHOT_KEEP@"
+                - name: SNAPSHOT_CLAIM
+                  value: data-gofer-0
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 16Mi
+                limits:
+                  memory: 64Mi

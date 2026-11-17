@@ -40,6 +40,7 @@ it was the wired default.
 ```
 cmd/server/            web tier entrypoint (HTTP, UI); selects the backend
 cmd/runtime/           agent runtime entrypoint (the image AEI launches per run)
+cmd/snapshot/          scheduled data-volume snapshots (runs from the web image)
 internal/runtime/      the backend contract (doc.go)
 internal/runtime/aei/  the AEI backend: dispatcher + workload entrypoint
 internal/config/       env configuration
@@ -109,8 +110,12 @@ the web tier is a single-replica StatefulSet with one SQLite database on a
 PersistentVolume (`DATA_DIR`), and delegated tokens are encrypted at rest with
 `VAULT_ENCRYPTION_KEY`, which `dev-up` generates into `gofer-secrets`. A pod restart
 keeps logins and the worklist. See
-[ADR 0004](docs/adr/0004-sqlite-persistent-storage.md) for the design and
-[docs/backup-restore.md](docs/backup-restore.md) for volume snapshots and restore.
+[ADR 0004](docs/adr/0004-sqlite-persistent-storage.md) for the design.
+
+Off kind, `make deploy` keeps the data disk even if its claim is deleted, and on a
+cluster with CSI snapshot support `make backup-apply SNAPSHOT_CLASS=<class>` schedules
+snapshots, with `make snapshot`, `make snapshots` and a guarded `make restore`. See
+[docs/backup-restore.md](docs/backup-restore.md).
 
 ### Deploy to another cluster
 

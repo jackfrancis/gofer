@@ -9,6 +9,9 @@
 # outbound HTTPS to the OAuth providers, GitHub, and the chat model.
 FROM gcr.io/distroless/static:nonroot
 COPY bin/linux/server /server
+# The scheduled backup (deploy/k8s/backup) runs this second binary from the same
+# image, so the snapshotter always ships with the web tier it backs up.
+COPY bin/linux/snapshot /snapshot
 EXPOSE 8080
 # Numeric UID/GID (distroless nonroot) so a runAsNonRoot pod can verify non-root.
 USER 65532:65532
