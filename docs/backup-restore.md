@@ -22,10 +22,13 @@ parameters.
 kind has no snapshot support, so the snapshot and restore targets do not work on the
 development cluster.
 
-**Status.** The snapshot program is unit-tested against a fake API server, and the
-safety argument below follows from how CSI snapshots and SQLite behave. The make
-targets and a restore have not yet been run against a real cluster; rehearse a
-restore on yours before relying on it.
+**Status.** Rehearsed on AKS with the Azure Disk CSI driver, against a live gofer:
+`backup-apply`, an on-demand `snapshot` (ready in about 15 seconds), pruning
+(including the stored snapshot itself), a full `restore` (about 40 seconds, gofer down
+for about 25) and [going back](#going-back-to-the-previous-volume) to the previous
+volume. Not yet rehearsed: [restoring into a new cluster or
+namespace](#restoring-into-a-new-cluster-or-namespace). Rehearse a restore on your
+own cluster before relying on it.
 
 ## Protection that needs no setup
 
@@ -92,9 +95,18 @@ deletionPolicy: Retain
 parameters:
   incremental: "true"
   # A resource group that is NOT the cluster's node resource group (MC_...), which is
-  # deleted with the cluster. The cluster's identity must be allowed to create
-  # snapshots there.
+  # deleted with the cluster.
   resourceGroup: <resource-group>
+```
+
+The managed Azure Disk CSI driver acts as the cluster's own managed identity
+(`az aks show -g <cluster-group> -n <cluster> --query identity.principalId`). Give it
+the built-in **Disk Snapshot Contributor** role on that resource group, which allows
+creating, reading and deleting snapshots there and nothing else:
+
+```sh
+az role assignment create --assignee-object-id <principal-id> --assignee-principal-type ServicePrincipal \
+  --role "Disk Snapshot Contributor" --scope "$(az group show -n <resource-group> --query id -o tsv)"
 ```
 
 ### 2. Schedule snapshots
