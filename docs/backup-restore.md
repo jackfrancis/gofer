@@ -28,7 +28,9 @@ development cluster.
 for about 25) and [going back](#going-back-to-the-previous-volume) to the previous
 volume. Not yet rehearsed: [restoring into a new cluster or
 namespace](#restoring-into-a-new-cluster-or-namespace). Rehearse a restore on your
-own cluster before relying on it.
+own cluster before relying on it. The additional restore preflight, backup-pause,
+and failure-recovery safeguards are covered by fake-kubectl tests; they have not yet
+been re-rehearsed against a live cluster.
 
 ## Protection that needs no setup
 
@@ -176,7 +178,22 @@ make restore   KUBECONFIG=<file> SNAPSHOT=<name> CONFIRM=<name>    # does it
 ```
 
 Without `CONFIRM` repeating the snapshot name, `restore` prints what it would do and
-changes nothing. With it, it:
+changes nothing. The confirmed restore uses Bash and `jq` (`hack/restore/restore.sh`).
+Before stopping the app it fetches and validates the replacement claim, temporarily
+suspends the backup CronJob if it was enabled, and checks for unfinished backup Jobs,
+unready snapshots of the source claim, and the snapshot-source protection finalizer.
+A failed API read or invalid claim aborts rather than continuing with an empty file.
+
+Existing Jobs are not cancelled by suspending a CronJob. If one is still pending or
+running, let it finish and retry. A failed/timed-out backup Job can leave an unready
+VolumeSnapshot behind: resolve the snapshot error and wait for readiness, or
+explicitly abort that snapshot before retrying. **Do not remove PVC protection
+finalizers manually.** The snapshot controller must release the source claim.
+These checks include manual backup Jobs and unlabelled source snapshots, and are
+repeated after shutdown. Do not start another restore, deployment, or manual
+snapshot concurrently with this procedure.
+
+Once the preflight succeeds, restore:
 
 1. sets the current volume's reclaim policy to `Retain`, so it survives the swap;
 2. scales gofer to zero and waits for the pod to go (the volume is ReadWriteOnce);
@@ -185,6 +202,27 @@ changes nothing. With it, it:
 4. scales gofer back to one; the StatefulSet adopts the restored claim;
 5. sets the restored volume to `DATA_RECLAIM_POLICY` and prints the old volume's
    name, with how to delete it or go back to it.
+
+Pod and PVC deletion each have a bounded wait (`RESTORE_TIMEOUT=120s` by default);
+a pod-deletion timeout is an error, not permission to delete its claim anyway.
+The original backup-schedule state is restored after success or a failure before
+claim deletion. An already-suspended schedule stays suspended; a missing CronJob is
+allowed for manually created snapshots. If shutdown or the second preflight fails
+before deletion is attempted, gofer's previous replica count is restored too.
+
+If PVC deletion, replacement creation, or rollout fails **after deletion was
+attempted**, backups stay suspended and the command prints the retained old PV and
+recovery guidance. A failed DELETE response can still mean the claim is terminating,
+so restore does not automatically restart the StatefulSet against a possibly missing
+claim. Inspect the claim and follow [Going back](#going-back-to-the-previous-volume)
+where necessary; only resume backups using the printed, cluster-qualified command
+once the app and its intended data volume are healthy. The script never force-removes
+storage finalizers or deletes an unfinished snapshot on your behalf.
+
+The restore operator needs read access to Jobs and VolumeSnapshots and get/patch
+access to the backup CronJob, in addition to the existing PVC/PV/StatefulSet rights.
+Failure-injection tests run with `go test ./hack/restore` (also part of `go test ./...`)
+using a fake kubectl; they require `make`, Bash, and `jq`, and never access a cluster.
 
 **Before restoring, check the encryption key.** `VAULT_ENCRYPTION_KEY` in
 `gofer-secrets` must be the key in use when the snapshot was taken. If the Secret was

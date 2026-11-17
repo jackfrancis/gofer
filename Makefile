@@ -177,6 +177,8 @@ SNAPSHOT_SCHEDULE ?= 0 */6 * * *
 SNAPSHOT_KEEP ?= 28
 # `make snapshot` waits this long for an on-demand snapshot, in seconds.
 SNAPSHOT_TIMEOUT ?= 900
+# Bound each pod/PVC deletion wait during a restore.
+RESTORE_TIMEOUT ?= 120s
 # `make restore SNAPSHOT=<name> CONFIRM=<name>`: the snapshot to restore, named twice.
 SNAPSHOT ?=
 CONFIRM ?=
@@ -601,11 +603,6 @@ snapshots: deploy-target
 	@$(KUBECTL) -n $(KUBE_NS) get volumesnapshot --sort-by=.metadata.creationTimestamp \
 		-o custom-columns='NAME:.metadata.name,READY:.status.readyToUse,SIZE:.status.restoreSize,CREATED:.metadata.creationTimestamp,SOURCE:.spec.source.persistentVolumeClaimName'
 
-# The replacement claim: the current claim's name, labels, class and access, with the
-# snapshot as its data source and its size (one line: make would hand the shell a
-# backslash-newline inside the quoted jq program).
-RESTORE_CLAIM_JQ = {apiVersion: "v1", kind: "PersistentVolumeClaim", metadata: {name: .metadata.name, namespace: .metadata.namespace, labels: (.metadata.labels // {})}, spec: {accessModes: .spec.accessModes, storageClassName: .spec.storageClassName, volumeMode: .spec.volumeMode, resources: {requests: {storage: (if $$size != "" then $$size else .spec.resources.requests.storage end)}}, dataSource: {apiGroup: "snapshot.storage.k8s.io", kind: "VolumeSnapshot", name: $$snap}}}
-
 # Replace the data volume with one restored from a snapshot. Everything written after
 # the snapshot is rolled back. It stops gofer for the swap, and keeps the current
 # volume (reclaim policy Retain) so you can go back. CONFIRM must repeat the snapshot
@@ -622,32 +619,10 @@ restore: deploy-target
 		echo "gofer stops for the swap. Everything written after the snapshot is rolled back."; \
 		echo "The current volume $$pv is kept, so you can go back (the steps are printed at the end)."
 	@[ "$(CONFIRM)" = "$(SNAPSHOT)" ] || { echo; echo "Nothing changed. To proceed, repeat the snapshot name: CONFIRM=$(SNAPSHOT)"; exit 1; }
-	@set -e; \
-		pv=$$($(KUBECTL) -n $(KUBE_NS) get pvc $(DATA_CLAIM) -o jsonpath='{.spec.volumeName}'); \
-		size=$$($(KUBECTL) -n $(KUBE_NS) get volumesnapshot "$(SNAPSHOT)" -o jsonpath='{.status.restoreSize}'); \
-		claim=$$(mktemp); trap 'rm -f "$$claim"' EXIT; \
-		$(KUBECTL) -n $(KUBE_NS) get pvc $(DATA_CLAIM) -o json | jq --arg snap "$(SNAPSHOT)" --arg size "$$size" '$(RESTORE_CLAIM_JQ)' > "$$claim"; \
-		echo "1/5 keeping the current volume $$pv"; \
-		$(KUBECTL) patch pv "$$pv" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}' >/dev/null; \
-		echo "2/5 stopping gofer"; \
-		$(KUBECTL) -n $(KUBE_NS) scale statefulset/gofer --replicas=0 >/dev/null; \
-		$(KUBECTL) -n $(KUBE_NS) wait --for=delete pod/gofer-0 --timeout=120s 2>/dev/null || true; \
-		echo "3/5 replacing $(DATA_CLAIM)"; \
-		$(KUBECTL) -n $(KUBE_NS) delete pvc $(DATA_CLAIM) --wait=true >/dev/null; \
-		$(KUBECTL) apply -f "$$claim" >/dev/null || { \
-			echo "ERROR: could not create $(DATA_CLAIM) from $(SNAPSHOT). gofer is stopped; volume $$pv is intact."; \
-			echo "To go back to it, see 'Going back' in docs/backup-restore.md (volume $$pv)."; exit 1; }; \
-		echo "4/5 starting gofer on the restored volume"; \
-		$(KUBECTL) -n $(KUBE_NS) scale statefulset/gofer --replicas=1 >/dev/null; \
-		$(KUBECTL) -n $(KUBE_NS) rollout status statefulset/gofer --timeout=$(ROLLOUT_TIMEOUT); \
-		new=$$($(KUBECTL) -n $(KUBE_NS) get pvc $(DATA_CLAIM) -o jsonpath='{.spec.volumeName}'); \
-		echo "5/5 setting the restored volume $$new to reclaim policy $(DATA_RECLAIM_POLICY)"; \
-		$(KUBECTL) patch pv "$$new" -p '{"spec":{"persistentVolumeReclaimPolicy":"$(DATA_RECLAIM_POLICY)"}}' >/dev/null; \
-		$(KUBECTL) -n $(KUBE_NS) logs gofer-0 | grep -m1 'persistent storage' || true; \
-		echo; echo "Restored $(DATA_CLAIM) from $(SNAPSHOT). Check the app, then:"; \
-		echo "  keep it:  delete the old volume and its disk with"; \
-		echo "            kubectl patch pv $$pv -p '{\"spec\":{\"persistentVolumeReclaimPolicy\":\"Delete\"}}'"; \
-		echo "  undo it:  see 'Going back' in docs/backup-restore.md (old volume $$pv)."
+	@KUBE_NS="$(KUBE_NS)" DATA_CLAIM="$(DATA_CLAIM)" \
+		SNAPSHOT="$(SNAPSHOT)" CONFIRM="$(CONFIRM)" \
+		DATA_RECLAIM_POLICY="$(DATA_RECLAIM_POLICY)" RESTORE_TIMEOUT="$(RESTORE_TIMEOUT)" \
+		ROLLOUT_TIMEOUT="$(ROLLOUT_TIMEOUT)" bash hack/restore/restore.sh $(KUBECTL)
 
 # Tear down gofer's app components (leaves the cluster + AEI in place).
 dev-down:
