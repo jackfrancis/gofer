@@ -55,6 +55,7 @@ internal/server/     web-tier router + middleware
 internal/webui/      landing page
 internal/github/     GitHub client (workload-only)
 internal/checkout/   unpack a repo tarball safely; search/list/read it (workload-only)
+internal/prow/       read a Prow job's public logs/artifacts from GCS, allowlisted (workload-only)
 internal/llm/        LLM ranking / converse (workload-only)
 internal/markdown/   render + sanitize assistant Markdown
 internal/metrics/    Prometheus metrics
@@ -144,6 +145,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   in `internal/agent/repotools.go`. A checkout is the ref's tarball unpacked into the
   sandbox's temp directory for that run only, under gofer-side size caps (AEI's pod
   has no scratch volume or storage limit) — see `docs/adr/0003-repository-checkout-tools.md`.
+- The CI tools (`github_get_ci_status`, `ci_job_summary`/`ci_list`/`ci_search`/`ci_read`)
+  are in `internal/agent/citools.go`. The `ci_*` tools open only Prow job URLs in
+  allowlisted GCS buckets (`internal/prow/url.go`) and talk only to
+  `storage.googleapis.com`, anonymously, through a client that strips credentials and
+  refuses other hosts: the runtime's egress is open, so never widen this into a
+  general URL fetch. See `docs/adr/0005-prow-ci-log-tools.md`.
 - `go test` binds httptest sockets; run it outside a restrictive sandbox.
 
 ## Build / test / run

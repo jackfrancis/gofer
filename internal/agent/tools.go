@@ -1,7 +1,8 @@
 // Read-only GitHub tools for the assistive conversation. The runtime injects
 // these behind the neutral worklist.ToolBox seam so the model can look up live
-// data — a file at a ref, a PR/issue's state and discussion, a search, and a whole
-// repository checked out at a ref (repotools.go) — while gofer core imports
+// data — a file at a ref, a PR/issue's state and discussion, a search, a whole
+// repository checked out at a ref (repotools.go), and a PR's CI results and the
+// public logs of its Prow jobs (citools.go) — while gofer core imports
 // no provider client. Every tool only ever reads, with the user's vended
 // credential; access is bounded by that token's own scopes, and reach spans any
 // repository the token can see.
@@ -14,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/jackfrancis/gofer/internal/github"
+	"github.com/jackfrancis/gofer/internal/prow"
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
@@ -23,6 +25,7 @@ type githubToolBox struct {
 	token       string
 	defaultRepo string         // the item's repo, used when a call omits "repo"
 	repos       *repoCheckouts // this run's repository checkouts (repotools.go)
+	ci          *prow.Session  // this run's CI job artifacts (citools.go)
 }
 
 var _ worklist.ToolBox = (*githubToolBox)(nil)
@@ -31,14 +34,17 @@ var _ worklist.ToolBox = (*githubToolBox)(nil)
 // token. defaultRepo is the conversation item's repo, used when a tool call
 // omits an explicit repo.
 func newGitHubToolBox(gh *github.Client, token, defaultRepo string) *githubToolBox {
-	return &githubToolBox{gh: gh, token: token, defaultRepo: defaultRepo, repos: newRepoCheckouts(gh, token)}
+	return &githubToolBox{gh: gh, token: token, defaultRepo: defaultRepo, repos: newRepoCheckouts(gh, token), ci: newCISession()}
 }
 
-// Close deletes the run's repository checkouts. The run calls it once the turn is
-// answered; nothing fetched outlives the run.
+// Close deletes the run's repository checkouts and fetched CI logs. The run calls it
+// once the turn is answered; nothing fetched outlives the run.
 func (t *githubToolBox) Close() {
 	if t.repos != nil {
 		t.repos.Close()
+	}
+	if t.ci != nil {
+		t.ci.Close()
 	}
 }
 
@@ -90,7 +96,7 @@ func (t *githubToolBox) Definitions() []worklist.ToolDef {
 			Description: "Search GitHub issues and pull requests (not code — use repo_search for code) with the GitHub search syntax. Use to find whether another PR or commit already addressed something (e.g. a dependency bump or a CVE). Returns the top matches as titles and states only — to read a match's description or comments, follow up with github_get_issue or github_get_pull_request.",
 			Parameters:  schemaSearch,
 		},
-	}, repoToolDefs()...)
+	}, append(repoToolDefs(), ciToolDefs()...)...)
 }
 
 // Invoke executes a named tool with JSON arguments and returns a text result for
@@ -98,6 +104,9 @@ func (t *githubToolBox) Definitions() []worklist.ToolDef {
 // converser relays to the model as a tool error.
 func (t *githubToolBox) Invoke(ctx context.Context, name string, args json.RawMessage) (string, error) {
 	if out, ok, err := t.invokeRepoTool(ctx, name, args); ok {
+		return out, err
+	}
+	if out, ok, err := t.invokeCITool(ctx, name, args); ok {
 		return out, err
 	}
 	switch name {
