@@ -99,8 +99,19 @@ deployments, query strings, fragments and userinfo.
 - **Bucket allowlist**, compiled in: `kubernetes-ci-logs` (current) and
   `kubernetes-jenkins` (older jobs). Adding a bucket is a code change and a review.
   A configurable list (for example, a deployment's own Prow) is left for later.
-- **Job path shape.** The path must be under `pr-logs/` or `logs/` and end at a build
-  ID (a run of digits). After decoding, it must not contain `..`, an empty segment, a
+- **Job path shape.** The path must follow one of the layouts Prow writes, ending at a
+  build ID (a run of digits):
+  - `logs/<job>/<build>` (periodic and postsubmit);
+  - `pr-logs/pull/batch/<job>/<build>` (batch presubmit);
+  - `pr-logs/pull/<org_repo>/<pr>/<job>/<build>` (presubmit). `<org_repo>` is just
+    the repo name for a repo in the deployment's default org, such as `test-infra`;
+  - `pr-logs/pull/<pr>/<job>/<build>` (presubmit of the default repo, which is
+    kubernetes/kubernetes on prow.k8s.io). It is recognised by an all-digit segment
+    after `pull/` with no second all-digit segment after it. Job names are never all
+    digits, so `pull/<digits>/<digits>/…` is read as a repo named in digits,
+    followed by its PR number.
+
+  After decoding, it must not contain `..`, an empty segment, a
   backslash, a NUL or a control character. The relative `path` argument gets the same
   checks and is joined under the job directory, so a call can read anything in that
   job and nothing outside it.
@@ -187,14 +198,17 @@ classify failures as flakes or infrastructure problems.
 | listing | 1,000 objects per listing (one page); 12 listings per run | listing marked partial; tool error past 12 |
 | files fetched by one directory search | 40 | counted as "over this answer's fetch limits" |
 | distinct jobs per run | 6 | tool error naming the jobs already opened |
-| one fetch | 60 s, and never the last 2 min of the run | tool error |
+| one fetch | 60 s, and never the last 2 min of the run (the reserve is measured from the run's deadline, not from a search's own 90 s budget) | tool error |
 | search time | 90 s | partial result, marked INCOMPLETE |
-| search output | 60 lines default, 200 max, ~28 KB, 300 bytes/line, 0–5 context lines | totals and per-file counts of what was not shown |
+| search output | 60 lines default, 200 max, ~28 KB counted as formatted (each match and context line costs its path, line number and text), 300 bytes/line, 0–5 context lines | totals and per-file counts of what was not shown |
+| any CI tool result | 48 KB, as a backstop to the per-tool estimates | cut at a line boundary, with a note of how much was dropped, and the untrusted frame closed |
 | read window | 400 lines default, 1,500 max, 32 KB, 2,000 bytes/line | "continue with start_line=N" |
 | `ci_job_summary` | 20 failing cases × 1 KB; 8 marker blocks × 25 lines, 16 KB of log text in all | counts of what was dropped, or a note |
 
-All limits fit under the converser's per-result clamp (`maxToolResultBytes`, 64 KB)
-and the run deadline (`converseDeadline`), and neither changes. `maxToolIterations`
+All limits fit under the converser's per-result clamp (`maxToolResultBytes`, 64 KB).
+The 48 KB backstop means that clamp never cuts a CI result mid-line or drops its
+closing delimiter. The limits also fit
+the run deadline (`converseDeadline`), and neither changes. `maxToolIterations`
 stays at 8: the summary tool is there so that CI questions don't need more rounds.
 
 ### 7. Prompt
@@ -254,7 +268,8 @@ Unit tests (`internal/prow`, `internal/agent/citools_test.go`,
 `internal/github/ci_test.go`), against a fake GCS (`internal/prow/prowtest`, which
 also holds a fixture job modelled on the #6825 run) and a fake GitHub:
 
-- URL parsing: each accepted form, and rejection of other hosts, look-alike hosts, the
+- URL parsing: each accepted form, including kubernetes/kubernetes's
+  `pr-logs/pull/<pr>/<job>/<build>` layout, and rejection of other hosts, look-alike hosts, the
   metadata address, other buckets, userinfo, ports, query strings and fragments,
   paths outside `logs/` and `pr-logs/pull/`, missing or non-numeric build IDs, plain
   and percent-encoded `..`, backslashes, control characters and empty segments;
@@ -267,7 +282,13 @@ also holds a fixture job modelled on the #6825 run) and a fake GitHub:
   missing its optional files;
 - search in a file and across a directory (binaries skipped, globs, literals,
   context lines, output bounds), windowed and negative-start reads, listings;
-- each per-run limit, caching (one download per object), stored names, clean-up on
+- each per-run limit, including the default 2-minute time reserve, which applies
+  when the toolbox passes zero limits and is still measured from the run's deadline
+  inside a search's shorter budget;
+- a search whose output is mostly long artifact paths with short lines (at most
+  results and context) staying within its budget once formatted, and the 48 KB
+  backstop keeping whole lines and closing the frame;
+- caching (one download per object), stored names, clean-up on
   `Close`, the untrusted frame and line prefixes (including a log line that is itself
   `>>>`), and `github_get_ci_status` ordering, `[prow]` marking and Partial reporting.
 

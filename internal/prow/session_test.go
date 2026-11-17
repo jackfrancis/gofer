@@ -326,6 +326,48 @@ func TestLimits(t *testing.T) {
 			t.Errorf("err = %v", err)
 		}
 	})
+	// A zero Limits (what the toolbox passes) keeps the default reserve: with less run
+	// time left than that, nothing is fetched.
+	t.Run("default time reserve", func(t *testing.T) {
+		s := newTestSession(t, prowtest.New(t, prowtest.JobObjects()), Limits{})
+		if s.lim.TimeReserve != DefaultLimits.TimeReserve {
+			t.Fatalf("TimeReserve = %v; want %v", s.lim.TimeReserve, DefaultLimits.TimeReserve)
+		}
+		dctx, cancel := context.WithTimeout(ctx, DefaultLimits.TimeReserve-time.Second)
+		defer cancel()
+		if _, err := s.Fetch(dctx, openFixture(t, s), "started.json"); err == nil || !strings.Contains(err.Error(), "not enough time") {
+			t.Errorf("err = %v", err)
+		}
+	})
+	// A search's own budget is shorter than the reserve; the reserve still comes off
+	// the run's deadline, so the search runs while the run has time and is refused
+	// when it does not.
+	t.Run("search budget under the reserve", func(t *testing.T) {
+		s := newTestSession(t, prowtest.New(t, prowtest.JobObjects()), Limits{})
+		job := openFixture(t, s)
+		opt := SearchOptions{Pattern: "FAIL", Timeout: 30 * time.Second}
+		rctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
+		if res, err := s.Search(rctx, job, opt); err != nil || res.TotalMatches == 0 {
+			t.Fatalf("Search = %+v, %v", res, err)
+		}
+		if res, err := s.Search(ctx, job, opt); err != nil || res.TotalMatches == 0 {
+			t.Fatalf("Search without a run deadline = %+v, %v", res, err)
+		}
+		sctx, cancel2 := context.WithTimeout(ctx, DefaultLimits.TimeReserve-time.Second)
+		defer cancel2()
+		if _, err := s.Search(sctx, job, SearchOptions{Pattern: "x", Path: "artifacts/", Timeout: 30 * time.Second}); err == nil || !strings.Contains(err.Error(), "not enough time") {
+			t.Errorf("a run inside its reserve must not fetch: %v", err)
+		}
+	})
+	t.Run("no time reserve", func(t *testing.T) {
+		s := newTestSession(t, prowtest.New(t, prowtest.JobObjects()), Limits{TimeReserve: -1})
+		dctx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+		if _, err := s.Fetch(dctx, openFixture(t, s), "started.json"); err != nil {
+			t.Errorf("a negative reserve must mean none: %v", err)
+		}
+	})
 }
 
 func TestCloseRemovesFiles(t *testing.T) {

@@ -195,3 +195,63 @@ func TestGitHubGetCIStatusTool(t *testing.T) {
 	}
 	assertFramed(t, out, untrustedOpen)
 }
+
+// A search whose output is mostly path prefixes (a deep artifact path, short lines,
+// the most context and results) stays within its budget once formatted, and the
+// tool result is under the converser's clamp with its frame closed.
+func TestCISearchFormattedOutputBounded(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	objects := prowtest.JobObjects()
+	deep := "artifacts/clusters/" + strings.Repeat("a-deeply-nested-directory/", 8) + "manager.log"
+	var log strings.Builder
+	for i := 0; i < 5000; i++ {
+		log.WriteString("E x\n")
+	}
+	objects["kubernetes-ci-logs/pr-logs/pull/o_r/42/pull-o-r-e2e/1234567890/"+deep] = log.String()
+	gcs := prowtest.New(t, objects)
+	box := newGitHubToolBox(github.NewClient(http.DefaultClient, "https://example.test"), "tok", "o/r")
+	box.ci.Close()
+	box.ci = prow.NewSession(prow.NewClient(gcs.URL), prow.Limits{})
+	t.Cleanup(box.Close)
+
+	job, _, err := box.ci.Open(prowtest.JobURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := box.ci.Search(context.Background(), job, prow.SearchOptions{Pattern: "E", Path: deep, MaxResults: prow.MaxSearchResults, ContextLines: prow.MaxContextLines})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The search's own accounting must hold: the backstop clamp should not be needed.
+	if n := len(formatCISearch(job, deep, res)); n > maxCIOutputBytes {
+		t.Fatalf("formatted search is %d bytes, over %d", n, maxCIOutputBytes)
+	}
+
+	out := ciInvoke(t, box, "ci_search", `{"url":"`+prowtest.JobURL+`","path":"`+deep+`","pattern":"E","max_results":200,"context_lines":5}`)
+	if len(out) > maxCIOutputBytes || strings.Contains(out, "output cut here") {
+		t.Fatalf("ci_search returned %d bytes (cut: %v)", len(out), strings.Contains(out, "output cut here"))
+	}
+	assertFramed(t, out, ciUntrustedOpen)
+}
+
+func TestClampCIOutput(t *testing.T) {
+	framed := "header\n\n" + ciUntrustedOpen + strings.Repeat("path:1: some log text\n", 100) + untrustedClose
+	if got := clampCIOutput(framed, len(framed)); got != framed {
+		t.Fatal("output within the limit must be unchanged")
+	}
+	got := clampCIOutput(framed, 500)
+	if len(got) > 500+200 || !strings.Contains(got, "output cut here") {
+		t.Fatalf("clamped output (%d bytes):\n%s", len(got), got)
+	}
+	assertFramed(t, got, ciUntrustedOpen)
+	for _, l := range strings.Split(strings.TrimSuffix(got, untrustedClose), "\n") {
+		if strings.HasPrefix(l, "path:") && l != "path:1: some log text" {
+			t.Fatalf("a line was cut mid-way: %q", l)
+		}
+	}
+	// A frame already closed is not closed again.
+	closed := "header\n" + ciUntrustedOpen + "path:1: x\n" + untrustedClose + "\n" + strings.Repeat("trailing note\n", 100)
+	if got := clampCIOutput(closed, 200); strings.Count(got, "\n"+untrustedClose) != 1 {
+		t.Fatalf("frame closed twice:\n%s", got)
+	}
+}

@@ -22,6 +22,13 @@ func TestParseJobURLAccepted(t *testing.T) {
 		{"https://prow.k8s.io/view/gs/kubernetes-ci-logs/logs/ci-capz-periodic/1999", "logs/ci-capz-periodic/1999", ""},
 		{"https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/batch/pull-x/77", "pr-logs/pull/batch/pull-x/77", ""},
 		{"https://prow.k8s.io/view/gs/kubernetes-jenkins/logs/old-job/5", "logs/old-job/5", ""},
+		// kubernetes/kubernetes, prow.k8s.io's default repo, has no org_repo segment.
+		{"https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/131130/pull-kubernetes-cmd/1912345678901234567", "pr-logs/pull/131130/pull-kubernetes-cmd/1912345678901234567", ""},
+		{"gs://kubernetes-ci-logs/pr-logs/pull/131130/pull-kubernetes-cmd/19/build-log.txt", "pr-logs/pull/131130/pull-kubernetes-cmd/19", "build-log.txt"},
+		// A repo in the default org: just the repo name, then the PR number.
+		{"https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/test-infra/35000/pull-test-infra-unit/8", "pr-logs/pull/test-infra/35000/pull-test-infra-unit/8", ""},
+		// A repo named in digits: the PR number follows it.
+		{"https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/123/456/pull-x/9", "pr-logs/pull/123/456/pull-x/9", ""},
 	} {
 		job, rel, err := ParseJobURL(tc.raw)
 		if err != nil {
@@ -56,6 +63,9 @@ func TestParseJobURLRejected(t *testing.T) {
 		"https://prow.k8s.io/pr?query=is%3Apr",                                       // not a job view
 		"https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/o_r/42/job",     // no build id
 		"https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/o_r/42/job/abc", // non-numeric build
+		"https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/131130/job",     // default repo, no build id
+		"https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/131130/job/x",   // default repo, non-numeric build
+		"https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/o_r/job/1/2",    // org_repo without a PR number
 		"https://prow.k8s.io/view/gs/kubernetes-ci-logs/other/job/1",                 // unknown layout
 		"https://prow.k8s.io/view/gs/kubernetes-ci-logs/" + jobPath + "/../../x",     // traversal
 		"https://prow.k8s.io/view/gs/kubernetes-ci-logs/" + jobPath + "/%2e%2e/x",    // encoded traversal

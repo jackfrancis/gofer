@@ -142,13 +142,22 @@ func ParseJobURL(raw string) (Job, string, error) {
 //
 //	logs/<job>/<build>                          periodic and postsubmit
 //	pr-logs/pull/batch/<job>/<build>            batch presubmit
+//	pr-logs/pull/<pr>/<job>/<build>             presubmit of the deployment's default
+//	                                            repo (kubernetes/kubernetes on prow.k8s.io)
 //	pr-logs/pull/<org_repo>/<pr>/<job>/<build>  presubmit
+//
+// The default-repo form is told apart by an all-digit segment after pull/ that is
+// not followed by another: job names are never all digits, so
+// pull/<digits>/<digits>/… is a repo named in digits followed by its PR number.
 func jobDepth(segs []string) (int, error) {
 	var n int
 	switch {
 	case len(segs) >= 1 && segs[0] == "logs":
 		n = 3
 	case len(segs) >= 3 && segs[0] == "pr-logs" && segs[1] == "pull" && segs[2] == "batch":
+		n = 5
+	case len(segs) >= 3 && segs[0] == "pr-logs" && segs[1] == "pull" && digits(segs[2]) &&
+		(len(segs) < 4 || !digits(segs[3])):
 		n = 5
 	case len(segs) >= 2 && segs[0] == "pr-logs" && segs[1] == "pull":
 		n = 6

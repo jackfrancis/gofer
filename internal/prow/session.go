@@ -21,7 +21,7 @@ type Limits struct {
 	MaxJobs        int           // distinct job runs opened this run
 	MaxListPages   int           // listing pages fetched this run
 	FetchTimeout   time.Duration // one object or listing page
-	TimeReserve    time.Duration // the slice of the run's remaining time a fetch never spends
+	TimeReserve    time.Duration // the slice of the run's remaining time a fetch never spends; negative for none
 }
 
 // DefaultLimits fit a large end-to-end job (the CAPZ e2e jobs hold ~700 objects and
@@ -94,7 +94,10 @@ func NewSession(c *Client, lim Limits) *Session {
 	if lim.FetchTimeout <= 0 {
 		lim.FetchTimeout = d.FetchTimeout
 	}
-	if lim.TimeReserve < 0 {
+	switch {
+	case lim.TimeReserve == 0:
+		lim.TimeReserve = d.TimeReserve
+	case lim.TimeReserve < 0: // explicitly none
 		lim.TimeReserve = 0
 	}
 	return &Session{c: c, lim: lim, files: map[string]*File{}, lists: map[string]listing{}}
@@ -141,12 +144,43 @@ func (s *Session) Open(raw string) (Job, string, error) {
 	return job, rel, nil
 }
 
+// runDeadlineKey holds the run's deadline once an operation has narrowed ctx with a
+// time budget of its own (see withBudget), so the reserve is still measured from the
+// run's end and not from the budget's.
+type runDeadlineKey struct{}
+
+type runDeadline struct {
+	at time.Time
+	ok bool
+}
+
+// withBudget bounds ctx to d for one operation (a search), remembering the run's
+// deadline. A budget shorter than the reserve must not be read as a run that is out
+// of time.
+func withBudget(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if _, set := ctx.Value(runDeadlineKey{}).(runDeadline); !set {
+		at, ok := ctx.Deadline()
+		ctx = context.WithValue(ctx, runDeadlineKey{}, runDeadline{at, ok})
+	}
+	return context.WithTimeout(ctx, d)
+}
+
 // timeout returns how long the next network call may take, or an error when the run
-// has no time left to spend on one.
+// has no time left to spend on one. The reserve comes off the run's deadline; an
+// operation's own budget (withBudget) caps the call but is not reserved against.
 func (s *Session) timeout(ctx context.Context) (time.Duration, error) {
 	t := s.lim.FetchTimeout
-	if dl, ok := ctx.Deadline(); ok {
-		if left := time.Until(dl) - s.lim.TimeReserve; left < t {
+	run, set := ctx.Value(runDeadlineKey{}).(runDeadline)
+	if !set {
+		run.at, run.ok = ctx.Deadline()
+	}
+	if run.ok {
+		if left := time.Until(run.at) - s.lim.TimeReserve; left < t {
+			t = left
+		}
+	}
+	if dl, ok := ctx.Deadline(); ok && set {
+		if left := time.Until(dl); left < t {
 			t = left
 		}
 	}

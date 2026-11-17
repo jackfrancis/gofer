@@ -7,6 +7,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -47,6 +48,10 @@ type SearchOptions struct {
 	Glob         string // file filter: "*.log" (base name) or "artifacts/*/logs/*" (whole path)
 	MaxResults   int
 	ContextLines int
+	// Timeout bounds the whole search (0 = only the run's deadline). Pass it here
+	// rather than narrowing ctx, so the session's time reserve is still measured
+	// from the run's deadline.
+	Timeout time.Duration
 }
 
 // Match is one matching line.
@@ -85,6 +90,11 @@ type SearchResult struct {
 // not a file is tried as a directory.
 func (s *Session) Search(ctx context.Context, job Job, opt SearchOptions) (SearchResult, error) {
 	var res SearchResult
+	if opt.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = withBudget(ctx, opt.Timeout)
+		defer cancel()
+	}
 	if opt.Pattern == "" {
 		return res, fmt.Errorf("pattern is required")
 	}
@@ -199,6 +209,11 @@ func (s *Session) Search(ctx context.Context, job Job, opt SearchOptions) (Searc
 	return res, nil
 }
 
+// lineCost is what one shown line (a match or a context line) costs in the formatted
+// result, which prints every line with its file path and line number:
+// "<path>:<line>: <text>" or "<path>-<line>- <text>".
+func lineCost(path string, textLen int) int { return len(path) + textLen + 16 }
+
 type searcher struct {
 	re       *regexp.Regexp
 	max      int
@@ -237,7 +252,7 @@ func (s *Session) searchFile(ctx context.Context, f *File, sr *searcher) error {
 			for _, i := range pending {
 				m := &res.Matches[i]
 				m.After = append(m.After, clipLine(text, 0, maxMatchLineBytes))
-				sr.outBytes += min(len(text), maxMatchLineBytes) + 8
+				sr.outBytes += lineCost(f.Rel, min(len(text), maxMatchLineBytes))
 				if len(m.After) < sr.ctxLines {
 					kept = append(kept, i)
 				}
@@ -249,11 +264,11 @@ func (s *Session) searchFile(ctx context.Context, f *File, sr *searcher) error {
 			res.TotalMatches++
 			if len(res.Matches) < sr.max && sr.outBytes < maxSearchOutputBytes {
 				m := Match{Path: f.Rel, Line: lr.num, Text: clipLine(text, loc[0], maxMatchLineBytes)}
-				sr.outBytes += len(m.Path) + len(m.Text) + 12
+				sr.outBytes += lineCost(m.Path, len(m.Text))
 				if sr.ctxLines > 0 {
 					m.Before = append([]string(nil), before...)
 					for _, b := range before {
-						sr.outBytes += len(b) + 8
+						sr.outBytes += lineCost(m.Path, len(b))
 					}
 				}
 				res.Matches = append(res.Matches, m)
