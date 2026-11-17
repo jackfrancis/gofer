@@ -244,7 +244,7 @@ make install-ingress KUBECONFIG=$KC \
 
 # Every deploy: TLS_HOST switches HTTPS on (and is the certificate's name).
 make deploy KUBECONFIG=$KC IMAGE=$REG/gofer:$TAG RUNTIME_IMAGE=$REG/gofer-runtime:$TAG \
-    TLS_HOST=<label>.westus2.cloudapp.azure.com ALLOWED_SOURCE_RANGES=<cidr>,...
+    TLS_HOST=<label>.westus2.cloudapp.azure.com ALLOWED_GITHUB_LOGINS=<you>,...
 make tls-status KUBECONFIG=$KC          # the certificate is Ready in about 30 seconds
 ```
 
@@ -260,15 +260,20 @@ redirect URIs (an app may have several, so keep the `http://` one until HTTPS wo
   `ACME_ENV=production` and delete the `gofer-tls` Secret so cert-manager re-issues
   from production. cert-manager renews before expiry on its own; no contact email is
   registered.
-- **Who can connect.** The allow-list moves from the cloud's network rules into
-  Traefik: `ALLOWED_SOURCE_RANGES` (comma-separated CIDRs; empty allows everyone)
-  becomes an `ipAllowList` on gofer's route only, and other addresses get `403`.
-  Traefik sees real client addresses because its Service uses
-  `externalTrafficPolicy: Local`. The address it sees is the one your HTTPS traffic
-  leaves from, which a corporate network client may change: Microsoft's Global Secure
-  Access, for example, tunnels port 443 through Microsoft's edge, so HTTPS arrives from
-  a shared edge address, not your own. Address allow-lists are a weak fit for that;
-  restricting who may sign in is the durable control.
+- **Who can sign in.** `ALLOWED_GITHUB_LOGINS=you,colleague` on `make deploy`
+  restricts sign-in to those GitHub accounts (case-insensitive). Anyone else who
+  completes GitHub's consent screen gets a `403`, no session, and nothing stored, and
+  the token GitHub issued for them is revoked. Removing a login also ends that
+  account's existing session on its next request. Other sign-in providers are refused
+  while the list is set. The value is kept in `gofer-config` across deploys that omit
+  it. This is the access control to rely on: it works from any network.
+- **Who can connect.** Optionally, `ALLOWED_SOURCE_RANGES` (comma-separated CIDRs;
+  empty allows everyone) adds an address allow-list as Traefik `ipAllowList` on gofer's
+  route only; other addresses get `403`. Traefik sees real client addresses because its
+  Service uses `externalTrafficPolicy: Local`, but the address it sees is the one your
+  HTTPS traffic leaves from, which a corporate network client may change: Microsoft's
+  Global Secure Access, for example, tunnels port 443 through Microsoft's edge, so HTTPS
+  arrives from a shared edge address, not your own.
 - **Cookies.** With `COOKIE_SECURE=true` the session cookie is only sent over HTTPS.
   Existing sessions keep working, as the cookie value does not change.
 

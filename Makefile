@@ -126,6 +126,12 @@ PUBLIC_SOURCE_RANGES ?=
 # value (http://localhost:8080, the port-forward). With a public Service it is the
 # address `make public-address` prints, or the static IP's DNS name.
 BASE_URL ?=
+# Who may sign in: comma-separated GitHub logins, written into gofer-config when set.
+# It persists across later deploys that omit it (the key is not in the base manifest,
+# so `kubectl apply` leaves it alone); clear it with
+#   kubectl -n gofer patch configmap gofer-config --type=json -p '[{"op":"remove","path":"/data/ALLOWED_GITHUB_LOGINS"}]'
+# Unset on the cluster, sign-in is open to any account (the server logs a warning).
+ALLOWED_GITHUB_LOGINS ?=
 # How long public-address waits for the cloud to assign the address, in seconds.
 PUBLIC_ADDRESS_TIMEOUT ?= 300
 # HTTPS (see README, "HTTPS"). `make install-ingress` installs Traefik and cert-manager
@@ -386,6 +392,7 @@ deploy-apply:
 	$(KUBECTL) kustomize deploy/k8s/base | sed 's|image: localhost/gofer:dev$$|image: $(IMAGE)|' | $(KUBECTL) apply -f -
 	@[ -z "$$AI_CONNECTIONS" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$$AI_CONNECTIONS" '{data:{AI_CONNECTIONS:$$v}}')"
 	@[ -z "$(BASE_URL)" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$(BASE_URL)" '{data:{BASE_URL:$$v}}')"
+	@[ -z "$(ALLOWED_GITHUB_LOGINS)" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$(ALLOWED_GITHUB_LOGINS)" '{data:{ALLOWED_GITHUB_LOGINS:$$v}}')"
 	@[ "$(PUBLIC_SERVICE)" != true ] || $(MAKE) --no-print-directory deploy-public
 	@[ -z "$(TLS_HOST)" ] || $(MAKE) --no-print-directory deploy-tls
 	sed 's|image: localhost/gofer-runtime:dev$$|image: $(RUNTIME_IMAGE)|' deploy/k8s/overlays/dev/agentapp.yaml | $(KUBECTL) apply -f -

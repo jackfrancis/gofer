@@ -31,7 +31,8 @@ import (
 // sessions; nil keeps them in memory. The returned cleanup is a no-op today (reserved
 // for the staleness reconciler).
 func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt vault.Vault, store worklist.Store, sessionStore session.Store) (http.Handler, func()) {
-	sessions := session.NewManager(cfg.SessionSecret, cfg.CookieSecure, session.WithStore(sessionStore))
+	sessions := session.NewManager(cfg.SessionSecret, cfg.CookieSecure, session.WithStore(sessionStore),
+		session.WithAllow(func(u *session.User) bool { return cfg.SignInAllowed(u.Provider, u.Login) }))
 	authH := auth.NewHandler(cfg, sessions, vlt)
 	// The web tier holds only the run-credential verification key: it authenticates a
 	// runtime's bearer but cannot mint one. Minting is a runtime/control-plane concern;

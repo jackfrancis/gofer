@@ -158,7 +158,7 @@ make kind-load-runtime  # rebuild + load only the runtime image
 make push IMAGE=... RUNTIME_IMAGE=... PLATFORM=linux/amd64  # build both images for a platform and push them
 make deploy KUBECONFIG=<file> IMAGE=... RUNTIME_IMAGE=...  # apply to any cluster (no kind, no secret creation); dev-up shares its apply step
 make install-ingress KUBECONFIG=<file>  # once per cluster: Traefik + cert-manager (pinned charts) for HTTPS
-make deploy ... TLS_HOST=<dns name> [ALLOWED_SOURCE_RANGES=...]  # serve over HTTPS with a Let's Encrypt certificate; make tls-status to watch it
+make deploy ... TLS_HOST=<dns name> ALLOWED_GITHUB_LOGINS=<logins> [ALLOWED_SOURCE_RANGES=...]  # HTTPS with a Let's Encrypt certificate, sign-in limited to those GitHub logins; make tls-status to watch it
 ```
 
 See README.md for the kind walkthrough, including the AEI-side install.

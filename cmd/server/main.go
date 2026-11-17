@@ -73,6 +73,12 @@ func main() {
 	// request is mid-write when the database closes.
 	defer closeStorage()
 
+	if len(cfg.AllowedGitHubLogins) == 0 {
+		log.Warn("sign-in is open to any account of the configured providers (set ALLOWED_GITHUB_LOGINS to restrict it)")
+	} else {
+		log.Info("sign-in restricted to an allow-list of GitHub logins", "logins", len(cfg.AllowedGitHubLogins))
+	}
+
 	if cfg.ConversationEnabled {
 		log.Info("assistive conversation enabled (the agent-runtime backend runs the model)")
 	} else {
