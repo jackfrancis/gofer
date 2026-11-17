@@ -22,6 +22,11 @@ parameters.
 kind has no snapshot support, so the snapshot and restore targets do not work on the
 development cluster.
 
+**Status.** The snapshot program is unit-tested against a fake API server, and the
+safety argument below follows from how CSI snapshots and SQLite behave. The make
+targets and a restore have not yet been run against a real cluster; rehearse a
+restore on yours before relying on it.
+
 ## Protection that needs no setup
 
 `make deploy` sets the data volume's reclaim policy to **`Retain`**
