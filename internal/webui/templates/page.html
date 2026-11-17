@@ -60,7 +60,7 @@
             <span>Hidden {{if eq $m.Role "agent"}}reply{{else}}message{{end}}</span>
             <form method="post" action="/items/thread/hide">
               <input type="hidden" name="id" value="{{$.Item.ID}}">
-              <input type="hidden" name="msg" value="{{$i}}">
+              <input type="hidden" name="msg" value="{{$.Item.TurnKey $i}}">
               <input type="hidden" name="hidden" value="false">
               <button class="zz-linkbtn" type="submit">Unhide</button>
             </form>
@@ -72,7 +72,7 @@
               {{if $m.Model}}<span class="zz-model">via {{$m.Model}}</span>{{end}}
               <form method="post" action="/items/thread/hide">
                 <input type="hidden" name="id" value="{{$.Item.ID}}">
-                <input type="hidden" name="msg" value="{{$i}}">
+                <input type="hidden" name="msg" value="{{$.Item.TurnKey $i}}">
                 <input type="hidden" name="hidden" value="true">
                 <button class="zz-linkbtn" type="submit" title="Hide this from the thread and from future model context">Hide</button>
               </form>

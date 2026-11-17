@@ -94,12 +94,20 @@ func (s *StoreSink) List(ctx context.Context) ([]worklist.WorkItem, error) {
 	return s.store.List(ctx, s.ownerID)
 }
 
-// Ingest writes items back for the owner. An empty batch is a no-op.
+// Ingest merges a run's items into the owner's stored items (worklist.MergeRunItems),
+// atomically. An empty batch is a no-op.
 func (s *StoreSink) Ingest(ctx context.Context, items []worklist.WorkItem) error {
 	if len(items) == 0 {
 		return nil
 	}
-	return s.store.Upsert(ctx, s.ownerID, items...)
+	return s.store.Update(ctx, s.ownerID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		return worklist.MergeRunItems(current, items), nil
+	})
+}
+
+// Reply appends an agent turn to the owner's item, atomically (worklist.AppendReply).
+func (s *StoreSink) Reply(ctx context.Context, itemID, replyTo string, reply worklist.Message) error {
+	return worklist.ApplyReply(ctx, s.store, s.ownerID, itemID, replyTo, reply)
 }
 
 // PlaneClient is the out-of-process Vendor and Sink: it reaches gofer's agent plane
@@ -177,16 +185,36 @@ func (c *PlaneClient) List(ctx context.Context) ([]worklist.WorkItem, error) {
 	return out.Items, nil
 }
 
-// Ingest writes items back through the agent plane. An empty batch is a no-op.
+// Ingest writes items back through the agent plane, which merges them into the
+// stored items. An empty batch is a no-op.
 func (c *PlaneClient) Ingest(ctx context.Context, items []worklist.WorkItem) error {
 	if len(items) == 0 {
 		return nil
 	}
-	body, err := json.Marshal(map[string]any{"items": items})
+	return c.post(ctx, "/agent/worklist", "ingest", map[string]any{"items": items})
+}
+
+// Reply appends an agent turn to an item's thread through the agent plane. The
+// request is idempotent (a repeat is recognized by the reply's ID), so resending it
+// after a lost response cannot duplicate the turn.
+func (c *PlaneClient) Reply(ctx context.Context, itemID, replyTo string, reply worklist.Message) error {
+	return c.post(ctx, "/agent/worklist/reply", "reply", ReplyRequest{ItemID: itemID, InReplyTo: replyTo, Message: reply})
+}
+
+// ReplyRequest is the body of POST /agent/worklist/reply.
+type ReplyRequest struct {
+	ItemID    string           `json:"item_id"`
+	InReplyTo string           `json:"in_reply_to"` // the answered user turn's Key
+	Message   worklist.Message `json:"message"`
+}
+
+// post sends one JSON body to the agent plane and expects 200.
+func (c *PlaneClient) post(ctx context.Context, path, what string, v any) error {
+	body, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+"/agent/worklist", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -198,7 +226,7 @@ func (c *PlaneClient) Ingest(ctx context.Context, items []worklist.WorkItem) err
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("ingest: status %d", resp.StatusCode)
+		return fmt.Errorf("%s: status %d", what, resp.StatusCode)
 	}
 	return nil
 }

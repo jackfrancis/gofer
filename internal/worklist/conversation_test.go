@@ -90,3 +90,59 @@ func TestReviewStateHelpers(t *testing.T) {
 		t.Error("issues are not subject to PR review actions")
 	}
 }
+
+// A reply that lands after a newer turn still answers the turn it names, so review
+// state and pending detection follow the reply links, not adjacency.
+func TestOutOfOrderReplies(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	stale := 5 * time.Minute
+	w := WorkItem{Type: TypePullRequest, Thread: []Message{
+		{ID: "r", Role: RoleUser, Kind: KindReviewRequest, Content: "review", At: now.Add(-2 * time.Minute)},
+		{ID: "f", Role: RoleUser, Content: "follow-up", At: now.Add(-time.Minute)},
+		{ID: "a", ReplyTo: "r", Role: RoleAgent, Content: "the review", Model: "x", At: now.Add(-30 * time.Second)},
+	}}
+	if !w.HasReview() || w.FirstReviewModel() != "x" {
+		t.Fatalf("the review answered out of order must count: HasReview=%v FirstReviewModel=%q", w.HasReview(), w.FirstReviewModel())
+	}
+	if !w.Answered("r") || w.Answered("f") {
+		t.Fatal("r is answered and f is not, whatever their positions")
+	}
+	if !w.ReplyPending(now, stale) {
+		t.Fatal("the unanswered follow-up is still pending, though the thread ends on an agent turn")
+	}
+	if w.ReplyStalled(now, stale) {
+		t.Fatal("a fresh follow-up is not stalled")
+	}
+	if !w.ReplyStalled(now.Add(10*time.Minute), stale) || w.ReplyPending(now.Add(10*time.Minute), stale) {
+		t.Fatal("once old, the unanswered follow-up is stalled, not pending")
+	}
+
+	// Answering the follow-up clears both.
+	w.Thread = append(w.Thread, Message{ID: "b", ReplyTo: "f", Role: RoleAgent, Content: "answer", At: now})
+	if w.ReplyPending(now, stale) || w.ReplyStalled(now.Add(10*time.Minute), stale) {
+		t.Fatal("every turn is answered")
+	}
+}
+
+// Turns stored before turns had IDs or replies recorded their target keep their old
+// meaning: a reply answers the user turn directly before it, and turns are told apart
+// by position even when their timestamps are equal.
+func TestLegacyTurns(t *testing.T) {
+	w := WorkItem{Type: TypePullRequest, Thread: []Message{
+		{Role: RoleUser, Kind: KindReviewRequest, Content: "review"},
+		{Role: RoleAgent, Content: "the review", Model: "y"},
+		{Role: RoleUser, Content: "follow-up"}, // same (zero) timestamp as the first turn
+	}}
+	if !w.HasReview() || w.FirstReviewModel() != "y" {
+		t.Fatalf("a legacy adjacent reply must count: HasReview=%v FirstReviewModel=%q", w.HasReview(), w.FirstReviewModel())
+	}
+	if w.TurnKey(0) == w.TurnKey(2) {
+		t.Fatal("legacy turns with equal timestamps must have distinct keys")
+	}
+	if !w.Answered(w.TurnKey(0)) || w.Answered(w.TurnKey(2)) {
+		t.Fatal("the first turn is answered and the follow-up is not")
+	}
+	if i, ok := w.TurnIndex(w.TurnKey(2)); !ok || i != 2 {
+		t.Fatalf("TurnIndex(TurnKey(2)) = %d, %v", i, ok)
+	}
+}

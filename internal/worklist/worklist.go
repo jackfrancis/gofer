@@ -193,8 +193,16 @@ type Store interface {
 	List(ctx context.Context, ownerID string) ([]WorkItem, error)
 	// Upsert adds or replaces an owner's items, keyed by WorkItem.ID.
 	// Implementations scope every item to ownerID so an agent cannot write another
-	// user's data.
+	// user's data. It is a BLIND write: it replaces whatever is stored, so a caller
+	// that read the items first can overwrite a change made in between. Use Update
+	// to change items that already exist.
 	Upsert(ctx context.Context, ownerID string, items ...WorkItem) error
+	// Update atomically reads, changes and writes an owner's items. fn receives a
+	// copy of the owner's current items and returns the items to write (added or
+	// replaced by ID, as Upsert); no other write to the store interleaves between
+	// the read and the write. fn must be quick and do no I/O. If fn returns an
+	// error, nothing is written and Update returns it.
+	Update(ctx context.Context, ownerID string, fn func(current []WorkItem) ([]WorkItem, error)) error
 }
 
 // Lister enumerates stored items across all owners. It is a cross-owner

@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
@@ -111,5 +112,153 @@ func TestRunConverseSynthesisVerdict(t *testing.T) {
 	}
 	if th[1].Content != "Both reviews say it's ready." {
 		t.Fatalf("verdict token should be stripped from content, got %q", th[1].Content)
+	}
+}
+
+// sideEffectConverser runs during() while the "model" is answering, to stand in for
+// what the owner does in the web tier meanwhile.
+type sideEffectConverser struct {
+	reply  string
+	during func()
+}
+
+func (f *sideEffectConverser) Reply(context.Context, worklist.WorkItem, string, string, []worklist.Message, string, worklist.ToolBox) (string, error) {
+	f.during()
+	return f.reply, nil
+}
+
+// The owner posts a follow-up while the run is answering. The reply lands, and the
+// follow-up is not overwritten by the run's stale copy of the thread — including the
+// write-back of the research signal that follows the reply.
+func TestRunConverseKeepsTurnsPostedMeanwhile(t *testing.T) {
+	t0 := time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)
+	sink := &memSink{items: []worklist.WorkItem{{
+		ID:     "github:o/r#1",
+		Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "first question", At: t0}},
+	}}}
+	fc := &sideEffectConverser{reply: "answer to the first", during: func() {
+		sink.items[0].Thread = append(sink.items[0].Thread, worklist.Message{Role: worklist.RoleUser, Content: "follow-up", At: t0.Add(time.Minute)})
+	}}
+	err := Run(context.Background(),
+		Params{JobType: JobConverse, ItemID: "github:o/r#1", Converser: fc, Researcher: &fakeResearcher{}},
+		fakeVendor{}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	th := sink.items[0].Thread
+	if len(th) != 3 || th[1].Content != "follow-up" || th[2].Content != "answer to the first" || th[2].Role != worklist.RoleAgent {
+		t.Fatalf("want [question, follow-up, reply], got %+v", th)
+	}
+	if sink.items[0].Signals.Research == nil {
+		t.Fatal("the research signal should still be written")
+	}
+}
+
+// The owner clears the conversation while the run is answering: the reply to the
+// cleared question is dropped rather than resurrecting a one-sided thread.
+func TestRunConverseDropsReplyToClearedThread(t *testing.T) {
+	sink := &memSink{items: []worklist.WorkItem{{
+		ID:     "github:o/r#1",
+		Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "q", At: time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)}},
+	}}}
+	fc := &sideEffectConverser{reply: "too late", during: func() { sink.items[0].Thread = nil }}
+	if err := Run(context.Background(), Params{JobType: JobConverse, ItemID: "github:o/r#1", Converser: fc}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(sink.items[0].Thread); n != 0 {
+		t.Fatalf("a reply to a cleared thread must be dropped, got %d turns", n)
+	}
+}
+
+// recordingConverser answers with a fixed reply and records the turns it was asked.
+type recordingConverser struct {
+	reply string
+	asked []string
+}
+
+func (f *recordingConverser) Reply(_ context.Context, _ worklist.WorkItem, _ string, _ string, _ []worklist.Message, userText string, _ worklist.ToolBox) (string, error) {
+	f.asked = append(f.asked, userText)
+	return f.reply, nil
+}
+
+// The review's reported scenario, through the real store sink: run A answers a review
+// request; the owner posts a follow-up and run B is dispatched for it; A's reply lands
+// before B starts. B must still answer the follow-up, and the review must still count.
+func TestConverseFollowUpAfterOutOfOrderReply(t *testing.T) {
+	ctx := context.Background()
+	t0 := time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", worklist.WorkItem{ID: "pr", Type: worklist.TypePullRequest, Thread: []worklist.Message{
+		{ID: "r", Role: worklist.RoleUser, Kind: worklist.KindReviewRequest, Content: "review this", At: t0},
+	}})
+	sink := NewStoreSink(store, "u1")
+	postFollowUp := func() {
+		_ = store.Update(ctx, "u1", func(cur []worklist.WorkItem) ([]worklist.WorkItem, error) {
+			cur[0].Thread = append(cur[0].Thread, worklist.Message{ID: "f", Role: worklist.RoleUser, Content: "follow-up", At: t0.Add(time.Minute)})
+			return cur, nil
+		})
+	}
+
+	// Run A: the follow-up is posted while the model answers the review.
+	a := &sideEffectConverser{reply: "the review", during: postFollowUp}
+	if err := Run(ctx, Params{JobType: JobConverse, ItemID: "pr", Turn: "r", Model: "x", Converser: a}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	// Run B starts only now, with the thread ending on A's reply.
+	b := &recordingConverser{reply: "the answer"}
+	if err := Run(ctx, Params{JobType: JobConverse, ItemID: "pr", Turn: "f", Model: "y", Converser: b}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.asked) != 1 || b.asked[0] != "follow-up" {
+		t.Fatalf("run B must answer the follow-up, was asked %q", b.asked)
+	}
+	items, _ := store.List(ctx, "u1")
+	it := items[0]
+	if len(it.Thread) != 4 || it.Thread[2].ReplyTo != "r" || it.Thread[3].ReplyTo != "f" {
+		t.Fatalf("want [review, follow-up, reply->r, reply->f], got %+v", it.Thread)
+	}
+	if !it.HasReview() || it.FirstReviewModel() != "x" {
+		t.Fatalf("the review answered out of order must count: HasReview=%v FirstReviewModel=%q", it.HasReview(), it.FirstReviewModel())
+	}
+	if it.ReplyPending(t0.Add(2*time.Minute), 5*time.Minute) {
+		t.Fatal("nothing is pending once both turns are answered")
+	}
+}
+
+// A run answers the turn it was dispatched for, not the newest one: run A, dispatched
+// for the review, starts only after the follow-up is posted.
+func TestConverseAnswersTheDispatchedTurn(t *testing.T) {
+	sink := &memSink{items: []worklist.WorkItem{{ID: "pr", Thread: []worklist.Message{
+		{ID: "r", Role: worklist.RoleUser, Content: "review this"},
+		{ID: "f", Role: worklist.RoleUser, Content: "follow-up"},
+	}}}}
+	a := &recordingConverser{reply: "the review"}
+	if err := Run(context.Background(), Params{JobType: JobConverse, ItemID: "pr", Turn: "r", Converser: a}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.asked) != 1 || a.asked[0] != "review this" {
+		t.Fatalf("run A must answer the review, was asked %q", a.asked)
+	}
+	if last := sink.items[0].Thread[2]; last.ReplyTo != "r" {
+		t.Fatalf("the reply must name the review turn, got %+v", last)
+	}
+}
+
+// A run whose turn is already answered (a duplicate dispatch) or gone does nothing.
+func TestConverseSkipsAnsweredOrMissingTurn(t *testing.T) {
+	for name, turn := range map[string]string{"answered": "r", "missing": "nope"} {
+		t.Run(name, func(t *testing.T) {
+			sink := &memSink{items: []worklist.WorkItem{{ID: "pr", Thread: []worklist.Message{
+				{ID: "r", Role: worklist.RoleUser, Content: "q"},
+				{ID: "a", ReplyTo: "r", Role: worklist.RoleAgent, Content: "done"},
+			}}}}
+			c := &recordingConverser{reply: "again"}
+			if err := Run(context.Background(), Params{JobType: JobConverse, ItemID: "pr", Turn: turn, Converser: c}, fakeVendor{}, sink); err != nil {
+				t.Fatal(err)
+			}
+			if len(c.asked) != 0 || len(sink.items[0].Thread) != 2 {
+				t.Fatalf("nothing should be answered, asked=%q thread=%d", c.asked, len(sink.items[0].Thread))
+			}
+		})
 	}
 }

@@ -55,6 +55,7 @@ func work(ctx context.Context, rt *aeiruntime.Runtime) error {
 		JobType:     spec.TaskRef,
 		Provider:    "github",
 		ItemID:      spec.Parameters["item"],
+		Turn:        strings.TrimSpace(spec.Parameters["turn"]),
 		Independent: strings.TrimSpace(spec.Parameters["independent"]) == "true",
 		Logger:      log,
 	}

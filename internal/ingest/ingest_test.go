@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"github.com/jackfrancis/gofer/internal/worklist"
 	"testing"
 )
 
@@ -36,7 +37,7 @@ func TestIngestorBuildsRunIntentAndSucceeds(t *testing.T) {
 	if err := ig.EnsureBackfill(context.Background(), "github:1"); err != nil {
 		t.Fatalf("EnsureBackfill: %v", err)
 	}
-	if err := ig.Converse(context.Background(), "github:1", "item-7", "", ""); err != nil {
+	if err := ig.Converse(context.Background(), "github:1", worklist.TurnRef{Item: "item-7", Turn: "t1"}, "", ""); err != nil {
 		t.Fatalf("Converse: %v", err)
 	}
 	if got := len(d.specs); got != 2 {

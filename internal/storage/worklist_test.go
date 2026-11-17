@@ -278,3 +278,154 @@ func TestWorklistLargeDocument(t *testing.T) {
 	}
 	same(t, got, scoped("alice", big))
 }
+
+// Update is a read-modify-write that no other write interleaves with: concurrent
+// appends to one item's thread all survive. The same pattern built from List and
+// Upsert loses most of them.
+func TestWorklistUpdateIsAtomic(t *testing.T) {
+	for name, s := range worklistImpls(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			if err := s.Upsert(ctx, "u1", item("a", "A")); err != nil {
+				t.Fatal(err)
+			}
+			const writers = 40
+			var wg sync.WaitGroup
+			errs := make(chan error, writers)
+			for w := range writers {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					errs <- s.Update(ctx, "u1", func(cur []worklist.WorkItem) ([]worklist.WorkItem, error) {
+						for i := range cur {
+							if cur[i].ID == "a" {
+								cur[i].Thread = append(cur[i].Thread, worklist.Message{Role: worklist.RoleUser, Content: fmt.Sprint(w)})
+								return cur[i : i+1], nil
+							}
+						}
+						return nil, fmt.Errorf("item a missing")
+					})
+				}()
+			}
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			base := len(item("a", "A").Thread)
+			got, _ := s.List(ctx, "u1")
+			if len(got) != 1 || len(got[0].Thread) != base+writers {
+				t.Fatalf("want 1 item with %d turns, got %d items, %d turns", base+writers, len(got), len(got[0].Thread))
+			}
+		})
+	}
+}
+
+func TestWorklistUpdateSemantics(t *testing.T) {
+	for name, s := range worklistImpls(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			if err := s.Upsert(ctx, "u1", item("a", "A")); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Upsert(ctx, "u2", item("x", "X")); err != nil {
+				t.Fatal(err)
+			}
+
+			// fn sees only the owner's items.
+			var seen []string
+			_ = s.Update(ctx, "u1", func(cur []worklist.WorkItem) ([]worklist.WorkItem, error) {
+				for _, it := range cur {
+					seen = append(seen, it.ID)
+				}
+				return nil, nil
+			})
+			if len(seen) != 1 || seen[0] != "a" {
+				t.Fatalf("fn should see only u1's items, saw %v", seen)
+			}
+
+			// An error writes nothing and is returned.
+			boom := fmt.Errorf("boom")
+			err := s.Update(ctx, "u1", func(cur []worklist.WorkItem) ([]worklist.WorkItem, error) {
+				cur[0].GitHub.Title = "changed"
+				return cur, boom
+			})
+			if err != boom {
+				t.Fatalf("want fn's error, got %v", err)
+			}
+			got, _ := s.List(ctx, "u1")
+			if got[0].GitHub.Title != "A" {
+				t.Fatalf("a failed update must write nothing, title is %q", got[0].GitHub.Title)
+			}
+
+			// Returned items are added or replaced by ID, scoped to the owner.
+			err = s.Update(ctx, "u1", func(cur []worklist.WorkItem) ([]worklist.WorkItem, error) {
+				cur[0].GitHub.Title = "A2"
+				b := item("b", "B")
+				b.OwnerID = "u2" // ignored: writes are re-scoped to u1
+				return []worklist.WorkItem{cur[0], b}, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ = s.List(ctx, "u1")
+			if len(got) != 2 || got[0].GitHub.Title != "A2" || got[1].ID != "b" || got[1].OwnerID != "u1" {
+				t.Fatalf("unexpected u1 items after update: %+v", got)
+			}
+			other, _ := s.List(ctx, "u2")
+			if len(other) != 1 || other[0].ID != "x" {
+				t.Fatalf("u2's items must be untouched, got %+v", other)
+			}
+
+			// Mutating fn's copy without returning it changes nothing.
+			_ = s.Update(ctx, "u1", func(cur []worklist.WorkItem) ([]worklist.WorkItem, error) {
+				cur[0].Thread = append(cur[0].Thread, worklist.Message{Role: worklist.RoleUser, Content: "dropped"})
+				return nil, nil
+			})
+			got, _ = s.List(ctx, "u1")
+			if n := len(got[0].Thread); n != len(item("a", "A").Thread) || got[0].Thread[n-1].Content == "dropped" {
+				t.Fatalf("an unreturned change must not be stored, thread is %+v", got[0].Thread)
+			}
+		})
+	}
+}
+
+// Neither store shares memory with its callers: a failed update leaves nested fields
+// (slices, pointers) untouched, and mutating what List returned changes nothing.
+func TestWorklistNestedFieldsAreCopies(t *testing.T) {
+	for name, s := range worklistImpls(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			a := item("a", "A")
+			a.Signals.Proposed = &worklist.AxisProposal{Relevance: 0.5}
+			if err := s.Upsert(ctx, "u1", a); err != nil {
+				t.Fatal(err)
+			}
+			check := func(when string) {
+				t.Helper()
+				got, _ := s.List(ctx, "u1")
+				if got[0].Signals.Reasons[0] != worklist.ReasonReviewRequested || got[0].Signals.Proposed.Relevance != 0.5 || got[0].Thread[0].Content != a.Thread[0].Content {
+					t.Fatalf("%s: stored nested fields changed: %+v %+v %+v", when, got[0].Signals.Reasons, got[0].Signals.Proposed, got[0].Thread[0])
+				}
+			}
+
+			_ = s.Update(ctx, "u1", func(cur []worklist.WorkItem) ([]worklist.WorkItem, error) {
+				cur[0].Signals.Reasons[0] = worklist.ReasonAuthor
+				cur[0].Signals.Proposed.Relevance = 0.9
+				cur[0].Thread[0].Content = "changed"
+				return nil, fmt.Errorf("reject")
+			})
+			check("after a failed update")
+
+			got, _ := s.List(ctx, "u1")
+			got[0].Signals.Reasons[0] = worklist.ReasonAuthor
+			got[0].Signals.Proposed.Relevance = 0.9
+			check("after mutating a List result")
+
+			a.Signals.Reasons[0] = worklist.ReasonAuthor // the caller's own copy, after Upsert
+			check("after mutating the upserted value")
+		})
+	}
+}

@@ -257,70 +257,71 @@ func (i *Ingestor) BackfillSucceeded(ctx context.Context, ownerID string) (bool,
 	return succeeded, nil
 }
 
-// Converse requests a github-converse run: an assistant answers the user's latest
-// thread turn on itemID with the chosen model (empty = the default). Accepted and
-// dropped by NoopDispatcher.
-func (i *Ingestor) Converse(ctx context.Context, ownerID, itemID, endpoint, model string) error {
-	return i.dispatchConverse(ctx, ownerID, itemID, endpoint, model, false)
+// Converse requests a github-converse run: an assistant answers the user turn ref
+// names with the chosen model (empty = the default). Accepted and dropped by
+// NoopDispatcher.
+func (i *Ingestor) Converse(ctx context.Context, ownerID string, ref worklist.TurnRef, endpoint, model string) error {
+	return i.dispatchConverse(ctx, ownerID, ref, endpoint, model, false)
 }
 
 // SecondOpinion requests an INDEPENDENT (blind) review of one item by an alternative
 // model — the review-panel action. A backend answers without the prior thread; a
 // consensus synthesis is chained once that review writes back.
-func (i *Ingestor) SecondOpinion(ctx context.Context, ownerID, itemID, endpoint, model string) error {
+func (i *Ingestor) SecondOpinion(ctx context.Context, ownerID string, ref worklist.TurnRef, endpoint, model string) error {
 	if model == "" {
 		return errors.New("ingest: second opinion requires a model")
 	}
-	return i.dispatchConverse(ctx, ownerID, itemID, endpoint, model, true)
+	return i.dispatchConverse(ctx, ownerID, ref, endpoint, model, true)
 }
 
-// SecondOpinionAll runs the review panel on each item in itemIDs as a bounded parallel
+// SecondOpinionAll runs the review panel on each turn in refs as a bounded parallel
 // batch of independent reviews.
-func (i *Ingestor) SecondOpinionAll(ctx context.Context, ownerID string, itemIDs []string, endpoint, model string) error {
+func (i *Ingestor) SecondOpinionAll(ctx context.Context, ownerID string, refs []worklist.TurnRef, endpoint, model string) error {
 	if model == "" {
 		return errors.New("ingest: second opinion requires a model")
 	}
-	return i.dispatchEach(ctx, ownerID, itemIDs, endpoint, model, true)
+	return i.dispatchEach(ctx, ownerID, refs, endpoint, model, true)
 }
 
-// ReviewAll concurrently dispatches a github-converse review run for each item in
-// itemIDs as a bounded parallel batch.
-func (i *Ingestor) ReviewAll(ctx context.Context, ownerID string, itemIDs []string, endpoint, model string) error {
-	return i.dispatchEach(ctx, ownerID, itemIDs, endpoint, model, false)
+// ReviewAll concurrently dispatches a github-converse review run for each turn in
+// refs as a bounded parallel batch.
+func (i *Ingestor) ReviewAll(ctx context.Context, ownerID string, refs []worklist.TurnRef, endpoint, model string) error {
+	return i.dispatchEach(ctx, ownerID, refs, endpoint, model, false)
 }
 
-// dispatchEach submits a github-converse run for every item, bounded by
+// dispatchEach submits a github-converse run for every turn, bounded by
 // reviewConcurrency, and joins any errors.
-func (i *Ingestor) dispatchEach(ctx context.Context, ownerID string, itemIDs []string, endpoint, model string, independent bool) error {
+func (i *Ingestor) dispatchEach(ctx context.Context, ownerID string, refs []worklist.TurnRef, endpoint, model string, independent bool) error {
 	var (
 		wg   sync.WaitGroup
 		mu   sync.Mutex
 		errs []error
 		sem  = make(chan struct{}, reviewConcurrency)
 	)
-	for _, id := range itemIDs {
+	for _, ref := range refs {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(id string) {
+		go func(ref worklist.TurnRef) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := i.dispatchConverse(ctx, ownerID, id, endpoint, model, independent); err != nil {
+			if err := i.dispatchConverse(ctx, ownerID, ref, endpoint, model, independent); err != nil {
 				mu.Lock()
 				errs = append(errs, err)
 				mu.Unlock()
 			}
-		}(id)
+		}(ref)
 	}
 	wg.Wait()
 	return errors.Join(errs...)
 }
 
-// dispatchConverse submits one github-converse run for itemID. A non-empty
+// dispatchConverse submits one github-converse run answering ref. A non-empty
 // endpoint/model overrides the default connection for this turn; independent carries a
 // blind-review flag so a runtime answers without the prior thread.
-func (i *Ingestor) dispatchConverse(ctx context.Context, ownerID, itemID, endpoint, model string, independent bool) error {
+func (i *Ingestor) dispatchConverse(ctx context.Context, ownerID string, ref worklist.TurnRef, endpoint, model string, independent bool) error {
 	params := i.runParams(ownerID)
-	params["item"] = itemID
+	params["item"] = ref.Item
+	params["turn"] = ref.Turn
 	if endpoint != "" {
 		params["ai_endpoint"] = endpoint
 	}

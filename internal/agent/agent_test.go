@@ -16,15 +16,42 @@ type fakeVendor struct{ token string }
 
 func (f fakeVendor) Vend(context.Context, string) (string, error) { return f.token, nil }
 
+// memSink is an in-memory Sink with the agent plane's write semantics: a write-back
+// is merged into the stored item (worklist.MergeRunItems) and a reply is appended
+// through worklist.AppendReply, so tests see what a real run's writes produce.
 type memSink struct {
 	items   []worklist.WorkItem
 	ingests int // write-back calls, so batching is observable
+	replies int // Reply calls
 }
 
-func (m *memSink) List(context.Context) ([]worklist.WorkItem, error) { return m.items, nil }
+func (m *memSink) List(context.Context) ([]worklist.WorkItem, error) {
+	out := make([]worklist.WorkItem, len(m.items))
+	for i, it := range m.items {
+		it.Thread = append([]worklist.Message(nil), it.Thread...)
+		out[i] = it
+	}
+	return out, nil
+}
 
 func (m *memSink) Ingest(_ context.Context, items []worklist.WorkItem) error {
 	m.ingests++
+	m.put(worklist.MergeRunItems(m.items, items))
+	return nil
+}
+
+func (m *memSink) Reply(_ context.Context, itemID, replyTo string, reply worklist.Message) error {
+	m.replies++
+	for i := range m.items {
+		if m.items[i].ID == itemID {
+			_, err := worklist.AppendReply(&m.items[i], replyTo, reply)
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *memSink) put(items []worklist.WorkItem) {
 	for _, it := range items {
 		found := false
 		for i := range m.items {
@@ -38,7 +65,6 @@ func (m *memSink) Ingest(_ context.Context, items []worklist.WorkItem) error {
 			m.items = append(m.items, it)
 		}
 	}
-	return nil
 }
 
 // runIngest vends a token, fetches from GitHub, and writes to the sink.

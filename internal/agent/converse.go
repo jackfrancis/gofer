@@ -39,20 +39,20 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	}
 	item := items[idx]
 
-	userText, history := splitThread(item.Thread)
-	if userText == "" {
-		return nil // the thread does not end on a user turn: nothing to answer
+	trigger, triggerKey, history, ok := turnToAnswer(item, p.Turn)
+	if !ok {
+		return nil // the turn is gone or already answered: nothing to do
 	}
+	userText := trigger.Content
 	if p.Independent {
 		// An independent review answers blind: the model still sees the item and its
 		// live context, but not the prior thread (other reviewers), so it forms its
 		// own view before the consensus synthesis weighs them all.
 		history = nil
 	}
-	// The turn being answered is the thread's last message (a user turn, since
-	// userText is non-empty). Its kind tells us whether this reply is a consensus
-	// synthesis, whose leading verdict token we record as structured metadata.
-	triggerKind := item.Thread[len(item.Thread)-1].Kind
+	// The turn's kind tells us whether this reply is a consensus synthesis, whose
+	// leading verdict token we record as structured metadata.
+	triggerKind := trigger.Kind
 
 	// Best-effort live context plus read-only GitHub tools: a vend failure (e.g.
 	// no credential) or an empty token leaves the assistant reasoning over the
@@ -96,44 +96,67 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	if triggerKind == worklist.KindSynthesisRequest {
 		verdict, content = worklist.ParseVerdict(reply)
 	}
-	item.Thread = append(item.Thread, worklist.Message{
+	msg := worklist.Message{
+		ID:      worklist.NewMessageID(),
+		ReplyTo: triggerKey,
 		Role:    worklist.RoleAgent,
 		Content: content,
 		Model:   p.Model,
 		Verdict: verdict,
 		At:      time.Now().UTC(),
-	})
+	}
+	// Append the reply to the thread as stored now, not to the copy read above: the
+	// owner may have posted, hidden or cleared turns while the model was answering.
+	if err := sink.Reply(ctx, item.ID, triggerKey, msg); err != nil {
+		return fmt.Errorf("reply: %w", err)
+	}
 	// A completed conversation turn is fresh evidence: re-weight the item's ranking
 	// from the thread (best-effort). The GitHub-metadata foundation stays
-	// authoritative — research only nuances it.
+	// authoritative — research only nuances it. The write-back carries only the
+	// signal; the plane keeps the stored thread.
 	if p.Researcher != nil {
+		item.Thread = append(item.Thread, msg)
 		if adj, rerr := p.Researcher.Research(ctx, item); rerr == nil {
 			item.Signals.Research = &adj
+			if err := sink.Ingest(ctx, []worklist.WorkItem{item}); err != nil {
+				return fmt.Errorf("ingest: %w", err)
+			}
 		}
-	}
-	if err := sink.Ingest(ctx, []worklist.WorkItem{item}); err != nil {
-		return fmt.Errorf("ingest: %w", err)
 	}
 	return nil
 }
 
-// splitThread returns the last user message's content (the prompt to answer) and
-// the messages before it (the history). It returns "" when the thread does not
-// end on a user turn — i.e. there is nothing new to answer.
-func splitThread(thread []worklist.Message) (userText string, history []worklist.Message) {
-	n := len(thread)
-	if n == 0 || thread[n-1].Role != worklist.RoleUser {
-		return "", nil
+// turnToAnswer returns the user turn a converse run answers, its key, and the turns
+// before it as history, with hidden turns withheld so a turn the user hid never rides along as
+// context. key names the turn the run was dispatched for (Params.Turn); empty picks
+// the most recent user turn. It reports false when there is nothing to answer: the
+// turn is gone (the owner cleared the thread), or it already has a reply (another run
+// answered it first). Answering the dispatched turn, not whatever is last, keeps a
+// follow-up posted while an earlier run worked from being skipped or answered twice.
+func turnToAnswer(item worklist.WorkItem, key string) (worklist.Message, string, []worklist.Message, bool) {
+	var (
+		idx int
+		ok  bool
+	)
+	if key != "" {
+		idx, ok = item.TurnIndex(key)
+	} else {
+		idx, ok = item.LastUserTurn()
 	}
-	// Withhold hidden turns from the model: a turn the user hid is dropped from the
-	// history so it never rides along as context in a future turn.
-	for _, m := range thread[:n-1] {
-		if m.Hidden {
-			continue
+	if !ok || item.Thread[idx].Role != worklist.RoleUser {
+		return worklist.Message{}, "", nil, false
+	}
+	key = item.TurnKey(idx)
+	if item.Answered(key) {
+		return worklist.Message{}, "", nil, false
+	}
+	var history []worklist.Message
+	for _, m := range item.Thread[:idx] {
+		if !m.Hidden {
+			history = append(history, m)
 		}
-		history = append(history, m)
 	}
-	return thread[n-1].Content, history
+	return item.Thread[idx], key, history, true
 }
 
 // formatDiscussion renders a fetched GitHub discussion snapshot as compact plain

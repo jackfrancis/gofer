@@ -27,30 +27,39 @@ type recordPipeline struct {
 	secondOpinions    []string
 	soModels          []string
 	soEndpoints       []string
+	turns             []worklist.TurnRef // every dispatched turn, in order
 }
 
 func (p *recordPipeline) EnsureBackfill(context.Context, string) error { return nil }
-func (p *recordPipeline) Converse(_ context.Context, _, itemID, endpoint, model string) error {
-	p.converses = append(p.converses, itemID)
+func (p *recordPipeline) Converse(_ context.Context, _ string, ref worklist.TurnRef, endpoint, model string) error {
+	p.converses = append(p.converses, ref.Item)
+	p.turns = append(p.turns, ref)
 	p.converseModels = append(p.converseModels, model)
 	p.converseEndpoints = append(p.converseEndpoints, endpoint)
 	return nil
 }
-func (p *recordPipeline) ReviewAll(_ context.Context, _ string, ids []string, endpoint, model string) error {
-	p.reviewed = append(p.reviewed, ids...)
+func (p *recordPipeline) ReviewAll(_ context.Context, _ string, refs []worklist.TurnRef, endpoint, model string) error {
+	for _, ref := range refs {
+		p.reviewed = append(p.reviewed, ref.Item)
+		p.turns = append(p.turns, ref)
+	}
 	p.reviewEndpoint = endpoint
 	p.reviewModel = model
 	return nil
 }
 func (p *recordPipeline) Refresh(context.Context, string) error { p.refreshed++; return nil }
-func (p *recordPipeline) SecondOpinion(_ context.Context, _, itemID, endpoint, model string) error {
-	p.secondOpinions = append(p.secondOpinions, itemID)
+func (p *recordPipeline) SecondOpinion(_ context.Context, _ string, ref worklist.TurnRef, endpoint, model string) error {
+	p.secondOpinions = append(p.secondOpinions, ref.Item)
+	p.turns = append(p.turns, ref)
 	p.soModels = append(p.soModels, model)
 	p.soEndpoints = append(p.soEndpoints, endpoint)
 	return nil
 }
-func (p *recordPipeline) SecondOpinionAll(_ context.Context, _ string, ids []string, endpoint, model string) error {
-	p.secondOpinions = append(p.secondOpinions, ids...)
+func (p *recordPipeline) SecondOpinionAll(_ context.Context, _ string, refs []worklist.TurnRef, endpoint, model string) error {
+	for _, ref := range refs {
+		p.secondOpinions = append(p.secondOpinions, ref.Item)
+		p.turns = append(p.turns, ref)
+	}
 	p.soModels = append(p.soModels, model)
 	p.soEndpoints = append(p.soEndpoints, endpoint)
 	return nil
@@ -102,7 +111,7 @@ func TestThreadHidesProgrammaticPrompts(t *testing.T) {
 }
 
 // HideMessage toggles the hidden flag on the addressed thread turn, leaves the others
-// untouched, and treats an out-of-range index as a safe no-op.
+// untouched, and treats a key naming no turn as a safe no-op.
 func TestHideMessageTogglesFlag(t *testing.T) {
 	store := worklist.NewMemoryStore()
 	store.Seed("u1", worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest, Thread: []worklist.Message{
@@ -119,7 +128,7 @@ func TestHideMessageTogglesFlag(t *testing.T) {
 		return rec
 	}
 
-	if rec := post("id=pr1&msg=1&hidden=true"); rec.Code != http.StatusSeeOther {
+	if rec := post("id=pr1&msg=pos:1&hidden=true"); rec.Code != http.StatusSeeOther {
 		t.Fatalf("status = %d, want 303 (Post/Redirect/Get)", rec.Code)
 	}
 	items, _ := store.List(context.Background(), "u1")
@@ -130,13 +139,13 @@ func TestHideMessageTogglesFlag(t *testing.T) {
 		t.Fatal("the other turn (index 0) must be untouched")
 	}
 
-	post("id=pr1&msg=1&hidden=false")
+	post("id=pr1&msg=pos:1&hidden=false")
 	items, _ = store.List(context.Background(), "u1")
 	if items[0].Thread[1].Hidden {
 		t.Fatal("expected the agent reply to be unhidden")
 	}
 
-	if rec := post("id=pr1&msg=9&hidden=true"); rec.Code != http.StatusSeeOther {
+	if rec := post("id=pr1&msg=pos:9&hidden=true"); rec.Code != http.StatusSeeOther {
 		t.Fatalf("out-of-range index status = %d, want 303 (safe no-op)", rec.Code)
 	}
 }
@@ -463,5 +472,77 @@ func TestThreadPostUsesSelectedModel(t *testing.T) {
 	h.ThreadPost(httptest.NewRecorder(), req2)
 	if len(pipe.converseModels) != 2 || pipe.converseModels[1] != "default-model" || pipe.converseEndpoints[1] != "https://default" {
 		t.Fatalf("fallback choice wrong: models=%v endpoints=%v", pipe.converseModels, pipe.converseEndpoints)
+	}
+}
+
+// Each dispatch names the turn its run must answer: a new message's ID, and for a
+// stalled review that Review all retries, the retried turn's key.
+func TestDispatchCarriesTheTurn(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	opts := []ModelOption{{Value: "c0|default", Endpoint: "https://default", Model: "default"}}
+	store := worklist.NewMemoryStore()
+	store.Seed("u1",
+		worklist.WorkItem{ID: "pr-stale", Type: worklist.TypePullRequest, Thread: []worklist.Message{
+			{Role: worklist.RoleUser, Kind: worklist.KindReviewRequest, Content: "r", At: now.Add(-10 * time.Minute)}, // stored before IDs
+		}},
+		worklist.WorkItem{ID: "pr-new", Type: worklist.TypePullRequest},
+	)
+	pipe := &recordPipeline{}
+	h := &Handler{sessions: fakeSessions{&session.User{ID: "u1"}}, store: store, pipeline: pipe, convEnabled: true, options: opts, now: func() time.Time { return now }}
+
+	h.ReviewAllPRs(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/items/review-all", nil))
+	req := httptest.NewRequest(http.MethodPost, "/items/thread", strings.NewReader("id=pr-new&content=hello"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.ThreadPost(httptest.NewRecorder(), req)
+
+	items, _ := store.List(context.Background(), "u1")
+	byID := map[string]worklist.WorkItem{}
+	for _, it := range items {
+		byID[it.ID] = it
+	}
+	if len(pipe.turns) != 3 {
+		t.Fatalf("want 3 dispatches (stale retry, new review, the posted message), got %+v", pipe.turns)
+	}
+	for _, ref := range pipe.turns {
+		it := byID[ref.Item]
+		i, ok := it.TurnIndex(ref.Turn)
+		if !ok || it.Thread[i].Role != worklist.RoleUser || it.Answered(ref.Turn) {
+			t.Fatalf("dispatch %+v must name an unanswered user turn on its item, thread %+v", ref, it.Thread)
+		}
+	}
+	stale := byID["pr-stale"]
+	if len(stale.Thread) != 1 || !stale.Thread[0].At.Equal(now) || pipe.turns[0].Turn != stale.TurnKey(0) {
+		t.Fatalf("the stalled review must be re-stamped and re-dispatched in place, got %+v / %+v", stale.Thread, pipe.turns[0])
+	}
+	if posted := byID["pr-new"].Thread; posted[len(posted)-1].ID == "" || pipe.turns[2].Turn != posted[len(posted)-1].ID {
+		t.Fatalf("the posted message must carry an ID that the dispatch names, got %+v / %+v", posted, pipe.turns[2])
+	}
+}
+
+// The bulk 2nd opinion decides eligibility and each PR's model against the same
+// snapshot. Here the page offered a menu while only pr1 (first-reviewed by "default")
+// was eligible, and the user picked "alt"; by the time of the click pr2's first review,
+// by "alt", has landed. pr2 must not get a second review from "alt".
+func TestSecondOpinionAllPlansAgainstStoredState(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)
+	opts := []ModelOption{
+		{Value: "c0|default", Endpoint: "https://default", Model: "default"},
+		{Value: "c1|alt", Endpoint: "https://alt", Model: "alt"},
+	}
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", reviewedByModel("pr1", "default", now), reviewedByModel("pr2", "alt", now))
+	pipe := &recordPipeline{}
+	h := &Handler{sessions: fakeSessions{&session.User{ID: "u1"}}, store: store, pipeline: pipe, convEnabled: true, options: opts, now: func() time.Time { return now }}
+
+	req := httptest.NewRequest(http.MethodPost, "/items/second-opinion-all", strings.NewReader("choice=c1|alt"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.SecondOpinionAllPRs(httptest.NewRecorder(), req)
+
+	got := map[string]string{}
+	for i, ref := range pipe.turns {
+		got[ref.Item] = pipe.soModels[i]
+	}
+	if got["pr1"] != "alt" || got["pr2"] != "default" {
+		t.Fatalf("each PR must get a model other than its first reviewer's, got %v", got)
 	}
 }
