@@ -58,6 +58,32 @@ func (s *MemoryStore) All(_ context.Context) (map[string][]WorkItem, error) {
 func (s *MemoryStore) Upsert(_ context.Context, ownerID string, items ...WorkItem) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.upsertLocked(ownerID, items)
+	return nil
+}
+
+// Update reads, changes and writes an owner's items under the store's lock, so no
+// other write interleaves. fn gets a deep enough copy that mutating an item's
+// Thread cannot touch the stored backing array.
+func (s *MemoryStore) Update(_ context.Context, ownerID string, fn func([]WorkItem) ([]WorkItem, error)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	src := s.items[ownerID]
+	current := make([]WorkItem, len(src))
+	for i, it := range src {
+		it.Thread = append([]Message(nil), it.Thread...)
+		current[i] = it
+	}
+	items, err := fn(current)
+	if err != nil {
+		return err
+	}
+	s.upsertLocked(ownerID, items)
+	return nil
+}
+
+// upsertLocked adds or replaces items by ID; the caller holds s.mu.
+func (s *MemoryStore) upsertLocked(ownerID string, items []WorkItem) {
 	existing := s.items[ownerID]
 	index := make(map[string]int, len(existing))
 	for i, it := range existing {
@@ -73,5 +99,4 @@ func (s *MemoryStore) Upsert(_ context.Context, ownerID string, items ...WorkIte
 		existing = append(existing, it)
 	}
 	s.items[ownerID] = existing
-	return nil
 }
