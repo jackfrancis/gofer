@@ -205,10 +205,11 @@ What each piece is, and why:
   `PUBLIC_SOURCE_RANGES` (`spec.loadBalancerSourceRanges`): kube-proxy also enforces
   that list on every node, so traffic the NSG admits through the tag is dropped
   there. `PUBLIC_SOURCE_RANGES` is for clouds without such annotations.
-- **No TLS.** The address serves plain HTTP and `COOKIE_SECURE` stays `false`. Put
-  TLS in front (an ingress controller with cert-manager, or Azure Application
-  Gateway) before using it for anything beyond a test, and before registering a
-  GitHub webhook to it.
+- **No TLS.** The address serves plain HTTP and `COOKIE_SECURE` stays `false`, so
+  the session cookie crosses the network in the clear, and browsers that upgrade
+  links to `https://` cannot reach it. Use it only for a first test; serve gofer over
+  HTTPS (next section) before anything else, and before registering a GitHub
+  webhook to it.
 - **Disk.** The StatefulSet's `data` claim uses the cluster's default StorageClass
   (on AKS, `default`: Azure Disk CSI, Standard SSD LRS, `WaitForFirstConsumer`), so
   a 1Gi Azure Disk is provisioned on first deploy in the cluster's node resource
@@ -223,6 +224,58 @@ What each piece is, and why:
 - **Isolation.** `AGENT_PROVIDER_CLASS` defaults to `isolated`, which on this cluster
   is AEI's agent-sandbox class with `kata-vm-isolation`: each run in its own Kata VM
   on the Kata pool.
+
+### HTTPS
+
+HTTPS replaces `gofer-public` with an ingress: [Traefik](https://traefik.io) holds the
+public address and terminates TLS, [cert-manager](https://cert-manager.io) obtains and
+renews a Let's Encrypt certificate for the DNS name, and gofer runs with
+`BASE_URL=https://<name>` and `COOKIE_SECURE=true`. (Traefik rather than ingress-nginx,
+which was retired in March 2026.) The manifests are in
+[deploy/k8s/tls](deploy/k8s/tls).
+
+```sh
+# Once per cluster: cert-manager and Traefik at pinned chart versions, with Traefik's
+# Service on the static IP (it replaces gofer-public, which must be gone first).
+A=service.beta.kubernetes.io
+make public-down KUBECONFIG=$KC
+make install-ingress KUBECONFIG=$KC \
+    INGRESS_SERVICE_ANNOTATIONS=$A/azure-load-balancer-resource-group=<group>,$A/azure-pip-name=<ip-name>
+
+# Every deploy: TLS_HOST switches HTTPS on (and is the certificate's name).
+make deploy KUBECONFIG=$KC IMAGE=$REG/gofer:$TAG RUNTIME_IMAGE=$REG/gofer-runtime:$TAG \
+    TLS_HOST=<label>.westus2.cloudapp.azure.com ALLOWED_GITHUB_LOGINS=<you>,...
+make tls-status KUBECONFIG=$KC          # the certificate is Ready in about 30 seconds
+```
+
+Before switching, add `https://<name>/auth/github/callback` to the GitHub OAuth app's
+redirect URIs (an app may have several, so keep the `http://` one until HTTPS works).
+
+- **Certificate.** HTTP-01 validation: Let's Encrypt fetches a token from
+  `http://<name>/.well-known/acme-challenge/` over the internet, so Traefik's Service
+  accepts ports 80 and 443 from everywhere. Plain HTTP is otherwise redirected to
+  HTTPS; the redirect runs at the lowest priority so the challenge route still answers.
+  To prove the setup without spending production rate limits, deploy once with
+  `ACME_ENV=staging` (an untrusted test certificate), then deploy with the default
+  `ACME_ENV=production` and delete the `gofer-tls` Secret so cert-manager re-issues
+  from production. cert-manager renews before expiry on its own; no contact email is
+  registered.
+- **Who can sign in.** `ALLOWED_GITHUB_LOGINS=you,colleague` on `make deploy`
+  restricts sign-in to those GitHub accounts (case-insensitive). Anyone else who
+  completes GitHub's consent screen gets a `403`, no session, and nothing stored, and
+  the token GitHub issued for them is revoked. Removing a login also ends that
+  account's existing session on its next request. Other sign-in providers are refused
+  while the list is set. The value is kept in `gofer-config` across deploys that omit
+  it. This is the access control to rely on: it works from any network.
+- **Who can connect.** Optionally, `ALLOWED_SOURCE_RANGES` (comma-separated CIDRs;
+  empty allows everyone) adds an address allow-list as Traefik `ipAllowList` on gofer's
+  route only; other addresses get `403`. Traefik sees real client addresses because its
+  Service uses `externalTrafficPolicy: Local`, but the address it sees is the one your
+  HTTPS traffic leaves from, which a corporate network client may change: Microsoft's
+  Global Secure Access, for example, tunnels port 443 through Microsoft's edge, so HTTPS
+  arrives from a shared edge address, not your own.
+- **Cookies.** With `COOKIE_SECURE=true` the session cookie is only sent over HTTPS.
+  Existing sessions keep working, as the cookie value does not change.
 
 `make run` starts the web tier alone for UI/OAuth work; without a reachable
 aei-controller, sign-in works but dispatch fails and the worklist stays empty. It

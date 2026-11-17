@@ -40,6 +40,7 @@ type provider struct {
 
 // Handler exposes HTTP handlers for the OAuth login lifecycle.
 type Handler struct {
+	cfg           *config.Config
 	sessions      *session.Manager
 	providers     map[string]*provider
 	client        *http.Client
@@ -51,6 +52,7 @@ type Handler struct {
 // credentials configured are registered.
 func NewHandler(cfg *config.Config, sessions *session.Manager, vlt vault.Vault) *Handler {
 	h := &Handler{
+		cfg:           cfg,
 		sessions:      sessions,
 		providers:     make(map[string]*provider),
 		client:        loginHTTPClient(),
@@ -238,6 +240,22 @@ func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		slog.Default().Warn("oauth user profile invalid", "provider", p.name, "err", err)
 		http.Error(w, "invalid user profile", http.StatusBadGateway)
+		return
+	}
+
+	// The sign-in allow-list (ALLOWED_GITHUB_LOGINS). A refused account gets no
+	// session and nothing in the vault, and the token GitHub just issued to this app
+	// for it is revoked, so gofer is left holding no credential of someone it refused.
+	if h.cfg != nil && !h.cfg.SignInAllowed(user.Provider, user.Login) {
+		slog.Default().Warn("sign-in refused: account not in ALLOWED_GITHUB_LOGINS",
+			"provider", p.name, "login", user.Login, "user", user.ID)
+		if p.name == "github" && token.AccessToken != "" {
+			if rerr := h.revokeGitHubToken(ctx, token.AccessToken); rerr != nil {
+				slog.Default().Warn("revoking a refused account's github token failed", "user", user.ID, "err", rerr)
+			}
+		}
+		h.sessions.Destroy(w, r) // drop the pre-auth flow
+		http.Error(w, "This account is not allowed to sign in to this gofer.", http.StatusForbidden)
 		return
 	}
 

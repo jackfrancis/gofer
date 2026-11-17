@@ -39,6 +39,11 @@ type Config struct {
 	// inflate the radar. Configurable via BOT_REVIEWERS; defaults to k8s-ci-robot.
 	BotReviewers []string
 
+	// AllowedGitHubLogins restricts sign-in to these GitHub logins, lowercased.
+	// Empty allows any account of any configured provider. Set via
+	// ALLOWED_GITHUB_LOGINS (comma-separated, case-insensitive). See SignInAllowed.
+	AllowedGitHubLogins []string
+
 	// ConversationEnabled reports whether the assistive conversation UI (Discuss)
 	// is offered. gofer brokers the model token to runtimes (see AI), so this is
 	// gated on the full model configuration being present (AI != nil).
@@ -328,6 +333,7 @@ func Load() (*Config, error) {
 		SinkURL:             getEnv("GOFER_SINK_URL", "http://gofer.gofer.svc.cluster.local:8080"),
 		Audience:            getEnv("AGENT_AUDIENCE", "gofer-agent"),
 		BotReviewers:        botReviewers,
+		AllowedGitHubLogins: lowerAll(splitAndTrim(os.Getenv("ALLOWED_GITHUB_LOGINS"))),
 		ConversationEnabled: len(conns) > 0,
 		// The ordered list of chat-model connections from AI_CONNECTIONS, each sharing
 		// AI_TOKEN; nil when AI is disabled. Callers read the default via DefaultConnection.
@@ -374,6 +380,34 @@ func loadVaultKey(dataDir string, getenv func(string) string) ([]byte, error) {
 		return nil, fmt.Errorf("VAULT_ENCRYPTION_KEY must be base64-encoded %d random bytes (e.g. `openssl rand -base64 %d`)", vaultKeySize, vaultKeySize)
 	}
 	return raw, nil
+}
+
+// SignInAllowed reports whether an account may sign in and hold a session. With no
+// allow-list configured, everyone may. With one, only a GitHub account whose login
+// is listed may (case-insensitively); other providers have no GitHub login to match,
+// so they are refused, as is a GitHub account whose login is empty.
+func (c *Config) SignInAllowed(provider, login string) bool {
+	if len(c.AllowedGitHubLogins) == 0 {
+		return true
+	}
+	if provider != "github" || login == "" {
+		return false
+	}
+	login = strings.ToLower(login)
+	for _, l := range c.AllowedGitHubLogins {
+		if l == login {
+			return true
+		}
+	}
+	return false
+}
+
+// lowerAll lowercases each element in place and returns the slice.
+func lowerAll(in []string) []string {
+	for i := range in {
+		in[i] = strings.ToLower(in[i])
+	}
+	return in
 }
 
 func getEnv(key, fallback string) string {

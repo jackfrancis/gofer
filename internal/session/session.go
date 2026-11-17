@@ -66,6 +66,7 @@ type Manager struct {
 	maxAge time.Duration
 	store  Store
 	now    func() time.Time // the clock; replaced in tests
+	allow  func(*User) bool // nil: every stored session is honoured
 
 	mu    sync.Mutex
 	flows map[string]*pendingFlow // session id -> in-progress OAuth flow
@@ -73,6 +74,14 @@ type Manager struct {
 
 // Option configures a Manager.
 type Option func(*Manager)
+
+// WithAllow makes CurrentUser honour a stored session only while allow(user) holds,
+// so tightening the sign-in allow-list also ends existing sessions of accounts it no
+// longer lists, instead of letting them run to expiry. The session itself is kept: an
+// account put back on the list is signed in again.
+func WithAllow(allow func(*User) bool) Option {
+	return func(m *Manager) { m.allow = allow }
+}
 
 // WithStore makes authenticated sessions live in store instead of in memory, so
 // logins survive a restart when the store is durable.
@@ -234,6 +243,9 @@ func (m *Manager) CurrentUser(r *http.Request) *User {
 	}
 	if m.now().After(expiresAt) {
 		_ = m.store.Delete(r.Context(), key)
+		return nil
+	}
+	if m.allow != nil && !m.allow(&u) {
 		return nil
 	}
 	return &u

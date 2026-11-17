@@ -177,3 +177,25 @@ func TestTamperedCookieIsRejected(t *testing.T) {
 		t.Fatal("a cookie with a bad signature was accepted")
 	}
 }
+
+// WithAllow: a stored session is honoured only while the account is allowed.
+func TestWithAllowGatesExistingSessions(t *testing.T) {
+	allowed := true
+	m := NewManager(testSecret, false, WithAllow(func(u *User) bool { return allowed && u.Login == "octocat" }))
+	r := login(t, m, &User{ID: "github:1", Provider: "github", Login: "octocat"})
+	if m.CurrentUser(r) == nil {
+		t.Fatal("an allowed account has no session")
+	}
+	allowed = false
+	if m.CurrentUser(r) != nil {
+		t.Error("a disallowed account's session was honoured")
+	}
+	allowed = true
+	if m.CurrentUser(r) == nil {
+		t.Error("the session did not come back once the account was allowed again")
+	}
+	other := login(t, m, &User{ID: "github:2", Provider: "github", Login: "mallory"})
+	if m.CurrentUser(other) != nil {
+		t.Error("an account the allow check rejects was honoured")
+	}
+}

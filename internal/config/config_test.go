@@ -200,3 +200,31 @@ func TestLoadVaultKey(t *testing.T) {
 		}
 	})
 }
+
+func TestSignInAllowed(t *testing.T) {
+	open := &Config{}
+	listed := &Config{AllowedGitHubLogins: lowerAll(splitAndTrim(" OctoCat , hubot,,"))}
+	cases := []struct {
+		cfg             *Config
+		provider, login string
+		want            bool
+	}{
+		{open, "github", "anyone", true},
+		{open, "google", "", true},
+		{listed, "github", "octocat", true},
+		{listed, "github", "OCTOCAT", true}, // case-insensitive
+		{listed, "github", "hubot", true},
+		{listed, "github", "mallory", false},
+		{listed, "github", "", false},        // no login to match
+		{listed, "google", "octocat", false}, // only GitHub logins can be listed
+		{listed, "microsoft", "", false},
+	}
+	for _, c := range cases {
+		if got := c.cfg.SignInAllowed(c.provider, c.login); got != c.want {
+			t.Errorf("SignInAllowed(%q, %q) with %v = %v, want %v", c.provider, c.login, c.cfg.AllowedGitHubLogins, got, c.want)
+		}
+	}
+	if len(listed.AllowedGitHubLogins) != 2 {
+		t.Errorf("parsed allow-list = %q, want [octocat hubot]", listed.AllowedGitHubLogins)
+	}
+}

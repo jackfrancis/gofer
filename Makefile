@@ -10,6 +10,7 @@
         engine kind-engine build-linux image image-runtime push-check push kind-load kind-load-runtime push-runtime \
         cluster-up cluster-down dev-up dev-down dev-forward dev-logs \
         deploy deploy-target deploy-apply deploy-public public-address public-down \
+        install-ingress deploy-tls tls-status \
         aei-check secrets-check dev-secrets \
         monitoring-load dev-monitoring dev-monitoring-down dev-forward-grafana dev-forward-prometheus
 
@@ -125,8 +126,37 @@ PUBLIC_SOURCE_RANGES ?=
 # value (http://localhost:8080, the port-forward). With a public Service it is the
 # address `make public-address` prints, or the static IP's DNS name.
 BASE_URL ?=
+# Who may sign in: comma-separated GitHub logins, written into gofer-config when set.
+# It persists across later deploys that omit it (the key is not in the base manifest,
+# so `kubectl apply` leaves it alone); clear it with
+#   kubectl -n gofer patch configmap gofer-config --type=json -p '[{"op":"remove","path":"/data/ALLOWED_GITHUB_LOGINS"}]'
+# Unset on the cluster, sign-in is open to any account (the server logs a warning).
+ALLOWED_GITHUB_LOGINS ?=
 # How long public-address waits for the cloud to assign the address, in seconds.
 PUBLIC_ADDRESS_TIMEOUT ?= 300
+# HTTPS (see README, "HTTPS"). `make install-ingress` installs Traefik and cert-manager
+# once per cluster; `make deploy TLS_HOST=<dns name>` then serves gofer over HTTPS at
+# that name with a Let's Encrypt certificate, instead of the plain-HTTP gofer-public.
+#   TLS_HOST                     the public DNS name; setting it switches HTTPS on
+#   ACME_ENV                     production (default) or staging (untrusted test certs)
+#   ALLOWED_SOURCE_RANGES        comma-separated CIDRs allowed through to gofer; empty
+#                                allows everyone. Enforced by Traefik per route, so the
+#                                ACME challenge stays reachable for Let's Encrypt.
+#   INGRESS_SERVICE_ANNOTATIONS  install-ingress only: annotations for Traefik's
+#                                LoadBalancer Service, same format as
+#                                PUBLIC_SERVICE_ANNOTATIONS (e.g. the AKS static IP)
+TLS_HOST ?=
+ACME_ENV ?= production
+ALLOWED_SOURCE_RANGES ?=
+INGRESS_SERVICE_ANNOTATIONS ?=
+ACME_SERVER_production = https://acme-v02.api.letsencrypt.org/directory
+ACME_SERVER_staging = https://acme-staging-v02.api.letsencrypt.org/directory
+ACME_SERVER = $(ACME_SERVER_$(ACME_ENV))
+# Pinned chart versions (bump deliberately). Traefik replaces ingress-nginx, which was
+# retired in March 2026.
+TRAEFIK_CHART_VERSION ?= 42.2.0
+CERT_MANAGER_CHART_VERSION ?= v1.21.3
+HELM = helm $(if $(KUBECONFIG_GIVEN),--kubeconfig "$(abspath $(KUBECONFIG))") $(if $(KUBE_CONTEXT),--kube-context $(KUBE_CONTEXT))
 # How long deploy waits for the web tier. A first rollout on a cloud cluster also
 # provisions and attaches the data disk.
 ROLLOUT_TIMEOUT ?= 180s
@@ -362,7 +392,9 @@ deploy-apply:
 	$(KUBECTL) kustomize deploy/k8s/base | sed 's|image: localhost/gofer:dev$$|image: $(IMAGE)|' | $(KUBECTL) apply -f -
 	@[ -z "$$AI_CONNECTIONS" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$$AI_CONNECTIONS" '{data:{AI_CONNECTIONS:$$v}}')"
 	@[ -z "$(BASE_URL)" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$(BASE_URL)" '{data:{BASE_URL:$$v}}')"
+	@[ -z "$(ALLOWED_GITHUB_LOGINS)" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$(ALLOWED_GITHUB_LOGINS)" '{data:{ALLOWED_GITHUB_LOGINS:$$v}}')"
 	@[ "$(PUBLIC_SERVICE)" != true ] || $(MAKE) --no-print-directory deploy-public
+	@[ -z "$(TLS_HOST)" ] || $(MAKE) --no-print-directory deploy-tls
 	sed 's|image: localhost/gofer-runtime:dev$$|image: $(RUNTIME_IMAGE)|' deploy/k8s/overlays/dev/agentapp.yaml | $(KUBECTL) apply -f -
 	@# Point the AgentApp at the well-known class name the admin published on the AEI side
 	@# (AGENT_PROVIDER_CLASS). gofer references a capability by name, not a substrate — an
@@ -395,6 +427,61 @@ public-address:
 
 public-down:
 	$(KUBECTL) -n $(KUBE_NS) delete service gofer-public --ignore-not-found
+
+# ---- HTTPS ------------------------------------------------------------------------
+#
+# Install the ingress layer gofer's HTTPS route needs, once per cluster: cert-manager
+# (with its CRDs) and Traefik, at the pinned chart versions. Like AEI, this is cluster
+# infrastructure, so it is a separate, explicit step and `deploy` never runs it.
+#
+# Traefik's Service is the cluster's public entry point: pass the static-IP annotations
+# in INGRESS_SERVICE_ANNOTATIONS (on AKS, the same pair gofer-public used; delete
+# gofer-public first with `make public-down`, since one address cannot serve both). It
+# accepts ports 80 and 443 from everywhere (Let's Encrypt must reach port 80), with
+# externalTrafficPolicy: Local so Traefik sees real client addresses and can apply
+# ALLOWED_SOURCE_RANGES per route. HTTP is redirected to HTTPS at the lowest priority,
+# which leaves cert-manager's challenge route answering on port 80.
+install-ingress: deploy-target
+	@[ "$(PUBLIC_SERVICE)" != true ] || { echo "ERROR: install-ingress replaces gofer-public; do not pass PUBLIC_SERVICE=true"; exit 1; }
+	$(HELM) upgrade --install cert-manager cert-manager --repo https://charts.jetstack.io \
+		--version $(CERT_MANAGER_CHART_VERSION) --namespace cert-manager --create-namespace \
+		--set crds.enabled=true --wait --timeout 5m
+	jq -n --arg a "$(INGRESS_SERVICE_ANNOTATIONS)" '{ \
+		ingressClass: {enabled: true, isDefaultClass: false, name: "traefik"}, \
+		ports: {web: {http: {redirections: {entryPoint: {to: "websecure", scheme: "https", permanent: true, priority: 1}}}}}, \
+		service: {spec: {externalTrafficPolicy: "Local"}, annotations: (reduce ($$a | split(",")[] | select(. != "")) as $$t ([]; \
+			if ($$t | test("=")) then . + [$$t] else .[:-1] + [.[-1] + "," + $$t] end) \
+			| map({key: (split("=")[0]), value: (split("=")[1:] | join("="))}) | from_entries)}}' | \
+		$(HELM) upgrade --install traefik traefik --repo https://traefik.github.io/charts \
+			--version $(TRAEFIK_CHART_VERSION) --namespace traefik --create-namespace \
+			--values - --wait --timeout 5m
+	@echo "ingress installed. Its address (point the DNS name / TLS_HOST at it):"
+	@$(KUBECTL) -n traefik get service traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}{"\n"}'
+
+# gofer's HTTPS route: the ACME Issuer, the allow-list, and the Ingress for TLS_HOST,
+# then BASE_URL=https://TLS_HOST (unless BASE_URL is given) and COOKIE_SECURE=true so
+# the session cookie never travels over plain HTTP. Run by deploy-apply when TLS_HOST
+# is set; the rollout that follows picks up the configuration.
+deploy-tls:
+	@[ "$(PUBLIC_SERVICE)" != true ] || { echo "ERROR: TLS_HOST and PUBLIC_SERVICE=true are alternatives; drop PUBLIC_SERVICE"; exit 1; }
+	@[ -n "$(ACME_SERVER)" ] || { echo "ERROR: ACME_ENV must be production or staging (got '$(ACME_ENV)')"; exit 1; }
+	@$(KUBECTL) get crd certificates.cert-manager.io middlewares.traefik.io >/dev/null 2>&1 || { \
+		echo "ERROR: cert-manager and Traefik are not installed on this cluster. Run 'make install-ingress' first."; exit 1; }
+	@# gofer-public held the address before HTTPS; Traefik's Service holds it now.
+	$(KUBECTL) -n $(KUBE_NS) delete service gofer-public --ignore-not-found
+	sed 's|__ACME_SERVER__|$(ACME_SERVER)|' deploy/k8s/tls/issuer.yaml | $(KUBECTL) apply -f -
+	kubectl patch --local -o yaml -f deploy/k8s/tls/middleware.yaml --type=merge -p "$$(jq -nc --arg r "$(ALLOWED_SOURCE_RANGES)" \
+		'{spec: {ipAllowList: {sourceRange: (if $$r == "" then ["0.0.0.0/0", "::/0"] else ($$r | split(",") | map(select(. != ""))) end)}}}')" | \
+		$(KUBECTL) apply -f -
+	sed 's|__TLS_HOST__|$(TLS_HOST)|g' deploy/k8s/tls/ingress.yaml | $(KUBECTL) apply -f -
+	$(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc \
+		--arg b "$(if $(BASE_URL),$(BASE_URL),https://$(TLS_HOST))" '{data: {BASE_URL: $$b, COOKIE_SECURE: "true"}}')"
+	@echo "HTTPS route applied for $(TLS_HOST) ($(ACME_ENV) certificate). Watch it with: make tls-status"
+
+# The certificate's progress: Ready once Let's Encrypt has issued it. Orders and
+# challenges appear only while an issuance is in flight.
+tls-status:
+	@$(KUBECTL) -n $(KUBE_NS) get certificate,certificaterequest,order,challenge 2>&1
 
 dev-up: cluster-up kind-load kind-load-runtime aei-check dev-secrets deploy-apply
 	@# Durable pulls actor images from a registry BY DIGEST (a tag invalidates ate's golden

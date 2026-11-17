@@ -16,6 +16,9 @@ data:
   # The browser-facing base URL. For the dev port-forward this is localhost; the
   # GitHub OAuth callback is BASE_URL + /auth/github/callback.
   BASE_URL: "http://localhost:8080"
+  # ALLOWED_GITHUB_LOGINS (comma-separated GitHub logins) restricts who may sign in;
+  # deliberately absent here so a deploy never resets it. `make deploy
+  # ALLOWED_GITHUB_LOGINS=you,colleague` writes it. Absent: any account may sign in.
   # false because the dev port-forward is plain http; set true behind TLS.
   COOKIE_SECURE: "false"
   # Binds a run credential to gofer's agent plane; a runtime's token must carry this
