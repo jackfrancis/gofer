@@ -1028,6 +1028,31 @@ func TestDeleteLogsAContentLeftBehind(t *testing.T) {
 	}
 }
 
+// The check after the delete also looks at the content name the snapshot's status
+// recorded, which a repaired binding may use instead of the dynamic name.
+func TestDeleteLogsAStatusNamedContentLeftBehind(t *testing.T) {
+	f := newFakeAPI()
+	f.addFailed("failed", ago(time.Hour), managed()) // its status names content-failed
+	delete(f.refs, "content-failed")
+	delete(f.contents, "content-failed")
+	f.beforeDelete = func(string) {
+		f.refs["content-failed"] = contentRef{"failed", "gofer", "uid-failed"}
+		f.contents["content-failed"] = "Retain"
+	}
+	s := newSnapshotter(t, f)
+	var logs bytes.Buffer
+	s.Log = slog.New(slog.NewTextHandler(&logs, nil))
+	if deleted, err := s.pruneFailed(context.Background()); err != nil || !slices.Equal(deleted, []string{"failed"}) {
+		t.Fatalf("want it deleted, got %v %v", deleted, err)
+	}
+	if !strings.Contains(logs.String(), "left behind") || !strings.Contains(logs.String(), "content=content-failed") {
+		t.Fatalf("want the status-named content logged, got %s", logs.String())
+	}
+	if f.contents["content-failed"] != "Retain" {
+		t.Fatal("the content left behind must not be changed")
+	}
+}
+
 // Once the job is being stopped, no further candidates are read or deleted.
 func TestPruneStopsAfterCancellation(t *testing.T) {
 	f := newFakeAPI()

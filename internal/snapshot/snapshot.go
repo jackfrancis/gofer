@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"time"
 )
@@ -600,24 +601,30 @@ func (s *Snapshotter) delete(ctx context.Context, listed volumeSnapshot, still f
 // content and records it in the snapshot's status in two separate writes, and a
 // binding can be repaired by hand, so one can appear between the last lookup and the
 // delete without changing the snapshot. It is left as it is (it may hold a backup
-// someone repaired) and logged, so an operator can rebind or delete it. Only the
-// dynamic name, snapcontent-<snapshot UID>, is checked: finding contents under other
-// names would need list access to every content in the cluster.
+// someone repaired) and logged, so an operator can recover or discard it
+// (docs/backup-restore.md). Both names known for it are checked: the one the
+// snapshot's status records, and the dynamic one, snapcontent-<snapshot UID>; finding
+// contents under other names would need list access to every content in the cluster.
 func (s *Snapshotter) checkLeftBehind(v volumeSnapshot) {
-	if v.Metadata.UID == "" {
-		return
+	var names []string
+	if v.Status != nil && v.Status.BoundVolumeSnapshotContentName != "" {
+		names = append(names, v.Status.BoundVolumeSnapshotContentName)
+	}
+	if v.Metadata.UID != "" && !slices.Contains(names, "snapcontent-"+v.Metadata.UID) {
+		names = append(names, "snapcontent-"+v.Metadata.UID)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), recoveryTimeout)
 	defer cancel()
-	name := "snapcontent-" + v.Metadata.UID
-	c, err := s.readContent(ctx, name)
-	switch {
-	case IsNotFound(err):
-	case err != nil:
-		s.log().Warn("could not check whether a deleted snapshot left a content behind", "snapshot", v.Metadata.Name, "content", name, "err", err)
-	case s.owns(c, v):
-		s.log().Warn("a content for the deleted snapshot appeared meanwhile and was left behind; bind it to a new VolumeSnapshot to keep it, or delete it",
-			"snapshot", v.Metadata.Name, "content", name, "deletionPolicy", c.Spec.DeletionPolicy)
+	for _, name := range names {
+		c, err := s.readContent(ctx, name)
+		switch {
+		case IsNotFound(err):
+		case err != nil:
+			s.log().Warn("could not check whether a deleted snapshot left a content behind", "snapshot", v.Metadata.Name, "content", name, "err", err)
+		case s.owns(c, v):
+			s.log().Warn("a content for the deleted snapshot appeared meanwhile and was left behind; to keep or discard it, see 'A content left behind' in docs/backup-restore.md",
+				"snapshot", v.Metadata.Name, "content", name, "deletionPolicy", c.Spec.DeletionPolicy)
+		}
 	}
 }
 

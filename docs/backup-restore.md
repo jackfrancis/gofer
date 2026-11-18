@@ -186,8 +186,8 @@ waits until it is ready to use, and then deletes the oldest beyond the newest
   VolumeSnapshotContent and records it on the snapshot in two separate writes, so a
   content can turn up for a snapshot that had none just before the job deletes it.
   The job then leaves that content as it is (it may hold a backup someone repaired)
-  and logs a warning naming it (`left behind`), so it can be bound to a new
-  VolumeSnapshot or deleted by hand.
+  and logs a warning naming it (`left behind`), so an operator can keep or discard
+  it: see [A content left behind](#a-content-left-behind).
 - A snapshot that is merely slow (not ready after ten minutes, with no error or
   already taken and still copying) is left in
   place: it may still finish and be a good backup. If it later fails, a run deletes it
@@ -400,10 +400,13 @@ StatefulSet creates an empty one:
 
 1. Create the namespace and `gofer-secrets`, with the backed-up
    `VAULT_ENCRYPTION_KEY`.
-2. Make the snapshot visible there. In the same cluster, a retained
-   VolumeSnapshotContent can be bound to a new VolumeSnapshot. Otherwise create a
-   pre-provisioned one from the stored snapshot's handle (on AKS, the Azure snapshot's
-   resource ID):
+2. Make the snapshot visible there: create a pre-provisioned VolumeSnapshotContent
+   from the stored snapshot's handle (on AKS, the Azure snapshot's resource ID; in
+   the same cluster, the retained content's `status.snapshotHandle`). A content the
+   snapshot controller created for another VolumeSnapshot cannot be bound to a new
+   one, even after that VolumeSnapshot is gone: the controller refuses it as
+   `SnapshotContentMismatch` ("dynamically provisioned while expecting a
+   pre-provisioned one"), also if its `volumeSnapshotRef` is edited.
 
    ```yaml
    apiVersion: snapshot.storage.k8s.io/v1
@@ -432,6 +435,51 @@ StatefulSet creates an empty one:
 3. Create `data-gofer-0` from it: a claim like the one `restore` creates, with
    `dataSource` naming the VolumeSnapshot.
 4. Deploy gofer (`make deploy`). The StatefulSet adopts the claim.
+
+### A content left behind
+
+The scheduled job can log that a VolumeSnapshotContent for a snapshot it deleted was
+`left behind` (see [Scheduled snapshots](#scheduled-snapshots)). It keeps the class's
+`Retain` policy, so its stored snapshot is still there, but the snapshot controller
+will not bind it to a new VolumeSnapshot (see step 2 above). To keep it or discard it:
+
+1. Check that it is still there, and note its driver and its stored snapshot's handle:
+
+   ```sh
+   kubectl get volumesnapshotcontent <content> \
+       -o jsonpath='{.spec.driver} {.status.snapshotHandle} {.spec.deletionPolicy}{"\n"}'
+   ```
+
+2. To keep it, create a pre-provisioned VolumeSnapshotContent and a VolumeSnapshot
+   from that driver and handle, as in step 2 of
+   [Restoring into a new cluster or namespace](#restoring-into-a-new-cluster-or-namespace),
+   under a new name such as `gofer-recovered`, and wait until the VolumeSnapshot is
+   ready to use. Then delete the old content object, leaving it at `Retain`: the
+   stored snapshot now belongs to the new content.
+
+   ```sh
+   kubectl delete volumesnapshotcontent <content>
+   ```
+
+   The new VolumeSnapshot carries none of the job's labels, so the job never prunes
+   it; delete it yourself, with its content set to `Delete`, when it is no longer
+   needed.
+
+3. To discard it instead, set it to `Delete` first. Deleting a `Retain` content
+   removes only the object and leaves the stored snapshot behind.
+
+   ```sh
+   kubectl patch volumesnapshotcontent <content> --type merge -p '{"spec":{"deletionPolicy":"Delete"}}'
+   kubectl delete volumesnapshotcontent <content>
+   ```
+
+   Never do this to a content whose handle a recovered content (step 2) also uses:
+   both point to the same stored snapshot, and `Delete` removes it.
+
+These steps were rehearsed on kind with csi-driver-host-path: binding the old content
+directly failed with `SnapshotContentMismatch`, the pre-provisioned route restored a
+claim with its data intact after the old content object was deleted, and the discard
+route made the driver delete the stored snapshot.
 
 ## Velero: the whole-namespace alternative
 
