@@ -188,14 +188,33 @@ side effect of someone else's installation.
     the issue's or PR's own global numeric ID. Search hits carry the issue ID; the
     repository ID comes from the visibility check, which already fetches the
     repository. Ingest writes both on every item.
-  - **Matching.** An incoming item merges onto a stored one (thread, read cursor,
-    hidden flag) only when their `IssueID`s agree. If either lacks an `IssueID`, the
-    `RepoID` and number must both agree. `worklist.MergeRunItems` applies this rule.
-    - **Same IDs, new name** (a renamed repository): the stored item is re-keyed to
-      the new name, and its thread follows.
-    - **Same name and number, different IDs** (a reused name): the stored item is
-      re-keyed to an orphan key, `github:<old name>#<n>@r<old RepoID>`, and keeps its
-      thread. The incoming item is stored fresh, with an empty thread.
+  - **An item's key is fixed when it is first stored, and never changes.** Both
+    `worklist.Store` implementations only upsert, so a key move would leave the old
+    row behind. `retireMissing` also compares keys, so it would take a renamed issue
+    for a finished one.
+    - A new item's key is `github:issue:<IssueID>`, which a rename cannot change.
+    - A legacy item keeps the name-based key it already has, as an opaque label.
+    - The repository name, number and URL shown to the user are ordinary
+      `GitHubRef` fields, updated on the same row at every ingest. A rename is
+      therefore an update in place: one row, one thread, and no key move in either
+      store.
+    - Nothing in gofer parses an item ID. Keys referenced elsewhere (`RelatedActive`,
+      dispatch parameters, thread turn references) stay valid because they never
+      change.
+  - **Reconciliation maps upstream identity to the stored key.** Before merging or
+    retiring, the web tier's `worklist.MergeRunItems` and ingest's comparison with
+    stored items (the `existing` list in `runIngest`) map each incoming item to a
+    stored key, in this order:
+    - by `IssueID`;
+    - then by `RepoID` and number, for a legacy item that has been bound (below);
+    - else it is a new item, with a new key.
+
+    The web tier assigns the key; a run only proposes items. `retireMissing` works on
+    the stored keys matched in this pass, never on name-derived IDs, so a renamed
+    issue counts as present.
+  - **A reused name cannot collide.** The replacement repository's issue #1 has its own
+    `IssueID`, so it gets its own key and an empty thread. The old row keeps its key
+    and its thread, untouched.
 - **Visibility is kept per repository ID, apart from the items.**
   - New table `repository_visibility`, keyed by owner and `RepoID`. Columns: the
     repository's current full name (informational only), the verdict (`public`,
@@ -216,15 +235,30 @@ side effect of someone else's installation.
   - Ingest reports a repository's verdict before writing back that repository's
     items.
 - **Legacy items have no `RepoID` or `IssueID`, so their identity can be ambiguous.**
-  Ingest binds a legacy item to a `RepoID` only on evidence that it is the same
-  repository:
-  - **A search hit:** this ingest's search returns the same name and number, now with
-    IDs (the user is involved in it now). The item binds to those IDs.
-  - **A rename redirect:** looking up the stored name redirects to a renamed
-    repository. GitHub redirects only to the original, so that repository's ID is
-    the item's.
+  A search hit with the same name and number proves nothing: if the name was reused,
+  and the user took part in issue #1 in both repositories, the old conversation would
+  attach to the replacement. So ingest binds a legacy item only on historical
+  evidence, from a direct lookup.
+  - **The lookup:** `GET /repos/{stored name}/issues/{n}`. Under Issues: read it
+    answers for PRs as well, and it follows a rename redirect to the original
+    repository. It goes through the visibility gate like any other read.
+  - **The evidence:** the answer's `created_at` must equal the item's stored creation
+    time (`Signals.OpenedAt`, which ingest has always taken from GitHub's
+    `created_at`), to the second. Its kind must match the stored `Type`: a
+    `pull_request` field means a PR.
+    - An issue in a replacement repository was created after the old repository gave
+      up the name, so it cannot carry the original's creation time.
+  - **On a match:** the item binds to the answer's `id` (`IssueID`) and to the
+    repository's ID from the gate. It keeps its existing key, and reconciliation finds
+    it by `IssueID` from then on.
+  - **What it covers:** renamed repositories (through the redirect), and closed legacy
+    items in unchanged repositories, which produce neither an open search hit nor a
+    redirect. Legacy items are looked up from the inventory, ahead of the rotating
+    window, until each is bound or found ambiguous.
 
-  A legacy item with neither is ambiguous. It is held back from every model input,
+  A legacy item is ambiguous when the lookup fails (404, refused, private in
+  public-only mode), when the creation times or kinds differ, or when it has no stored
+  creation time. It is held back from every model input,
   its thread is never merged onto a new item, and it stays visible to the user,
   marked as unverified. Every item stored before rollout came through a token that
   reads public repositories only, so this affects only items whose name changed hands
@@ -587,8 +621,9 @@ all user tokens" on the OAuth app's settings page once the switch is made.
    - `GITHUB_CLIENT_KIND`, with each kind's scopes;
    - `GITHUB_PRIVATE_REPOS` (off), with the `github:private` run scope:
      - the visibility gate and the redirect check;
-     - `RepoID` and `IssueID` on items, ID-based matching in `MergeRunItems`, and the
-       legacy binding rules;
+     - `RepoID` and `IssueID` on items, permanent item keys (`github:issue:<IssueID>`
+       for new items), reconciliation by `IssueID` in `MergeRunItems` and ingest, and
+       legacy binding by direct lookup;
      - the `repository_visibility` table with `ReportVisibility`, and the repository
        inventory;
      - ingest's unknown-visibility rule, and retirement only after a check in the
@@ -698,6 +733,9 @@ Left unverified:
   the app is not installed on, and whether an issue keeps its global `id` when it is
   transferred. If it does not, a transferred issue arrives as a new item, and its old
   copy waits for its own repository's check before it is retired.
+- **That search's `created_at` and the issue endpoint's agree to the second** for the
+  same issue, which legacy binding relies on. If they ever differ, the legacy item is
+  ambiguous and held back; no thread attaches wrongly.
 - **A dispatched run's credential carrying `github:private`** once the AgentApp
   ceiling allows it. AEI's code copies requested scopes within the ceiling into the
   minted credential, but no run with the new scope has been dispatched.
