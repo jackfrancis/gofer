@@ -274,10 +274,36 @@ Once the preflight succeeds, restore:
 1. sets the current volume's reclaim policy to `Retain`, so it survives the swap;
 2. scales gofer to zero and waits for the pod to go (the volume is ReadWriteOnce);
 3. deletes the claim `data-gofer-0` and creates it again, with the same name,
-   labels, storage class and access mode, from the snapshot;
+   labels, storage class and access mode, from the snapshot. The deletion is
+   conditioned on the claim's UID and resourceVersion from the final check, so a
+   claim changed after that check (for example, resized) is not deleted. The new
+   claim requests the snapshot's `restoreSize`, the size every CSI driver can
+   restore (some, such as Dell Unity, reject any other). Without a usable
+   `restoreSize` (absent or `0`) it requests the current claim's size;
 4. scales gofer back to one; the StatefulSet adopts the restored claim;
 5. sets the restored volume to `DATA_RECLAIM_POLICY` and prints the old volume's
-   name, with how to delete it or go back to it.
+   name, with how to delete it or go back to it;
+6. if the claim was expanded after the snapshot was taken, expands the bound,
+   restored claim back to its previous request (unless someone already raised it
+   further; the patch is conditioned on the claim's resourceVersion), then waits up
+   to `EXPAND_TIMEOUT` (whole seconds, 300s by default; each read is bounded by the
+   time left) for its `status.capacity` to reach that size. Some drivers grow a
+   disk only while it is detached, and the claim's capacity changes only after the
+   node grows the filesystem, which for such a volume happens when gofer mounts it
+   again. If the capacity falls short, restore exits nonzero, reports the claim's
+   and the volume's capacity, and prints how to finish: if the volume (PV) has
+   grown, or the claim shows `FileSystemResizePending`, restart gofer; otherwise
+   stop gofer, wait for the *volume's* capacity (not the claim's) or that
+   condition, start gofer, and check the claim's capacity.
+
+Sizes are Kubernetes quantities in any valid spelling (`4Gi`, `+4Gi`, `4.Gi`,
+`4e9`, `1E`, `1Ei`, ...); an unreadable size stops the restore before anything
+changes. So does a snapshot smaller than the claim when the claim's storage class
+does not set `allowVolumeExpansion: true`, or the operator may not patch the claim,
+since restoring it would shrink the claim.
+The claim's storage request is also rechecked before and after shutdown: a resize
+during the restore stops it before the claim is deleted, and gofer is restarted on
+the unchanged claim.
 
 Pod and PVC deletion each have a bounded wait (`RESTORE_TIMEOUT=120s` by default);
 a pod-deletion timeout is an error, not permission to delete its claim anyway.
@@ -290,19 +316,24 @@ Failure handling distinguishes replacement/startup from post-restore finalizatio
 
 - **Before a restored rollout is confirmed:** failed PVC deletion, replacement
   creation, startup, or rollout leaves backups suspended and prints the retained old
-  PV and recovery guidance. The message distinguishes an unconfirmed replacement from
-  a successfully created claim whose rollout is not yet confirmed. A failed DELETE
-  response can still mean the claim is terminating, so cleanup never automatically
-  starts the StatefulSet against a possibly missing claim. Inspect the PVC, pod and
-  rollout; follow [Going back](#going-back-to-the-previous-volume) where necessary.
-  Resume backups using the printed, cluster-qualified command only after recovery.
-- **After the restored rollout succeeds:** a later PVC read or reclaim-policy error
-  is reported as incomplete finalization, not failed application recovery. The command
+  PV and recovery guidance. The message distinguishes an unconfirmed replacement
+  from a successfully created claim whose rollout is not yet confirmed. A failed
+  DELETE response can still mean the claim is terminating, or that the DELETE
+  commits later, so cleanup restarts the original app only if the claim is still
+  live at a resourceVersion other than the one the DELETE required (which it can
+  then never match). Otherwise it never starts the StatefulSet against a possibly
+  missing claim. Inspect the PVC, pod and rollout; follow [Going
+  back](#going-back-to-the-previous-volume) where necessary. Resume backups using
+  the printed, cluster-qualified command only after recovery.
+- **After the restored rollout succeeds:** a later PVC read, reclaim-policy,
+  expansion error, or expansion that has not reached its capacity in time is
+  reported as incomplete finalization, not failed application recovery. The command
   still exits nonzero, but does not stop or roll back the restored app and restores
   the prior backup-schedule state. Verify and repair the restored PV's requested
-  reclaim policy; do not repeat the restore solely to repair volume protection. If
-  resuming backups also fails, that is reported separately with a manual resume
-  command. An already-paused or absent CronJob remains untouched.
+  reclaim policy (and, if it was to be expanded, the claim's storage request); do
+  not repeat the restore solely to repair volume protection. If resuming backups
+  also fails, that is reported separately with a manual resume command. An
+  already-paused or absent CronJob remains untouched.
 
 The script never force-removes storage finalizers or deletes an unfinished snapshot
 on your behalf, and this restore preflight stays strict. Cleaning up failed backup
@@ -321,7 +352,10 @@ If one of these stalls, look at the snapshot and the controller's events rather 
 working around the preflight.
 
 The restore operator needs read access to Jobs and VolumeSnapshots and get/patch
-access to the backup CronJob, in addition to the existing PVC/PV/StatefulSet rights.
+access to the backup CronJob, in addition to the existing PVC/PV/StatefulSet rights,
+and, when the claim must be expanded after restore, read access to StorageClasses
+and patch access to the claim (checked with `kubectl auth can-i` before anything
+changes).
 Failure-injection tests run with `go test ./hack/restore` (also part of `go test ./...`)
 using a fake kubectl; they require `make`, Bash, and `jq`, and never access a cluster.
 The child process uses a minimal environment and pinned Make configuration so exported
@@ -433,7 +467,11 @@ StatefulSet creates an empty one:
    ```
 
 3. Create `data-gofer-0` from it: a claim like the one `restore` creates, with
-   `dataSource` naming the VolumeSnapshot.
+   `dataSource` naming the VolumeSnapshot and a storage request equal to its
+   `restoreSize` (some CSI drivers reject any other size). If the snapshot reports
+   no `restoreSize`, or `0`, request the size of the volume it was taken from
+   instead (its claim's recorded request). Expand the claim once it is bound if you
+   need more.
 4. Deploy gofer (`make deploy`). The StatefulSet adopts the claim.
 
 ### A content left behind

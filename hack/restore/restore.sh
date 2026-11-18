@@ -10,6 +10,11 @@ snapshot=${SNAPSHOT:?SNAPSHOT must be set}
 policy=${DATA_RECLAIM_POLICY:-Retain}
 wait_timeout=${RESTORE_TIMEOUT:-120s}
 rollout_timeout=${ROLLOUT_TIMEOUT:-180s}
+expand_timeout=${EXPAND_TIMEOUT:-300s}
+[[ $expand_timeout =~ ^([0-9]+)s?$ ]] || { echo "ERROR: EXPAND_TIMEOUT must be whole seconds, such as 300s." >&2; exit 1; }
+# Force base 10: Bash arithmetic would read "08" as invalid octal.
+expand_seconds=$((10#${BASH_REMATCH[1]}))
+((expand_seconds > 0)) || { echo "ERROR: EXPAND_TIMEOUT must be at least 1s." >&2; exit 1; }
 [[ $# -gt 0 ]] || { echo "ERROR: pass kubectl and its cluster-selection flags." >&2; exit 1; }
 kubectl=("$@")
 case "$policy" in Retain|Delete) ;; *) echo "ERROR: invalid DATA_RECLAIM_POLICY: $policy" >&2; exit 1;; esac
@@ -29,6 +34,8 @@ stop_attempted=false
 restore_phase=preflight
 pv=
 replicas=1
+expand_to=
+size=
 cleanup() {
     local status=$?
     trap - EXIT
@@ -63,6 +70,9 @@ cleanup() {
                 # finalization, not claim replacement or application startup.
                 echo "ERROR: gofer's restored rollout succeeded, but post-restore finalization is incomplete." >&2
                 echo "Verify the bound PV for $namespace/$claim and its requested reclaim policy ($policy)." >&2
+                if [[ -n $expand_to ]]; then
+                    echo "Then verify that $namespace/$claim requests and has a capacity of at least $expand_to (it was restored at $size)." >&2
+                fi
                 echo "No rollback or additional stop was attempted. Do not repeat restore solely to repair volume protection." >&2
                 echo "Original volume $pv is retained." >&2
                 ;;
@@ -99,17 +109,61 @@ pv=$(jq -er --arg name "$claim" --arg ns "$namespace" '
 kube -n "$namespace" get volumesnapshot "$snapshot" -o json > "$tmp/snapshot.json"
 jq -e '.status.readyToUse == true and .metadata.deletionTimestamp == null and (.metadata.uid | type == "string" and length > 0)' "$tmp/snapshot.json" >/dev/null || \
     fail "snapshot $snapshot is no longer ready to use. Nothing changed."
+# Converts a Kubernetes quantity string to a number of bytes, or fails.
+# shellcheck disable=SC2016 # jq variables, not shell expansions
+jq_bytes='
+    def bytes:
+        (capture("^(?<sign>[+-]?)(?<n>[0-9]+(\\.[0-9]*)?|\\.[0-9]+)(?<s>Ki|Mi|Gi|Ti|Pi|Ei|[eE][+-]?[0-9]+|n|u|m|k|M|G|T|P|E)?$")
+         // error("invalid storage quantity: \(.)")) as $q
+        # Normalize "4." and ".5" for every jq version.
+        | ($q.n | if endswith(".") then . + "0" else . end | if startswith(".") then "0" + . else . end | tonumber)
+          * (if $q.sign == "-" then -1 else 1 end)
+          * (if $q.s == null then 1
+             elif ($q.s | test("^[eE][+-]?[0-9]+$")) then pow(10; $q.s[1:] | ltrimstr("+") | tonumber)
+             else {Ki: 1024, Mi: 1048576, Gi: 1073741824, Ti: 1099511627776,
+                   Pi: 1125899906842624, Ei: 1152921504606846976,
+                   n: 1e-9, u: 1e-6, m: 1e-3, k: 1e3, M: 1e6, G: 1e9,
+                   T: 1e12, P: 1e15, E: 1e18}[$q.s] end);
+    '
 size=$(jq -er '.status.restoreSize // "" | select(type == "string")' "$tmp/snapshot.json")
-jq -e --arg snap "$snapshot" --arg size "$size" '
+# Restore at the snapshot's restoreSize, which every CSI driver can provision (some,
+# such as Dell Unity, reject any other size). If the claim was expanded after the
+# snapshot was taken, expand the restored claim back to the current request once it
+# is bound. Without a usable restoreSize (absent or 0), request the current size.
+# Quantities follow the Kubernetes grammar; an unparseable one fails here, before
+# anything changes.
+jq -e --arg snap "$snapshot" --arg size "$size" "$jq_bytes"'
     select((.spec.accessModes | type == "array" and length > 0)
         and (.spec.resources.requests.storage | type == "string" and length > 0))
-    | {apiVersion: "v1", kind: "PersistentVolumeClaim",
-       metadata: {name: .metadata.name, namespace: .metadata.namespace, labels: (.metadata.labels // {})},
-       spec: {accessModes: .spec.accessModes, storageClassName: .spec.storageClassName,
-              volumeMode: (.spec.volumeMode // "Filesystem"),
-              resources: {requests: {storage: (if $size != "" then $size else .spec.resources.requests.storage end)}},
-              dataSource: {apiGroup: "snapshot.storage.k8s.io", kind: "VolumeSnapshot", name: $snap}}}
-' "$tmp/original.json" > "$tmp/claim.json" || fail "could not build a valid replacement claim. Nothing changed."
+    | .spec.resources.requests.storage as $current
+    | ($current | bytes) as $current_bytes
+    | select($current_bytes > 0)
+    | (if $size == "" then 0 else ($size | bytes) end) as $restore_bytes
+    | (if $restore_bytes <= 0 or $restore_bytes == $current_bytes then $current else $size end) as $storage
+    | {expand_to: (if $restore_bytes > 0 and $restore_bytes < $current_bytes then $current else "" end),
+       storage_class: (.spec.storageClassName // ""),
+       claim: {apiVersion: "v1", kind: "PersistentVolumeClaim",
+         metadata: {name: .metadata.name, namespace: .metadata.namespace, labels: (.metadata.labels // {})},
+         spec: {accessModes: .spec.accessModes, storageClassName: .spec.storageClassName,
+                volumeMode: (.spec.volumeMode // "Filesystem"),
+                resources: {requests: {storage: $storage}},
+                dataSource: {apiGroup: "snapshot.storage.k8s.io", kind: "VolumeSnapshot", name: $snap}}}}
+' "$tmp/original.json" > "$tmp/plan.json" || fail "could not build a valid replacement claim. Nothing changed."
+jq -e '.claim' "$tmp/plan.json" > "$tmp/claim.json"
+expand_to=$(jq -er '.expand_to' "$tmp/plan.json")
+if [[ -n "$expand_to" ]]; then
+    # Restoring at the smaller snapshot size is only safe if the claim can grow
+    # back afterward; otherwise the restore would permanently shrink it.
+    storage_class=$(jq -er '.storage_class' "$tmp/plan.json")
+    [[ -n "$storage_class" ]] || fail "$claim must grow from $size to $expand_to after restore, but has no storage class. Nothing changed."
+    kube get storageclass "$storage_class" -o json > "$tmp/storageclass.json"
+    jq -e '.allowVolumeExpansion == true' "$tmp/storageclass.json" >/dev/null || \
+        fail "snapshot $snapshot restores at $size, smaller than $claim ($expand_to), and storage class $storage_class does not allow volume expansion. Nothing changed."
+    # The expansion patch runs after the original claim is gone: check it is allowed now.
+    can_patch=$(kube -n "$namespace" auth can-i patch "persistentvolumeclaims/$claim" || true)
+    [[ $can_patch == yes ]] || \
+        fail "$claim must grow from $size to $expand_to after restore, but you may not patch persistentvolumeclaims/$claim in $namespace. Nothing changed."
+fi
 replicas=$(kube -n "$namespace" get statefulset gofer -o jsonpath='{.spec.replicas}')
 case "$replicas" in 0|1) ;; *) fail "expected gofer to have zero or one replicas, got: $replicas";; esac
 
@@ -146,6 +200,16 @@ check_quiet() {
     ' "$tmp/snapshots.json")
     [[ -z "$snapshots" ]] || fail "unfinished source snapshots: $snapshots. Wait for readiness or explicitly abort failed snapshots, then retry restore."
     kube -n "$namespace" get pvc "$claim" -o json > "$tmp/current.json"
+    # The replacement is sized from the first read. A resize during restore keeps
+    # the claim's UID and volume, so compare the request itself.
+    jq -e --slurpfile original "$tmp/original.json" '
+        .spec.resources.requests.storage == $original[0].spec.resources.requests.storage
+    ' "$tmp/current.json" >/dev/null || fail "$claim's storage request changed during restore. Retry restore so the replacement matches it."
+    # Delete only the exact object verified here; see the preconditions below.
+    jq -e '{apiVersion: "v1", kind: "DeleteOptions",
+            preconditions: {uid: (.metadata.uid | select(type == "string" and length > 0)),
+                            resourceVersion: (.metadata.resourceVersion | select(type == "string" and length > 0))}}
+    ' "$tmp/current.json" > "$tmp/delete-options.json" || fail "$claim has no UID or resourceVersion."
     jq -e --arg pv "$pv" --slurpfile original "$tmp/original.json" '
         .metadata.uid == $original[0].metadata.uid and .spec.volumeName == $pv
         and .metadata.deletionTimestamp == null
@@ -160,28 +224,128 @@ check_quiet() {
 }
 check_quiet
 
-echo "1/5 keeping the current volume $pv"
+steps=5
+[[ -z "$expand_to" ]] || steps=6
+echo "1/$steps keeping the current volume $pv"
 kube patch pv "$pv" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}' >/dev/null
-echo "2/5 stopping gofer"
+echo "2/$steps stopping gofer"
 stop_attempted=true
 kube -n "$namespace" scale statefulset/gofer --replicas=0 >/dev/null
 kube -n "$namespace" wait --for=delete pod/gofer-0 --timeout="$wait_timeout"
 # Recheck after shutdown in case a previously dispatched/manual backup started.
 check_quiet
-echo "3/5 replacing $claim"
+echo "3/$steps replacing $claim"
 restore_phase=deleting_claim
-kube -n "$namespace" delete pvc "$claim" --wait=true --timeout="$wait_timeout"
+# kubectl delete has no precondition flags; send DeleteOptions to the claim's URL.
+# A change after the final check (for example, a resize) then fails the delete.
+if ! kube delete --raw "/api/v1/namespaces/$namespace/persistentvolumeclaims/$claim" -f "$tmp/delete-options.json" >/dev/null; then
+    # Restart the original app only if the claim demonstrably cannot be deleted by
+    # this request. A failed response does not prove the DELETE was rejected: it may
+    # still commit after a read that shows the unchanged claim. A live claim with the
+    # original UID at a different resourceVersion fails the precondition, now or later.
+    if kube -n "$namespace" get pvc "$claim" -o json > "$tmp/after-delete.json" && \
+        jq -e --slurpfile original "$tmp/original.json" --slurpfile options "$tmp/delete-options.json" '
+            .metadata.uid == $original[0].metadata.uid and .metadata.deletionTimestamp == null
+            and (.metadata.resourceVersion | type == "string" and length > 0)
+            and .metadata.resourceVersion != $options[0].preconditions.resourceVersion
+        ' "$tmp/after-delete.json" >/dev/null; then
+        restore_phase=preflight
+        fail "$claim changed after the final check and was not deleted. Retry restore."
+    fi
+    exit 1
+fi
+kube -n "$namespace" wait --for=delete "pvc/$claim" --timeout="$wait_timeout"
 kube create -f "$tmp/claim.json" >/dev/null
 restore_phase=claim_created
 # A successful create is the only point at which starting the StatefulSet is safe.
-echo "4/5 starting gofer on the restored volume"
+echo "4/$steps starting gofer on the restored volume"
 kube -n "$namespace" scale statefulset/gofer --replicas=1 >/dev/null
 kube -n "$namespace" rollout status statefulset/gofer --timeout="$rollout_timeout"
 restore_phase=rollout_complete
 new=$(kube -n "$namespace" get pvc "$claim" -o jsonpath='{.spec.volumeName}')
 [[ -n "$new" ]] || fail "the restored PVC has no bound volume"
-echo "5/5 setting the restored volume $new to reclaim policy $policy"
+echo "5/$steps setting the restored volume $new to reclaim policy $policy"
 kube patch pv "$new" -p "{\"spec\":{\"persistentVolumeReclaimPolicy\":\"$policy\"}}" >/dev/null
+print_command() {
+    printf '    ' >&2
+    printf '%q ' "${kubectl[@]}" -n "$namespace" "$@" >&2
+    printf '\n' >&2
+}
+# Explain how to finish an expansion that did not reach the claim in time. The
+# claim's capacity changes only after the node grows the filesystem, which for an
+# offline volume happens when gofer mounts it again. So the signal to (re)start
+# gofer is the volume's own capacity, or the claim's FileSystemResizePending.
+expansion_incomplete() {
+    local capacity fs_pending=false pv_capacity=unknown pv_grown=false
+    capacity=$(jq -r '.status.capacity.storage // "unknown"' "$tmp/expanded.json" 2>/dev/null) || capacity=unknown
+    [[ -n $capacity ]] || capacity=unknown
+    if jq -e '[.status.conditions[]? | select(.type == "FileSystemResizePending" and .status == "True")] | length > 0' \
+        "$tmp/expanded.json" >/dev/null 2>&1; then
+        fs_pending=true
+    fi
+    if kube get pv "$new" -o json --request-timeout=10s > "$tmp/expanded-pv.json"; then
+        pv_capacity=$(jq -r '.spec.capacity.storage // "unknown"' "$tmp/expanded-pv.json" 2>/dev/null) || pv_capacity=unknown
+        if jq -e --arg target "$expand_to" "$jq_bytes"'(.spec.capacity.storage | bytes) >= ($target | bytes)' \
+            "$tmp/expanded-pv.json" >/dev/null 2>&1; then
+            pv_grown=true
+        fi
+    fi
+    echo "ERROR: after $expand_timeout, $claim's capacity is $capacity and volume $new's is $pv_capacity, short of $expand_to." >&2
+    if [[ $fs_pending == true || $pv_grown == true ]]; then
+        echo "The volume has grown; its filesystem grows when gofer mounts it again. Restart gofer, then check that the claim's capacity reaches $expand_to:" >&2
+        print_command rollout restart statefulset/gofer
+        print_command rollout status statefulset/gofer
+        print_command get pvc "$claim" -o "jsonpath={.status.capacity.storage}"
+    else
+        echo "If the driver expands only detached volumes, stop gofer and wait until volume $new reaches $expand_to" >&2
+        echo "(or $claim shows FileSystemResizePending); the claim's own capacity changes only after gofer mounts it." >&2
+        echo "Then start gofer and check that the claim's capacity reaches $expand_to:" >&2
+        print_command scale statefulset/gofer --replicas=0
+        printf '    ' >&2; printf '%q ' "${kubectl[@]}" get pv "$new" -o "jsonpath={.spec.capacity.storage}" >&2; printf '\n' >&2
+        print_command get pvc "$claim" -o "jsonpath={.status.conditions[?(@.type=='FileSystemResizePending')].status}"
+        print_command scale statefulset/gofer --replicas=1
+        print_command get pvc "$claim" -o "jsonpath={.status.capacity.storage}"
+    fi
+}
+if [[ -n "$expand_to" ]]; then
+    echo "6/$steps expanding $claim from the snapshot's $size to $expand_to"
+    kube -n "$namespace" get pvc "$claim" -o json > "$tmp/restored.json"
+    # Never lower a request someone raised meanwhile. The resourceVersion in the
+    # merge patch makes the API server reject it if the claim changed since this read.
+    expand_patch=$(jq -er --arg target "$expand_to" "$jq_bytes"'
+        select(.metadata.resourceVersion | type == "string" and length > 0)
+        | if (.spec.resources.requests.storage | bytes) >= ($target | bytes) then ""
+          else {metadata: {resourceVersion: .metadata.resourceVersion},
+                spec: {resources: {requests: {storage: $target}}}} | tojson end
+    ' "$tmp/restored.json")
+    if [[ -n "$expand_patch" ]]; then
+        kube -n "$namespace" patch pvc "$claim" --type=merge -p "$expand_patch" >/dev/null
+    else
+        echo "$claim already requests at least $expand_to; leaving its request unchanged."
+    fi
+    # An accepted patch only changes the request. Some drivers grow the disk only
+    # while it is detached, or the filesystem only on the next mount. Bound every
+    # read and sleep by the deadline: kubectl requests have no timeout by default.
+    deadline=$((SECONDS + expand_seconds))
+    : > "$tmp/expanded.json"
+    while :; do
+        # The last read, at the deadline, gets one second.
+        remaining=$((deadline - SECONDS))
+        ((remaining > 0)) || remaining=1
+        # Keep the last successful read for the diagnosis in expansion_incomplete.
+        if kube -n "$namespace" get pvc "$claim" -o json --request-timeout="${remaining}s" > "$tmp/poll.json" && \
+            mv "$tmp/poll.json" "$tmp/expanded.json" && \
+            jq -e --arg target "$expand_to" "$jq_bytes"'
+                (.status.capacity.storage | type == "string") and (.status.capacity.storage | bytes) >= ($target | bytes)
+            ' "$tmp/expanded.json" >/dev/null 2>&1; then
+            break
+        fi
+        ((SECONDS < deadline)) || { expansion_incomplete; exit 1; }
+        remaining=$((deadline - SECONDS))
+        sleep $((remaining < 5 ? remaining : 5))
+    done
+    echo "$claim now has capacity $(jq -r '.status.capacity.storage' "$tmp/expanded.json")."
+fi
 kube -n "$namespace" logs gofer-0 | grep -m1 'persistent storage' || true
 echo
 echo "Restored $claim from $snapshot. Original volume $pv is retained."

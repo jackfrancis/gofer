@@ -179,6 +179,8 @@ SNAPSHOT_KEEP ?= 28
 SNAPSHOT_TIMEOUT ?= 900
 # Bound each pod/PVC deletion wait during a restore.
 RESTORE_TIMEOUT ?= 120s
+# Bound the wait for a restored claim to grow back to its previous size.
+EXPAND_TIMEOUT ?= 300s
 # `make restore SNAPSHOT=<name> CONFIRM=<name>`: the snapshot to restore, named twice.
 SNAPSHOT ?=
 CONFIRM ?=
@@ -631,7 +633,7 @@ restore: deploy-target
 	@KUBE_NS="$(KUBE_NS)" DATA_CLAIM="$(DATA_CLAIM)" \
 		SNAPSHOT="$(SNAPSHOT)" CONFIRM="$(CONFIRM)" \
 		DATA_RECLAIM_POLICY="$(DATA_RECLAIM_POLICY)" RESTORE_TIMEOUT="$(RESTORE_TIMEOUT)" \
-		ROLLOUT_TIMEOUT="$(ROLLOUT_TIMEOUT)" bash hack/restore/restore.sh $(KUBECTL)
+		ROLLOUT_TIMEOUT="$(ROLLOUT_TIMEOUT)" EXPAND_TIMEOUT="$(EXPAND_TIMEOUT)" bash hack/restore/restore.sh $(KUBECTL)
 
 # Tear down gofer's app components (leaves the cluster + AEI in place).
 dev-down:
