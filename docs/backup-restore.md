@@ -139,7 +139,11 @@ waits until it is ready to use, and then deletes the oldest beyond the newest
   error has lasted `SNAPSHOT_WAIT`, timed from `status.error.time` (which the
   controller keeps while the message stays the same), or once it is still erroring
   24 hours after it was created (in case a driver's message changes on every
-  attempt, which restarts that clock). Every run, successful or not, deletes the
+  attempt, which restarts that clock). A snapshot the storage system has already
+  taken (`status.creationTime` is set) never counts as failed: a driver that copies
+  the data in the background reports success before the snapshot is ready, and the
+  controller keeps the earlier error until it is, so such a snapshot is treated as
+  slow (below). Every run, successful or not, deletes the
   labeled snapshots that have failed, even when its own snapshot could not be
   created (a full VolumeSnapshot quota, say). A run's own snapshot rarely qualifies
   by the time the run ends, since its error appeared during the run, so a backup
@@ -150,11 +154,17 @@ waits until it is ready to use, and then deletes the oldest beyond the newest
   finalizer, so a failed snapshot left in place would block
   [restore](#restore-from-a-snapshot). Deleting failed snapshots never lowers the
   count of usable ones, and a snapshot someone is already deleting is left to that
-  deletion (its storage keeps whatever policy it had). The job switches a content to
-  `Delete` only after checking that it belongs to the snapshot being deleted, and it
-  deletes only the version of the snapshot it checked: if the snapshot changes in
-  between (becomes ready, say), it is kept and its content gets its policy back.
-- A snapshot that is merely slow (no error, not ready after ten minutes) is left in
+  deletion (its storage keeps whatever policy it had). Each step is conditional on
+  what the job checked: it deletes a snapshot only if it is still the labeled object
+  it listed, switches a content to `Delete` only if the content belongs to that
+  snapshot and has not changed since it was read, and deletes only the version of
+  the snapshot it checked. If anything changed in between (the snapshot became
+  ready, say), the snapshot is kept and its content gets its policy back. When a
+  request fails without a definite answer, the job reads the objects again to see
+  what happened before undoing anything; if it cannot tell, the job fails and says
+  which content to check.
+- A snapshot that is merely slow (not ready after ten minutes, with no error or
+  already taken and still copying) is left in
   place: it may still finish and be a good backup. If it later fails, a run deletes it
   once it counts as failed; if it finishes, it counts like any other. One that stays unready and
   error-free indefinitely is only removed once it is older than the newest

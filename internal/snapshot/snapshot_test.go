@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -41,13 +42,22 @@ type fakeAPI struct {
 	failGetOf string    // answer GETs of this content with a 500
 	onGet     func(name string, obj map[string]any, n int)
 	onPatch   func(content string) // runs as a content's policy is changed
+	// onContentGet runs after a content has been read, before anything else.
+	onContentGet func(content string)
+	// fault decides how a PATCH or DELETE to path fails: "before" answers 500 without
+	// applying it, "after" applies it and answers 500 (a lost response).
+	fault     func(method, path string) string
+	contentRV map[string]int // content name -> resourceVersion
 	getsByKey map[string]int
 }
+
+// contentUID is the UID the fake gives a content.
+func contentUID(name string) string { return "cuid-" + name }
 
 func newFakeAPI() *fakeAPI {
 	return &fakeAPI{
 		snaps: map[string]map[string]any{}, contents: map[string]string{}, refs: map[string]contentRef{},
-		created: map[string]bool{}, token: "tok", getsByKey: map[string]int{},
+		created: map[string]bool{}, token: "tok", getsByKey: map[string]int{}, contentRV: map[string]int{},
 	}
 }
 
@@ -129,6 +139,20 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.calls = append(f.calls, r.Method+" "+r.URL.Path)
+	fault := ""
+	if f.fault != nil && (r.Method == "PATCH" || r.Method == "DELETE") {
+		fault = f.fault(r.Method, r.URL.Path)
+	}
+	if fault == "before" {
+		http.Error(w, `{"message":"internal error"}`, http.StatusInternalServerError)
+		return
+	}
+	if fault == "after" {
+		w = &lostResponse{ResponseWriter: w}
+		defer func() {
+			http.Error(w.(*lostResponse).ResponseWriter, `{"message":"timeout"}`, http.StatusInternalServerError)
+		}()
+	}
 	switch {
 	case r.Method == "POST" && r.URL.Path == snapPrefix:
 		if f.reject != "" {
@@ -227,35 +251,67 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, `{"message":"etcd unavailable"}`, http.StatusInternalServerError)
 			return
 		}
-		ref, ok := f.refs[name]
+		_, ok := f.refs[name]
 		if !ok {
 			http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"spec": map[string]any{
-			"deletionPolicy":    f.contents[name],
-			"volumeSnapshotRef": map[string]any{"name": ref.name, "namespace": ref.namespace, "uid": ref.uid},
-		}})
+		_ = json.NewEncoder(w).Encode(f.content(name))
+		if f.onContentGet != nil {
+			f.onContentGet(name)
+		}
 	case r.Method == "PATCH" && strings.HasPrefix(r.URL.Path, contentPrefix):
 		if r.Header.Get("Content-Type") != "application/merge-patch+json" {
 			http.Error(w, `{"message":"bad patch type"}`, http.StatusUnsupportedMediaType)
 			return
 		}
+		name := strings.TrimPrefix(r.URL.Path, contentPrefix)
+		if _, ok := f.refs[name]; !ok {
+			http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
+			return
+		}
 		var patch struct {
+			Metadata struct {
+				UID             string `json:"uid"`
+				ResourceVersion string `json:"resourceVersion"`
+			} `json:"metadata"`
 			Spec struct {
 				DeletionPolicy string `json:"deletionPolicy"`
 			} `json:"spec"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&patch)
-		f.contents[strings.TrimPrefix(r.URL.Path, contentPrefix)] = patch.Spec.DeletionPolicy
-		if f.onPatch != nil {
-			f.onPatch(strings.TrimPrefix(r.URL.Path, contentPrefix))
+		if m := patch.Metadata; (m.UID != "" && m.UID != contentUID(name)) || (m.ResourceVersion != "" && m.ResourceVersion != strconv.Itoa(f.contentRV[name])) {
+			http.Error(w, `{"message":"the object has been modified"}`, http.StatusConflict)
+			return
 		}
-		w.WriteHeader(http.StatusOK)
+		f.contents[name] = patch.Spec.DeletionPolicy
+		f.contentRV[name]++
+		if f.onPatch != nil {
+			f.onPatch(name)
+		}
+		_ = json.NewEncoder(w).Encode(f.content(name))
 	default:
 		http.Error(w, `{"message":"unexpected"}`, http.StatusTeapot)
 	}
 }
+
+// content is a content object as the fake serves it.
+func (f *fakeAPI) content(name string) map[string]any {
+	ref := f.refs[name]
+	return map[string]any{
+		"metadata": map[string]any{"name": name, "uid": contentUID(name), "resourceVersion": strconv.Itoa(f.contentRV[name])},
+		"spec": map[string]any{
+			"deletionPolicy":    f.contents[name],
+			"volumeSnapshotRef": map[string]any{"name": ref.name, "namespace": ref.namespace, "uid": ref.uid},
+		},
+	}
+}
+
+// lostResponse swallows a response, so the request is applied but its answer lost.
+type lostResponse struct{ http.ResponseWriter }
+
+func (l *lostResponse) WriteHeader(int)             {}
+func (l *lostResponse) Write(b []byte) (int, error) { return len(b), nil }
 
 func newSnapshotter(t *testing.T, f *fakeAPI) *Snapshotter {
 	t.Helper()
@@ -557,6 +613,167 @@ func TestDeleteLeavesADeletePolicyAlone(t *testing.T) {
 			t.Fatalf("unexpected %s", c)
 		}
 	}
+}
+
+// A snapshot the storage system has already taken (status.creationTime set) is still
+// copying, whatever earlier error it shows: it is slow, not failed.
+func TestPruneKeepsATakenSnapshot(t *testing.T) {
+	f := newFakeAPI()
+	taken := func(name string, created time.Time) {
+		f.addFailed(name, created, managed())
+		f.status(name)["error"].(map[string]any)["time"] = created.Add(time.Minute).Format(time.RFC3339)
+		f.status(name)["creationTime"] = created.Add(11 * time.Minute).Format(time.RFC3339)
+	}
+	taken("copying", ago(time.Hour))
+	taken("copying-long", ago(MaxErrorAge+time.Hour))
+	f.add("good", ago(MaxErrorAge+2*time.Hour), true, managed())
+	s := newSnapshotter(t, f)
+	if deleted, err := s.pruneFailed(context.Background()); err != nil || len(deleted) != 0 {
+		t.Fatalf("a taken snapshot must not count as failed, deleted %v %v", deleted, err)
+	}
+	// Like any slow snapshot, it still goes once it is beyond the newest Keep usable.
+	taken("copying-old", ago(MaxErrorAge+3*time.Hour))
+	s.Keep = 1
+	if deleted, err := s.Prune(context.Background()); err != nil || !slices.Equal(deleted, []string{"copying-old"}) {
+		t.Fatalf("want only the one beyond the window pruned, got %v %v", deleted, err)
+	}
+}
+
+// Wait does not report a taken snapshot as failing.
+func TestWaitTakenIsSlowNotFailing(t *testing.T) {
+	f := newFakeAPI()
+	f.readyAt, f.failWith = -1, "earlier attempt failed"
+	f.onGet = func(_ string, obj map[string]any, _ int) {
+		obj["status"].(map[string]any)["creationTime"] = now.Format(time.RFC3339)
+	}
+	s := newSnapshotter(t, f)
+	name, _ := s.Take(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := s.Wait(ctx, name)
+	var failing *FailedError
+	if errors.As(err, &failing) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want a plain timeout, got %v", err)
+	}
+}
+
+// The snapshot deleted is the one listed: if its labels are removed, or it is
+// replaced under the same name, between the list and the delete, it is left alone.
+func TestDeleteChecksTheListedIdentity(t *testing.T) {
+	for name, change := range map[string]func(obj map[string]any){
+		"labels removed": func(obj map[string]any) { obj["metadata"].(map[string]any)["labels"] = map[string]string{} },
+		"replaced":       func(obj map[string]any) { obj["metadata"].(map[string]any)["uid"] = "uid-a-new-object" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeAPI()
+			f.addFailed("failed", ago(time.Hour), managed())
+			f.onGet = func(_ string, obj map[string]any, _ int) { change(obj) }
+			s := newSnapshotter(t, f)
+			if deleted, err := s.pruneFailed(context.Background()); err != nil || len(deleted) != 0 {
+				t.Fatalf("want nothing deleted, got %v %v", deleted, err)
+			}
+			if f.contents["content-failed"] != "Retain" || len(f.deletes()) != 0 {
+				t.Fatalf("nothing may be touched: policy %q, deletes %v", f.contents["content-failed"], f.deletes())
+			}
+		})
+	}
+}
+
+// The content's switch to Delete is conditional on the content as checked: if it is
+// rebound to another snapshot in between, it is not switched.
+func TestDeleteSwitchesOnlyTheContentChecked(t *testing.T) {
+	f := newFakeAPI()
+	f.addFailed("failed", ago(time.Hour), managed())
+	f.onContentGet = func(name string) {
+		f.refs[name] = contentRef{"good", "gofer", "uid-good"}
+		f.contentRV[name]++
+	}
+	s := newSnapshotter(t, f)
+	if deleted, err := s.pruneFailed(context.Background()); err != nil || len(deleted) != 0 {
+		t.Fatalf("want nothing deleted, got %v %v", deleted, err)
+	}
+	if f.contents["content-failed"] != "Retain" {
+		t.Fatal("a content that changed since it was checked must not be switched")
+	}
+}
+
+// Writes whose outcome is unknown are checked before anything is undone.
+func TestDeleteUncertainWrites(t *testing.T) {
+	t.Run("switch applied, answer lost", func(t *testing.T) {
+		f := newFakeAPI()
+		f.addFailed("failed", ago(time.Hour), managed())
+		patches := 0
+		f.fault = func(method, _ string) string {
+			if method == "PATCH" {
+				if patches++; patches == 1 {
+					return "after"
+				}
+			}
+			return ""
+		}
+		s := newSnapshotter(t, f)
+		if _, err := s.pruneFailed(context.Background()); err == nil {
+			t.Fatal("want the failed switch reported")
+		}
+		if _, ok := f.snaps["failed"]; !ok || f.contents["content-failed"] != "Retain" {
+			t.Fatalf("the snapshot must stay with its policy back to Retain, have %q", f.contents["content-failed"])
+		}
+	})
+	t.Run("delete applied, answer lost", func(t *testing.T) {
+		f := newFakeAPI()
+		f.addFailed("failed", ago(time.Hour), managed())
+		f.fault = func(method, _ string) string {
+			if method == "DELETE" {
+				return "after"
+			}
+			return ""
+		}
+		s := newSnapshotter(t, f)
+		if deleted, err := s.pruneFailed(context.Background()); err != nil || !slices.Equal(deleted, []string{"failed"}) {
+			t.Fatalf("want it counted as deleted, got %v %v", deleted, err)
+		}
+		if f.contents["content-failed"] != "Delete" {
+			t.Fatal("a snapshot that went must keep Delete, or its storage is stranded")
+		}
+	})
+	t.Run("delete not applied", func(t *testing.T) {
+		f := newFakeAPI()
+		f.addFailed("failed", ago(time.Hour), managed())
+		f.fault = func(method, _ string) string {
+			if method == "DELETE" {
+				return "before"
+			}
+			return ""
+		}
+		s := newSnapshotter(t, f)
+		if _, err := s.pruneFailed(context.Background()); err == nil {
+			t.Fatal("want the failed delete reported")
+		}
+		if _, ok := f.snaps["failed"]; !ok || f.contents["content-failed"] != "Retain" {
+			t.Fatalf("the snapshot must stay with its policy back to Retain, have %q", f.contents["content-failed"])
+		}
+	})
+	t.Run("undo answer lost too", func(t *testing.T) {
+		f := newFakeAPI()
+		f.addFailed("failed", ago(time.Hour), managed())
+		f.fault = func(method, _ string) string {
+			switch method {
+			case "DELETE":
+				return "before"
+			case "PATCH":
+				return "after" // every switch, the undo included, loses its answer
+			}
+			return ""
+		}
+		s := newSnapshotter(t, f)
+		_, err := s.pruneFailed(context.Background())
+		if f.contents["content-failed"] != "Retain" {
+			t.Fatalf("the undo must be confirmed by reading back, have %q", f.contents["content-failed"])
+		}
+		if err == nil || strings.Contains(err.Error(), "by hand") {
+			t.Fatalf("want the failed delete reported, without a false alarm about the policy, got %v", err)
+		}
+	})
 }
 
 // A snapshot that recovers between the list and the delete is not deleted.
