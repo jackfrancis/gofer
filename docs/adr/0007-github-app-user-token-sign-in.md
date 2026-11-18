@@ -145,6 +145,20 @@ feature: the `gha_*` tools read job logs with a token that cannot write.
 The ID and key changes also fix renames and reused names on their own, so they could
 ship separately if those start to matter.
 
+**Rolling back once private access has been used.** Phase 1's guard works only on
+live GitHub requests. Ranking, research and Discuss also read what gofer has stored,
+and only phase 2's web-tier filters keep stored private items and `private_access`
+text away from models.
+- Once `GITHUB_PRIVATE_REPOS` has ever been on, rolling the images back to phase 1
+  against the same database would remove those filters, and stored private history
+  would reach the model again.
+- So after private access has been used, a rollback must either keep the phase 2
+  stored-data filters (roll back only to a release that has them), or restore a
+  database backup taken before private access was first turned on
+  (`docs/backup-restore.md`).
+- Before private access is used, phase 2 rolls back to phase 1 freely: nothing private
+  has been stored.
+
 **Gaps phase 1 accepts.** Both exist in today's code, so neither is a regression.
 - A repository that turns private after ingest keeps its stored items, which were
   public when gofer stored them. They can still reach models. A complete public
@@ -788,7 +802,8 @@ again and get `gho_` tokens. A user who never signed in through the app still ha
 legacy row that matches again, but its token was revoked at step 4. Its first 401 is
 confirmed with check-token, and since it has no refresh token, the row is deleted and
 the user is asked to sign in. Revoke the app's tokens, or delete the app. The step-2
-release works under both apps, so no image rollback is needed. The only schema
+release works under both apps, so no image rollback is needed. (Rolling images back
+from phase 2 to phase 1 has its own limit; see "Phasing".) The only schema
 change is the additive `repository_visibility` table, so there is nothing to
 restore.
 
