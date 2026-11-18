@@ -726,7 +726,7 @@ func (t *githubToolBox) ghaJobSummary(ctx context.Context, repo string, job gith
 
 	b.WriteString("  log:\n")
 	if logErr != nil {
-		fmt.Fprintf(&b, "    could not be read: %s\n", oneLine(logErr.Error(), 300))
+		fmt.Fprintf(&b, "    could not be read: %s\n", ghaLogErr(logErr))
 		if tooLarge(logErr) {
 			// The failing step's own log is usually far smaller than the job's.
 			for _, s := range job.Steps {
@@ -796,13 +796,21 @@ func (t *githubToolBox) ghaTail(ctx context.Context, b *strings.Builder, l *ghaL
 func (t *githubToolBox) ghaStepTail(ctx context.Context, b *strings.Builder, l *ghaLog, step int, why string) bool {
 	f, err := t.ghaStepLog(ctx, l, step)
 	if err != nil {
-		fmt.Fprintf(b, "    step %d's own log could not be read: %s\n", step, oneLine(err.Error(), 300))
+		fmt.Fprintf(b, "    step %d's own log could not be read: %s\n", step, ghaLogErr(err))
 		return false
 	}
 	ghaWriteLines(t, b, f, f.Rel, -ghaTailLines, ghaTailLines,
 		fmt.Sprintf("the end of step %d, from its own log (%s, numbered within the step; %s)", step, f.Rel, why))
 	return true
 }
+
+// maxGHALogErr bounds a log error in a summary. A refusal carries the token's and
+// the endpoint's scopes and GitHub's message, which alone can run to a few hundred
+// bytes; the scopes come first in the error, so even a clipped one keeps them.
+const maxGHALogErr = 900
+
+// ghaLogErr renders a job or step log's fetch error for a summary line.
+func ghaLogErr(err error) string { return oneLine(err.Error(), maxGHALogErr) }
 
 // ghaWriteLines writes a window of f as name:line: text lines under a heading.
 func ghaWriteLines(t *githubToolBox, b *strings.Builder, f *prow.File, name string, from, n int, heading string) {

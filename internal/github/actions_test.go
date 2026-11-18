@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackfrancis/gofer/internal/httpretry"
 )
 
 func TestParseActionsURL(t *testing.T) {
@@ -455,3 +457,113 @@ func TestActionsJobLogAPIHopUsesClientTransport(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// A refused log request carries GitHub's own reason and the scope headers, which is
+// what tells a missing scope from an organisation's OAuth App access restriction.
+func TestActionsJobLogForbiddenCarriesReason(t *testing.T) {
+	type resp struct {
+		status  int
+		headers map[string]string
+		body    string
+	}
+	cases := []struct {
+		name    string
+		r       resp
+		is      error
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "org restriction",
+			r: resp{403, map[string]string{"X-OAuth-Scopes": "read:user, user:email", "X-Accepted-OAuth-Scopes": ""},
+				`{"message":"Although you appear to have the correct authorization credentials, the ` + "`example`" + ` organization has enabled OAuth App access restrictions."}`},
+			is: ErrLogForbidden,
+			want: []string{"job log: access denied (status 403)", "GitHub refused this token access to the job log",
+				`GitHub says "Although you appear to have the correct authorization credentials`,
+				"the token's scopes: read:user, user:email", "scopes this endpoint accepts: (none)",
+				"not anything the job itself printed"},
+		},
+		{
+			name: "missing scope",
+			r:    resp{403, map[string]string{"X-OAuth-Scopes": "read:user", "X-Accepted-OAuth-Scopes": "repo"}, `{"message":"Must have admin rights to Repository."}`},
+			is:   ErrLogForbidden,
+			want: []string{`GitHub says "Must have admin rights to Repository."`, "scopes this endpoint accepts: repo"},
+		},
+		{
+			name:    "rate limit",
+			r:       resp{403, map[string]string{"X-RateLimit-Remaining": "0"}, `{"message":"API rate limit exceeded for user."}`},
+			is:      ErrLogRateLimited,
+			want:    []string{"GitHub rate limit (status 403)", `GitHub says "API rate limit exceeded for user."`},
+			notWant: []string{"refused this token access"},
+		},
+		{
+			name: "sso",
+			r:    resp{403, map[string]string{"X-GitHub-SSO": "required; url=https://github.com/orgs/example/sso?authorization_request=abc"}, `{"message":"Resource protected by organization SAML enforcement."}`},
+			is:   ErrLogForbidden,
+			want: []string{"requires SAML SSO authorisation"}, notWant: []string{"authorization_request"},
+		},
+		{
+			name: "not json, long",
+			r:    resp{403, nil, strings.Repeat("x", 20000)},
+			is:   ErrLogForbidden,
+			want: []string{"GitHub refused this token access"}, notWant: []string{"xxxx", "GitHub says"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				for k, v := range c.r.headers {
+					w.Header().Set(k, v)
+				}
+				w.WriteHeader(c.r.status)
+				_, _ = w.Write([]byte(c.r.body))
+			}))
+			defer api.Close()
+			cl := NewClient(api.Client(), api.URL)
+			_, err := cl.ActionsJobLog(context.Background(), "tok", "o/r", 42, &bytes.Buffer{}, 1<<20)
+			if !errors.Is(err, c.is) {
+				t.Fatalf("err = %v, want %v", err, c.is)
+			}
+			for _, w := range c.want {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("error lacks %q: %v", w, err)
+				}
+			}
+			for _, w := range c.notWant {
+				if strings.Contains(err.Error(), w) {
+					t.Errorf("error contains %q: %v", w, err)
+				}
+			}
+		})
+	}
+}
+
+// A long GitHub message is clipped.
+func TestReasonClipsMessage(t *testing.T) {
+	r := reason{message: clipReason(strings.Repeat("é", 400))}
+	if len(r.message) > 304 || !strings.HasSuffix(r.message, "…") {
+		t.Errorf("message not clipped: %d bytes", len(r.message))
+	}
+}
+
+// With the production retry transport, a 429 whose Retry-After outlasts the request
+// deadline still reaches the caller as a rate limit, with GitHub's reason, instead
+// of a bare deadline error.
+func TestActionsJobLogRateLimitThroughRetryTransport(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"message":"You have exceeded a secondary rate limit."}`))
+	}))
+	defer api.Close()
+	c := NewClient(httpretry.Wrap(&http.Client{Timeout: 2 * time.Second}), api.URL)
+	start := time.Now()
+	_, err := c.ActionsJobLog(context.Background(), "tok", "o/r", 42, &bytes.Buffer{}, 1<<20)
+	if !errors.Is(err, ErrLogRateLimited) || !strings.Contains(err.Error(), "status 429") ||
+		!strings.Contains(err.Error(), `GitHub says "You have exceeded a secondary rate limit."`) {
+		t.Fatalf("err = %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Errorf("took %s: it waited out the deadline", time.Since(start))
+	}
+}

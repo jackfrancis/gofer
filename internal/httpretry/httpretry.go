@@ -137,6 +137,19 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return resp, err
 		}
 		attempt := total - *left
+		// The retry's moment is fixed now, before the body is drained: draining a
+		// slow body must not push the retry later than Retry-After asked. A moment
+		// past the request's deadline would only end in the deadline's error,
+		// discarding this result (a 429's status, Retry-After and body tell the
+		// caller more), so return it as it is instead.
+		// One clock reading for both the delay and the moment it ends: an HTTP-date
+		// Retry-After is turned into a delay from this same reading, so a date equal
+		// to the deadline lands exactly on it rather than a hair before.
+		now := time.Now()
+		retryAt := now.Add(retryDelay(resp, base, max, attempt, now))
+		if !beforeDeadline(req.Context(), retryAt) {
+			return resp, err
+		}
 		*left--
 
 		rewound, rerr := rewind(req)
@@ -145,7 +158,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		req = rewound
 		drain(resp)
-		if werr := waitBeforeRetry(req.Context(), resp, base, max, attempt); werr != nil {
+		if werr := sleepCtx(req.Context(), time.Until(retryAt)); werr != nil {
 			return nil, werr
 		}
 	}
@@ -177,21 +190,32 @@ func drain(resp *http.Response) {
 	_ = resp.Body.Close()
 }
 
-// waitBeforeRetry blocks before a retry, returning early if the context is
-// cancelled. A 429 with a Retry-After header uses that delay (capped);
-// otherwise an exponentially growing, half-jittered backoff.
-func waitBeforeRetry(ctx context.Context, prev *http.Response, base, max time.Duration, attempt int) error {
+// retryDelay is how long after now to retry: a Retry-After header's delay
+// (capped), otherwise an exponentially growing, half-jittered backoff.
+func retryDelay(prev *http.Response, base, max time.Duration, attempt int, now time.Time) time.Duration {
 	wait := jitteredBackoff(base, max, attempt)
-	if d, ok := retryAfter(prev); ok {
+	if d, ok := retryAfter(prev, now); ok {
 		wait = d
 		if wait > maxRetryAfter {
 			wait = maxRetryAfter
 		}
 	}
-	if wait <= 0 {
+	return wait
+}
+
+// beforeDeadline reports whether t comes before ctx's deadline (always, without
+// one).
+func beforeDeadline(ctx context.Context, t time.Time) bool {
+	deadline, ok := ctx.Deadline()
+	return !ok || t.Before(deadline)
+}
+
+// sleepCtx blocks for d, returning early if the context is cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
 		return nil
 	}
-	timer := time.NewTimer(wait)
+	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -212,8 +236,9 @@ func jitteredBackoff(base, max time.Duration, attempt int) time.Duration {
 	return half + time.Duration(rand.Int63n(int64(half)+1))
 }
 
-// retryAfter parses a response's Retry-After header (seconds or an HTTP-date).
-func retryAfter(resp *http.Response) (time.Duration, bool) {
+// retryAfter parses a response's Retry-After header (seconds, or an HTTP-date taken
+// relative to now).
+func retryAfter(resp *http.Response, now time.Time) (time.Duration, bool) {
 	if resp == nil {
 		return 0, false
 	}
@@ -228,7 +253,7 @@ func retryAfter(resp *http.Response) (time.Duration, bool) {
 		return time.Duration(secs) * time.Second, true
 	}
 	if when, err := http.ParseTime(v); err == nil {
-		d := time.Until(when)
+		d := when.Sub(now)
 		if d < 0 {
 			d = 0
 		}
