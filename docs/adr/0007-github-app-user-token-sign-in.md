@@ -256,7 +256,8 @@ side effect of someone else's installation.
     - It goes through the visibility gate like any other read.
     - Ingest reports what GitHub returned through a new sink call,
       `BindLegacy(key, ...)`: the issue's `id`, `created_at`, kind (a `pull_request`
-      field means a PR), title, author login, and the repository's ID from the gate.
+      field means a PR), title, author login, and the repository's ID and
+      `created_at` from the gate.
       Ingest does not decide whether the item matches.
   - **The web tier decides, atomically.** In one `worklist.Store.Update` on the stored
     key, it compares the report with what it stored, and binds only if the row is
@@ -272,9 +273,21 @@ side effect of someone else's installation.
       fails this check too, which is the conservative outcome.
     - **Author:** if the stored reasons say the user authored the item, the reported
       author is the user.
-    - **One repository per name:** every legacy item sharing a stored repository name
-      must resolve to the same repository ID. If two disagree, every item under that
-      name stays unverified.
+    - **The issue ID is not already taken.** In the same transaction, the web tier
+      checks whether another row already holds the reported `IssueID`. That happens
+      when a lookup timed out and the same ingest then stored the issue from search
+      under its permanent key. If another row holds it, the legacy row is not bound:
+      it stays unverified, and its thread is not merged into the other row.
+    - **One repository per name, decided as a group.** A report is staged on its row
+      (a store-owned field in the JSON document) rather than published. The web tier
+      binds the items under one stored repository name together, in one transaction,
+      once every unbound legacy item under that name has a staged report or a
+      definite failure (404, or a failed check above).
+      - If the staged reports agree on one repository ID, the passing items are bound
+        together.
+      - If any two disagree, the whole group stays unverified.
+      - A member whose lookup keeps failing transiently holds its group back.
+      - The legacy set is fixed at rollout, so every group is finite.
   - **What a match establishes, and what it does not.**
     - An issue *created in* a replacement repository cannot carry the original's
       creation time, because it was created after the name was given up.
@@ -291,8 +304,8 @@ side effect of someone else's installation.
       private;
     - any check above fails;
     - the item has no stored creation time;
-    - the repository the lookup reached was created after the item's stored creation
-      time. An issue cannot predate the repository it was opened in, short of a
+    - the repository the lookup reached was created (its reported `created_at`) after
+      the item's stored creation time. An issue cannot predate the repository it was opened in, short of a
       transfer, and a transfer is no reason to trust the binding either.
   - **What it covers:** renamed repositories (through the redirect), and closed legacy
     items in unchanged repositories, which produce neither an open search hit nor a
