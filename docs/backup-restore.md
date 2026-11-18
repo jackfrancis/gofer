@@ -129,17 +129,26 @@ Each run takes a VolumeSnapshot of `data-gofer-0` named `data-gofer-0-<UTC time>
 waits until it is ready to use, and then deletes the oldest beyond the newest
 `SNAPSHOT_KEEP` usable ones. The defaults keep a week of six-hourly snapshots.
 
-- A run whose snapshot fails, or is not ready within ten minutes, fails the job and
-  prunes no usable snapshot, so a broken backup never deletes good ones. Watch for
-  failed jobs with `kubectl -n gofer get jobs`.
-- Failed snapshots are deleted, with their stored content, as soon as a run sees
-  them. A snapshot has failed when it reports `status.error` and is not ready to use.
-  A run deletes its own snapshot if it fails, and every run (successful or not)
-  deletes any earlier managed snapshot that has failed since. This matters because
-  the snapshot controller treats any not-ready snapshot as still reading
-  `data-gofer-0` and keeps the claim's `pvc-as-source-protection` finalizer, so a
-  failed snapshot left in place would block [restore](#restore-from-a-snapshot). Deleting failed
-  snapshots never lowers the count of usable ones.
+- A run whose snapshot is not ready within ten minutes (`SNAPSHOT_WAIT`) fails the
+  job and prunes no usable snapshot, so a broken backup never deletes good ones.
+  Watch for failed jobs with `kubectl -n gofer get jobs`.
+- Failed snapshots are deleted, with their stored content. An error alone is not a
+  failure: the snapshot controller records its latest attempt in `status.error`,
+  keeps retrying, and clears the error once an attempt succeeds. So a run keeps
+  waiting through errors, and a snapshot counts as failed only once it has kept
+  reporting one for `SNAPSHOT_WAIT`:
+  - a run deletes its own snapshot if it is still reporting an error when the wait
+    ends;
+  - every run (successful or not, even one whose snapshot could not be created, as
+    when a quota on VolumeSnapshots is full) deletes any earlier labeled snapshot
+    that is older than `SNAPSHOT_WAIT` and reporting an error.
+
+  This matters because the snapshot controller treats any not-ready snapshot as
+  still reading `data-gofer-0` and keeps the claim's `pvc-as-source-protection`
+  finalizer, so a failed snapshot left in place would block
+  [restore](#restore-from-a-snapshot). Deleting failed snapshots never lowers the
+  count of usable ones, and a snapshot someone is already deleting is left to that
+  deletion (its storage keeps whatever policy it had).
 - A snapshot that is merely slow (no error, not ready after ten minutes) is left in
   place: it may still finish and be a good backup. If it later fails, the next run
   deletes it; if it finishes, it counts like any other. One that stays unready and
@@ -204,11 +213,11 @@ unready snapshots of the source claim, and the snapshot-source protection finali
 A failed API read or invalid claim aborts rather than continuing with an empty file.
 
 Existing Jobs are not cancelled by suspending a CronJob. If one is still pending or
-running, let it finish and retry. A backup Job deletes its snapshot if it fails, but
-one that timed out leaves its still-unready snapshot behind, and a snapshot taken by
-hand is never cleaned up for you. Wait for such a snapshot to become ready, or, if it
-has failed, let the next backup run delete it (or delete it yourself) before
-retrying. **Do not remove PVC protection
+running, let it finish and retry. A backup Job deletes its snapshot if it is still
+reporting an error when the job gives up, but one that timed out without an error
+leaves its still-unready snapshot behind, and a snapshot taken by hand is never
+cleaned up for you. Wait for such a snapshot to become ready, or, if it has failed,
+let the next backup run delete it (or delete it yourself) before retrying. **Do not remove PVC protection
 finalizers manually.** The snapshot controller must release the source claim.
 These checks include manual backup Jobs and unlabelled source snapshots, and are
 repeated after shutdown. Do not start another restore, deployment, or manual
@@ -253,6 +262,8 @@ The script never force-removes storage finalizers or deletes an unfinished snaps
 on your behalf, and this restore preflight stays strict. Cleaning up failed backup
 snapshots is the scheduled backup's job (see [Scheduled snapshots](#scheduled-snapshots)),
 so a failed backup no longer blocks restore for long: at most until the next run.
+A snapshot that is still retrying an error is not failed yet, so it can block restore
+until it succeeds or a later run deletes it.
 
 The restore operator needs read access to Jobs and VolumeSnapshots and get/patch
 access to the backup CronJob, in addition to the existing PVC/PV/StatefulSet rights.

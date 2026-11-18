@@ -7,7 +7,9 @@
 //	SNAPSHOT_CLASS  the VolumeSnapshotClass to use (required)
 //	SNAPSHOT_CLAIM  the claim to snapshot (default data-gofer-0)
 //	SNAPSHOT_KEEP   usable snapshots to keep (default 28)
-//	SNAPSHOT_WAIT   how long to wait for the snapshot to be usable (default 10m)
+//	SNAPSHOT_WAIT   how long to wait for the snapshot to be usable (default 10m); also
+//	                how long any snapshot may keep reporting an error before it is
+//	                deleted as failed
 package main
 
 import (
@@ -57,6 +59,7 @@ func run(log *slog.Logger) error {
 		Claim:     getenv("SNAPSHOT_CLAIM", "data-gofer-0"),
 		Class:     class,
 		Keep:      keep,
+		Grace:     wait, // an erroring snapshot gets as long to recover as a new one gets to finish
 		Log:       log,
 	}
 	return s.Run(ctx, wait)

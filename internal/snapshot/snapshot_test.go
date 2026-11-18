@@ -14,26 +14,44 @@ import (
 	"time"
 )
 
+// now is the fake clock every test's Snapshotter runs on; the fake API server stamps
+// new snapshots with it too.
+var now = time.Date(2026, 11, 17, 19, 30, 5, 0, time.UTC)
+
+func ago(d time.Duration) time.Time { return now.Add(-d) }
+
+// contentRef is a VolumeSnapshotContent's back-reference to its snapshot.
+type contentRef struct{ name, namespace, uid string }
+
 // fakeAPI is a tiny stand-in for the API server's snapshot endpoints. It applies the
 // label selector the way the API server would, and records every call.
 type fakeAPI struct {
 	mu        sync.Mutex
 	snaps     map[string]map[string]any // name -> object
 	contents  map[string]string         // content name -> deletionPolicy
+	refs      map[string]contentRef     // content name -> its snapshot reference
+	created   map[string]bool           // snapshots created through POST
 	calls     []string
 	token     string
-	readyAt   int // GETs of a snapshot before it reports ready; -1 never
-	failWith  string
+	readyAt   int    // GETs of a created snapshot before it reports ready; -1 never
+	failWith  string // error a created snapshot reports while not ready
+	unbound   bool   // a created snapshot's status never names its content
+	reject    string // refuse every create with this message
+	failGetOf string // answer GETs of this content with a 500
+	onGet     func(name string, obj map[string]any, n int)
 	getsByKey map[string]int
 }
 
 func newFakeAPI() *fakeAPI {
-	return &fakeAPI{snaps: map[string]map[string]any{}, contents: map[string]string{}, token: "tok", getsByKey: map[string]int{}}
+	return &fakeAPI{
+		snaps: map[string]map[string]any{}, contents: map[string]string{}, refs: map[string]contentRef{},
+		created: map[string]bool{}, token: "tok", getsByKey: map[string]int{},
+	}
 }
 
 func (f *fakeAPI) add(name string, created time.Time, ready bool, labels map[string]string) {
 	f.snaps[name] = map[string]any{
-		"metadata": map[string]any{"name": name, "labels": labels, "creationTimestamp": created.Format(time.RFC3339)},
+		"metadata": map[string]any{"name": name, "uid": "uid-" + name, "labels": labels, "creationTimestamp": created.Format(time.RFC3339)},
 		"status":   map[string]any{"readyToUse": ready, "boundVolumeSnapshotContentName": "content-" + name, "restoreSize": "1Gi"},
 	}
 	f.contents["content-"+name] = "Retain"
@@ -42,12 +60,43 @@ func (f *fakeAPI) add(name string, created time.Time, ready bool, labels map[str
 // addFailed seeds a snapshot that reports an error and is not ready.
 func (f *fakeAPI) addFailed(name string, created time.Time, labels map[string]string) {
 	f.add(name, created, false, labels)
-	f.snaps[name]["status"].(map[string]any)["error"] = map[string]any{"message": "boom"}
+	f.status(name)["error"] = map[string]any{"message": "boom"}
+}
+
+// addUnbound seeds a failed snapshot whose status does not name its content, and a
+// dynamic content for it (snapcontent-<uid>) referring back to ref.
+func (f *fakeAPI) addUnbound(name string, created time.Time, ref contentRef) {
+	f.addFailed(name, created, managed())
+	delete(f.status(name), "boundVolumeSnapshotContentName")
+	delete(f.contents, "content-"+name)
+	f.contents["snapcontent-uid-"+name] = "Retain"
+	f.refs["snapcontent-uid-"+name] = ref
+}
+
+func (f *fakeAPI) status(name string) map[string]any { return f.snaps[name]["status"].(map[string]any) }
+
+func (f *fakeAPI) terminate(obj map[string]any) {
+	obj["metadata"].(map[string]any)["deletionTimestamp"] = now.Format(time.RFC3339)
+}
+
+func (f *fakeAPI) deletes() []string {
+	var out []string
+	for _, c := range f.calls {
+		if name, ok := strings.CutPrefix(c, "DELETE "+snapPrefix+"/"); ok {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 func managed() map[string]string {
 	return map[string]string{LabelManagedBy: ManagedBy, LabelClaim: "data-gofer-0"}
 }
+
+const (
+	snapPrefix    = "/apis/snapshot.storage.k8s.io/v1/namespaces/gofer/volumesnapshots"
+	contentPrefix = "/apis/snapshot.storage.k8s.io/v1/volumesnapshotcontents/"
+)
 
 func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
@@ -57,18 +106,28 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.calls = append(f.calls, r.Method+" "+r.URL.Path)
-	const snapPrefix = "/apis/snapshot.storage.k8s.io/v1/namespaces/gofer/volumesnapshots"
-	const contentPrefix = "/apis/snapshot.storage.k8s.io/v1/volumesnapshotcontents/"
 	switch {
 	case r.Method == "POST" && r.URL.Path == snapPrefix:
+		if f.reject != "" {
+			http.Error(w, `{"message":"`+f.reject+`"}`, http.StatusForbidden)
+			return
+		}
 		var obj map[string]any
 		body, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(body, &obj)
 		meta := obj["metadata"].(map[string]any)
 		name := meta["name"].(string)
-		meta["creationTimestamp"] = time.Date(2026, 11, 17, 19, 30, 5, 0, time.UTC).Format(time.RFC3339) // set by the API server
+		meta["creationTimestamp"] = now.Format(time.RFC3339) // set by the API server
+		meta["uid"] = "uid-" + name
 		f.snaps[name] = obj
-		f.contents["content-"+name] = "Retain" // the class's deletionPolicy, as the controller would bind it
+		f.created[name] = true
+		// The controller binds a content with the class's deletionPolicy.
+		if f.unbound {
+			f.contents["snapcontent-uid-"+name] = "Retain"
+			f.refs["snapcontent-uid-"+name] = contentRef{name, "gofer", "uid-" + name}
+		} else {
+			f.contents["content-"+name] = "Retain"
+		}
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write(body)
 	case r.Method == "GET" && r.URL.Path == snapPrefix:
@@ -98,20 +157,38 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.getsByKey[name]++
-		status := map[string]any{
-			"readyToUse":                     f.readyAt >= 0 && f.getsByKey[name] > f.readyAt,
-			"restoreSize":                    "1Gi",
-			"boundVolumeSnapshotContentName": "content-" + name,
+		if f.created[name] {
+			status := map[string]any{"readyToUse": f.readyAt >= 0 && f.getsByKey[name] > f.readyAt, "restoreSize": "1Gi"}
+			if !f.unbound {
+				status["boundVolumeSnapshotContentName"] = "content-" + name
+			}
+			if f.failWith != "" && !status["readyToUse"].(bool) {
+				status["error"] = map[string]any{"message": f.failWith}
+			}
+			obj["status"] = status
 		}
-		if f.failWith != "" {
-			status["error"] = map[string]any{"message": f.failWith}
+		if f.onGet != nil {
+			f.onGet(name, obj, f.getsByKey[name])
 		}
-		obj["status"] = status
 		_ = json.NewEncoder(w).Encode(obj)
 	case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, snapPrefix+"/"):
 		name := strings.TrimPrefix(r.URL.Path, snapPrefix+"/")
 		delete(f.snaps, name)
 		w.WriteHeader(http.StatusOK)
+	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, contentPrefix):
+		name := strings.TrimPrefix(r.URL.Path, contentPrefix)
+		if name == f.failGetOf {
+			http.Error(w, `{"message":"etcd unavailable"}`, http.StatusInternalServerError)
+			return
+		}
+		ref, ok := f.refs[name]
+		if !ok {
+			http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"spec": map[string]any{
+			"volumeSnapshotRef": map[string]any{"name": ref.name, "namespace": ref.namespace, "uid": ref.uid},
+		}})
 	case r.Method == "PATCH" && strings.HasPrefix(r.URL.Path, contentPrefix):
 		if r.Header.Get("Content-Type") != "application/merge-patch+json" {
 			http.Error(w, `{"message":"bad patch type"}`, http.StatusUnsupportedMediaType)
@@ -141,9 +218,12 @@ func newSnapshotter(t *testing.T, f *fakeAPI) *Snapshotter {
 		Class:     "snaps",
 		Keep:      2,
 		Poll:      time.Millisecond,
-		Now:       func() time.Time { return time.Date(2026, 11, 17, 19, 30, 5, 0, time.UTC) },
+		Now:       func() time.Time { return now },
 	}
 }
+
+// newName is the name Take gives the snapshot it creates at now.
+const newName = "data-gofer-0-20261117-193005"
 
 func TestTakeCreatesALabeledSnapshot(t *testing.T) {
 	f := newFakeAPI()
@@ -152,7 +232,7 @@ func TestTakeCreatesALabeledSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if name != "data-gofer-0-20261117-193005" {
+	if name != newName {
 		t.Fatalf("unexpected name %q", name)
 	}
 	obj := f.snaps[name]
@@ -175,57 +255,67 @@ func TestTakeNeedsAClass(t *testing.T) {
 }
 
 func TestWait(t *testing.T) {
+	wait := func(t *testing.T, f *fakeAPI, d time.Duration) (string, error) {
+		s := newSnapshotter(t, f)
+		name, _ := s.Take(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), d)
+		defer cancel()
+		return s.Wait(ctx, name)
+	}
 	t.Run("ready", func(t *testing.T) {
 		f := newFakeAPI()
 		f.readyAt = 2
-		s := newSnapshotter(t, f)
-		name, _ := s.Take(context.Background())
-		size, err := s.Wait(context.Background(), name)
-		if err != nil || size != "1Gi" {
+		if size, err := wait(t, f, time.Second); err != nil || size != "1Gi" {
 			t.Fatalf("want ready with a size, got %q %v", size, err)
 		}
 	})
-	t.Run("failed", func(t *testing.T) {
+	// The controller retries after an error, so an error does not end the wait.
+	t.Run("recovers from an error", func(t *testing.T) {
 		f := newFakeAPI()
-		f.readyAt, f.failWith = -1, "quota exceeded"
-		s := newSnapshotter(t, f)
-		name, _ := s.Take(context.Background())
-		if _, err := s.Wait(context.Background(), name); err == nil || !strings.Contains(err.Error(), "quota exceeded") {
-			t.Fatalf("want the snapshot's error, got %v", err)
+		f.readyAt, f.failWith = 1, "transient"
+		if size, err := wait(t, f, time.Second); err != nil || size != "1Gi" {
+			t.Fatalf("want the retried snapshot ready, got %q %v", size, err)
 		}
 	})
 	t.Run("ready despite a stale error", func(t *testing.T) {
 		f := newFakeAPI()
-		f.readyAt, f.failWith = 0, "transient"
-		s := newSnapshotter(t, f)
-		name, _ := s.Take(context.Background())
-		if size, err := s.Wait(context.Background(), name); err != nil || size != "1Gi" {
+		f.readyAt = 0
+		f.onGet = func(_ string, obj map[string]any, _ int) {
+			obj["status"].(map[string]any)["error"] = map[string]any{"message": "old"}
+		}
+		if size, err := wait(t, f, time.Second); err != nil || size != "1Gi" {
 			t.Fatalf("a snapshot ready to use is usable, got %q %v", size, err)
+		}
+	})
+	t.Run("still failing", func(t *testing.T) {
+		f := newFakeAPI()
+		f.readyAt, f.failWith = -1, "quota exceeded"
+		_, err := wait(t, f, 20*time.Millisecond)
+		var failing *FailedError
+		if !errors.As(err, &failing) || failing.Message != "quota exceeded" || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("want a FailedError wrapping the deadline, got %v", err)
 		}
 	})
 	t.Run("timeout", func(t *testing.T) {
 		f := newFakeAPI()
 		f.readyAt = -1
-		s := newSnapshotter(t, f)
-		name, _ := s.Take(context.Background())
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-		defer cancel()
-		if _, err := s.Wait(ctx, name); err == nil {
-			t.Fatal("want a timeout")
+		_, err := wait(t, f, 20*time.Millisecond)
+		var failing *FailedError
+		if errors.As(err, &failing) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("want a plain timeout, got %v", err)
 		}
 	})
 }
 
 func TestPrune(t *testing.T) {
 	f := newFakeAPI()
-	base := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
-	day := func(n int) time.Time { return base.Add(time.Duration(n) * 24 * time.Hour) }
+	day := func(n int) time.Time { return ago(time.Duration(7-n) * 24 * time.Hour) }
 	f.add("in-progress", day(6), false, managed())      // newest, not ready yet: keep
 	f.add("good-5", day(5), true, managed())            // usable #1: keep
-	f.add("failed-4", day(4), false, managed())         // between keepers: keep
+	f.add("pending-4", day(4), false, managed())        // between keepers: keep
 	f.add("good-3", day(3), true, managed())            // usable #2: keep
 	f.add("good-2", day(2), true, managed())            // beyond Keep=2: delete
-	f.add("failed-1", day(1), false, managed())         // beyond: delete
+	f.add("pending-1", day(1), false, managed())        // beyond: delete
 	f.add("by-hand", day(0), true, map[string]string{}) // not managed: never touched
 	f.add("other-claim", day(0), true, map[string]string{LabelManagedBy: ManagedBy, LabelClaim: "other"})
 	s := newSnapshotter(t, f)
@@ -235,17 +325,17 @@ func TestPrune(t *testing.T) {
 		t.Fatal(err)
 	}
 	slices.Sort(deleted)
-	if !slices.Equal(deleted, []string{"failed-1", "good-2"}) {
+	if !slices.Equal(deleted, []string{"good-2", "pending-1"}) {
 		t.Fatalf("deleted %v", deleted)
 	}
-	for _, name := range []string{"in-progress", "good-5", "failed-4", "good-3", "by-hand", "other-claim"} {
+	for _, name := range []string{"in-progress", "good-5", "pending-4", "good-3", "by-hand", "other-claim"} {
 		if _, ok := f.snaps[name]; !ok {
 			t.Errorf("%s must be kept", name)
 		}
 	}
 	// Each pruned snapshot's stored content is switched to Delete first, so the
 	// storage goes with it; kept ones stay Retain.
-	if f.contents["content-good-2"] != "Delete" || f.contents["content-failed-1"] != "Delete" {
+	if f.contents["content-good-2"] != "Delete" || f.contents["content-pending-1"] != "Delete" {
 		t.Fatalf("pruned contents must be set to Delete, got %v", f.contents)
 	}
 	if f.contents["content-good-3"] != "Retain" {
@@ -258,16 +348,16 @@ func TestPrune(t *testing.T) {
 	}
 }
 
-// Failed snapshots go wherever they sit; in-progress ones inside the window and
-// usable ones up to Keep stay.
+// Failed snapshots go wherever they sit; in-progress ones inside the window, ones
+// still within their grace period, and usable ones up to Keep stay.
 func TestPruneDeletesFailedAnywhere(t *testing.T) {
 	f := newFakeAPI()
-	base := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
-	day := func(n int) time.Time { return base.Add(time.Duration(n) * 24 * time.Hour) }
-	f.addFailed("failed-8", day(8), managed())     // newest, failed: delete
-	f.add("in-progress", day(7), false, managed()) // not ready, no error: keep
-	f.add("stale-error", day(6), true, managed())  // ready with an old error: usable #1, keep
-	f.snaps["stale-error"]["status"].(map[string]any)["error"] = map[string]any{"message": "transient"}
+	day := func(n int) time.Time { return ago(time.Duration(9-n) * 24 * time.Hour) }
+	f.addFailed("failed-8", day(8), managed())           // failed, newest: delete
+	f.addFailed("retrying", ago(time.Minute), managed()) // erroring, within grace: keep
+	f.add("in-progress", day(7), false, managed())       // not ready, no error: keep
+	f.add("stale-error", day(6), true, managed())        // ready with an old error: usable #1, keep
+	f.status("stale-error")["error"] = map[string]any{"message": "transient"}
 	f.addFailed("failed-5", day(5), managed())          // between keepers: delete
 	f.add("good-4", day(4), true, managed())            // usable #2: keep
 	f.add("good-3", day(3), true, managed())            // beyond Keep=2: delete
@@ -283,7 +373,7 @@ func TestPruneDeletesFailedAnywhere(t *testing.T) {
 	if !slices.Equal(deleted, []string{"failed-2", "failed-5", "failed-8", "good-3"}) {
 		t.Fatalf("deleted %v", deleted)
 	}
-	for _, name := range []string{"in-progress", "stale-error", "good-4", "by-hand"} {
+	for _, name := range []string{"retrying", "in-progress", "stale-error", "good-4", "by-hand"} {
 		if _, ok := f.snaps[name]; !ok {
 			t.Errorf("%s must be kept", name)
 		}
@@ -293,13 +383,47 @@ func TestPruneDeletesFailedAnywhere(t *testing.T) {
 	}
 }
 
+// The grace period is the Snapshotter's to set.
+func TestPruneGrace(t *testing.T) {
+	f := newFakeAPI()
+	f.addFailed("erroring", ago(30*time.Minute), managed())
+	f.add("good", ago(time.Hour), true, managed())
+	s := newSnapshotter(t, f)
+	s.Grace = time.Hour
+	if deleted, err := s.Prune(context.Background()); err != nil || len(deleted) != 0 {
+		t.Fatalf("an error younger than the grace period must be kept, got %v %v", deleted, err)
+	}
+	s.Grace = 20 * time.Minute
+	if deleted, err := s.Prune(context.Background()); err != nil || !slices.Equal(deleted, []string{"erroring"}) {
+		t.Fatalf("want the erroring snapshot deleted past its grace, got %v %v", deleted, err)
+	}
+}
+
+// A snapshot that recovers between the list and the delete is not deleted.
+func TestPruneRechecksBeforeDeleting(t *testing.T) {
+	f := newFakeAPI()
+	f.addFailed("recovered", ago(time.Hour), managed())
+	f.add("good", ago(2*time.Hour), true, managed())
+	f.onGet = func(name string, obj map[string]any, _ int) {
+		if name == "recovered" {
+			obj["status"] = map[string]any{"readyToUse": true, "boundVolumeSnapshotContentName": "content-recovered"}
+		}
+	}
+	s := newSnapshotter(t, f)
+	if deleted, err := s.Prune(context.Background()); err != nil || len(deleted) != 0 {
+		t.Fatalf("want nothing deleted, got %v %v", deleted, err)
+	}
+	if f.contents["content-recovered"] != "Retain" {
+		t.Fatal("a recovered snapshot's content must stay Retain")
+	}
+}
+
 // Deleting failed snapshots never lowers the number of usable ones below Keep.
 func TestPruneFailedNeverCostsAUsableOne(t *testing.T) {
 	f := newFakeAPI()
-	base := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
 	for i := range 3 {
-		f.addFailed("failed-"+string(rune('a'+i)), base.Add(time.Duration(2*i)*time.Hour), managed())
-		f.add("good-"+string(rune('a'+i)), base.Add(time.Duration(2*i+1)*time.Hour), true, managed())
+		f.addFailed("failed-"+string(rune('a'+i)), ago(time.Duration(10-2*i)*time.Hour), managed())
+		f.add("good-"+string(rune('a'+i)), ago(time.Duration(9-2*i)*time.Hour), true, managed())
 	}
 	s := newSnapshotter(t, f)
 	s.Keep = 3
@@ -316,22 +440,23 @@ func TestPruneFailedNeverCostsAUsableOne(t *testing.T) {
 	}
 }
 
-// pruneFailed touches only failed snapshots, never usable or in-progress ones.
+// pruneFailed touches only failed snapshots, never usable, in-progress or still
+// retrying ones.
 func TestPruneFailedOnly(t *testing.T) {
 	f := newFakeAPI()
-	base := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
 	for i := range 4 {
-		f.add("good-"+string(rune('a'+i)), base.Add(time.Duration(i)*time.Hour), true, managed())
+		f.add("good-"+string(rune('a'+i)), ago(time.Duration(i+1)*time.Hour), true, managed())
 	}
-	f.add("old-in-progress", base.Add(-time.Hour), false, managed())
-	f.addFailed("failed", base.Add(-2*time.Hour), managed())
+	f.add("old-in-progress", ago(9*time.Hour), false, managed())
+	f.addFailed("retrying", ago(time.Minute), managed())
+	f.addFailed("failed", ago(10*time.Hour), managed())
 	s := newSnapshotter(t, f)
 	s.Keep = 1
 	deleted, err := s.pruneFailed(context.Background())
 	if err != nil || !slices.Equal(deleted, []string{"failed"}) {
 		t.Fatalf("want only the failed one deleted, got %v %v", deleted, err)
 	}
-	if len(f.snaps) != 5 {
+	if len(f.snaps) != 6 {
 		t.Fatalf("have %v", keys(f.snaps))
 	}
 }
@@ -339,11 +464,12 @@ func TestPruneFailedOnly(t *testing.T) {
 // A snapshot already being deleted is neither counted as a backup nor deleted again.
 func TestPruneSkipsTerminating(t *testing.T) {
 	f := newFakeAPI()
-	base := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
-	f.add("going", base.Add(3*time.Hour), true, managed())
-	f.snaps["going"]["metadata"].(map[string]any)["deletionTimestamp"] = base.Format(time.RFC3339)
-	f.add("good-b", base.Add(2*time.Hour), true, managed())
-	f.add("good-a", base.Add(time.Hour), true, managed())
+	f.add("going", ago(time.Hour), true, managed())
+	f.terminate(f.snaps["going"])
+	f.addFailed("failed-going", ago(time.Hour), managed())
+	f.terminate(f.snaps["failed-going"])
+	f.add("good-b", ago(2*time.Hour), true, managed())
+	f.add("good-a", ago(3*time.Hour), true, managed())
 	s := newSnapshotter(t, f)
 	s.Keep = 2
 	deleted, err := s.Prune(context.Background())
@@ -360,7 +486,7 @@ func TestPruneSkipsTerminating(t *testing.T) {
 // Pruning never removes the last usable snapshot, whatever Keep says.
 func TestPruneKeepsAtLeastOne(t *testing.T) {
 	f := newFakeAPI()
-	f.add("only", time.Now(), true, managed())
+	f.add("only", ago(time.Hour), true, managed())
 	s := newSnapshotter(t, f)
 	s.Keep = 0
 	if deleted, err := s.Prune(context.Background()); err != nil || len(deleted) != 0 {
@@ -368,29 +494,76 @@ func TestPruneKeepsAtLeastOne(t *testing.T) {
 	}
 }
 
-// A run whose snapshot fails deletes that snapshot (and its stored content) and any
-// earlier failed one, but prunes nothing else, so a broken backup cannot delete good
-// ones.
+// A failed snapshot whose status never named its content still takes its storage
+// with it: the content is found by the controller's naming and its back-reference.
+func TestDeleteFindsUnboundContent(t *testing.T) {
+	t.Run("matching back-reference", func(t *testing.T) {
+		f := newFakeAPI()
+		f.addUnbound("failed", ago(time.Hour), contentRef{"failed", "gofer", "uid-failed"})
+		s := newSnapshotter(t, f)
+		if deleted, err := s.pruneFailed(context.Background()); err != nil || !slices.Equal(deleted, []string{"failed"}) {
+			t.Fatalf("want it deleted, got %v %v", deleted, err)
+		}
+		if f.contents["snapcontent-uid-failed"] != "Delete" {
+			t.Fatal("the unbound content must be set to Delete")
+		}
+	})
+	t.Run("someone else's content", func(t *testing.T) {
+		f := newFakeAPI()
+		f.addUnbound("failed", ago(time.Hour), contentRef{"failed", "gofer", "uid-of-an-older-object"})
+		s := newSnapshotter(t, f)
+		if deleted, err := s.pruneFailed(context.Background()); err != nil || !slices.Equal(deleted, []string{"failed"}) {
+			t.Fatalf("want it deleted, got %v %v", deleted, err)
+		}
+		if f.contents["snapcontent-uid-failed"] != "Retain" {
+			t.Fatal("a content that does not refer back to the snapshot must not be touched")
+		}
+	})
+	t.Run("lookup fails", func(t *testing.T) {
+		f := newFakeAPI()
+		f.addUnbound("failed", ago(time.Hour), contentRef{"failed", "gofer", "uid-failed"})
+		f.failGetOf = "snapcontent-uid-failed"
+		s := newSnapshotter(t, f)
+		if _, err := s.pruneFailed(context.Background()); err == nil {
+			t.Fatal("want the lookup error")
+		}
+		if _, ok := f.snaps["failed"]; !ok {
+			t.Fatal("unsure where its storage is, the snapshot must be kept")
+		}
+	})
+	t.Run("no content", func(t *testing.T) {
+		f := newFakeAPI()
+		f.addUnbound("failed", ago(time.Hour), contentRef{})
+		delete(f.refs, "snapcontent-uid-failed")
+		s := newSnapshotter(t, f)
+		if deleted, err := s.pruneFailed(context.Background()); err != nil || !slices.Equal(deleted, []string{"failed"}) {
+			t.Fatalf("want it deleted, got %v %v", deleted, err)
+		}
+	})
+}
+
+// A run whose snapshot is still failing when the wait ends deletes it (and its stored
+// content) and any earlier failed one, but prunes nothing else, so a broken backup
+// cannot delete good ones.
 func TestRunDeletesItsFailedSnapshot(t *testing.T) {
 	f := newFakeAPI()
 	f.readyAt, f.failWith = -1, "boom"
 	for i := range 4 {
-		f.add("old-"+string(rune('a'+i)), time.Now().Add(-time.Duration(i+1)*time.Hour), true, managed())
+		f.add("old-"+string(rune('a'+i)), ago(time.Duration(i+1)*time.Hour), true, managed())
 	}
-	f.addFailed("earlier-failed", time.Now().Add(-30*time.Minute), managed())
+	f.addFailed("earlier-failed", ago(30*time.Minute), managed())
 	s := newSnapshotter(t, f)
 	s.Keep = 1
-	err := s.Run(context.Background(), time.Second)
-	var failed *FailedError
-	if !errors.As(err, &failed) || failed.Message != "boom" {
-		t.Fatalf("want the failed snapshot to fail the run, got %v", err)
+	err := s.Run(context.Background(), 50*time.Millisecond)
+	var failing *FailedError
+	if !errors.As(err, &failing) || failing.Message != "boom" {
+		t.Fatalf("want the failing snapshot to fail the run, got %v", err)
 	}
-	const name = "data-gofer-0-20261117-193005"
-	if _, ok := f.snaps[name]; ok {
+	if _, ok := f.snaps[newName]; ok {
 		t.Fatal("the run's failed snapshot must be deleted")
 	}
-	if f.contents["content-"+name] != "Delete" {
-		t.Fatalf("the failed snapshot's content must be set to Delete, got %q", f.contents["content-"+name])
+	if f.contents["content-"+newName] != "Delete" {
+		t.Fatalf("the failed snapshot's content must be set to Delete, got %q", f.contents["content-"+newName])
 	}
 	if _, ok := f.snaps["earlier-failed"]; ok {
 		t.Fatal("an earlier failed snapshot must be deleted too")
@@ -402,27 +575,46 @@ func TestRunDeletesItsFailedSnapshot(t *testing.T) {
 	}
 }
 
+// A snapshot that reports an error and then succeeds on the controller's retry is a
+// good backup, and the run carries on as usual.
+func TestRunKeepsASnapshotThatRecovers(t *testing.T) {
+	f := newFakeAPI()
+	f.readyAt, f.failWith = 1, "transient"
+	f.add("old-a", ago(time.Hour), true, managed())
+	f.add("old-b", ago(2*time.Hour), true, managed())
+	s := newSnapshotter(t, f)
+	s.Keep = 2
+	if err := s.Run(context.Background(), time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.snaps[newName]; !ok || f.contents["content-"+newName] != "Retain" {
+		t.Fatal("the recovered snapshot must stay, with its storage retained")
+	}
+	if !slices.Equal(f.deletes(), []string{"old-b"}) {
+		t.Fatalf("want only the oldest beyond Keep pruned, deleted %v", f.deletes())
+	}
+}
+
 // A run whose snapshot is merely slow leaves it in place (it may still finish) and
 // prunes nothing usable, but still clears out snapshots that have failed.
 func TestRunLeavesASlowSnapshot(t *testing.T) {
 	f := newFakeAPI()
 	f.readyAt = -1
 	for i := range 3 {
-		f.add("old-"+string(rune('a'+i)), time.Now().Add(-time.Duration(i+1)*time.Hour), true, managed())
+		f.add("old-"+string(rune('a'+i)), ago(time.Duration(i+1)*time.Hour), true, managed())
 	}
-	f.addFailed("earlier-failed", time.Now().Add(-30*time.Minute), managed())
+	f.addFailed("earlier-failed", ago(30*time.Minute), managed())
 	s := newSnapshotter(t, f)
 	s.Keep = 1
 	err := s.Run(context.Background(), 20*time.Millisecond)
-	var failed *FailedError
-	if err == nil || errors.As(err, &failed) || !errors.Is(err, context.DeadlineExceeded) {
+	var failing *FailedError
+	if err == nil || errors.As(err, &failing) || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("want a timeout, got %v", err)
 	}
-	const name = "data-gofer-0-20261117-193005"
-	if _, ok := f.snaps[name]; !ok {
+	if _, ok := f.snaps[newName]; !ok {
 		t.Fatal("a snapshot that is only slow must be left to finish")
 	}
-	if f.contents["content-"+name] != "Retain" {
+	if f.contents["content-"+newName] != "Retain" {
 		t.Fatal("a slow snapshot's content must stay Retain")
 	}
 	if _, ok := f.snaps["earlier-failed"]; ok {
@@ -433,19 +625,63 @@ func TestRunLeavesASlowSnapshot(t *testing.T) {
 	}
 }
 
+// If someone starts deleting the run's snapshot while it waits, their deletion stands
+// as they made it: the run does not switch its storage from Retain to Delete.
+func TestRunLeavesAnOperatorsDeletionAlone(t *testing.T) {
+	f := newFakeAPI()
+	f.readyAt, f.failWith = -1, "boom"
+	f.onGet = func(name string, obj map[string]any, n int) {
+		if name == newName && n >= 2 {
+			f.terminate(obj)
+		}
+	}
+	s := newSnapshotter(t, f)
+	var failing *FailedError
+	if err := s.Run(context.Background(), 30*time.Millisecond); !errors.As(err, &failing) {
+		t.Fatalf("want the failing snapshot to fail the run, got %v", err)
+	}
+	if f.contents["content-"+newName] != "Retain" {
+		t.Fatal("an operator's deletion must keep the storage policy they chose")
+	}
+	if len(f.deletes()) != 0 {
+		t.Fatalf("the run must not delete a snapshot already being deleted, deleted %v", f.deletes())
+	}
+}
+
+// If the snapshot cannot even be created (an earlier failed one may be what fills the
+// namespace's snapshot quota), failed snapshots are still cleaned up.
+func TestRunCleansUpWhenCreateIsRejected(t *testing.T) {
+	f := newFakeAPI()
+	f.reject = "exceeded quota: count/volumesnapshots.snapshot.storage.k8s.io"
+	f.addFailed("earlier-failed", ago(time.Hour), managed())
+	f.add("good", ago(2*time.Hour), true, managed())
+	s := newSnapshotter(t, f)
+	s.Keep = 1
+	err := s.Run(context.Background(), time.Second)
+	if err == nil || !strings.Contains(err.Error(), "exceeded quota") {
+		t.Fatalf("want the create error, got %v", err)
+	}
+	if _, ok := f.snaps["earlier-failed"]; ok {
+		t.Fatal("the failed snapshot must be deleted")
+	}
+	if _, ok := f.snaps["good"]; !ok {
+		t.Fatal("a usable snapshot must stay")
+	}
+}
+
 // When the job itself is stopped, the run does not go on deleting things.
 func TestRunCancelledCleansNothing(t *testing.T) {
 	f := newFakeAPI()
-	f.readyAt = -1
-	f.addFailed("earlier-failed", time.Now().Add(-30*time.Minute), managed())
+	f.readyAt, f.failWith = -1, "boom"
+	f.addFailed("earlier-failed", ago(time.Hour), managed())
 	s := newSnapshotter(t, f)
 	ctx, cancel := context.WithCancel(context.Background())
 	time.AfterFunc(20*time.Millisecond, cancel)
 	if err := s.Run(ctx, time.Minute); !errors.Is(err, context.Canceled) {
 		t.Fatalf("want cancellation, got %v", err)
 	}
-	if _, ok := f.snaps["earlier-failed"]; !ok {
-		t.Fatal("a cancelled run must not clean up")
+	if len(f.deletes()) != 0 {
+		t.Fatalf("a cancelled run must not clean up, deleted %v", f.deletes())
 	}
 }
 
@@ -464,7 +700,7 @@ func TestRunTakesWaitsAndPrunes(t *testing.T) {
 	if len(f.snaps) != 2 {
 		t.Fatalf("want 2 snapshots left, have %v", keys(f.snaps))
 	}
-	if _, ok := f.snaps["data-gofer-0-20261117-193005"]; !ok {
+	if _, ok := f.snaps[newName]; !ok {
 		t.Fatal("the new snapshot must stay")
 	}
 }

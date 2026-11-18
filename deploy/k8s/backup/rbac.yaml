@@ -35,8 +35,9 @@ subjects:
 # stored snapshots (deletionPolicy Retain) so an accidental deletion loses nothing,
 # and pruning (or deleting a failed snapshot) switches one content to Delete just
 # before deleting its snapshot.
-# VolumeSnapshotContents are cluster-scoped, so this needs a ClusterRole. It can only
-# read and patch them, not create or delete them.
+# It reads a content to confirm it belongs to a failed snapshot whose status never
+# named it. VolumeSnapshotContents are cluster-scoped, so this needs a ClusterRole. It
+# can only read and patch them, not create or delete them.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
