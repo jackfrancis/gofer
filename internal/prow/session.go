@@ -1,6 +1,7 @@
 package prow
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -218,7 +219,46 @@ func (s *Session) Fetch(ctx context.Context, job Job, rel string) (*File, error)
 	if strings.HasSuffix(object, "/") {
 		return nil, fmt.Errorf("a file path is required")
 	}
-	key := job.Bucket + "/" + object
+	cleanRel, _ := CleanRel(rel)
+	fetch := func(ctx context.Context, w io.Writer, max int64) (int64, error) {
+		return s.c.Fetch(ctx, job.Bucket, object, w, max)
+	}
+	return s.fetch(ctx, job.Bucket+"/"+object, object, cleanRel, fetch, FetchOptions{})
+}
+
+// FetchFunc downloads one log into w, writing at most max bytes (more is an error
+// wrapping ErrTooLarge), and returns the bytes written. A missing log is an error
+// wrapping ErrNotFound.
+type FetchFunc func(ctx context.Context, w io.Writer, max int64) (int64, error)
+
+// FetchOptions adjust how a fetched log is stored.
+type FetchOptions struct {
+	// LineHead, when set, sees the first bytes (up to MaxLineHead) of every stored
+	// line, numbered as Search and Read number them, and returns how many of those
+	// bytes to drop: a per-line timestamp, say. It runs while the session is locked
+	// and must not call the session.
+	LineHead func(num int, head []byte) (drop int)
+}
+
+// MaxLineHead is the most of a line FetchOptions.LineHead is shown.
+const MaxLineHead = 64
+
+// FetchWith stores a log that is not a Prow job object (a GitHub Actions job log),
+// fetched by fetch, under key, with everything Fetch gives a job object: the
+// per-run byte, object and time budgets, the scratch directory, normalisation, and
+// the cache — a second call with the same key returns the stored file (or the
+// remembered failure) without fetching, and without calling opt.LineHead. key must
+// not collide with a "bucket/object" name; prefix it with a scheme ("gha:…"). rel
+// names the file in results.
+func (s *Session) FetchWith(ctx context.Context, key, rel string, fetch FetchFunc, opt FetchOptions) (*File, error) {
+	if key == "" || !strings.Contains(key, ":") {
+		return nil, fmt.Errorf("prow: FetchWith key must be scheme-qualified")
+	}
+	return s.fetch(ctx, key, key, rel, fetch, opt)
+}
+
+// fetch is Fetch and FetchWith: budgets, caching, and the timeout around download.
+func (s *Session) fetch(ctx context.Context, key, object, rel string, fetch FetchFunc, opt FetchOptions) (*File, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if f, ok := s.files[key]; ok {
@@ -242,12 +282,11 @@ func (s *Session) Fetch(ctx context.Context, job Job, rel string) (*File, error)
 	cctx, cancel := context.WithTimeout(ctx, t)
 	defer cancel()
 
-	cleanRel, _ := CleanRel(rel)
-	f := &File{Object: object, Rel: cleanRel}
+	f := &File{Object: object, Rel: rel}
 	s.fetched++
-	f.err = s.download(cctx, job.Bucket, f, max)
+	f.err = s.download(cctx, f, max, fetch, opt)
 	if f.err != nil && cctx.Err() != nil && ctx.Err() == nil {
-		f.err = fmt.Errorf("fetching %s timed out", cleanRel)
+		f.err = fmt.Errorf("fetching %s timed out", rel)
 	}
 	s.files[key] = f
 	return f, f.err
@@ -255,7 +294,7 @@ func (s *Session) Fetch(ctx context.Context, job Job, rel string) (*File, error)
 
 // download fetches one object to a raw file, then stores it normalised (text) or as
 // is (binary). Caller holds mu.
-func (s *Session) download(ctx context.Context, bucket string, f *File, max int64) error {
+func (s *Session) download(ctx context.Context, f *File, max int64, fetch FetchFunc, opt FetchOptions) error {
 	s.seq++
 	rawName := strconv.Itoa(s.seq) + ".raw"
 	raw, err := s.root.OpenFile(rawName, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
@@ -266,7 +305,7 @@ func (s *Session) download(ctx context.Context, bucket string, f *File, max int6
 		_ = raw.Close()
 		_ = s.root.Remove(rawName)
 	}()
-	n, err := s.c.Fetch(ctx, bucket, f.Object, raw, max)
+	n, err := fetch(ctx, raw, max)
 	s.downloaded += n
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -290,7 +329,21 @@ func (s *Session) download(ctx context.Context, bucket string, f *File, max int6
 		_ = out.Close()
 		return err
 	}
-	size, err := normalize(out, raw)
+	var size int64
+	if opt.LineHead != nil {
+		// headWriter writes line by line; buffer those writes on their way to disk.
+		bw := bufio.NewWriterSize(out, 64<<10)
+		hw := &headWriter{w: bw, fn: opt.LineHead, collecting: true}
+		if _, err = normalize(ctx, hw, raw); err == nil {
+			err = hw.finish()
+		}
+		if ferr := bw.Flush(); err == nil {
+			err = ferr
+		}
+		size = hw.n
+	} else {
+		size, err = normalize(ctx, out, raw)
+	}
 	if cerr := out.Close(); err == nil {
 		err = cerr
 	}

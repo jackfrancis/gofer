@@ -1,8 +1,9 @@
 // Read-only GitHub tools for the assistive conversation. The runtime injects
 // these behind the neutral worklist.ToolBox seam so the model can look up live
 // data — a file at a ref, a PR/issue's state and discussion, a search, a whole
-// repository checked out at a ref (repotools.go), and a PR's CI results and the
-// public logs of its Prow jobs (citools.go) — while gofer core imports
+// repository checked out at a ref (repotools.go), a PR's CI results and the
+// public logs of its Prow jobs (citools.go), and its GitHub Actions job logs
+// (ghatools.go) — while gofer core imports
 // no provider client. Every tool only ever reads, with the user's vended
 // credential; access is bounded by that token's own scopes, and reach spans any
 // repository the token can see.
@@ -25,7 +26,8 @@ type githubToolBox struct {
 	token       string
 	defaultRepo string         // the item's repo, used when a call omits "repo"
 	repos       *repoCheckouts // this run's repository checkouts (repotools.go)
-	ci          *prow.Session  // this run's CI job artifacts (citools.go)
+	ci          *prow.Session  // this run's CI job artifacts and Actions job logs (citools.go)
+	gha         ghaLogs        // this run's Actions job logs, by job (ghatools.go)
 }
 
 var _ worklist.ToolBox = (*githubToolBox)(nil)

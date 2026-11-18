@@ -1,6 +1,7 @@
 package prow
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -18,7 +19,7 @@ func TestNormalize(t *testing.T) {
 		"\r\x1b[2Kprogress\r\x1b[2Kdone\n": "\nprogress\ndone\n",
 	} {
 		var b strings.Builder
-		if _, err := normalize(&b, strings.NewReader(in)); err != nil {
+		if _, err := normalize(context.Background(), &b, strings.NewReader(in)); err != nil {
 			t.Fatal(err)
 		}
 		if b.String() != want {
@@ -51,5 +52,72 @@ func TestClipLine(t *testing.T) {
 	}
 	if got := clipLine("é\xffx", 0, 300); got != "é�x" {
 		t.Fatalf("invalid UTF-8 = %q", got)
+	}
+}
+
+func TestHeadWriter(t *testing.T) {
+	long := strings.Repeat("y", MaxLineHead*3)
+	in := "TS1 a\nTS2 b\n\n" + "TS3 " + long + "\n" + strings.Repeat("z", MaxLineHead) + "\nTS4 end"
+	var heads []string
+	var nums []int
+	var out strings.Builder
+	h := &headWriter{w: &out, collecting: true, fn: func(num int, head []byte) int {
+		nums = append(nums, num)
+		heads = append(heads, string(head))
+		if strings.HasPrefix(string(head), "TS") {
+			return 4
+		}
+		return 0
+	}}
+	// Write in awkward pieces, so heads and newlines straddle writes.
+	for i := 0; i < len(in); i += 7 {
+		if _, err := h.Write([]byte(in[i:min(i+7, len(in))])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.finish(); err != nil {
+		t.Fatal(err)
+	}
+	want := "a\nb\n\n" + long + "\n" + strings.Repeat("z", MaxLineHead) + "\nend"
+	if out.String() != want {
+		t.Fatalf("output = %q\nwant     %q", out.String(), want)
+	}
+	if h.n != int64(len(want)) {
+		t.Errorf("counted %d bytes, wrote %d", h.n, len(want))
+	}
+	if len(nums) != 6 || nums[0] != 1 || nums[5] != 6 {
+		t.Fatalf("line numbers = %v, want 1..6", nums)
+	}
+	for i, n := range nums {
+		if n != i+1 {
+			t.Fatalf("line numbers = %v, want 1..6", nums)
+		}
+	}
+	if len(heads[3]) != MaxLineHead || heads[2] != "" {
+		t.Errorf("heads = %q", heads)
+	}
+
+	// The numbering agrees with lineReader's.
+	lr := newLineReader(strings.NewReader(want))
+	for {
+		if _, ok := lr.next(); !ok {
+			break
+		}
+	}
+	if lr.num != 6 {
+		t.Errorf("lineReader counts %d lines, headWriter %d", lr.num, len(nums))
+	}
+}
+
+func TestNormalizeStopsWhenCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var b strings.Builder
+	_, err := normalize(ctx, &b, strings.NewReader(strings.Repeat("x\n", normalizeCheckEvery)))
+	if err != context.Canceled {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if b.Len() >= 2*normalizeCheckEvery {
+		t.Errorf("normalised the whole input (%d bytes) after cancellation", b.Len())
 	}
 }

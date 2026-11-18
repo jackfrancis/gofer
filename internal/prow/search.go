@@ -86,20 +86,14 @@ type SearchResult struct {
 	Incomplete     string
 }
 
-// Search searches one file, or every file under a directory, in job. A path that is
-// not a file is tried as a directory.
-func (s *Session) Search(ctx context.Context, job Job, opt SearchOptions) (SearchResult, error) {
-	var res SearchResult
-	if opt.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = withBudget(ctx, opt.Timeout)
-		defer cancel()
-	}
+// newSearcher validates opt's pattern and bounds and returns the matcher state one
+// search shares across its files.
+func newSearcher(opt SearchOptions, res *SearchResult) (*searcher, error) {
 	if opt.Pattern == "" {
-		return res, fmt.Errorf("pattern is required")
+		return nil, fmt.Errorf("pattern is required")
 	}
 	if len(opt.Pattern) > maxPatternBytes {
-		return res, fmt.Errorf("pattern is too long (max %d bytes)", maxPatternBytes)
+		return nil, fmt.Errorf("pattern is too long (max %d bytes)", maxPatternBytes)
 	}
 	expr := opt.Pattern
 	if opt.Literal {
@@ -111,7 +105,48 @@ func (s *Session) Search(ctx context.Context, job Job, opt SearchOptions) (Searc
 	// RE2: linear time, so an untrusted pattern cannot stall the run.
 	re, err := regexp.Compile(expr)
 	if err != nil {
-		return res, fmt.Errorf("bad pattern (RE2 syntax; set literal=true to search for an exact string): %v", err)
+		return nil, fmt.Errorf("bad pattern (RE2 syntax; set literal=true to search for an exact string): %v", err)
+	}
+	max := opt.MaxResults
+	if max <= 0 {
+		max = DefaultSearchResults
+	}
+	max = min(max, MaxSearchResults)
+	ctxLines := min(max0(opt.ContextLines), MaxContextLines)
+	return &searcher{re: re, max: max, ctxLines: ctxLines, res: res}, nil
+}
+
+// SearchFile searches one already-fetched file (from Fetch or FetchWith) with
+// opt's pattern and result bounds; opt.Path and opt.Glob are ignored.
+func (s *Session) SearchFile(ctx context.Context, f *File, opt SearchOptions) (SearchResult, error) {
+	var res SearchResult
+	if opt.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = withBudget(ctx, opt.Timeout)
+		defer cancel()
+	}
+	sr, err := newSearcher(opt, &res)
+	if err != nil {
+		return res, err
+	}
+	if f.Binary {
+		return res, fmt.Errorf("%s is binary content, not searchable", f.Rel)
+	}
+	return res, s.searchFile(ctx, f, sr)
+}
+
+// Search searches one file, or every file under a directory, in job. A path that is
+// not a file is tried as a directory.
+func (s *Session) Search(ctx context.Context, job Job, opt SearchOptions) (SearchResult, error) {
+	var res SearchResult
+	if opt.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = withBudget(ctx, opt.Timeout)
+		defer cancel()
+	}
+	sr, err := newSearcher(opt, &res)
+	if err != nil {
+		return res, err
 	}
 	if opt.Glob != "" {
 		if _, err := path.Match(opt.Glob, "x"); err != nil {
@@ -122,14 +157,6 @@ func (s *Session) Search(ctx context.Context, job Job, opt SearchOptions) (Searc
 	if err != nil {
 		return res, err
 	}
-	max := opt.MaxResults
-	if max <= 0 {
-		max = DefaultSearchResults
-	}
-	max = min(max, MaxSearchResults)
-	ctxLines := min(max0(opt.ContextLines), MaxContextLines)
-	sr := &searcher{re: re, max: max, ctxLines: ctxLines, res: &res}
-
 	// A single file: fetch it directly.
 	if rel != "" && !strings.HasSuffix(opt.Path, "/") {
 		f, ferr := s.Fetch(ctx, job, rel)
@@ -328,6 +355,12 @@ func (s *Session) Read(ctx context.Context, job Job, rel string, startLine, maxL
 	if err != nil {
 		return ReadResult{}, err
 	}
+	return s.ReadFile(f, startLine, maxLines)
+}
+
+// ReadFile returns up to maxLines lines of an already-fetched file (from Fetch or
+// FetchWith) starting at startLine, as Read does.
+func (s *Session) ReadFile(f *File, startLine, maxLines int) (ReadResult, error) {
 	res := ReadResult{Path: f.Rel, Size: f.Size, Binary: f.Binary}
 	if f.Binary {
 		return res, nil
