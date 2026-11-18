@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackfrancis/gofer/internal/github/githubtest"
 	"github.com/jackfrancis/gofer/internal/httpretry"
 )
 
@@ -56,7 +57,7 @@ func TestParseActionsURL(t *testing.T) {
 
 func TestActionsRunJobsPaginates(t *testing.T) {
 	var paths []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.RequestURI())
 		if r.Header.Get("Authorization") != "Bearer tok" {
 			t.Errorf("missing token on %s", r.URL.Path)
@@ -129,7 +130,7 @@ type logServers struct {
 func newLogServers(t *testing.T, body string) *logServers {
 	t.Helper()
 	ls := &logServers{blobBody: func(w http.ResponseWriter) { _, _ = w.Write([]byte(body)) }}
-	ls.blob = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ls.blob = httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		ls.blobHits.Add(1)
 		if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
 			ls.blobSawCreds.Store(true)
@@ -140,7 +141,7 @@ func newLogServers(t *testing.T, body string) *logServers {
 		}
 		ls.blobBody(w)
 	}))
-	ls.api = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ls.api = httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer tok" {
 			t.Errorf("API request without the token: %s", r.URL.Path)
 		}
@@ -296,7 +297,7 @@ func TestBlobGuard(t *testing.T) {
 // guard drops it on every blob hop.
 func TestActionsJobLogNoRefererOnChainedRedirect(t *testing.T) {
 	var sawReferer atomic.Value
-	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	final := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		sawReferer.Store(r.Header.Get("Referer"))
 		_, _ = w.Write([]byte("log\n"))
 	}))
@@ -391,14 +392,14 @@ func TestActionsJobLogRetriesRefusedLink(t *testing.T) {
 
 func TestActionsStepLog(t *testing.T) {
 	var path string
-	blob := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	blob := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "" {
 			t.Error("the blob host received the token")
 		}
 		_, _ = w.Write([]byte("step\n"))
 	}))
 	defer blob.Close()
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	api := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		path = r.URL.Path
 		http.Redirect(w, r, blob.URL+"/s?sig=x", http.StatusFound)
 	}))
@@ -419,7 +420,7 @@ func TestActionsStepLog(t *testing.T) {
 // The API's own redirect can carry a malformed Location too; net/http's client would
 // quote it in an error before CheckRedirect ran.
 func TestActionsJobLogRedactsBadAPILocation(t *testing.T) {
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	api := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", "http://[::1%zz/logs?sig=s3cret-api-sig")
 		w.WriteHeader(http.StatusFound)
 	}))
@@ -511,7 +512,7 @@ func TestActionsJobLogForbiddenCarriesReason(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			api := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 				for k, v := range c.r.headers {
 					w.Header().Set(k, v)
 				}
@@ -550,7 +551,7 @@ func TestReasonClipsMessage(t *testing.T) {
 // deadline still reaches the caller as a rate limit, with GitHub's reason, instead
 // of a bare deadline error.
 func TestActionsJobLogRateLimitThroughRetryTransport(t *testing.T) {
-	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	api := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Retry-After", "60")
 		w.WriteHeader(http.StatusTooManyRequests)
 		_, _ = w.Write([]byte(`{"message":"You have exceeded a secondary rate limit."}`))

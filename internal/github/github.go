@@ -53,6 +53,15 @@ type Client struct {
 	// It never carries the token (actions.go); built on first use.
 	blobOnce sync.Once
 	blob     *http.Client
+
+	// api is http with redirects left to the caller, which gates them
+	// (visibility.go); built on first use.
+	apiOnce sync.Once
+	api     *http.Client
+
+	// repos caches the public-only gate's answers. A Client serves one run, so this is
+	// the per-run cache ADR 0007 calls for.
+	repos repoGate
 }
 
 // NewClient returns a GitHub client. A nil httpClient uses http.DefaultClient; an
@@ -68,14 +77,19 @@ func NewClient(httpClient *http.Client, baseURL string) *Client {
 }
 
 // signals are the (reason, query) pairs retrieved for the authenticated user.
-// archived:false keeps stale archived-repo items out of the worklist.
+// archived:false keeps stale archived-repo items out of the worklist, and
+// searchIssues adds is:public to each (ADR 0007's public-only guard).
 //
-// MEMBERSHIP IS ONE UNION QUERY. involves:@me is author ∪ assignee ∪ mentions ∪
-// commenter, so it replaces four separate per-relationship queries with one. That is
-// not just tidier: the individual qualifiers are not reliable — a PR the user was
-// tagged in and replied to has been observed matching involves: while matching
-// neither commenter: nor any other single qualifier. Chasing those quirks one at a
-// time is a losing game; asking the broad question once is not.
+// MEMBERSHIP IS ONE UNION QUALIFIER. involves:@me is author ∪ assignee ∪ mentions ∪
+// commenter, so it replaces four separate per-relationship queries. That is not just
+// tidier: the individual qualifiers are not reliable — a PR the user was tagged in and
+// replied to has been observed matching involves: while matching neither commenter:
+// nor any other single qualifier. Chasing those quirks one at a time is a losing game;
+// asking the broad question is not.
+//
+// It runs as two queries, issues and PRs, because a GitHub App user token answers 422
+// to a search without is:issue or is:pr (ADR 0007). Together they match exactly what
+// the unsplit query did.
 //
 // review-requested: is NOT part of involves:, and it is gofer's most important
 // relationship, so it stays a query of its own.
@@ -87,7 +101,8 @@ var signals = []struct {
 	reason worklist.Reason
 	query  string
 }{
-	{worklist.ReasonInvolved, "is:open involves:@me archived:false"},
+	{worklist.ReasonInvolved, "is:issue is:open involves:@me archived:false"},
+	{worklist.ReasonInvolved, "is:pr is:open involves:@me archived:false"},
 	{worklist.ReasonReviewRequested, "is:pr is:open review-requested:@me archived:false"},
 }
 
@@ -107,6 +122,10 @@ var signals = []struct {
 // set, and an item missing from it is genuinely no longer open (merged, closed, or no
 // longer involving the user). The ingest relies on that to retire stale items; on a
 // partial walk it must not, since a missing item may simply not have been reached.
+//
+// Every hit's repository must pass the public-only gate (publicHits). A hit from a
+// repository that is not confirmed public is left out; one whose check had no answer
+// also makes the result incomplete, since its item may still be open.
 func (c *Client) FetchWorklist(ctx context.Context, token string) (items []worklist.WorkItem, complete bool, err error) {
 	now := time.Now().UTC()
 	// The relationship a union query cannot report is derived from each item's payload,
@@ -142,6 +161,8 @@ func (c *Client) FetchWorklist(ctx context.Context, token string) (items []workl
 	for _, wi := range seen {
 		out = append(out, wi)
 	}
+	out, confirmed := c.publicHits(ctx, token, out)
+	complete = complete && confirmed
 	// Deduplication runs through a map, so without this the result order is Go's
 	// randomized map iteration — and every downstream "first N" (the rank cap, any
 	// paging) would pick a different arbitrary subset on each run, reshuffling the
@@ -194,7 +215,8 @@ func reasonsFor(from worklist.Reason, it searchItem, viewer string) []worklist.R
 }
 
 type searchResponse struct {
-	Items []searchItem `json:"items"`
+	Items      []searchItem `json:"items"`
+	TotalCount int          `json:"total_count"`
 	// IncompleteResults is GitHub's own flag that the search timed out server-side
 	// and the items are not the full match set.
 	IncompleteResults bool `json:"incomplete_results"`
@@ -290,33 +312,8 @@ func (c *Client) searchIssues(ctx context.Context, token, q string) (out []searc
 		if !c.search.wait(ctx, searchTimeReserve) {
 			break
 		}
-		u := fmt.Sprintf("%s/search/issues?per_page=%d&page=%d&sort=updated&order=desc&q=%s",
-			c.baseURL, searchPerPage, page, url.QueryEscape(q))
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		sr, more, err := c.searchPage(ctx, token, q, page, searchPerPage)
 		if err != nil {
-			return nil, false, err
-		}
-		setHeaders(req, token)
-
-		resp, err := c.http.Do(req)
-		if err != nil {
-			return nil, false, err
-		}
-		body, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBody))
-		// Record the budget and the next-page link before the body is discarded; the
-		// response is closed here rather than deferred because this runs in a loop.
-		c.search.note(resp.Header)
-		more := hasNextPage(resp.Header)
-		status := resp.StatusCode
-		resp.Body.Close()
-		if rerr != nil {
-			return nil, false, rerr
-		}
-		if status != http.StatusOK {
-			return nil, false, fmt.Errorf("status %d", status)
-		}
-		var sr searchResponse
-		if err := json.Unmarshal(body, &sr); err != nil {
 			return nil, false, err
 		}
 		out = append(out, sr.Items...)
@@ -329,6 +326,85 @@ func (c *Client) searchIssues(ctx context.Context, token, q string) (out []searc
 	// Left the loop early: the budget broke it, or the result ceiling ended it with
 	// pages still to come. Either way the set is partial.
 	return out, false, nil
+}
+
+// searchPage fetches one page of a search, restricted to public repositories
+// (publicQuery). more reports that the API advertises a further page.
+func (c *Client) searchPage(ctx context.Context, token, q string, page, per int) (sr searchResponse, more bool, err error) {
+	u := fmt.Sprintf("%s/search/issues?per_page=%d&page=%d&sort=updated&order=desc&q=%s",
+		c.baseURL, per, page, url.QueryEscape(publicQuery(q)))
+	resp, err := c.apiDo(ctx, token, u)
+	if err != nil {
+		return sr, false, err
+	}
+	body, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	// Record the budget and the next-page link before the body is discarded.
+	c.search.note(resp.Header)
+	more = hasNextPage(resp.Header)
+	status := resp.StatusCode
+	resp.Body.Close()
+	if rerr != nil {
+		return sr, false, rerr
+	}
+	if status != http.StatusOK {
+		return sr, false, fmt.Errorf("status %d", status)
+	}
+	if err := json.Unmarshal(body, &sr); err != nil {
+		return sr, false, err
+	}
+	return sr, more, nil
+}
+
+// gateConcurrency bounds the visibility checks ingest runs at once.
+const gateConcurrency = 8
+
+// publicHits keeps the items whose repository passes the public-only gate. confirmed
+// is false when any repository's check had no answer (a timeout, a rate limit, the
+// run's time budget): its items are left out, and the caller must not treat the
+// fetch as the whole open set. A definite answer (private, not found, refused) drops
+// the items without that.
+func (c *Client) publicHits(ctx context.Context, token string, items []worklist.WorkItem) (kept []worklist.WorkItem, confirmed bool) {
+	var repos []string
+	verdicts := make(map[string]verdict)
+	for _, it := range items {
+		if _, ok := verdicts[it.GitHub.Repo]; !ok {
+			verdicts[it.GitHub.Repo] = verdictUnknown
+			repos = append(repos, it.GitHub.Repo)
+		}
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, gateConcurrency)
+	for _, repo := range repos {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			// Out of time: leave it unknown rather than spend what the write-back needs.
+			if !fitsBudget(ctx, searchTimeReserve) {
+				return
+			}
+			v := c.checkRepo(ctx, token, repo).verdict
+			mu.Lock()
+			verdicts[repo] = v
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	confirmed = true
+	for _, v := range verdicts {
+		if v == verdictUnknown {
+			confirmed = false
+		}
+	}
+	kept = items[:0]
+	for _, it := range items {
+		if verdicts[it.GitHub.Repo] == verdictPublic {
+			kept = append(kept, it)
+		}
+	}
+	return kept, confirmed
 }
 
 // hasNextPage reports whether a response's Link header advertises a further page.
@@ -418,22 +494,9 @@ func fitsBudget(ctx context.Context, d time.Duration) bool {
 
 // Login returns the authenticated user's GitHub login.
 func (c *Client) Login(ctx context.Context, token string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/user", nil)
+	body, err := c.get(ctx, token, "/user")
 	if err != nil {
 		return "", err
-	}
-	setHeaders(req, token)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("status %d", resp.StatusCode)
 	}
 	var u struct {
 		Login string `json:"login"`

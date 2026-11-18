@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/jackfrancis/gofer/internal/github"
+	"github.com/jackfrancis/gofer/internal/github/githubtest"
 	"github.com/jackfrancis/gofer/internal/prow"
 	"github.com/jackfrancis/gofer/internal/prow/prowtest"
 )
@@ -161,7 +162,7 @@ func TestCIToolErrors(t *testing.T) {
 }
 
 func TestGitHubGetCIStatusTool(t *testing.T) {
-	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	gh := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/o/r/pulls/42":
 			_, _ = w.Write([]byte(`{"head":{"ref":"f","sha":"1a0deb77418b69ddf08cfa6f09f6d068201be0e4"}}`))

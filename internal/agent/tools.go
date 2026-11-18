@@ -95,7 +95,7 @@ func (t *githubToolBox) Definitions() []worklist.ToolDef {
 		},
 		{
 			Name:        "github_search",
-			Description: "Search GitHub issues and pull requests (not code — use repo_search for code) with the GitHub search syntax. Use to find whether another PR or commit already addressed something (e.g. a dependency bump or a CVE). Returns the top matches as titles and states only — to read a match's description or comments, follow up with github_get_issue or github_get_pull_request.",
+			Description: "Search GitHub issues and pull requests (not code — use repo_search for code) with the GitHub search syntax. Use to find whether another PR or commit already addressed something (e.g. a dependency bump or a CVE). Searches public repositories only; a query that does not say is:issue or is:pr returns both. Returns the top matches as titles and states only — to read a match's description or comments, follow up with github_get_issue or github_get_pull_request.",
 			Parameters:  schemaSearch,
 		},
 	}, append(repoToolDefs(), ciToolDefs()...)...)

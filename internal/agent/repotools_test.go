@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackfrancis/gofer/internal/github"
+	"github.com/jackfrancis/gofer/internal/github/githubtest"
 )
 
 // repoArchive builds a GitHub-style tarball (top-level directory, files).
@@ -43,17 +44,25 @@ func repoServer(t *testing.T, files map[string]string) (*httptest.Server, *atomi
 	t.Helper()
 	data := repoArchive(t, files)
 	var downloads atomic.Int32
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// The download is on its own host, as codeload is: the client follows an API-host
+	// redirect only to a repository that passes the public-only gate.
+	dl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/download" {
+			http.NotFound(w, r)
+			return
+		}
+		downloads.Add(1)
+		_, _ = w.Write(data)
+	}))
+	t.Cleanup(dl.Close)
+	return httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/o/r/tarball/v1.2.3", "/repos/o/r/tarball", "/repos/o/dep/tarball/v9", "/repos/o/r/tarball/release/1.2":
 			if r.Header.Get("Authorization") != "Bearer s3cret-token" {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
-			http.Redirect(w, r, "/download?sig=presigned", http.StatusFound)
-		case "/download":
-			downloads.Add(1)
-			_, _ = w.Write(data)
+			http.Redirect(w, r, dl.URL+"/download?sig=presigned", http.StatusFound)
 		default:
 			http.NotFound(w, r)
 		}

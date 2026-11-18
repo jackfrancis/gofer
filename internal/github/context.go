@@ -1,9 +1,9 @@
 // Read-only context fetches for the assistive conversation: a discussion
 // snapshot for the item under discussion, plus the lookups the conversation
 // tools call (a file at a ref, a PR/issue's state, a search). Every call only
-// ever GETs, with the user's vended credential; reach is bounded by that token's
-// own scopes, and any repository the token can see is fair game. gofer core
-// never imports this client — only the agent runtime does.
+// ever GETs, with the user's vended credential, and only from public repositories:
+// the public-only guard (visibility.go) refuses any other, whatever the token can
+// see. gofer core never imports this client — only the agent runtime does.
 package github
 
 import (
@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -69,6 +70,10 @@ type Review struct {
 // missing piece is not fatal, so a degraded snapshot is better than none.
 func (c *Client) Discussion(ctx context.Context, token, repo string, number int, isPR bool) (Discussion, error) {
 	var d Discussion
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return Discussion{}, err
+	}
 
 	// Description from the issues endpoint (works for both issues and PRs).
 	issueBody, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/issues/%d", repo, number))
@@ -76,9 +81,13 @@ func (c *Client) Discussion(ctx context.Context, token, repo string, number int,
 		return Discussion{}, err
 	}
 	var issue struct {
-		Body string `json:"body"`
+		Body          string `json:"body"`
+		RepositoryURL string `json:"repository_url"`
 	}
 	if err := json.Unmarshal(issueBody, &issue); err != nil {
+		return Discussion{}, err
+	}
+	if err := c.confirmSameOrPublic(ctx, token, repo, c.repoFromAPIURL(issue.RepositoryURL)); err != nil {
 		return Discussion{}, err
 	}
 	d.Body = truncateRunes(issue.Body, maxDiscussionBody)
@@ -120,8 +129,16 @@ func (c *Client) Discussion(ctx context.Context, token, repo string, number int,
 			Head struct {
 				SHA string `json:"sha"`
 			} `json:"head"`
+			Base struct {
+				Repo struct {
+					FullName string `json:"full_name"`
+				} `json:"repo"`
+			} `json:"base"`
 		}
 		if err := json.Unmarshal(body, &pr); err == nil {
+			if err := c.confirmSameOrPublic(ctx, token, repo, pr.Base.Repo.FullName); err != nil {
+				return Discussion{}, err
+			}
 			d.HeadSHA = pr.Head.SHA
 		}
 	}
@@ -298,6 +315,10 @@ func fileWindow(text string, offset int) string {
 // PullRequestStatus returns a pull request's current state (open/closed, merged
 // or not, base/head, title) as a compact text summary.
 func (c *Client) PullRequestStatus(ctx context.Context, token, repo string, number int) (string, error) {
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return "", err
+	}
 	body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/pulls/%d", repo, number))
 	if err != nil {
 		return "", err
@@ -309,7 +330,10 @@ func (c *Client) PullRequestStatus(ctx context.Context, token, repo string, numb
 		MergedAt *time.Time `json:"merged_at"`
 		Title    string     `json:"title"`
 		Base     struct {
-			Ref string `json:"ref"`
+			Ref  string `json:"ref"`
+			Repo struct {
+				FullName string `json:"full_name"`
+			} `json:"repo"`
 		} `json:"base"`
 		Head struct {
 			Ref string `json:"ref"`
@@ -318,6 +342,9 @@ func (c *Client) PullRequestStatus(ctx context.Context, token, repo string, numb
 		HTMLURL string `json:"html_url"`
 	}
 	if err := json.Unmarshal(body, &pr); err != nil {
+		return "", err
+	}
+	if err := c.confirmSameOrPublic(ctx, token, repo, pr.Base.Repo.FullName); err != nil {
 		return "", err
 	}
 	merged := "not merged"
@@ -337,19 +364,27 @@ func (c *Client) PullRequestStatus(ctx context.Context, token, repo string, numb
 
 // IssueStatus returns an issue's (or PR's) current state as a compact summary.
 func (c *Client) IssueStatus(ctx context.Context, token, repo string, number int) (string, error) {
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return "", err
+	}
 	body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/issues/%d", repo, number))
 	if err != nil {
 		return "", err
 	}
 	var is struct {
-		Number      int        `json:"number"`
-		State       string     `json:"state"`
-		Title       string     `json:"title"`
-		ClosedAt    *time.Time `json:"closed_at"`
-		HTMLURL     string     `json:"html_url"`
-		PullRequest *struct{}  `json:"pull_request"`
+		Number        int        `json:"number"`
+		State         string     `json:"state"`
+		Title         string     `json:"title"`
+		ClosedAt      *time.Time `json:"closed_at"`
+		HTMLURL       string     `json:"html_url"`
+		RepositoryURL string     `json:"repository_url"`
+		PullRequest   *struct{}  `json:"pull_request"`
 	}
 	if err := json.Unmarshal(body, &is); err != nil {
+		return "", err
+	}
+	if err := c.confirmSameOrPublic(ctx, token, repo, c.repoFromAPIURL(is.RepositoryURL)); err != nil {
 		return "", err
 	}
 	kind := "issue"
@@ -364,21 +399,42 @@ func (c *Client) IssueStatus(ctx context.Context, token, repo string, number int
 }
 
 // Search runs a GitHub issues/PRs search and returns the top matches as compact
-// text. It accepts the full GitHub search syntax (e.g. "repo:owner/name otel").
+// text. It accepts the full GitHub search syntax (e.g. "repo:owner/name otel"), and
+// searches public repositories only (searchPage adds is:public).
+//
+// A GitHub App user token answers 422 to a query that does not say whether it wants
+// issues or pull requests, so a query without is:issue, is:pr, is:pull-request,
+// type:issue or type:pr runs twice, once for each, and the matches are merged by
+// recency. Only the first page of each is read: the tool shows maxSearchResults, and
+// GitHub's total_count gives the rest, so paging further would only spend the small
+// search budget.
 func (c *Client) Search(ctx context.Context, token, query string) (string, error) {
-	items, _, err := c.searchIssues(ctx, token, query)
-	if err != nil {
-		return "", err
+	variants := []string{query}
+	if !hasTypeQualifier(query) {
+		variants = []string{query + " is:issue", query + " is:pr"}
+	}
+	var items []searchItem
+	total := 0
+	for _, q := range variants {
+		if !c.search.wait(ctx, 0) {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+		}
+		sr, _, err := c.searchPage(ctx, token, q, 1, maxSearchResults)
+		if err != nil {
+			return "", err
+		}
+		items = append(items, sr.Items...)
+		total += max(sr.TotalCount, len(sr.Items))
 	}
 	if len(items) == 0 {
 		return "no matching issues or pull requests", nil
 	}
+	slices.SortStableFunc(items, func(a, b searchItem) int { return b.UpdatedAt.Compare(a.UpdatedAt) })
 	var b strings.Builder
-	shown := len(items)
-	if shown > maxSearchResults {
-		shown = maxSearchResults
-	}
-	fmt.Fprintf(&b, "%d result(s) (showing %d):\n", len(items), shown)
+	shown := min(len(items), maxSearchResults)
+	fmt.Fprintf(&b, "%d result(s) (showing %d):\n", total, shown)
 	for _, it := range items[:shown] {
 		repo := strings.TrimPrefix(it.RepositoryURL, defaultBaseURL+"/repos/")
 		kind := "issue"
@@ -406,6 +462,17 @@ func (c *Client) Tarball(ctx context.Context, token, repo, ref string) (io.ReadC
 	if !repoName.MatchString(repo) || strings.Contains(repo, "..") {
 		return nil, fmt.Errorf("repo must be owner/name")
 	}
+	if ref != "" {
+		for _, seg := range strings.Split(ref, "/") {
+			if seg == "" || seg == "." || seg == ".." || strings.ContainsAny(seg, "\x00\r\n ") {
+				return nil, fmt.Errorf("invalid ref %q", ref)
+			}
+		}
+	}
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return nil, err
+	}
 	p := "/repos/" + repo + "/tarball"
 	if ref != "" {
 		for _, seg := range strings.Split(ref, "/") {
@@ -424,6 +491,9 @@ func (c *Client) Tarball(ctx context.Context, token, repo, ref string) (io.ReadC
 	// download is bounded by the caller's context instead.
 	hc := *c.http
 	hc.Timeout = 0
+	// The codeload hop is followed as before; an API-host hop only to a public
+	// repository.
+	hc.CheckRedirect = c.followGated(token)
 	resp, err := hc.Do(req)
 	if err != nil {
 		var ue *url.Error

@@ -6,10 +6,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/jackfrancis/gofer/internal/github/githubtest"
 )
 
 func timelineServer(body string) *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/timeline") {
 			_, _ = w.Write([]byte(body))
 			return

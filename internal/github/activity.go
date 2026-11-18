@@ -4,32 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"time"
 )
-
-// get performs an authenticated GET and returns the response body.
-func (c *Client) get(ctx context.Context, token, path string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
-	if err != nil {
-		return nil, err
-	}
-	setHeaders(req, token)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
-	}
-	return body, nil
-}
 
 type timelineEvent struct {
 	Event             string    `json:"event"`

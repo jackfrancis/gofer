@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/jackfrancis/gofer/internal/github/githubtest"
 )
 
 // newTestClient points a Client at a test server.
@@ -17,7 +19,7 @@ func newTestClient(srv *httptest.Server) *Client {
 
 func TestFileContents(t *testing.T) {
 	const body = "module foo\n\ngo 1.26.0\n"
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/repos/o/r/contents/go.mod" {
 			http.NotFound(w, r)
 			return
@@ -40,7 +42,7 @@ func TestFileContents(t *testing.T) {
 }
 
 func TestFileContentsDirectoryAndBinary(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/o/r/contents/dir":
 			_, _ = w.Write([]byte(`[{"name":"a"},{"name":"b"}]`)) // a directory is a JSON array
@@ -63,7 +65,7 @@ func TestFileContentsDirectoryAndBinary(t *testing.T) {
 }
 
 func TestPullRequestStatus(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/repos/o/r/pulls/7" {
 			http.NotFound(w, r)
 			return
@@ -84,7 +86,7 @@ func TestPullRequestStatus(t *testing.T) {
 }
 
 func TestIssueStatus(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/repos/o/r/issues/9" {
 			http.NotFound(w, r)
 			return
@@ -102,19 +104,33 @@ func TestIssueStatus(t *testing.T) {
 	}
 }
 
+// Search runs a query without a type qualifier once for issues and once for PRs (a
+// GitHub App user token refuses the mix with 422), restricts both to public
+// repositories, and merges the matches by recency with GitHub's total counts.
 func TestSearch(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var queries []string
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/search/issues" {
 			http.NotFound(w, r)
 			return
 		}
-		if q := r.URL.Query().Get("q"); q != "repo:o/r otel" {
-			t.Errorf("q = %q", q)
+		q := r.URL.Query().Get("q")
+		queries = append(queries, q)
+		if r.URL.Query().Get("page") != "1" {
+			t.Errorf("Search read page %s; it reads the first page only", r.URL.Query().Get("page"))
 		}
-		_, _ = w.Write([]byte(`{"items":[` +
-			`{"number":7,"title":"Add otel","state":"open","html_url":"https://github.com/o/r/pull/7","repository_url":"https://api.github.com/repos/o/r","pull_request":{"url":"x"}},` +
-			`{"number":8,"title":"otel bug","state":"closed","html_url":"https://github.com/o/r/issues/8","repository_url":"https://api.github.com/repos/o/r"}` +
-			`]}`))
+		switch q {
+		case "repo:o/r otel is:issue is:public":
+			_, _ = w.Write([]byte(`{"total_count":5,"items":[` +
+				`{"number":8,"title":"otel bug","state":"closed","updated_at":"2026-01-01T00:00:00Z","html_url":"https://github.com/o/r/issues/8","repository_url":"https://api.github.com/repos/o/r"}` +
+				`]}`))
+		case "repo:o/r otel is:pr is:public":
+			_, _ = w.Write([]byte(`{"total_count":1,"items":[` +
+				`{"number":7,"title":"Add otel","state":"open","updated_at":"2026-02-01T00:00:00Z","html_url":"https://github.com/o/r/pull/7","repository_url":"https://api.github.com/repos/o/r","pull_request":{"url":"x"}}` +
+				`]}`))
+		default:
+			w.WriteHeader(http.StatusUnprocessableEntity)
+		}
 	}))
 	defer srv.Close()
 
@@ -122,15 +138,30 @@ func TestSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"2 result(s)", "PR o/r#7", "issue o/r#8", "[open]", "[closed]"} {
+	if len(queries) != 2 {
+		t.Fatalf("queries = %q, want an issue and a PR query", queries)
+	}
+	for _, want := range []string{"6 result(s) (showing 2)", "PR o/r#7", "issue o/r#8", "[open]", "[closed]"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("Search missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Index(got, "PR o/r#7") > strings.Index(got, "issue o/r#8") {
+		t.Errorf("matches not merged most recent first:\n%s", got)
+	}
+
+	// A query that names its type runs once, as written, plus is:public.
+	for _, q := range []string{"is:pr author:x", "Type:Issue label:bug", "is:pull-request foo"} {
+		queries = nil
+		_, _ = newTestClient(srv).Search(context.Background(), "tok", q)
+		if len(queries) != 1 || queries[0] != q+" is:public" {
+			t.Errorf("Search(%q) sent %q, want one query with is:public", q, queries)
 		}
 	}
 }
 
 func TestDiscussionPullRequest(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/o/r/issues/7":
 			_, _ = w.Write([]byte(`{"body":"Please review this change."}`))
@@ -176,7 +207,7 @@ func TestDiscussionPullRequest(t *testing.T) {
 }
 
 func TestDiscussionIssueSkipsPRFetches(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/pulls/") {
 			t.Errorf("issue discussion should not hit %s", r.URL.Path)
 		}
@@ -204,13 +235,16 @@ func TestDiscussionIssueSkipsPRFetches(t *testing.T) {
 // ref per path segment, and never surfaces the (pre-signed) download URL in an error.
 func TestTarball(t *testing.T) {
 	var gotAuth, gotPath string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// The archive is on another host, as codeload is.
+	dl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("archive-bytes"))
+	}))
+	defer dl.Close()
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/repos/o/r/tarball"):
 			gotAuth, gotPath = r.Header.Get("Authorization"), r.URL.EscapedPath()
-			http.Redirect(w, r, "/dl?token=presigned", http.StatusFound)
-		case r.URL.Path == "/dl":
-			_, _ = w.Write([]byte("archive-bytes"))
+			http.Redirect(w, r, dl.URL+"/dl?token=presigned", http.StatusFound)
 		case r.URL.Path == "/repos/o/gone/tarball":
 			http.Redirect(w, r, "http://127.0.0.1:1/dl?token=presigned", http.StatusFound)
 		default:

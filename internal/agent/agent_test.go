@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackfrancis/gofer/internal/github/githubtest"
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
@@ -69,7 +71,7 @@ func (m *memSink) put(items []worklist.WorkItem) {
 
 // runIngest vends a token, fetches from GitHub, and writes to the sink.
 func TestRunIngestFetchesAndWrites(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/user" {
 			_, _ = w.Write([]byte(`{"login":"me"}`))
 			return
@@ -98,7 +100,7 @@ func TestRunIngestFetchesAndWrites(t *testing.T) {
 // conversation thread and user/agent overrides while taking the fresh GitHub fields,
 // never clobbering the thread the way a raw fetch-and-replace would.
 func TestRunIngestPreservesThreads(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/user" {
 			_, _ = w.Write([]byte(`{"login":"me"}`))
 			return
@@ -174,7 +176,7 @@ func TestRunUnknownJobType(t *testing.T) {
 // calls (enrich) are counted per item number.
 func ingestServer(t *testing.T, open []int, incomplete bool, timelines map[string]int) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/user":
 			_, _ = w.Write([]byte(`{"login":"me"}`))
@@ -313,5 +315,72 @@ func TestRunIngestReopenedItemResurfaces(t *testing.T) {
 	}
 	if len(got.Thread) != 1 {
 		t.Errorf("resurfacing must keep the thread; got %d turns", len(got.Thread))
+	}
+}
+
+// The public-only guard in ingest (ADR 0007): a hit from a private repository is never
+// written, and a repository whose visibility check has no answer makes the fetch
+// incomplete, so a stored item that is missing from it is not retired.
+func TestRunIngestPublicOnly(t *testing.T) {
+	var mu sync.Mutex
+	flaky := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit := func(repo string, n int) string {
+			return fmt.Sprintf(`{"number":%d,"title":"T","html_url":"u","state":"open","repository_url":"https://api.github.com/repos/%s","pull_request":{"url":"x"}}`, n, repo)
+		}
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case "/search/issues":
+			if strings.Contains(r.URL.Query().Get("q"), "is:pr is:open involves:@me") {
+				fmt.Fprintf(w, `{"items":[%s,%s]}`, hit("o/r", 7), hit("o/secret", 1))
+				return
+			}
+			_, _ = w.Write([]byte(`{"items":[]}`))
+		case "/repos/o/r":
+			mu.Lock()
+			f := flaky
+			mu.Unlock()
+			if f {
+				http.Error(w, "boom", http.StatusInternalServerError)
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":1,"full_name":"o/r","private":false}`))
+		case "/repos/o/secret":
+			_, _ = w.Write([]byte(`{"id":2,"full_name":"o/secret","private":true}`))
+		default:
+			if strings.HasPrefix(r.URL.Path, "/repos/o/secret/") {
+				t.Errorf("request to a private repository: %s", r.URL.Path)
+			}
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+	params := Params{JobType: JobIngest, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()}
+
+	sink := &memSink{}
+	if err := Run(context.Background(), params, fakeVendor{token: "tok"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range sink.items {
+		if it.GitHub.Repo == "o/secret" {
+			t.Fatalf("a private repository's hit was written: %s", it.ID)
+		}
+	}
+	itemByID(t, sink.items, "github:o/r#7")
+
+	// o/r's check now has no answer: its hit is skipped and the stored #8 (absent from
+	// the search) must not be retired, since the fetch is no longer complete.
+	mu.Lock()
+	flaky = true
+	mu.Unlock()
+	sink = &memSink{items: []worklist.WorkItem{prItem(7), prItem(8)}}
+	if err := Run(context.Background(), params, fakeVendor{token: "tok"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range sink.items {
+		if !it.Meta.CompletedAt.IsZero() {
+			t.Errorf("%s was retired after a fetch with an unconfirmed repository", it.ID)
+		}
 	}
 }

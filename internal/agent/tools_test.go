@@ -10,12 +10,13 @@ import (
 	"testing"
 
 	"github.com/jackfrancis/gofer/internal/github"
+	"github.com/jackfrancis/gofer/internal/github/githubtest"
 )
 
 // githubToolServer serves the minimal GitHub endpoints the toolbox calls.
 func githubToolServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/repos/o/r/contents/go.mod":
 			enc := base64.StdEncoding.EncodeToString([]byte("module foo\n"))
@@ -97,7 +98,7 @@ func TestGitHubToolBoxInvokeValidation(t *testing.T) {
 // comments ride along (delimited as untrusted data), so the model can read why an
 // issue in another repository was closed.
 func TestGitHubToolBoxIssueIncludesDiscussion(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/k/k/issues/139221":
 			_, _ = w.Write([]byte(`{"number":139221,"state":"closed","closed_at":"2026-05-26T00:00:00Z","title":"CVE","html_url":"u","body":"Latest 1.35 affected."}`))
@@ -123,7 +124,7 @@ func TestGitHubToolBoxIssueIncludesDiscussion(t *testing.T) {
 
 // A pull request lookup carries its reviews and changed files as well.
 func TestGitHubToolBoxPullRequestIncludesDiscussion(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/o/r/pulls/7":
 			_, _ = w.Write([]byte(`{"number":7,"state":"open","title":"t","base":{"ref":"main"},"head":{"ref":"f","sha":"abc"},"html_url":"u"}`))

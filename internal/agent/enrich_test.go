@@ -9,12 +9,13 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jackfrancis/gofer/internal/github/githubtest"
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
 // runEnrich fetches per-item timeline signals and updates the item's Signals.
 func TestRunEnrichUpdatesSignals(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/user":
 			_, _ = w.Write([]byte(`{"login":"me"}`))
@@ -49,7 +50,7 @@ func TestRunEnrichUpdatesSignals(t *testing.T) {
 // the user actually spoke, so the honest generic "involved" reason is upgraded to
 // "commented". A stronger, already-proven relationship is left alone.
 func TestRunEnrichUpgradesInvolvedReason(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/user":
 			_, _ = w.Write([]byte(`{"login":"me"}`))
@@ -92,7 +93,7 @@ func TestRunEnrichCoversEveryItemInBatches(t *testing.T) {
 		mu        sync.Mutex
 		timelines int
 	)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/user":
 			_, _ = w.Write([]byte(`{"login":"me"}`))

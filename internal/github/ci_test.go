@@ -6,11 +6,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/jackfrancis/gofer/internal/github/githubtest"
 )
 
 func ciServer(t *testing.T, checkRunsStatus int) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer tok" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
