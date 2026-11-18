@@ -18,7 +18,11 @@ type result struct {
 	err     error
 	calls   [][]string
 	created map[string]any
+	// deleteOptions is the DeleteOptions body sent with the claim deletion.
+	deleteOptions map[string]any
 }
+
+const claimPath = "/api/v1/namespaces/gofer/persistentvolumeclaims/data-gofer-0"
 
 // Exercise the real make target and shell script. Every kubectl invocation goes
 // to this test binary in helper mode; no kubeconfig or live cluster is accessed.
@@ -68,6 +72,11 @@ func runRestore(t *testing.T, scenario string, confirm bool) result {
 			t.Fatal(err)
 		}
 	}
+	if data, readErr := os.ReadFile(filepath.Join(dir, "delete-options.json")); readErr == nil {
+		if err := json.Unmarshal(data, &r.deleteOptions); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if ctx.Err() != nil {
 		t.Fatalf("restore test timed out: %s", out)
 	}
@@ -75,13 +84,32 @@ func runRestore(t *testing.T, scenario string, confirm bool) result {
 }
 
 func (r result) has(parts ...string) bool {
-	return slices.ContainsFunc(r.calls, func(call []string) bool {
+	return r.index(parts...) >= 0
+}
+
+// index returns the position of the first call starting with parts, or -1.
+func (r result) index(parts ...string) int {
+	return slices.IndexFunc(r.calls, func(call []string) bool {
 		return slices.Equal(call[:min(len(parts), len(call))], parts)
 	})
 }
 
+// expansion is the patch that grows the restored claim back to its old request.
+func expansion(size string) []string {
+	return []string{"patch", "pvc", "data-gofer-0", "--type=merge", "-p", `{"spec":{"resources":{"requests":{"storage":"` + size + `"}}}}`}
+}
+
+// verifiedDelete reports whether the claim deletion was conditioned on the UID and
+// resourceVersion of the last read.
+func (r result) verifiedDelete(resourceVersion string) bool {
+	pre, _ := r.deleteOptions["preconditions"].(map[string]any)
+	return r.has("delete", "--raw", claimPath, "-f") && r.deleteOptions["kind"] == "DeleteOptions" &&
+		pre["uid"] == "pvc-uid" && pre["resourceVersion"] == resourceVersion
+}
+
 func TestRestoreRejectsInvalidInputBeforeMutating(t *testing.T) {
-	for _, scenario := range []string{"claim_read_error", "claim_empty", "claim_invalid", "claim_no_access", "snapshot_read_error", "snapshot_unready", "invalid_restore_size", "cronjob_read_error"} {
+	for _, scenario := range []string{"claim_read_error", "claim_empty", "claim_invalid", "claim_no_access", "snapshot_read_error", "snapshot_unready", "invalid_restore_size", "cronjob_read_error", "no_expansion", "storageclass_read_error",
+		"sizes=4Gi,1.2.3", "sizes=4Gi,4GB", "sizes=4Gi,4Gi ", "sizes=4Gi,e3", "sizes=4Gi,4Ei1", "sizes=bogus,2Gi", "sizes=0,2Gi"} {
 		t.Run(scenario, func(t *testing.T) {
 			r := runRestore(t, scenario, true)
 			if r.err == nil {
@@ -91,6 +119,9 @@ func TestRestoreRejectsInvalidInputBeforeMutating(t *testing.T) {
 				if r.has(verb) {
 					t.Errorf("unexpected %s after failed preflight: %v\n%s", verb, r.calls, r.output)
 				}
+			}
+			if scenario == "no_expansion" && !strings.Contains(r.output, "does not allow volume expansion") {
+				t.Errorf("must explain why a smaller snapshot cannot be restored: %s", r.output)
 			}
 		})
 	}
@@ -109,7 +140,7 @@ func TestRestoreNeedsConfirmation(t *testing.T) {
 }
 
 func TestRestoreRejectsUnfinishedBackupsBeforeStopping(t *testing.T) {
-	for _, scenario := range []string{"active_job", "pending_job", "failed_snapshot", "pending_snapshot", "source_finalizer", "jobs_read_error", "snapshots_read_error", "pvc_changed", "snapshot_changed", "snapshot_deleting", "suspend_error"} {
+	for _, scenario := range []string{"active_job", "pending_job", "failed_snapshot", "pending_snapshot", "source_finalizer", "jobs_read_error", "snapshots_read_error", "pvc_changed", "early_resize", "snapshot_changed", "snapshot_deleting", "suspend_error"} {
 		t.Run(scenario, func(t *testing.T) {
 			r := runRestore(t, scenario, true)
 			if r.err == nil || r.has("scale") || r.has("delete") || r.has("create") || r.has("patch", "pv") {
@@ -123,7 +154,7 @@ func TestRestoreRejectsUnfinishedBackupsBeforeStopping(t *testing.T) {
 }
 
 func TestRestoreAbortsBeforeDeletionAndRestartsOriginalApp(t *testing.T) {
-	for _, scenario := range []string{"pod_timeout", "scale_error", "late_job", "late_snapshot"} {
+	for _, scenario := range []string{"pod_timeout", "scale_error", "late_job", "late_snapshot", "late_resize"} {
 		t.Run(scenario, func(t *testing.T) {
 			r := runRestore(t, scenario, true)
 			if r.err == nil || r.has("delete") || r.has("create") {
@@ -135,21 +166,40 @@ func TestRestoreAbortsBeforeDeletionAndRestartsOriginalApp(t *testing.T) {
 			if !r.has("patch", "cronjob", "gofer-snapshot", "--type=merge", "-p", `{"spec":{"suspend":false}}`) {
 				t.Fatal("backup schedule was not restored")
 			}
+			if scenario == "late_resize" && !strings.Contains(r.output, "storage request changed during restore") {
+				t.Fatalf("must report the resize: %s", r.output)
+			}
 		})
 	}
 }
 
+// A resize between the final read and the DELETE changes the claim's
+// resourceVersion; the precondition rejects the deletion and the original app
+// restarts on its unchanged claim.
+func TestRestoreDeletesOnlyTheVerifiedClaim(t *testing.T) {
+	r := runRestore(t, "delete_conflict", true)
+	if r.err == nil || r.has("create") || !r.verifiedDelete("100") {
+		t.Fatalf("must condition deletion on the last verified claim and stop when it fails: %v %v\n%s", r.deleteOptions, r.calls, r.output)
+	}
+	if !r.has("scale", "statefulset/gofer", "--replicas=1") || !strings.Contains(r.output, "was not deleted") {
+		t.Fatalf("must restart the original app on its undeleted claim: %s", r.output)
+	}
+	if !r.has("patch", "cronjob", "gofer-snapshot", "--type=merge", "-p", `{"spec":{"suspend":false}}`) {
+		t.Fatal("backup schedule was not restored")
+	}
+}
+
 func TestRestoreLeavesBackupsPausedAfterDestructiveFailure(t *testing.T) {
-	for _, scenario := range []string{"delete_timeout", "create_error", "start_error", "rollout_error"} {
+	for _, scenario := range []string{"delete_error", "delete_timeout", "create_error", "start_error", "rollout_error"} {
 		t.Run(scenario, func(t *testing.T) {
 			r := runRestore(t, scenario, true)
-			if r.err == nil || !r.has("delete", "pvc", "data-gofer-0", "--wait=true", "--timeout=1s") {
+			if r.err == nil || !r.verifiedDelete("100") || (scenario != "delete_error" && !r.has("wait", "--for=delete", "pvc/data-gofer-0", "--timeout=1s")) {
 				t.Fatalf("expected a bounded failed restore: %v\n%s", r.calls, r.output)
 			}
 			if r.has("patch", "cronjob", "gofer-snapshot", "--type=merge", "-p", `{"spec":{"suspend":false}}`) {
 				t.Fatal("backups must stay paused while the claim needs recovery")
 			}
-			if (scenario == "delete_timeout" || scenario == "create_error") && r.has("scale", "statefulset/gofer", "--replicas=1") {
+			if (scenario == "delete_error" || scenario == "delete_timeout" || scenario == "create_error") && r.has("scale", "statefulset/gofer", "--replicas=1") {
 				t.Fatal("must not start gofer without a successfully created replacement claim")
 			}
 			if !strings.Contains(r.output, "Original volume original-pv is retained") || !strings.Contains(r.output, "Scheduled backups remain suspended") {
@@ -167,7 +217,7 @@ func TestRestoreLeavesBackupsPausedAfterDestructiveFailure(t *testing.T) {
 }
 
 func TestRestoreReportsPostRolloutFinalizationFailures(t *testing.T) {
-	for _, scenario := range []string{"restored_pvc_read_error", "restored_pvc_unbound", "reclaim_policy_error", "reclaim_policy_resume_error", "paused_reclaim_policy_error", "no_cronjob_reclaim_policy_error"} {
+	for _, scenario := range []string{"restored_pvc_read_error", "restored_pvc_unbound", "reclaim_policy_error", "reclaim_policy_resume_error", "paused_reclaim_policy_error", "no_cronjob_reclaim_policy_error", "expand_error"} {
 		t.Run(scenario, func(t *testing.T) {
 			r := runRestore(t, scenario, true)
 			if r.err == nil || r.created == nil || !r.has("rollout", "status", "statefulset/gofer", "--timeout=1s") {
@@ -200,6 +250,9 @@ func TestRestoreReportsPostRolloutFinalizationFailures(t *testing.T) {
 			}
 			if !shouldResume && r.has("patch", "cronjob") {
 				t.Fatalf("must not change an absent or already-paused CronJob: %v", r.calls)
+			}
+			if !strings.Contains(r.output, "verify that gofer/data-gofer-0 requests 4Gi (it was restored at 2Gi)") {
+				t.Fatalf("missing expansion guidance: %s", r.output)
 			}
 			if scenario == "reclaim_policy_resume_error" && !strings.Contains(r.output, "could not resume scheduled backups") {
 				t.Fatalf("must report both finalization and schedule-resume failures: %s", r.output)
@@ -247,23 +300,52 @@ func TestRestoreIgnoresCallerConfiguration(t *testing.T) {
 
 func TestRestoreSuccess(t *testing.T) {
 	// The fake claim requests 4Gi; the fake snapshot's restoreSize is 2Gi unless a
-	// scenario changes it. The replacement requests the larger of the two.
-	wantSizes := map[string]string{
-		"larger_restore_size": "8Gi",        // the snapshot needs more than the claim asks
-		"byte_restore_size":   "5000000000", // plain bytes, larger than 4Gi (4294967296)
-		"equal_restore_size":  "4Gi",        // 4294967296 bytes == 4Gi: keep the claim's form
-		"zero_restore_size":   "4Gi",        // some drivers report 0
+	// scenario changes it ("sizes=<claim>,<restoreSize>" sets both). The replacement
+	// requests restoreSize, which the CSI driver can always provision, and is then
+	// expanded to the claim's request if that is larger. Without a usable
+	// restoreSize, it requests the claim's size.
+	type sizes struct{ create, expand string }
+	want := map[string]sizes{
+		"normal":              {"2Gi", "4Gi"}, // the claim was expanded after the snapshot
+		"already_suspended":   {"2Gi", "4Gi"},
+		"no_cronjob":          {"2Gi", "4Gi"},
+		"no_restore_size":     {"4Gi", ""},
+		"zero_restore_size":   {"4Gi", ""},        // some drivers report 0
+		"larger_restore_size": {"8Gi", ""},        // the snapshot needs more than the claim asks
+		"byte_restore_size":   {"5000000000", ""}, // plain bytes, larger than 4Gi (4294967296)
+		"equal_restore_size":  {"4Gi", ""},        // 4294967296 bytes == 4Gi: keep the claim's form
+		// Kubernetes quantity spellings, preserved as written.
+		"sizes=+4Gi,2Gi":           {"2Gi", "+4Gi"},
+		"sizes=4.Gi,2Gi":           {"2Gi", "4.Gi"},
+		"sizes=4Gi,+2Gi":           {"+2Gi", "4Gi"},
+		"sizes=4Gi,2.Gi":           {"2.Gi", "4Gi"},
+		"sizes=4Gi,.5Gi":           {".5Gi", "4Gi"},
+		"sizes=4Gi,4.Gi":           {"4Gi", ""}, // equal
+		"sizes=4Gi,4096Mi":         {"4Gi", ""},
+		"sizes=4Gi,4e9":            {"4e9", "4Gi"},
+		"sizes=4Gi,4E+9":           {"4E+9", "4Gi"},
+		"sizes=5e9,4294967296e0":   {"4294967296e0", "5e9"},
+		"sizes=2E,1Ei":             {"1Ei", "2E"}, // 1Ei (1.15e18) < 2E (2e18): E and Ei are suffixes
+		"sizes=1Ei,1E":             {"1E", "1Ei"},
+		"sizes=1Ei,1.5E":           {"1.5E", ""}, // the snapshot is larger
+		"sizes=4000M,3.5G":         {"3.5G", "4000M"},
+		"sizes=4Gi,4194304k":       {"4194304k", "4Gi"},
+		"sizes=4Gi,4294967296000m": {"4Gi", ""},
 	}
-	for _, scenario := range []string{"normal", "already_suspended", "no_cronjob", "no_restore_size", "larger_restore_size", "byte_restore_size", "equal_restore_size", "zero_restore_size"} {
+	for scenario, w := range want {
 		t.Run(scenario, func(t *testing.T) {
 			r := runRestore(t, scenario, true)
 			if r.err != nil {
 				t.Fatalf("restore failed: %v\n%s", r.err, r.output)
 			}
-			if !r.has("wait", "--for=delete", "pod/gofer-0", "--timeout=1s") || !r.has("delete", "pvc", "data-gofer-0", "--wait=true", "--timeout=1s") {
+			if !r.has("wait", "--for=delete", "pod/gofer-0", "--timeout=1s") || !r.has("wait", "--for=delete", "pvc/data-gofer-0", "--timeout=1s") {
 				t.Fatal("pod and PVC deletion must both have bounded waits")
 			}
-			if !r.has("patch", "pv", "restored-pv") {
+			if !r.verifiedDelete("100") {
+				t.Fatalf("deletion must be conditioned on the last verified claim: %v %v", r.deleteOptions, r.calls)
+			}
+			reclaim := r.index("patch", "pv", "restored-pv")
+			if reclaim < 0 {
 				t.Fatal("restored volume must get its reclaim policy")
 			}
 			resumed := r.has("patch", "cronjob", "gofer-snapshot", "--type=merge", "-p", `{"spec":{"suspend":false}}`)
@@ -271,17 +353,25 @@ func TestRestoreSuccess(t *testing.T) {
 				t.Fatalf("changed the original backup schedule state: %v", r.calls)
 			}
 			spec := r.created["spec"].(map[string]any)
-			// The claim was expanded to 4Gi after the 2Gi snapshot: keep 4Gi.
-			wantSize := "4Gi"
-			if size, ok := wantSizes[scenario]; ok {
-				wantSize = size
-			}
-			if spec["storageClassName"] != "test-storage-class" || spec["volumeMode"] != "Filesystem" || spec["accessModes"].([]any)[0] != "ReadWriteOnce" || spec["volumeName"] != nil || spec["dataSource"].(map[string]any)["name"] != "backup" || spec["resources"].(map[string]any)["requests"].(map[string]any)["storage"] != wantSize {
-				t.Fatalf("incorrect replacement claim: %v", spec)
+			if spec["storageClassName"] != "test-storage-class" || spec["volumeMode"] != "Filesystem" || spec["accessModes"].([]any)[0] != "ReadWriteOnce" || spec["volumeName"] != nil || spec["dataSource"].(map[string]any)["name"] != "backup" || spec["resources"].(map[string]any)["requests"].(map[string]any)["storage"] != w.create {
+				t.Fatalf("incorrect replacement claim, want %s: %v", w.create, spec)
 			}
 			meta := r.created["metadata"].(map[string]any)
 			if meta["uid"] != nil || meta["name"] != "data-gofer-0" || meta["namespace"] != "gofer" || meta["labels"].(map[string]any)["app"] != "gofer" {
 				t.Fatalf("incorrect replacement metadata: %v", meta)
+			}
+			expanded := r.index(expansion(w.expand)...)
+			if w.expand == "" {
+				if r.has("patch", "pvc") || r.has("get", "storageclass") {
+					t.Fatalf("must not expand a claim restored at its full size: %v", r.calls)
+				}
+				return
+			}
+			if !r.has("get", "storageclass", "test-storage-class", "-o", "json") {
+				t.Fatalf("must check that the claim can be expanded before restoring: %v", r.calls)
+			}
+			if expanded < reclaim || expanded < r.index("rollout", "status") {
+				t.Fatalf("must expand the bound, protected claim to %s after rollout: %v", w.expand, r.calls)
 			}
 		})
 	}
@@ -344,6 +434,10 @@ func TestKubectlHelper(t *testing.T) {
 	paused := strings.HasPrefix(scenario, "paused_") || scenario == "already_suspended"
 	noCronjob := strings.HasPrefix(scenario, "no_cronjob_") || scenario == "no_cronjob"
 	scenario = strings.TrimPrefix(strings.TrimPrefix(scenario, "paused_"), "no_cronjob_")
+	claimSize, restoreSize := "4Gi", "2Gi"
+	if spec, ok := strings.CutPrefix(scenario, "sizes="); ok {
+		claimSize, restoreSize, _ = strings.Cut(spec, ",")
+	}
 	is := func(parts ...string) bool { return slices.Equal(args[:min(len(parts), len(args))], parts) }
 	count := func(parts ...string) int {
 		n := 0
@@ -357,7 +451,7 @@ func TestKubectlHelper(t *testing.T) {
 	emit := func(v any) { _ = json.NewEncoder(os.Stdout).Encode(v) }
 	fail := func() { fmt.Fprintln(os.Stderr, "injected failure:", scenario); os.Exit(1) }
 	snap := func(name, claim string, ready bool) map[string]any {
-		return map[string]any{"metadata": map[string]any{"name": name, "uid": name + "-uid"}, "spec": map[string]any{"source": map[string]any{"persistentVolumeClaimName": claim}}, "status": map[string]any{"readyToUse": ready, "restoreSize": "2Gi"}}
+		return map[string]any{"metadata": map[string]any{"name": name, "uid": name + "-uid"}, "spec": map[string]any{"source": map[string]any{"persistentVolumeClaimName": claim}}, "status": map[string]any{"readyToUse": ready, "restoreSize": restoreSize}}
 	}
 	switch {
 	case is("config", "current-context"):
@@ -377,7 +471,17 @@ func TestKubectlHelper(t *testing.T) {
 			os.Exit(0)
 		}
 		var pvc map[string]any
-		_ = json.Unmarshal([]byte(`{"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"data-gofer-0","namespace":"gofer","uid":"pvc-uid","labels":{"app":"gofer"},"finalizers":["kubernetes.io/pvc-protection"]},"spec":{"volumeName":"original-pv","storageClassName":"test-storage-class","accessModes":["ReadWriteOnce"],"volumeMode":"Filesystem","resources":{"requests":{"storage":"4Gi"}}},"status":{"phase":"Bound"}}`), &pvc)
+		_ = json.Unmarshal([]byte(`{"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"data-gofer-0","namespace":"gofer","uid":"pvc-uid","resourceVersion":"100","labels":{"app":"gofer"},"finalizers":["kubernetes.io/pvc-protection"]},"spec":{"volumeName":"original-pv","storageClassName":"test-storage-class","accessModes":["ReadWriteOnce"],"volumeMode":"Filesystem","resources":{"requests":{"storage":"4Gi"}}},"status":{"phase":"Bound"}}`), &pvc)
+		pvc["spec"].(map[string]any)["resources"].(map[string]any)["requests"].(map[string]any)["storage"] = claimSize
+		if scenario == "early_resize" && n >= 2 || scenario == "late_resize" && n >= 3 {
+			// A resize keeps the claim's UID and volume.
+			pvc["metadata"].(map[string]any)["resourceVersion"] = "101"
+			pvc["spec"].(map[string]any)["resources"].(map[string]any)["requests"].(map[string]any)["storage"] = "8Gi"
+		}
+		if scenario == "delete_error" && count("delete") > 0 {
+			fmt.Fprintln(os.Stderr, "not found")
+			os.Exit(1)
+		}
 		if scenario == "claim_no_access" {
 			delete(pvc["spec"].(map[string]any), "accessModes")
 		}
@@ -431,6 +535,11 @@ func TestKubectlHelper(t *testing.T) {
 		} else {
 			fmt.Println("2026-11-16T00:00:00Z")
 		}
+	case is("get", "storageclass", "test-storage-class", "-o", "json"):
+		if scenario == "storageclass_read_error" {
+			fail()
+		}
+		emit(map[string]any{"metadata": map[string]any{"name": "test-storage-class"}, "allowVolumeExpansion": scenario != "no_expansion"})
 	case is("get", "statefulset", "gofer"):
 		fmt.Println("1")
 	case is("get", "cronjob", "gofer-snapshot"):
@@ -498,8 +607,23 @@ func TestKubectlHelper(t *testing.T) {
 		if scenario == "pod_timeout" {
 			fail()
 		}
-	case is("delete", "pvc", "data-gofer-0"):
+	case is("delete", "--raw", "/api/v1/namespaces/gofer/persistentvolumeclaims/data-gofer-0", "-f") && len(args) == 5:
+		data, err := os.ReadFile(args[4])
+		if err != nil || !json.Valid(data) {
+			fail()
+		}
+		if err := os.WriteFile(filepath.Join(dir, "delete-options.json"), data, 0600); err != nil {
+			fail()
+		}
+		if scenario == "delete_conflict" || scenario == "delete_error" {
+			fail()
+		}
+	case is("wait", "--for=delete", "pvc/data-gofer-0"):
 		if scenario == "delete_timeout" {
+			fail()
+		}
+	case is("patch", "pvc", "data-gofer-0"):
+		if scenario == "expand_error" {
 			fail()
 		}
 	case is("create", "-f"):
