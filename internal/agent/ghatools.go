@@ -845,8 +845,8 @@ func (t *githubToolBox) ghaRead(ctx context.Context, a ghaArgs) (string, error) 
 	label := ghaLabel(tg.repo, *tg.job)
 	start, n := a.StartLine, a.MaxLines
 	step := a.Step
-	if step == 0 && start == 0 {
-		step = tg.step // the step a "#step:N" link named
+	if step == 0 {
+		step = tg.step // the step a "#step:N" link named, on every page
 	}
 	if step > 0 {
 		if err := checkStep(*tg.job, step); err != nil {

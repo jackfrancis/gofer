@@ -95,8 +95,8 @@ numbered within the step, and results name it `step-N.log` to keep the two numbe
 apart. Ranges are still approximate where one step ends and the next starts within a
 second, and the summary marks them with "≈".
 
-A step read from the job log stays inside the step on every page. With `step` set,
-`start_line` is a job-log line inside the step (as a continuation hint gives it; the
+A step read from the job log stays inside the step on every page. With `step` set
+(or, when it is absent, a `#step:N` link in the URL), `start_line` is a job-log line inside the step (as a continuation hint gives it; the
 default is the step's first line), a negative one counts back from the step's end,
 and one outside the step is an error. The window never runs past the step's last
 line, whatever `max_lines` asks, and offers no continuation once the step's end is
@@ -191,7 +191,8 @@ Unit tests use `httptest` servers: the API on one server, the blob host on anoth
   - an oversized job log: an explicit step read, and the summary's failing-step tail,
     from the step's own log;
   - a step read capped at the step's last line, with no continuation past it, also
-    on a second page that follows the continuation hint;
+    on a second page that follows the continuation hint, for both `step` and a
+    `#step:N` link;
   - steps starting in the same second: shared ranges, and the failing step's tail and
     `step=N` read from its own log;
   - the diagnosis ahead of a capped job list, for a run and for a PR;

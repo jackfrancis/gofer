@@ -354,14 +354,17 @@ func TestGHASearchAndRead(t *testing.T) {
 	if !strings.Contains(out, "lines 6-7 of 15. Continue with start_line=8.") {
 		t.Errorf("read of step 3 with max_lines=2:\n%s", out)
 	}
-	// Following a continuation hint with step still set stays inside the step.
-	out = ciInvoke(t, box, "gha_read", `{`+job+`,"step":3,"max_lines":8}`)
-	if !strings.Contains(out, "lines 6-13 of 15. Continue with start_line=14.") {
-		t.Fatalf("first page of step 3:\n%s", out)
-	}
-	out = ciInvoke(t, box, "gha_read", `{`+job+`,"step":3,"start_line":14,"max_lines":8}`)
-	if !strings.Contains(out, "lines 14-14 of 15.\n") || strings.Contains(out, "    15\t") || strings.Contains(out, "Continue") {
-		t.Errorf("second page of step 3 left the step:\n%s", out)
+	// Following a continuation hint stays inside the step, whether the step was named
+	// by the step argument or by a "#step:N" link.
+	for _, sel := range []string{job + `,"step":3`, `"url":"https://github.com/o/r/actions/runs/7/job/42#step:3:1"`} {
+		out = ciInvoke(t, box, "gha_read", `{`+sel+`,"max_lines":8}`)
+		if !strings.Contains(out, "lines 6-13 of 15. Continue with start_line=14.") {
+			t.Fatalf("first page of step 3 (%s):\n%s", sel, out)
+		}
+		out = ciInvoke(t, box, "gha_read", `{`+sel+`,"start_line":14,"max_lines":8}`)
+		if !strings.Contains(out, "lines 14-14 of 15.\n") || strings.Contains(out, "    15\t") || strings.Contains(out, "Continue") {
+			t.Errorf("second page of step 3 left the step (%s):\n%s", sel, out)
+		}
 	}
 	// A negative start counts back from the step's end.
 	out = ciInvoke(t, box, "gha_read", `{`+job+`,"step":3,"start_line":-2}`)
