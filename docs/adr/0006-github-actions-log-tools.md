@@ -1,6 +1,6 @@
 # ADR 0006 — The conversation can read GitHub Actions job logs
 
-Status: accepted — implemented and unit-tested; in prod, GitHub refuses gofer's `read:user` token the job logs ("Must have admin rights to Repository"), so reading them needs a broader credential (see Scope)
+Status: accepted — implemented and unit-tested; in prod, GitHub refuses gofer's token the job logs ("Must have admin rights to Repository") while serving them to a broader token; the cause is not yet isolated (see Scope)
 Date: 2026-11-18
 
 ## Context
@@ -161,18 +161,26 @@ fixes: the log endpoints may need more scope than `read:user`, or the organisati
 may restrict OAuth apps it has not approved, which keeps public metadata readable
 but refuses anything that needs an authenticated identity.
 
-**It is scope.** With the reason passed through (below), a retry on the same job
-showed GitHub's answer: "Must have admin rights to Repository.", for a token whose
-scopes are `read:user, user:email`. An organisation's OAuth App restriction says so
-in a different message. Despite its wording, the message is GitHub's answer to a
-token without repository scope; it does not mean only admins can read the log. So
-reading Actions logs needs a broader credential than gofer requests. The candidate
-is `public_repo` (unverified as the minimum), which also grants write access to
-public repositories and so breaks gofer's read-only rule; `repo` is broader still.
-A read-only alternative, such as a fine-grained token limited to public
-repositories, is also unverified and would be a new credential path. Choosing
-between them is a separate decision. Until then the tools report the refusal and
-its reason, and the conversation says plainly that it cannot read the log.
+**What the retry showed, and what it does not.** With the reason passed through
+(below), a retry on the same job quoted GitHub's answer: "Must have admin rights to
+Repository.", for a token whose scopes are `read:user, user:email`. Together with the
+302 for the broader token, that establishes that GitHub refuses gofer's token and
+serves the log to a different one. It does not isolate why. The two tokens differ in
+scopes (`read:user, user:email` against `repo, read:org, workflow, gist`) and in the
+OAuth app that issued them, and the message names no scope. GitHub's documentation
+says anyone with read access to a repository can use this endpoint, and asks for the
+`repo` scope only for private repositories, which a public `kubernetes-sigs`
+repository is not. So a missing scope is one hypothesis, not a finding; an
+organisation policy on gofer's OAuth app (whose usual message differs from this one)
+or some other condition on the endpoint remain possible.
+
+What would isolate it, each against this job's log endpoint: a classic token with
+only `public_repo`, a fine-grained token with read-only access to public
+repositories, and an unauthenticated request from an address that has not used up
+its anonymous rate limit (the one tried was rate-limited and told nothing). Until
+one of those says otherwise, no decision to grant gofer write access (`public_repo`
+or `repo`) should rest on this 403. Meanwhile the tools report the refusal and its
+reason, and the conversation says plainly that it cannot read the log.
 
 The first release dropped GitHub's response body on a refusal, so the tool said only
 "status 403". A refused log request now carries GitHub's own message, the token's
@@ -246,7 +254,7 @@ Unit tests use `httptest` servers: the API on one server, the blob host on anoth
 
 Not yet covered:
 
-- which credential is the minimum that reads Actions logs (`public_repo`, or a read-only fine-grained token), and the step-log endpoint with gofer's token (see Scope);
+- why GitHub refuses gofer's token the job logs, and which credential (if any beyond today's) reads them: a `public_repo`-only token, a read-only fine-grained token, or no token at all; and the step-log endpoint with gofer's token (see Scope);
 - the real blob host and its redirect behaviour;
 - the step-log endpoint against real GitHub, including which scopes it needs and
   whether its lines carry the same timestamp prefix;
