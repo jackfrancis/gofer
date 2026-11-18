@@ -727,6 +727,9 @@ func (t *githubToolBox) ghaJobSummary(ctx context.Context, repo string, job gith
 	b.WriteString("  log:\n")
 	if logErr != nil {
 		fmt.Fprintf(&b, "    could not be read: %s\n", ghaLogErr(logErr))
+		if note := ghaRefusalNote(logErr, repo, job); note != "" {
+			fmt.Fprintf(&b, "    note: %s\n", note)
+		}
 		if tooLarge(logErr) {
 			// The failing step's own log is usually far smaller than the job's.
 			for _, s := range job.Steps {
@@ -797,6 +800,9 @@ func (t *githubToolBox) ghaStepTail(ctx context.Context, b *strings.Builder, l *
 	f, err := t.ghaStepLog(ctx, l, step)
 	if err != nil {
 		fmt.Fprintf(b, "    step %d's own log could not be read: %s\n", step, ghaLogErr(err))
+		if note := ghaRefusalNote(err, l.repo, l.job); note != "" {
+			fmt.Fprintf(b, "    note: %s\n", note)
+		}
 		return false
 	}
 	ghaWriteLines(t, b, f, f.Rel, -ghaTailLines, ghaTailLines,
@@ -811,6 +817,31 @@ const maxGHALogErr = 900
 
 // ghaLogErr renders a job or step log's fetch error for a summary line.
 func ghaLogErr(err error) string { return oneLine(err.Error(), maxGHALogErr) }
+
+// ghaRefusalNote explains a log GitHub refused to a classic token without repository
+// scope, and how the user can read it with their own credentials; "" for any other
+// error. GitHub's message for that refusal ("Must have admin rights to Repository.")
+// reads as if only admins may see the log, which gofer's tests showed is not so
+// (ADR 0006), so the note says what was established instead.
+func ghaRefusalNote(err error, repo string, job github.ActionsJob) string {
+	var lae *github.LogAccessError
+	if !errors.As(err, &lae) || !lae.LacksRepoScope() {
+		return ""
+	}
+	return fmt.Sprintf("GitHub refuses Actions logs to gofer's sign-in token, which has no repository scope, "+
+		"exactly as it refuses a request with no token; a token with the public_repo scope or a read-only "+
+		"fine-grained token can read them. Despite its wording, the message does not mean only repository "+
+		"admins can read the log. The user can read it with their own GitHub credentials: "+
+		"gh run view %d --repo %s --job %d --log-failed, or the job's page.", job.RunID, repo, job.ID)
+}
+
+// ghaWithNote adds the refusal note to an error a tool returns.
+func ghaWithNote(err error, repo string, job github.ActionsJob) error {
+	if note := ghaRefusalNote(err, repo, job); note != "" {
+		return fmt.Errorf("%w. %s", err, note)
+	}
+	return err
+}
 
 // ghaWriteLines writes a window of f as name:line: text lines under a heading.
 func ghaWriteLines(t *githubToolBox, b *strings.Builder, f *prow.File, name string, from, n int, heading string) {
@@ -832,7 +863,7 @@ func (t *githubToolBox) ghaSearch(ctx context.Context, a ghaArgs) (string, error
 	}
 	l, err := t.ghaOpen(ctx, tg.repo, *tg.job)
 	if err != nil {
-		return "", err
+		return "", ghaWithNote(err, tg.repo, *tg.job)
 	}
 	res, err := t.ci.SearchFile(ctx, l.file, prow.SearchOptions{
 		Pattern: a.Pattern, Literal: a.Literal, IgnoreCase: a.IgnoreCase,
@@ -867,7 +898,7 @@ func (t *githubToolBox) ghaRead(ctx context.Context, a ghaArgs) (string, error) 
 			// The step's own log may fit where the whole job's does not.
 			return t.ghaReadStepLog(ctx, &ghaLog{repo: tg.repo, job: *tg.job}, label, step, start, n, "the job log is too large to fetch")
 		}
-		return "", err
+		return "", ghaWithNote(err, tg.repo, *tg.job)
 	}
 	stepEnd := 0
 	if step > 0 {
@@ -911,7 +942,7 @@ func (t *githubToolBox) ghaRead(ctx context.Context, a ghaArgs) (string, error) 
 func (t *githubToolBox) ghaReadStepLog(ctx context.Context, l *ghaLog, label string, step, start, n int, why string) (string, error) {
 	f, err := t.ghaStepLog(ctx, l, step)
 	if err != nil {
-		return "", err
+		return "", ghaWithNote(err, l.repo, l.job)
 	}
 	res, err := t.ci.ReadFile(f, start, n)
 	if err != nil {

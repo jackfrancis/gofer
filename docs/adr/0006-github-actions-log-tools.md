@@ -1,6 +1,6 @@
 # ADR 0006 — The conversation can read GitHub Actions job logs
 
-Status: accepted — implemented and unit-tested; in prod, GitHub refuses gofer's token the job logs ("Must have admin rights to Repository") while serving them to a broader token; the cause is not yet isolated (see Scope)
+Status: accepted — implemented and unit-tested; in prod, GitHub refuses job logs to gofer's `read:user` token for lack of repository scope; a read-only fine-grained credential reads them, so a read-only sign-in is the path forward (see Scope)
 Date: 2026-11-18
 
 ## Context
@@ -161,7 +161,7 @@ fixes: the log endpoints may need more scope than `read:user`, or the organisati
 may restrict OAuth apps it has not approved, which keeps public metadata readable
 but refuses anything that needs an authenticated identity.
 
-**What the retry showed, and what it does not.** With the reason passed through
+**What the first retry showed, and what it did not.** With the reason passed through
 (below), a retry on the same job quoted GitHub's answer: "Must have admin rights to
 Repository.", for a token whose scopes are `read:user, user:email`. Together with the
 302 for the broader token, that establishes that GitHub refuses gofer's token and
@@ -170,17 +170,41 @@ scopes (`read:user, user:email` against `repo, read:org, workflow, gist`) and in
 OAuth app that issued them, and the message names no scope. GitHub's documentation
 says anyone with read access to a repository can use this endpoint, and asks for the
 `repo` scope only for private repositories, which a public `kubernetes-sigs`
-repository is not. So a missing scope is one hypothesis, not a finding; an
+repository is not. So a missing scope was then one hypothesis, not a finding; an
 organisation policy on gofer's OAuth app (whose usual message differs from this one)
-or some other condition on the endpoint remain possible.
+or some other condition on the endpoint remained possible. The tests below settled it.
 
-What would isolate it, each against this job's log endpoint: a classic token with
-only `public_repo`, a fine-grained token with read-only access to public
-repositories, and an unauthenticated request from an address that has not used up
-its anonymous rate limit (the one tried was rate-limited and told nothing). Until
-one of those says otherwise, no decision to grant gofer write access (`public_repo`
-or `repo`) should rest on this 403. Meanwhile the tools report the refusal and its
-reason, and the conversation says plainly that it cannot read the log.
+**What isolated it** (2026-11-18). Each credential was tried against the same job's
+log endpoint (`/actions/jobs/134438618532/logs`):
+
+| Credential | Result |
+| --- | --- |
+| None (unauthenticated) | 403, "Must have admin rights to Repository." |
+| Classic token, `read:user` only (gofer's scopes, but not issued by gofer's app) | 403, the same |
+| gofer's sign-in token (`read:user, user:email`) | 403, the same |
+| Classic token, `public_repo` only | 302 |
+| Fine-grained token, public repositories read-only, no permissions | 302 |
+
+The step-log endpoint answered the same way unauthenticated (403, same message).
+
+So it is scope, not gofer's app: a personal token with gofer's scopes, which no
+organisation app policy applies to, is refused just as gofer's token is, and GitHub
+treats such a token exactly like no token. The message does not mean only admins
+can read the log. Among classic scopes, `public_repo` is the smallest that reads it,
+and it grants write access to public repositories, which gofer's read-only rule
+forbids. A read-only fine-grained credential also reads it, so a read-only path
+exists: most likely a GitHub App sign-in, whose user tokens are fine-grained. A
+personal fine-grained token is not the same as an app user token, so that still
+needs confirming; it is being designed as a separate piece of work, and no write
+scope should be requested in the meantime.
+
+Until then, when GitHub's headers show a classic token without `repo` or
+`public_repo` (and no SAML SSO requirement), the tools add a note to the refusal:
+GitHub refuses the log to gofer's token as it does to no token, a `public_repo` or
+read-only fine-grained token can read it, the message does not mean only admins can,
+and the user can read it with their own credentials (`gh run view <run> --repo
+<owner/name> --job <job> --log-failed`, or the job's page). Other refusals carry no
+note, since their cause may differ.
 
 The first release dropped GitHub's response body on a refusal, so the tool said only
 "status 403". A refused log request now carries GitHub's own message, the token's
@@ -254,7 +278,7 @@ Unit tests use `httptest` servers: the API on one server, the blob host on anoth
 
 Not yet covered:
 
-- why GitHub refuses gofer's token the job logs, and which credential (if any beyond today's) reads them: a `public_repo`-only token, a read-only fine-grained token, or no token at all; and the step-log endpoint with gofer's token (see Scope);
+- whether a GitHub App user token (rather than a personal fine-grained token) reads Actions logs for a public repository where the app is not installed; and the step-log endpoint with gofer's token (see Scope);
 - the real blob host and its redirect behaviour;
 - the step-log endpoint against real GitHub, including which scopes it needs and
   whether its lines carry the same timestamp prefix;

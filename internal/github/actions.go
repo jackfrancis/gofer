@@ -42,6 +42,41 @@ var ErrLogTooLarge = errors.New("job log too large")
 // access restriction.
 var ErrLogForbidden = errors.New("access denied")
 
+// LogAccessError is a log the API refused to this token. It matches
+// ErrLogForbidden, and its message carries GitHub's reason and the scope headers.
+type LogAccessError struct {
+	What   string // "job log" or "step log"
+	Status int    // 401 or 403
+	reason reason
+}
+
+func (e *LogAccessError) Error() string {
+	return fmt.Sprintf("%s: %s (status %d): GitHub refused this token access to the %s (gofer's access to GitHub, not anything the job itself printed)%s",
+		e.What, ErrLogForbidden.Error(), e.Status, e.What, e.reason.String())
+}
+
+// Is makes a LogAccessError match ErrLogForbidden.
+func (e *LogAccessError) Is(target error) bool { return target == ErrLogForbidden }
+
+// LacksRepoScope reports a refusal to a classic OAuth token whose granted scopes,
+// as GitHub reported them, include neither repo nor public_repo, with no SAML SSO
+// requirement. That is the case gofer's tests pinned down (ADR 0006): GitHub serves
+// Actions logs to a token with public_repo or to a read-only fine-grained token,
+// and refuses one with only read:user exactly as it refuses no token at all. A
+// refusal without the scopes header (a fine-grained or app token) is not this case.
+func (e *LogAccessError) LacksRepoScope() bool {
+	if e.reason.sso || e.reason.tokenScopes == nil {
+		return false
+	}
+	for _, sc := range strings.Split(*e.reason.tokenScopes, ",") {
+		switch strings.TrimSpace(sc) {
+		case "repo", "public_repo":
+			return false
+		}
+	}
+	return true
+}
+
 // ErrLogRateLimited reports a log request refused by a GitHub rate limit.
 var ErrLogRateLimited = errors.New("GitHub rate limit")
 
@@ -324,7 +359,7 @@ func (c *Client) logLocation(ctx context.Context, token, path, what string, w io
 		if r.rateLimited || resp.StatusCode == http.StatusTooManyRequests {
 			return nil, 0, fmt.Errorf("%s: %w (status %d)%s", what, ErrLogRateLimited, resp.StatusCode, r.String())
 		}
-		return nil, 0, fmt.Errorf("%s: %w (status %d): GitHub refused this token access to the %s (gofer's access to GitHub, not anything the job itself printed)%s", what, ErrLogForbidden, resp.StatusCode, what, r.String())
+		return nil, 0, &LogAccessError{What: what, Status: resp.StatusCode, reason: r}
 	case resp.StatusCode < 300 || resp.StatusCode > 399:
 		return nil, 0, fmt.Errorf("%s: status %d%s", what, resp.StatusCode, apiReason(resp).String())
 	}

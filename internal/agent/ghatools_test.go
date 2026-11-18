@@ -157,6 +157,13 @@ func newGHAFake(t *testing.T) *ghaFake {
 		if r.Header.Get("Authorization") != "Bearer s3cret-token" {
 			t.Errorf("API call without the token: %s", r.URL.Path)
 		}
+		if r.URL.Path == "/repos/o/r/actions/jobs/51/logs" {
+			// Refused although the token has public_repo: not the scope case.
+			w.Header().Set("X-OAuth-Scopes", "public_repo, read:user")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Resource not accessible by integration"}`))
+			return
+		}
 		if r.URL.Path == "/repos/o/r/actions/jobs/50/steps/3/logs" {
 			// Job 50's whole log is served (and is too large); its step log is refused,
 			// with GitHub's full-length restriction message.
@@ -192,6 +199,8 @@ func newGHAFake(t *testing.T) *ghaFake {
 			_, _ = w.Write([]byte(ghaJobJSONSteps(45, "lint", "failure", ghaSameSecondSteps)))
 		case "/repos/o/r/actions/jobs/48":
 			_, _ = w.Write([]byte(ghaJobJSONSteps(48, "e2e", "failure", ghaBackgroundSteps)))
+		case "/repos/o/r/actions/jobs/51":
+			_, _ = w.Write([]byte(ghaJobJSON(51, "links", "failure")))
 		case "/repos/o/r/actions/jobs/50":
 			_, _ = w.Write([]byte(ghaJobJSON(50, "links", "failure")))
 		case "/repos/o/r/actions/jobs/49":
@@ -569,14 +578,29 @@ func TestGHALogForbiddenSaysWhy(t *testing.T) {
 		"the token's scopes: read:user, user:email",
 		"scopes this endpoint accepts: (none)",
 		"not anything the job itself printed",
+		// The token lacks repository scope, so the note says what that means and how
+		// the user can read the log.
+		"note: GitHub refuses Actions logs to gofer's sign-in token, which has no repository scope",
+		"does not mean only repository admins can read the log",
+		"gh run view 7 --repo o/r --job 49 --log-failed",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("summary lacks %q:\n%s", want, out)
 		}
 	}
 	_, err := box.Invoke(context.Background(), "gha_read", json.RawMessage(`{"job_id":49,"step":3}`))
-	if err == nil || !strings.Contains(err.Error(), "OAuth App access restrictions") {
+	if err == nil || !strings.Contains(err.Error(), "OAuth App access restrictions") || !strings.Contains(err.Error(), "gh run view 7 --repo o/r --job 49 --log-failed") {
 		t.Errorf("gha_read: err = %v", err)
+	}
+	_, err = box.Invoke(context.Background(), "gha_search", json.RawMessage(`{"job_id":49,"pattern":"x"}`))
+	if err == nil || !strings.Contains(err.Error(), "--log-failed") {
+		t.Errorf("gha_search: err = %v", err)
+	}
+
+	// A refusal to a token that has public_repo is a different problem: no note.
+	out = ciInvoke(t, box, "gha_job_summary", `{"job_id":51}`)
+	if !strings.Contains(out, "access denied (status 403)") || strings.Contains(out, "note:") {
+		t.Errorf("summary for a public_repo token's refusal:\n%s", out)
 	}
 }
 
@@ -598,6 +622,7 @@ func TestGHAStepFallbackRefusalKeepsScopes(t *testing.T) {
 		"step 3's own log could not be read: step log: access denied (status 403): GitHub refused this token access to the step log",
 		"the token's scopes: read:user, user:email; scopes this endpoint accepts: (none)",
 		"has enabled OAuth App access restrictions",
+		"note: GitHub refuses Actions logs to gofer's sign-in token",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("summary lacks %q:\n%s", want, out)
