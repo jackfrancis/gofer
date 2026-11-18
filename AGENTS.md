@@ -38,6 +38,7 @@ a reference for the seam with nothing plugged in.
 cmd/server/          web tier entrypoint (HTTP, UI); selects the backend
 cmd/runtime/         agent runtime entrypoint (one-line shim over internal/runtime/aei)
 cmd/snapshot/        takes and prunes data-volume snapshots (the backup CronJob runs it from the web image)
+hack/restore/       guarded restore script + fake-kubectl regression tests (make restore)
 internal/runtime/    the backend contract (doc.go)
 internal/runtime/aei/  the AEI backend: dispatcher (aei.go) + workload entrypoint (workload.go)
 internal/config/     env configuration
@@ -139,7 +140,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   `docs/backup-restore.md`.
 - Recovery: `make deploy` sets the data volume's reclaim policy to `Retain`;
   `make backup-apply SNAPSHOT_CLASS=<class>` schedules snapshots and `make restore`
-  swaps the claim for one restored from a snapshot. Never write an environment's
+  swaps the claim for one restored from a snapshot. The restore script validates the
+  claim before downtime and pauses/checks backup activity. Replacement/startup
+  failures after attempted claim deletion leave backups paused for manual recovery.
+  Once the restored rollout is confirmed, finalization errors are reported separately
+  and the prior backup schedule is restored without restarting or rolling back the app.
+  Never strip storage finalizers to force a restore. Never write an environment's
   names (cloud resource groups, registries, hostnames, snapshot classes) into this
   repository: they are make parameters or live with the cluster.
 - Change an existing work item with `worklist.Store.Update` (one atomic
