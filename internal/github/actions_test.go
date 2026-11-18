@@ -413,3 +413,45 @@ func TestActionsStepLog(t *testing.T) {
 		t.Error("step 0 accepted")
 	}
 }
+
+// The API's own redirect can carry a malformed Location too; net/http's client would
+// quote it in an error before CheckRedirect ran.
+func TestActionsJobLogRedactsBadAPILocation(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://[::1%zz/logs?sig=s3cret-api-sig")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer api.Close()
+	c := NewClient(api.Client(), api.URL)
+	_, err := c.ActionsJobLog(context.Background(), "tok", "o/r", 42, &bytes.Buffer{}, 1<<20)
+	if err == nil {
+		t.Fatal("a malformed API redirect succeeded")
+	}
+	for _, leak := range []string{"s3cret", "::1%zz"} {
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("error leaks %q: %v", leak, err)
+		}
+	}
+}
+
+// The API hop still goes through the client's transport, so a credential-adding or
+// retrying transport is honoured there (and only there).
+func TestActionsJobLogAPIHopUsesClientTransport(t *testing.T) {
+	ls := newLogServers(t, "x\n")
+	var used atomic.Bool
+	hc := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		used.Store(true)
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+	c := NewClient(hc, ls.api.URL)
+	if _, err := c.ActionsJobLog(context.Background(), "tok", "o/r", 42, &bytes.Buffer{}, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if !used.Load() {
+		t.Error("the API hop bypassed the client's transport")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

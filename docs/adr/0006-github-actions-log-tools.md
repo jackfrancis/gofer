@@ -77,15 +77,31 @@ buffered on their way to disk, and normalisation checks the fetch's context ever
 MiB, so a large log stays inside the fetch's time budget.
 
 The tools also use `LineHead` to assign lines to steps: a line belongs to the latest
-step start at or before its second. The API gives step starts only to the second, and
-quick steps often start in the same second as each other. Such steps form one group
-whose lines the timestamps cannot split, so the summary shows the group's range on
-each of them and names the others. For a grouped (or unplaced) step, `gha_read step=N`
-and the failing-step tail fetch the step's own log from the step-log endpoint instead.
-Its lines are numbered within the step, and results name it `step-N.log` to keep the
-two numberings apart. Ranges are still approximate where one step ends and the next
-starts within a second, and the summary marks them with "≈". Steps within a job run
-one after another, so there is no parallel-step case.
+step start at or before its second. Two cases defeat that, and both are reported as
+"mixed with step(s) N", never as a clean range:
+
+- **Same-second starts.** The API gives step starts only to the second, and quick
+  steps often start in the same second as each other. Such steps form one group whose
+  lines the timestamps cannot split, so the summary shows the group's range on each.
+- **Overlap in time.** A `background` step runs while the steps after it run, so its
+  output lands, by time, inside theirs. A step that starts before an earlier one has
+  ended (in whole seconds, so starting in the second the previous one ended does not
+  count), or after one that has not ended, overlaps it. A step left with no lines of
+  its own is still listed as running alongside the others.
+
+For such a step (or one with no lines at all), `gha_read step=N` and the failing-step
+tail fetch the step's own log from the step-log endpoint instead. Its lines are
+numbered within the step, and results name it `step-N.log` to keep the two numberings
+apart. Ranges are still approximate where one step ends and the next starts within a
+second, and the summary marks them with "≈".
+
+A step read from the job log stays inside the step: its window starts at the step's
+first line, never runs past its last (whatever `max_lines` asks), and offers no
+continuation once the step's end is reached.
+
+When the job log is over the per-file or per-run byte budget, an explicit
+`gha_read step=N` reads the step's own log instead, and the summary takes its
+failing-step tail from there. Both count under the job's slot and the same budgets.
 
 The scanner gained a `Before` window, and `ScanLog` orders windows by where they
 start before it merges them. A merge that would grow past the 25 lines a block shows
@@ -95,8 +111,11 @@ truncate them.
 
 ### Credential handling
 
-- The token goes to the API host only. The log request is made with the shared
-  client, using a copy whose `CheckRedirect` returns the 302 unfollowed. The blob is
+- The token goes to the API host only. The log request is a single round trip
+  through the shared client's transport (its retries included), not `Client.Do`,
+  and its 302 is read rather than followed. `Client.Do` would parse a redirect's
+  `Location` before `CheckRedirect` could stop it, and quote a malformed one,
+  pre-signed URL and all, in its error. The blob is
   then fetched by a separate client, built on a fresh clone of the default
   transport, never on the caller's client, because that client's transport might
   add a credential. A guard RoundTripper on that client deletes `Authorization`,
@@ -142,6 +161,8 @@ Unit tests use `httptest` servers: the API on one server, the blob host on anoth
   - a malformed redirect `Location` kept out of the error, and cancellation kept as
     such;
   - one fresh link after a refused one, and a clear error after two;
+  - a malformed `Location` on the API's own redirect kept out of the error, with the
+    API hop still going through the client's transport;
   - the step-log endpoint;
   - the size bound, with and without a Content-Length;
   - 404 and 410;
@@ -162,6 +183,11 @@ Unit tests use `httptest` servers: the API on one server, the blob host on anoth
   - search and read, including `step`, `#step:N` and a negative start;
   - one download per job across calls;
   - errors for ambiguous runs, Prow URLs, other hosts and missing jobs;
+  - a background step overlapping the step after it: both reported as mixed, and the
+    failing background step's tail read from its own log;
+  - an oversized job log: an explicit step read, and the summary's failing-step tail,
+    from the step's own log;
+  - a step read capped at the step's last line, with no continuation past it;
   - steps starting in the same second: shared ranges, and the failing step's tail and
     `step=N` read from its own log;
   - the diagnosis ahead of a capped job list, for a run and for a PR;

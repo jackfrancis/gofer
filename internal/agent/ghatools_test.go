@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/jackfrancis/gofer/internal/prow"
 )
 
 // ghaFailLog is job 42's log: steps 1 (lines 1-2), 2 (3-5), 3 (6-14, failing), 4 (15).
@@ -63,6 +65,33 @@ const ghaSameSecondSteps = `[
 	{"number":4,"name":"Complete job","status":"completed","conclusion":"success","started_at":"2026-11-01T10:00:21Z","completed_at":"2026-11-01T10:00:21Z"}
 ]`
 
+// Job 48: step 2 runs in the background while step 3 runs, and fails; its failure
+// line lands, by time, inside step 3's range.
+var ghaBackgroundLog = strings.Join([]string{
+	"2026-11-01T10:00:00.1000000Z Current runner version",
+	"2026-11-01T10:00:02.1000000Z ##[group]Run ./server",
+	"2026-11-01T10:00:03.0000000Z server listening",
+	"2026-11-01T10:00:05.2000000Z ##[group]Run go test ./...",
+	"2026-11-01T10:00:06.0000000Z ok  \texample.com/a\t0.1s",
+	"2026-11-01T10:00:10.0000000Z server: fatal: out of memory",
+	"2026-11-01T10:00:21.0000000Z Post job cleanup.",
+}, "\n") + "\n"
+
+var ghaBackgroundStep2 = "2026-11-01T10:00:02.1000000Z ##[group]Run ./server\n" +
+	"2026-11-01T10:00:03.0000000Z server listening\n" +
+	"2026-11-01T10:00:10.0000000Z server: fatal: out of memory\n"
+
+const ghaBackgroundSteps = `[
+	{"number":1,"name":"Set up job","status":"completed","conclusion":"success","started_at":"2026-11-01T10:00:00Z","completed_at":"2026-11-01T10:00:02Z"},
+	{"number":2,"name":"Start server","status":"completed","conclusion":"failure","started_at":"2026-11-01T10:00:02Z","completed_at":"2026-11-01T10:00:20Z"},
+	{"number":3,"name":"Run tests","status":"completed","conclusion":"success","started_at":"2026-11-01T10:00:05Z","completed_at":"2026-11-01T10:00:08Z"},
+	{"number":4,"name":"Complete job","status":"completed","conclusion":"success","started_at":"2026-11-01T10:00:21Z","completed_at":"2026-11-01T10:00:21Z"}
+]`
+
+// ghaStep42of3 is job 42's step 3 alone (its own log).
+var ghaStep42of3 = "2026-11-01T10:00:15.0000000Z --- FAIL: TestThing (0.00s)\n" +
+	"2026-11-01T10:00:19.0000000Z ##[error]Process completed with exit code 1.\n"
+
 const ghaSteps = `[
 	{"number":1,"name":"Set up job","status":"completed","conclusion":"success","started_at":"2026-11-01T10:00:00Z","completed_at":"2026-11-01T10:00:02Z"},
 	{"number":2,"name":"Checkout","status":"completed","conclusion":"success","started_at":"2026-11-01T10:00:02Z","completed_at":"2026-11-01T10:00:05Z"},
@@ -110,6 +139,14 @@ func newGHAFake(t *testing.T) *ghaFake {
 			_, _ = w.Write([]byte(ghaSameSecondLog))
 		case "/45-3":
 			_, _ = w.Write([]byte(ghaSameSecondStep3))
+		case "/48":
+			_, _ = w.Write([]byte(ghaBackgroundLog))
+		case "/48-2":
+			_, _ = w.Write([]byte(ghaBackgroundStep2))
+		case "/48-3":
+			_, _ = w.Write([]byte("2026-11-01T10:00:05.2000000Z ##[group]Run go test ./...\n"))
+		case "/42-3":
+			_, _ = w.Write([]byte(ghaStep42of3))
 		default:
 			http.NotFound(w, r)
 		}
@@ -133,6 +170,8 @@ func newGHAFake(t *testing.T) *ghaFake {
 		switch r.URL.Path {
 		case "/repos/o/r/actions/jobs/45":
 			_, _ = w.Write([]byte(ghaJobJSONSteps(45, "lint", "failure", ghaSameSecondSteps)))
+		case "/repos/o/r/actions/jobs/48":
+			_, _ = w.Write([]byte(ghaJobJSONSteps(48, "e2e", "failure", ghaBackgroundSteps)))
 		case "/repos/o/r/actions/jobs/47":
 			_, _ = w.Write([]byte(ghaJobJSON(47, "no log", "failure")))
 		case "/repos/o/r/actions/runs/9/jobs":
@@ -300,9 +339,20 @@ func TestGHASearchAndRead(t *testing.T) {
 
 	out = ciInvoke(t, box, "gha_read", `{`+job+`,"step":3}`)
 	assertFramed(t, out, ciUntrustedOpen)
-	if !strings.Contains(out, "gha_read log in Actions job 42 in o/r: lines 6-14 of 15. Continue with start_line=15.") ||
-		!strings.Contains(out, "    14\t##[error]Process completed") || strings.Contains(out, "    15\t") {
+	if !strings.HasPrefix(out, "Step 3 is log lines 6-14.\n") ||
+		!strings.Contains(out, "gha_read log in Actions job 42 in o/r: lines 6-14 of 15.\n") ||
+		!strings.Contains(out, "    14\t##[error]Process completed") || strings.Contains(out, "    15\t") || strings.Contains(out, "Continue") {
 		t.Errorf("read of step 3:\n%s", out)
+	}
+	// A larger max_lines still stops at the step's last line.
+	out = ciInvoke(t, box, "gha_read", `{`+job+`,"step":3,"max_lines":40}`)
+	if !strings.Contains(out, "lines 6-14 of 15.\n") || strings.Contains(out, "    15\t") || strings.Contains(out, "Continue") {
+		t.Errorf("read of step 3 with max_lines=40:\n%s", out)
+	}
+	// A smaller one pages inside it.
+	out = ciInvoke(t, box, "gha_read", `{`+job+`,"step":3,"max_lines":2}`)
+	if !strings.Contains(out, "lines 6-7 of 15. Continue with start_line=8.") {
+		t.Errorf("read of step 3 with max_lines=2:\n%s", out)
 	}
 
 	// A "#step:N" link reads that step.
@@ -382,8 +432,8 @@ func TestGHAStepsStartingTogether(t *testing.T) {
 	ghaCheckClean(t, f, out)
 	for _, want := range []string{
 		"  1 Set up job: success (≈ log lines 1-1)",
-		"  2 Setup Go: success (≈ log lines 2-5, shared with step(s) 3, which started the same second; gha_read step=2 reads its own log)",
-		"✗ 3 Lint: failure (≈ log lines 2-5, shared with step(s) 2, which started the same second; gha_read step=3 reads its own log)",
+		"  2 Setup Go: success (≈ log lines 2-5, mixed with step(s) 3, which started the same second or ran at the same time; gha_read step=2 reads its own log)",
+		"✗ 3 Lint: failure (≈ log lines 2-5, mixed with step(s) 2, which started the same second or ran at the same time; gha_read step=3 reads its own log)",
 		"  4 Complete job: success (≈ log lines 6-6)",
 		"the end of step 3, from its own log (step-3.log, numbered within the step",
 		"step-3.log:2: internal/x.go:3:1: unused variable",
@@ -407,6 +457,55 @@ func TestGHAStepsStartingTogether(t *testing.T) {
 	out = ciInvoke(t, box, "gha_read", `{"job_id":45,"step":4}`)
 	if !strings.Contains(out, "gha_read log in Actions job 45 in o/r: lines 6-6 of 6.") {
 		t.Errorf("read of step 4:\n%s", out)
+	}
+}
+
+// A background step overlaps the steps after it: neither gets a clean range, and the
+// failing background step is read from its own log.
+func TestGHABackgroundStep(t *testing.T) {
+	box, f := ghaBox(t)
+	out := ciInvoke(t, box, "gha_job_summary", `{"job_id":48}`)
+	ghaCheckClean(t, f, out)
+	for _, want := range []string{
+		"✗ 2 Start server: failure (≈ log lines 2-3, mixed with step(s) 3, which started the same second or ran at the same time; gha_read step=2 reads its own log)",
+		"  3 Run tests: success (≈ log lines 4-6, mixed with step(s) 2, which started the same second or ran at the same time; gha_read step=3 reads its own log)",
+		"  4 Complete job: success (≈ log lines 7-7)",
+		"the end of step 2, from its own log (step-2.log, numbered within the step; the job log cannot place it)",
+		"step-2.log:3: server: fatal: out of memory",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary lacks %q:\n%s", want, out)
+		}
+	}
+	out = ciInvoke(t, box, "gha_read", `{"job_id":48,"step":3}`)
+	if !strings.HasPrefix(out, "Step 3's own log (the job log cannot place its lines)") {
+		t.Errorf("read of a step overlapped by a background step:\n%s", out)
+	}
+}
+
+// When the job log is over the per-file limit, an explicit step read (and the
+// summary's failing-step tail) uses the step's own, smaller log.
+func TestGHAStepLogWhenJobLogTooLarge(t *testing.T) {
+	box, f := ghaBox(t)
+	box.ci.Close()
+	box.ci = prow.NewSession(prow.NewClient("http://127.0.0.1:1"), prow.Limits{MaxObjectBytes: int64(len(ghaStep42of3))})
+
+	out := ciInvoke(t, box, "gha_read", `{"job_id":42,"step":3}`)
+	ghaCheckClean(t, f, out)
+	if !strings.HasPrefix(out, "Step 3's own log (the job log is too large to fetch)") ||
+		!strings.Contains(out, "gha_read step-3.log in Actions job 42 in o/r: lines 1-2 of 2.") {
+		t.Errorf("step read with an oversized job log:\n%s", out)
+	}
+	// Without a step there is nothing smaller to read.
+	if _, err := box.Invoke(context.Background(), "gha_read", json.RawMessage(`{"job_id":42}`)); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Errorf("whole-log read: err = %v", err)
+	}
+
+	out = ciInvoke(t, box, "gha_job_summary", `{"job_id":42}`)
+	if !strings.Contains(out, "could not be read: job log too large") ||
+		!strings.Contains(out, "the end of step 3, from its own log (step-3.log, numbered within the step; the job log is too large to fetch)") ||
+		!strings.Contains(out, "step-3.log:2: ##[error]Process completed with exit code 1.") {
+		t.Errorf("summary with an oversized job log:\n%s", out)
 	}
 }
 

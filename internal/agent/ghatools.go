@@ -15,6 +15,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -73,11 +74,12 @@ type ghaLog struct {
 type lineRange struct{ first, last int }
 
 // stepLines is where a step's output sits in the job log, by the runner's
-// timestamps. Steps that started in the same second cannot be told apart that way:
-// each of them carries their shared range and names the others.
+// timestamps. Steps that started in the same second, or ran at the same time (a
+// background step), cannot be told apart that way: each carries the range its time
+// gave it (zero when none) and names the steps its lines may be mixed with.
 type stepLines struct {
 	lineRange
-	shared []int // the other steps whose lines are in this range
+	shared []int // the other steps whose lines may be in this range
 }
 
 func (s stepLines) ambiguous() bool { return len(s.shared) > 0 }
@@ -101,7 +103,7 @@ var (
 		`},"required":["pattern"]}`)
 
 	schemaGHARead = json.RawMessage(`{"type":"object","properties":{` + ghaTargetProps +
-		`"step":{"type":"integer","description":"a step number (from gha_job_summary): read that step. Its lines in the job log, from its first; or, when the job log cannot place them (steps that started in the same second), the step's own log (step-N.log, numbered from 1), in which start_line then counts"},` +
+		`"step":{"type":"integer","description":"a step number (from gha_job_summary): read that step. Its lines in the job log, from its first; or, when the job log cannot place them (steps that started in the same second or ran at the same time), the step's own log (step-N.log, numbered from 1), in which start_line then counts"},` +
 		`"start_line":{"type":"integer","description":"first line, 1-based (default 1, or the step's first line); negative counts from the end, e.g. -200 reads the last 200 lines"},` +
 		`"max_lines":{"type":"integer","description":"lines to return, up to 1500 (default 400, or the whole step)"}` +
 		`}}`)
@@ -359,13 +361,17 @@ func (t *githubToolBox) ghaStepLog(ctx context.Context, l *ghaLog, step int) (*p
 }
 
 // stepMapper assigns log lines to steps by time: the runner stamps every line, and
-// the API gives each step's start (to the second). A line belongs to the latest step
-// start at or before it; unstamped lines belong with the line before. Steps that
-// started in the same second form one group, whose lines cannot be split between
-// them. The ranges are approximate at a boundary within one second.
+// the API gives each step's start and end (to the second). A line belongs to the
+// latest step start at or before it; unstamped lines belong with the line before.
+// Steps that started in the same second form one group, whose lines cannot be split
+// between them, and a step that overlaps another in time (a background step runs
+// alongside the steps after it) has its lines mixed into theirs. Both are reported
+// as such, never as a clean range. The ranges are approximate at a boundary within
+// one second.
 type stepMapper struct {
-	groups [][]int     // step numbers, by group, groups in start order
-	starts []time.Time // each group's start second
+	order  []github.ActionsStep // steps that ran, by start
+	groups [][]int              // step numbers, by group, groups in start order
+	starts []time.Time          // each group's start second
 	ranges []lineRange
 	cur    int
 }
@@ -385,7 +391,7 @@ func newStepMapper(steps []github.ActionsStep) *stepMapper {
 		}
 		return order[i].Number < order[k].Number
 	})
-	m := &stepMapper{cur: -1}
+	m := &stepMapper{cur: -1, order: order}
 	for _, s := range order {
 		if n := len(m.starts); n > 0 && m.starts[n-1].Equal(sec(s)) {
 			m.groups[n-1] = append(m.groups[n-1], s.Number)
@@ -419,25 +425,74 @@ func (m *stepMapper) lineHead(num int, head []byte) int {
 	return drop
 }
 
-// result is each step's lines, by step number.
+// result is each step's lines, by step number. A step whose lines may be mixed with
+// others' (same start second, or overlapping in time) names them; a step that
+// overlaps others but was given no lines is listed with a zero range.
 func (m *stepMapper) result() map[int]stepLines {
+	mixed := map[int]map[int]bool{}
+	link := func(a, b int) {
+		if mixed[a] == nil {
+			mixed[a] = map[int]bool{}
+		}
+		mixed[a][b] = true
+	}
+	for _, nums := range m.groups {
+		for _, a := range nums {
+			for _, b := range nums {
+				if a != b {
+					link(a, b)
+				}
+			}
+		}
+	}
+	// Overlap in time: a later step that starts before an earlier one has ended (in
+	// whole seconds, so a step starting in the second the previous one ended is not
+	// counted). An earlier step that has not ended overlaps everything after it.
+	sec := func(t time.Time) time.Time { return t.Truncate(time.Second) }
+	for i, a := range m.order {
+		for _, b := range m.order[i+1:] {
+			if a.CompletedAt.IsZero() || sec(b.StartedAt).Before(sec(a.CompletedAt)) {
+				link(a.Number, b.Number)
+				link(b.Number, a.Number)
+			}
+		}
+	}
+	others := func(n int) []int {
+		var out []int
+		for o := range mixed[n] {
+			out = append(out, o)
+		}
+		sort.Ints(out)
+		return out
+	}
 	out := map[int]stepLines{}
 	for g, nums := range m.groups {
 		r := m.ranges[g]
-		if r.first == 0 {
-			continue
-		}
 		for _, n := range nums {
-			sl := stepLines{lineRange: r}
-			for _, o := range nums {
-				if o != n {
-					sl.shared = append(sl.shared, o)
-				}
+			if r.first == 0 && len(mixed[n]) == 0 {
+				continue
 			}
-			out[n] = sl
+			out[n] = stepLines{lineRange: r, shared: others(n)}
 		}
 	}
 	return out
+}
+
+// tooLarge reports a log over the per-file or per-run byte budget.
+func tooLarge(err error) bool {
+	return errors.Is(err, github.ErrLogTooLarge) || errors.Is(err, prow.ErrTooLarge)
+}
+
+// checkStep reports a step that cannot have a log.
+func checkStep(job github.ActionsJob, n int) error {
+	s, ok := stepOf(job, n)
+	switch {
+	case !ok:
+		return fmt.Errorf("job %d has no step %d; see gha_job_summary for its steps", job.ID, n)
+	case s.Conclusion == "skipped" || s.StartedAt.IsZero():
+		return fmt.Errorf("step %d did not run (%s), so it has no log", n, oneLine(ghaState(s.Status, s.Conclusion), 40))
+	}
+	return nil
 }
 
 func stepOf(job github.ActionsJob, n int) (github.ActionsStep, bool) {
@@ -656,9 +711,12 @@ func (t *githubToolBox) ghaJobSummary(ctx context.Context, repo string, job gith
 		fmt.Fprintf(&b, "    %s %d %s: %s", mark, s.Number, oneLine(s.Name, 200), oneLine(ghaState(s.Status, s.Conclusion), 40))
 		if l != nil {
 			if r, ok := l.steps[s.Number]; ok {
-				if r.ambiguous() {
-					fmt.Fprintf(&b, " (≈ log lines %d-%d, shared with step(s) %s, which started the same second; gha_read step=%d reads its own log)", r.first, r.last, joinInts(r.shared), s.Number)
-				} else {
+				switch {
+				case r.ambiguous() && r.first == 0:
+					fmt.Fprintf(&b, " (ran at the same time as step(s) %s, whose log lines its output is mixed into; gha_read step=%d reads its own log)", joinInts(r.shared), s.Number)
+				case r.ambiguous():
+					fmt.Fprintf(&b, " (≈ log lines %d-%d, mixed with step(s) %s, which started the same second or ran at the same time; gha_read step=%d reads its own log)", r.first, r.last, joinInts(r.shared), s.Number)
+				default:
 					fmt.Fprintf(&b, " (≈ log lines %d-%d)", r.first, r.last)
 				}
 			}
@@ -669,6 +727,15 @@ func (t *githubToolBox) ghaJobSummary(ctx context.Context, repo string, job gith
 	b.WriteString("  log:\n")
 	if logErr != nil {
 		fmt.Fprintf(&b, "    could not be read: %s\n", oneLine(logErr.Error(), 300))
+		if tooLarge(logErr) {
+			// The failing step's own log is usually far smaller than the job's.
+			for _, s := range job.Steps {
+				if ghaStepFailed(s) && checkStep(job, s.Number) == nil {
+					t.ghaStepTail(ctx, &b, &ghaLog{repo: repo, job: job}, s.Number, "the job log is too large to fetch")
+					break
+				}
+			}
+		}
 		b.WriteString(untrustedClose)
 		return b.String()
 	}
@@ -716,16 +783,25 @@ func (t *githubToolBox) ghaTail(ctx context.Context, b *strings.Builder, l *ghaL
 			ghaWriteLines(t, b, l.file, ghaLogName, from, r.last-from+1, fmt.Sprintf("the end of step %d", s.Number))
 			return
 		}
-		f, err := t.ghaStepLog(ctx, l, s.Number)
-		if err == nil {
-			ghaWriteLines(t, b, f, f.Rel, -ghaTailLines, ghaTailLines,
-				fmt.Sprintf("the end of step %d, from its own log (%s, numbered within the step; the job log cannot place it)", s.Number, f.Rel))
+		if t.ghaStepTail(ctx, b, l, s.Number, "the job log cannot place it") {
 			return
 		}
-		fmt.Fprintf(b, "    step %d's own log could not be read: %s\n", s.Number, oneLine(err.Error(), 300))
 		break
 	}
 	ghaWriteLines(t, b, l.file, ghaLogName, max(total-ghaTailLines+1, 1), ghaTailLines, "the end of the log")
+}
+
+// ghaStepTail writes the end of one step's own log, saying why it was used; false
+// when that log could not be read (the reason is written instead).
+func (t *githubToolBox) ghaStepTail(ctx context.Context, b *strings.Builder, l *ghaLog, step int, why string) bool {
+	f, err := t.ghaStepLog(ctx, l, step)
+	if err != nil {
+		fmt.Fprintf(b, "    step %d's own log could not be read: %s\n", step, oneLine(err.Error(), 300))
+		return false
+	}
+	ghaWriteLines(t, b, f, f.Rel, -ghaTailLines, ghaTailLines,
+		fmt.Sprintf("the end of step %d, from its own log (%s, numbered within the step; %s)", step, f.Rel, why))
+	return true
 }
 
 // ghaWriteLines writes a window of f as name:line: text lines under a heading.
@@ -766,10 +842,6 @@ func (t *githubToolBox) ghaRead(ctx context.Context, a ghaArgs) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	l, err := t.ghaOpen(ctx, tg.repo, *tg.job)
-	if err != nil {
-		return "", err
-	}
 	label := ghaLabel(tg.repo, *tg.job)
 	start, n := a.StartLine, a.MaxLines
 	step := a.Step
@@ -777,32 +849,30 @@ func (t *githubToolBox) ghaRead(ctx context.Context, a ghaArgs) (string, error) 
 		step = tg.step // the step a "#step:N" link named
 	}
 	if step > 0 {
-		s, ok := stepOf(l.job, step)
-		switch {
-		case !ok:
-			return "", fmt.Errorf("job %d has no step %d; see gha_job_summary for its steps", l.job.ID, step)
-		case s.Conclusion == "skipped" || s.StartedAt.IsZero():
-			return "", fmt.Errorf("step %d did not run (%s), so it has no log", step, oneLine(ghaState(s.Status, s.Conclusion), 40))
+		if err := checkStep(*tg.job, step); err != nil {
+			return "", err
 		}
+	}
+	l, err := t.ghaOpen(ctx, tg.repo, *tg.job)
+	if err != nil {
+		if step > 0 && tooLarge(err) {
+			// The step's own log may fit where the whole job's does not.
+			return t.ghaReadStepLog(ctx, &ghaLog{repo: tg.repo, job: *tg.job}, label, step, start, n, "the job log is too large to fetch")
+		}
+		return "", err
+	}
+	stepEnd := 0
+	if step > 0 {
 		r, mapped := l.steps[step]
 		if !mapped || r.ambiguous() {
-			// The job log cannot place this step: read its own log, in which start_line
-			// counts.
-			f, err := t.ghaStepLog(ctx, l, step)
-			if err != nil {
-				return "", err
-			}
-			res, err := t.ci.ReadFile(f, start, n)
-			if err != nil {
-				return "", err
-			}
-			return fmt.Sprintf("Step %d's own log (the job log cannot place its lines); page it with step=%d and start_line.\n", step, step) +
-				formatCIRead("gha_read", label, res), nil
+			return t.ghaReadStepLog(ctx, l, label, step, start, n, "the job log cannot place its lines")
 		}
 		if start == 0 {
-			start = r.first
-			if n == 0 {
-				n = r.last - r.first + 1
+			// The step's window: from its first line, never past its last.
+			length := r.last - r.first + 1
+			start, stepEnd = r.first, r.last
+			if n <= 0 || n > length {
+				n = length
 			}
 		}
 	}
@@ -810,5 +880,28 @@ func (t *githubToolBox) ghaRead(ctx context.Context, a ghaArgs) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	return formatCIRead("gha_read", label, res), nil
+	out := formatCIRead("gha_read", label, res)
+	if stepEnd > 0 {
+		if res.First+len(res.Lines)-1 >= stepEnd {
+			res.More = false // the step is read to its end; what follows is another step
+			out = formatCIRead("gha_read", label, res)
+		}
+		r := l.steps[step]
+		out = fmt.Sprintf("Step %d is log lines %d-%d.\n", step, r.first, r.last) + out
+	}
+	return out, nil
+}
+
+// ghaReadStepLog reads a window of one step's own log, in which start counts.
+func (t *githubToolBox) ghaReadStepLog(ctx context.Context, l *ghaLog, label string, step, start, n int, why string) (string, error) {
+	f, err := t.ghaStepLog(ctx, l, step)
+	if err != nil {
+		return "", err
+	}
+	res, err := t.ci.ReadFile(f, start, n)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("Step %d's own log (%s); page it with step=%d and start_line.\n", step, why, step) +
+		formatCIRead("gha_read", label, res), nil
 }

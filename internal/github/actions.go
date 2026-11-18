@@ -226,8 +226,8 @@ func (c *Client) ActionsRunJobs(ctx context.Context, token, repo string, runID i
 // invisible one ErrLogNotFound.
 //
 // The API answers with a redirect to a short-lived, pre-signed URL on a blob host.
-// The token is sent to the API host only: the redirect is not followed by the API
-// client but read, and the log is fetched by a separate client that carries no
+// The token is sent to the API host only: the API request is a single round trip,
+// whose redirect is read rather than followed, and the log is fetched by a separate client that carries no
 // credential, strips any Authorization, Cookie, Proxy-Authorization or Referer
 // header, and requires https (unless the API itself is plain http, a test stub).
 // The pre-signed URL is itself a credential, so no error ever includes it, and a
@@ -281,9 +281,21 @@ func (c *Client) logLocation(ctx context.Context, token, path, what string, w io
 		return nil, 0, fmt.Errorf("build %s request", what)
 	}
 	setHeaders(req, token)
-	api := *c.http
-	api.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := api.Do(req)
+	// One round trip through the client's transport (its retries included), not
+	// Client.Do: the client parses a redirect's Location before CheckRedirect can stop
+	// it, and quotes a malformed one, pre-signed URL and all, in its error. Here only
+	// resp.Location() below parses it, and its error is not passed on.
+	if t := c.http.Timeout; t > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t)
+		defer cancel()
+		req = req.WithContext(ctx)
+	}
+	rt := c.http.Transport
+	if rt == nil {
+		rt = http.DefaultTransport
+	}
+	resp, err := rt.RoundTrip(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("%s: %w", what, stripURL(err))
 	}
