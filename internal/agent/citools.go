@@ -292,7 +292,7 @@ func formatCIStatus(label string, st github.CIStatus) string {
 			tag := ""
 			if _, _, err := prow.ParseJobURL(c.URL); err == nil {
 				tag = "[prow] "
-			} else if ghaURLTag(c.URL) {
+			} else if _, ok := ghaCheckRef(c); ok {
 				tag = "[actions] "
 			}
 			fmt.Fprintf(&b, "           %s%s\n", tag, oneLine(c.URL, 500))

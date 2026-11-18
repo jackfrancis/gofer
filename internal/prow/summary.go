@@ -327,7 +327,7 @@ func parseJUnit(r io.Reader, file string, js *JUnitSummary, seen map[string]bool
 // already run on the file, but an escaped ESC survives it as an entity).
 func stripControls(s string) string {
 	var b strings.Builder
-	_, _ = normalize(&b, strings.NewReader(s))
+	_, _ = normalize(context.Background(), &b, strings.NewReader(s))
 	return b.String()
 }
 

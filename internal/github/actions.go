@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -227,70 +228,116 @@ func (c *Client) ActionsRunJobs(ctx context.Context, token, repo string, runID i
 // The API answers with a redirect to a short-lived, pre-signed URL on a blob host.
 // The token is sent to the API host only: the redirect is not followed by the API
 // client but read, and the log is fetched by a separate client that carries no
-// credential, strips any Authorization, Cookie or Proxy-Authorization header, and
-// requires https (unless the API itself is plain http, a test stub). The pre-signed
-// URL is itself a credential, so no error ever includes it.
+// credential, strips any Authorization, Cookie, Proxy-Authorization or Referer
+// header, and requires https (unless the API itself is plain http, a test stub).
+// The pre-signed URL is itself a credential, so no error ever includes it, and a
+// link refused by the blob host (expired before it was used) is replaced by a
+// fresh one once.
 func (c *Client) ActionsJobLog(ctx context.Context, token, repo string, jobID int64, w io.Writer, max int64) (int64, error) {
 	if err := checkActionsRepo(repo); err != nil {
 		return 0, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/repos/%s/actions/jobs/%d/logs", c.baseURL, repo, jobID), nil)
+	return c.downloadLog(ctx, token, fmt.Sprintf("/repos/%s/actions/jobs/%d/logs", repo, jobID), "job log", w, max)
+}
+
+// ActionsStepLog downloads one step's log (its lines alone, numbered from 1) the
+// same way ActionsJobLog downloads a job's.
+func (c *Client) ActionsStepLog(ctx context.Context, token, repo string, jobID int64, step int, w io.Writer, max int64) (int64, error) {
+	if err := checkActionsRepo(repo); err != nil {
+		return 0, err
+	}
+	if step <= 0 {
+		return 0, fmt.Errorf("step must be a positive step number")
+	}
+	return c.downloadLog(ctx, token, fmt.Sprintf("/repos/%s/actions/jobs/%d/steps/%d/logs", repo, jobID, step), "step log", w, max)
+}
+
+// downloadLog asks the API at path for a log's download link and fetches it. A link
+// the blob host refuses (403/404: it expired between the redirect and the fetch) is
+// asked for again once; nothing has been written to w by then.
+func (c *Client) downloadLog(ctx context.Context, token, path, what string, w io.Writer, max int64) (int64, error) {
+	for attempt := 1; ; attempt++ {
+		loc, n, err := c.logLocation(ctx, token, path, what, w, max)
+		if loc == nil {
+			return n, err // served directly, or refused by the API
+		}
+		n, status, err := c.fetchBlob(ctx, loc, what, w, max)
+		if status == http.StatusForbidden || status == http.StatusNotFound {
+			if attempt < 2 {
+				continue
+			}
+			return 0, fmt.Errorf("%s download: status %d, again with a fresh download link", what, status)
+		}
+		return n, err
+	}
+}
+
+// logLocation requests a log from the API without following its redirect. It returns
+// the redirect's location, or nil when the API served the log itself (written to w)
+// or refused.
+func (c *Client) logLocation(ctx context.Context, token, path, what string, w io.Writer, max int64) (*url.URL, int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
-		return 0, fmt.Errorf("build log request")
+		return nil, 0, fmt.Errorf("build %s request", what)
 	}
 	setHeaders(req, token)
 	api := *c.http
 	api.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := api.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("job log: %w", stripURL(err))
+		return nil, 0, fmt.Errorf("%s: %w", what, stripURL(err))
 	}
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusOK:
-		// A server that serves the log itself (no redirect).
-		return copyBounded(w, resp, max)
+		// A server that serves the log itself (no redirect). The URL is the API's own,
+		// not a credential.
+		n, err := copyBounded(w, resp, max, func(err error) error { return fmt.Errorf("%s: %w", what, stripURL(err)) })
+		return nil, n, err
 	case resp.StatusCode == http.StatusNotFound:
-		return 0, fmt.Errorf("%w (status 404): the job does not exist, or its repository is not visible with this token", ErrLogNotFound)
+		return nil, 0, fmt.Errorf("%w (status 404): the job or step does not exist, or its repository is not visible with this token", ErrLogNotFound)
 	case resp.StatusCode == http.StatusGone:
-		return 0, fmt.Errorf("%w (status 410): the log has expired or was deleted", ErrLogNotFound)
+		return nil, 0, fmt.Errorf("%w (status 410): the log has expired or was deleted", ErrLogNotFound)
 	case resp.StatusCode < 300 || resp.StatusCode > 399:
-		return 0, fmt.Errorf("job log: status %d", resp.StatusCode)
+		return nil, 0, fmt.Errorf("%s: status %d", what, resp.StatusCode)
 	}
 	loc, err := resp.Location()
 	if err != nil {
-		return 0, fmt.Errorf("job log: redirect without a usable location")
+		return nil, 0, fmt.Errorf("%s: redirect without a usable location", what)
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	return loc, 0, nil
+}
 
+// fetchBlob downloads a pre-signed location with the credential-free client. status
+// is the blob host's answer (0 when there was none).
+func (c *Client) fetchBlob(ctx context.Context, loc *url.URL, what string, w io.Writer, max int64) (n int64, status int, err error) {
 	blob, err := http.NewRequestWithContext(ctx, http.MethodGet, loc.String(), nil)
 	if err != nil {
-		return 0, fmt.Errorf("job log: bad redirect location")
+		return 0, 0, fmt.Errorf("%s: bad redirect location", what)
 	}
 	blob.Header.Set("User-Agent", "gofer-agent")
-	bresp, err := c.blobClient().Do(blob)
+	resp, err := c.blobClient().Do(blob)
 	if err != nil {
-		return 0, fmt.Errorf("job log download: %w", stripURL(err))
+		return 0, 0, blobError(ctx, what, err)
 	}
-	defer bresp.Body.Close()
-	switch {
-	case bresp.StatusCode == http.StatusNotFound || bresp.StatusCode == http.StatusForbidden:
-		// A pre-signed URL that expired between the redirect and the fetch.
-		return 0, fmt.Errorf("job log download: status %d (the download link expired; try again)", bresp.StatusCode)
-	case bresp.StatusCode != http.StatusOK:
-		return 0, fmt.Errorf("job log download: status %d", bresp.StatusCode)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, resp.StatusCode, fmt.Errorf("%s download: status %d", what, resp.StatusCode)
 	}
-	return copyBounded(w, bresp, max)
+	n, err = copyBounded(w, resp, max, func(err error) error { return blobError(ctx, what, err) })
+	return n, resp.StatusCode, err
 }
 
 // copyBounded copies resp's body to w, failing with ErrLogTooLarge past max bytes.
-func copyBounded(w io.Writer, resp *http.Response, max int64) (int64, error) {
+// A read error is reported through wrap.
+func copyBounded(w io.Writer, resp *http.Response, max int64, wrap func(error) error) (int64, error) {
 	if resp.ContentLength > max {
 		return 0, fmt.Errorf("%w: %d bytes, over the %d-byte limit", ErrLogTooLarge, resp.ContentLength, max)
 	}
 	n, err := io.Copy(w, io.LimitReader(resp.Body, max+1))
 	if err != nil {
-		return n, fmt.Errorf("job log download: %w", stripURL(err))
+		return n, wrap(err)
 	}
 	if n > max {
 		return n, fmt.Errorf("%w: over the %d-byte limit", ErrLogTooLarge, max)
@@ -298,14 +345,31 @@ func copyBounded(w io.Writer, resp *http.Response, max int64) (int64, error) {
 	return n, nil
 }
 
-// stripURL drops the URL net/http embeds in a transport error: a pre-signed blob URL
-// is a credential.
+// stripURL drops the URL net/http embeds in a transport error to the API host.
 func stripURL(err error) error {
 	var ue *url.Error
 	if errors.As(err, &ue) {
 		return ue.Err
 	}
 	return err
+}
+
+// blobError reports a failed blob request without its text. Below the outer
+// *url.Error, net/http can still quote the pre-signed URL (a redirect Location it
+// could not parse, say), so nothing of it is kept but what a caller acts on:
+// cancellation and timeouts keep their identity.
+func blobError(ctx context.Context, what string, err error) error {
+	if cerr := ctx.Err(); cerr != nil {
+		return fmt.Errorf("%s download: %w", what, cerr)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%s download timed out: %w", what, context.DeadlineExceeded)
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return fmt.Errorf("%s download timed out: %w", what, context.DeadlineExceeded)
+	}
+	return fmt.Errorf("%s download failed (details withheld: they can contain the pre-signed download URL)", what)
 }
 
 // blobClient is the credential-free client for log downloads, built on first use.
@@ -334,8 +398,9 @@ func (c *Client) blobClient() *http.Client {
 }
 
 // blobGuard is the last RoundTripper before the network for log downloads: it
-// removes every credential header and refuses anything but https, so no caller
-// mistake can send the GitHub token to the blob host.
+// removes every credential header (and Referer, which can carry a pre-signed URL)
+// and refuses anything but https, so no caller mistake can send the GitHub token or
+// a download link to a blob host.
 type blobGuard struct {
 	base      http.RoundTripper
 	allowHTTP bool
@@ -348,11 +413,17 @@ func (g *blobGuard) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.User != nil {
 		return nil, fmt.Errorf("log download: refusing a location with user info")
 	}
-	if req.Header.Get("Authorization") != "" || req.Header.Get("Cookie") != "" || req.Header.Get("Proxy-Authorization") != "" {
-		req = req.Clone(req.Context())
-		req.Header.Del("Authorization")
-		req.Header.Del("Cookie")
-		req.Header.Del("Proxy-Authorization")
+	// Referer too: on a redirect from the blob host, net/http sets it to the previous
+	// URL, pre-signed query and all.
+	drop := []string{"Authorization", "Cookie", "Proxy-Authorization", "Referer"}
+	for _, h := range drop {
+		if req.Header.Get(h) != "" {
+			req = req.Clone(req.Context())
+			for _, h := range drop {
+				req.Header.Del(h)
+			}
+			break
+		}
 	}
 	return g.base.RoundTrip(req)
 }

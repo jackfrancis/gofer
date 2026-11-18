@@ -183,9 +183,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   `internal/agent/ghatools.go`, over `internal/github/actions.go`. They store each job
   log in the same `prow.Session` (`FetchWith`), so the CI byte/file/time budgets, search,
   read and marker scan are shared. The log endpoint redirects to a pre-signed blob URL:
-  the API client reads the redirect instead of following it, and a separate,
-  credential-stripping client fetches the blob, so the token never leaves the API host.
-  Never put the blob URL in an error. See `docs/adr/0006-github-actions-log-tools.md`.
+  the API client reads the redirect instead of following it, and a separate client
+  fetches the blob, stripping credential headers and `Referer` (net/http sets it to the
+  previous, pre-signed URL on a redirect), so the token never leaves the API host.
+  Never put the blob URL in an error, not even net/http's inner one. A generic
+  `/runs/<id>` check link is an Actions job only when the check's app is
+  `github-actions`. See `docs/adr/0006-github-actions-log-tools.md`.
 - `go test` binds httptest sockets; run it outside a restrictive sandbox.
 
 ## Build / test / run

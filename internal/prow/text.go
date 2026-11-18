@@ -3,13 +3,17 @@ package prow
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"strings"
 	"unicode/utf8"
 )
 
 const (
-	binarySniffBytes = 8000
+	// normalizeCheckEvery is how many bytes normalize reads between checks of its
+	// context (a power of two).
+	normalizeCheckEvery = 1 << 20
+	binarySniffBytes    = 8000
 	// maxScanLine is the longest line kept whole for search and read; the rest of an
 	// over-long line is dropped (it is still counted as one line).
 	maxScanLine = 64 << 10
@@ -27,8 +31,9 @@ func isBinary(head []byte) bool {
 // every line ending as "\n": ANSI CSI and OSC sequences are dropped (the test
 // framework colours its output), "\r\n" becomes "\n", and a bare "\r" — a
 // progress-bar redraw — becomes "\n" so redraws do not merge into one huge line. It
-// returns the bytes written.
-func normalize(w io.Writer, r io.Reader) (int64, error) {
+// returns the bytes written. It stops with ctx's error once ctx is done, so a large
+// log never runs past the fetch's time budget.
+func normalize(ctx context.Context, w io.Writer, r io.Reader) (int64, error) {
 	br := bufio.NewReaderSize(r, 64<<10)
 	bw := bufio.NewWriterSize(w, 64<<10)
 	var n int64
@@ -45,7 +50,11 @@ func normalize(w io.Writer, r io.Reader) (int64, error) {
 		cr // after a bare CR
 	)
 	state := text
+	var read int64
 	for {
+		if read++; read&(normalizeCheckEvery-1) == 0 && ctx.Err() != nil {
+			return n, ctx.Err()
+		}
 		b, err := br.ReadByte()
 		if err == io.EOF {
 			break

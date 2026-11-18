@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestParseActionsURL(t *testing.T) {
@@ -263,10 +264,11 @@ func TestBlobGuard(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer tok")
 	req.Header.Set("Cookie", "a=b")
 	req.Header.Set("Proxy-Authorization", "Basic x")
+	req.Header.Set("Referer", "https://blob.example.test/prev?sig=2")
 	if _, err := g.RoundTrip(req); err != nil {
 		t.Fatal(err)
 	}
-	for _, h := range []string{"Authorization", "Cookie", "Proxy-Authorization"} {
+	for _, h := range []string{"Authorization", "Cookie", "Proxy-Authorization", "Referer"} {
 		if rec.got.Header.Get(h) != "" {
 			t.Errorf("%s reached the blob host", h)
 		}
@@ -285,5 +287,129 @@ func TestBlobGuard(t *testing.T) {
 	}
 	if _, err := (&blobGuard{base: rec, allowHTTP: true}).RoundTrip(plain); err != nil {
 		t.Errorf("plain http refused against a plain-http (test) API: %v", err)
+	}
+}
+
+// On a redirect, net/http sets Referer to the previous URL — the pre-signed one. The
+// guard drops it on every blob hop.
+func TestActionsJobLogNoRefererOnChainedRedirect(t *testing.T) {
+	var sawReferer atomic.Value
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawReferer.Store(r.Header.Get("Referer"))
+		_, _ = w.Write([]byte("log\n"))
+	}))
+	defer final.Close()
+	ls := newLogServers(t, "")
+	ls.blobBody = func(w http.ResponseWriter) {
+		w.Header().Set("Location", final.URL+"/moved")
+		w.WriteHeader(http.StatusFound)
+	}
+	c := NewClient(ls.api.Client(), ls.api.URL)
+	var buf bytes.Buffer
+	if _, err := c.ActionsJobLog(context.Background(), "tok", "o/r", 42, &buf, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if buf.String() != "log\n" {
+		t.Fatalf("log = %q", buf.String())
+	}
+	if ref, _ := sawReferer.Load().(string); ref != "" {
+		t.Errorf("the second blob host received Referer %q", ref)
+	}
+}
+
+// A redirect Location net/http cannot parse is quoted inside its error; none of it
+// may reach the caller.
+func TestActionsJobLogRedactsBadLocation(t *testing.T) {
+	ls := newLogServers(t, "")
+	ls.blobBody = func(w http.ResponseWriter) {
+		w.Header().Set("Location", "http://[::1%zz/next?sig=s3cret-sig-2")
+		w.WriteHeader(http.StatusFound)
+	}
+	c := NewClient(ls.api.Client(), ls.api.URL)
+	_, err := c.ActionsJobLog(context.Background(), "tok", "o/r", 42, &bytes.Buffer{}, 1<<20)
+	if err == nil {
+		t.Fatal("a malformed redirect succeeded")
+	}
+	for _, leak := range []string{"s3cret", "::1%zz", ls.blob.URL} {
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("error leaks %q: %v", leak, err)
+		}
+	}
+}
+
+func TestActionsJobLogKeepsCancellation(t *testing.T) {
+	ls := newLogServers(t, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	ls.blobBody = func(w http.ResponseWriter) {
+		cancel()
+		w.(http.Flusher).Flush()
+		time.Sleep(50 * time.Millisecond)
+	}
+	c := NewClient(ls.api.Client(), ls.api.URL)
+	_, err := c.ActionsJobLog(ctx, "tok", "o/r", 42, &bytes.Buffer{}, 1<<20)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if strings.Contains(err.Error(), "s3cret-sig") {
+		t.Errorf("error leaks the pre-signed URL: %v", err)
+	}
+}
+
+// A link the blob host refuses (it expired before use) is replaced once.
+func TestActionsJobLogRetriesRefusedLink(t *testing.T) {
+	ls := newLogServers(t, "")
+	var refusals atomic.Int32
+	refusals.Store(1)
+	ls.blobBody = func(w http.ResponseWriter) {
+		if refusals.Add(-1) >= 0 {
+			http.Error(w, "AuthenticationFailed", http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write([]byte("fresh\n"))
+	}
+	c := NewClient(ls.api.Client(), ls.api.URL)
+	var buf bytes.Buffer
+	if _, err := c.ActionsJobLog(context.Background(), "tok", "o/r", 42, &buf, 1<<20); err != nil || buf.String() != "fresh\n" {
+		t.Fatalf("after one refusal: %q, %v", buf.String(), err)
+	}
+	if ls.apiLogHits.Load() != 2 {
+		t.Errorf("asked the API for %d links, want 2", ls.apiLogHits.Load())
+	}
+
+	// Refused twice: give up, saying so.
+	refusals.Store(2)
+	_, err := c.ActionsJobLog(context.Background(), "tok", "o/r", 42, &bytes.Buffer{}, 1<<20)
+	if err == nil || !strings.Contains(err.Error(), "status 403, again with a fresh download link") {
+		t.Fatalf("refused twice: err = %v", err)
+	}
+	if ls.apiLogHits.Load() != 4 {
+		t.Errorf("asked the API for %d links in all, want 4", ls.apiLogHits.Load())
+	}
+}
+
+func TestActionsStepLog(t *testing.T) {
+	var path string
+	blob := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			t.Error("the blob host received the token")
+		}
+		_, _ = w.Write([]byte("step\n"))
+	}))
+	defer blob.Close()
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		http.Redirect(w, r, blob.URL+"/s?sig=x", http.StatusFound)
+	}))
+	defer api.Close()
+	c := NewClient(api.Client(), api.URL)
+	var buf bytes.Buffer
+	if _, err := c.ActionsStepLog(context.Background(), "tok", "o/r", 42, 3, &buf, 1<<20); err != nil || buf.String() != "step\n" {
+		t.Fatalf("step log = %q, %v", buf.String(), err)
+	}
+	if path != "/repos/o/r/actions/jobs/42/steps/3/logs" {
+		t.Errorf("requested %s", path)
+	}
+	if _, err := c.ActionsStepLog(context.Background(), "tok", "o/r", 42, 0, &buf, 1<<20); err == nil {
+		t.Error("step 0 accepted")
 	}
 }

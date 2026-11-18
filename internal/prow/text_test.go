@@ -1,6 +1,7 @@
 package prow
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -18,7 +19,7 @@ func TestNormalize(t *testing.T) {
 		"\r\x1b[2Kprogress\r\x1b[2Kdone\n": "\nprogress\ndone\n",
 	} {
 		var b strings.Builder
-		if _, err := normalize(&b, strings.NewReader(in)); err != nil {
+		if _, err := normalize(context.Background(), &b, strings.NewReader(in)); err != nil {
 			t.Fatal(err)
 		}
 		if b.String() != want {
@@ -105,5 +106,18 @@ func TestHeadWriter(t *testing.T) {
 	}
 	if lr.num != 6 {
 		t.Errorf("lineReader counts %d lines, headWriter %d", lr.num, len(nums))
+	}
+}
+
+func TestNormalizeStopsWhenCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var b strings.Builder
+	_, err := normalize(ctx, &b, strings.NewReader(strings.Repeat("x\n", normalizeCheckEvery)))
+	if err != context.Canceled {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if b.Len() >= 2*normalizeCheckEvery {
+		t.Errorf("normalised the whole input (%d bytes) after cancellation", b.Len())
 	}
 }

@@ -29,16 +29,20 @@ import (
 )
 
 const (
-	// maxGHAJobs bounds the distinct Actions job logs one run fetches (the Prow tools
-	// allow as many Prow jobs).
+	// maxGHAJobs bounds the distinct Actions jobs whose logs one run fetches (the Prow
+	// tools allow as many Prow jobs). A job counts once its fetch is attempted.
 	maxGHAJobs = 6
-	// maxGHARunJobsShown bounds the jobs a run overview lists.
-	maxGHARunJobsShown = 60
+	// maxGHAJobsListed bounds the jobs a run or pull request overview lists. The
+	// overview puts the first failing job's diagnosis ahead of its list, so a wide
+	// failing matrix cannot crowd it out of the result.
+	maxGHAJobsListed = 40
 	// ghaTailLines is how much of a failing step's end a summary shows when the log has
 	// no failure marker.
 	ghaTailLines = 40
 	// ghaLogName names a job log in search and read results.
 	ghaLogName = "log"
+	// ghaApp is the check-run app slug of GitHub Actions.
+	ghaApp = "github-actions"
 )
 
 // ghaLogPatterns are the failure lines of an Actions log: the runner's own error
@@ -53,28 +57,39 @@ var ghaTimestamp = regexp.MustCompile(`^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)
 
 // ghaLogs is this run's Actions job logs, by job.
 type ghaLogs struct {
-	mu   sync.Mutex
-	jobs map[string]*ghaLog // by "repo/job id"
+	mu       sync.Mutex
+	jobs     map[string]*ghaLog // fetched, by "repo/job id"
+	reserved map[string]bool    // every job a fetch was attempted for: the per-answer limit
 }
 
-// ghaLog is one job's fetched log, with each step's approximate line range.
+// ghaLog is one job's fetched log, with where each step's lines sit in it.
 type ghaLog struct {
 	repo  string
 	job   github.ActionsJob
 	file  *prow.File
-	steps map[int]lineRange // by step number; absent when a step has no lines
+	steps map[int]stepLines // by step number; absent when a step has no lines
 }
 
 type lineRange struct{ first, last int }
 
+// stepLines is where a step's output sits in the job log, by the runner's
+// timestamps. Steps that started in the same second cannot be told apart that way:
+// each of them carries their shared range and names the others.
+type stepLines struct {
+	lineRange
+	shared []int // the other steps whose lines are in this range
+}
+
+func (s stepLines) ambiguous() bool { return len(s.shared) > 0 }
+
 var (
-	ghaTargetProps = `"url":{"type":"string","description":"a GitHub Actions link exactly as a check or page shows it: https://github.com/<owner>/<repo>/actions/runs/<run>/job/<job> (a job), …/actions/runs/<run> (a run), or a check run's https://github.com/<owner>/<repo>/runs/<id>"},` +
+	ghaTargetProps = `"url":{"type":"string","description":"a GitHub Actions link exactly as a check or page shows it: https://github.com/<owner>/<repo>/actions/runs/<run>/job/<job> (a job), …/actions/runs/<run> (a run), or a GitHub Actions check run's https://github.com/<owner>/<repo>/runs/<id>"},` +
 		`"repo":{"type":"string","description":"owner/name, with job_id or run_id instead of url; defaults to the current item's repository"},` +
 		`"job_id":{"type":"integer","description":"instead of url: an Actions job ID (the same number as its check run ID)"},`
 
 	schemaGHASummary = json.RawMessage(`{"type":"object","properties":{` + ghaTargetProps +
-		`"run_id":{"type":"integer","description":"instead of url: a workflow run ID; lists its jobs and summarises the first failing one"},` +
-		`"number":{"type":"integer","description":"instead of url: a pull request number; finds the failing GitHub Actions checks on its head commit and summarises the first"}` +
+		`"run_id":{"type":"integer","description":"instead of url: a workflow run ID; summarises its first failing job and lists its jobs"},` +
+		`"number":{"type":"integer","description":"instead of url: a pull request number; summarises the first failing GitHub Actions check on its head commit and lists the others"}` +
 		`}}`)
 
 	schemaGHASearch = json.RawMessage(`{"type":"object","properties":{` + ghaTargetProps +
@@ -86,7 +101,7 @@ var (
 		`},"required":["pattern"]}`)
 
 	schemaGHARead = json.RawMessage(`{"type":"object","properties":{` + ghaTargetProps +
-		`"step":{"type":"integer","description":"a step number (from gha_job_summary): read from that step's first log line"},` +
+		`"step":{"type":"integer","description":"a step number (from gha_job_summary): read that step. Its lines in the job log, from its first; or, when the job log cannot place them (steps that started in the same second), the step's own log (step-N.log, numbered from 1), in which start_line then counts"},` +
 		`"start_line":{"type":"integer","description":"first line, 1-based (default 1, or the step's first line); negative counts from the end, e.g. -200 reads the last 200 lines"},` +
 		`"max_lines":{"type":"integer","description":"lines to return, up to 1500 (default 400, or the whole step)"}` +
 		`}}`)
@@ -97,7 +112,7 @@ func ghaToolDefs() []worklist.ToolDef {
 	return []worklist.ToolDef{
 		{
 			Name:        "gha_job_summary",
-			Description: "Summarise a GitHub Actions job from its URL (a failing check's details link, https://github.com/<owner>/<repo>/actions/runs/<run>/job/<job>): its result, the commit it tested, every step with its result and approximate log line range, and the places in the job's log that show the failure (the runner's ##[error] lines with the output just before them, go test FAIL lines, panics, make errors), or the end of the failing step when there are none. A run URL lists the run's jobs and summarises the first failing one; a pull request number does the same for the failing Actions checks on its head commit. Start here for any question about why a GitHub Actions job failed, then follow up with gha_search or gha_read.",
+			Description: "Summarise a GitHub Actions job from its URL (a failing check's details link, https://github.com/<owner>/<repo>/actions/runs/<run>/job/<job>): its result, the workflow's head commit (what the run was triggered on; the commit actually tested is whatever the workflow checked out — a pull_request run tests a merge commit — which its checkout step's log shows), every step with its result and approximate log line range, and the places in the job's log that show the failure (the runner's ##[error] lines with the output just before them, go test FAIL lines, panics, make errors), or the end of the failing step when there are none. A run URL summarises the run's first failing job and lists its jobs; a pull request number does the same for the failing Actions checks on its head commit. Start here for any question about why a GitHub Actions job failed, then follow up with gha_search or gha_read.",
 			Parameters:  schemaGHASummary,
 		},
 		{
@@ -157,6 +172,21 @@ func (t *githubToolBox) runGHATool(ctx context.Context, name string, args json.R
 	return out, true, err
 }
 
+// ghaCheckRef returns the Actions job (or run) a check links to, when the check is
+// GitHub Actions'. A /runs/<id> or /commit/<sha>/checks/<id> link is the generic
+// check-run page GitHub gives every app's check, so it counts only for a check by
+// the github-actions app; an /actions/runs/… link is Actions' own.
+func ghaCheckRef(c github.CICheck) (github.ActionsRef, bool) {
+	if c.Kind != "check" {
+		return github.ActionsRef{}, false
+	}
+	ref, err := github.ParseActionsURL(c.URL)
+	if err != nil || (ref.RunID == 0 && c.App != ghaApp) {
+		return github.ActionsRef{}, false
+	}
+	return ref, true
+}
+
 // ghaTarget is what a call names: one job, or a run (jobs listed), in repo.
 type ghaTarget struct {
 	repo  string
@@ -167,10 +197,11 @@ type ghaTarget struct {
 	step  int                 // a step the URL linked
 }
 
-// resolve turns url / repo+job_id / repo+run_id into a target.
+// ghaResolve turns url / repo+job_id / repo+run_id into a target.
 func (t *githubToolBox) ghaResolve(ctx context.Context, a ghaArgs) (ghaTarget, error) {
 	var tg ghaTarget
 	var ref github.ActionsRef
+	generic := false // a generic check-run link: maybe not an Actions job at all
 	switch {
 	case strings.TrimSpace(a.URL) != "":
 		r, err := github.ParseActionsURL(a.URL)
@@ -180,7 +211,7 @@ func (t *githubToolBox) ghaResolve(ctx context.Context, a ghaArgs) (ghaTarget, e
 			}
 			return tg, err
 		}
-		ref = r
+		ref, generic = r, r.RunID == 0
 	case a.JobID > 0:
 		ref = github.ActionsRef{Repo: t.repoOr(a.Repo), JobID: a.JobID}
 	case a.RunID > 0:
@@ -192,6 +223,9 @@ func (t *githubToolBox) ghaResolve(ctx context.Context, a ghaArgs) (ghaTarget, e
 	if ref.JobID > 0 {
 		j, err := t.gh.ActionsJob(ctx, t.token, ref.Repo, ref.JobID)
 		if err != nil {
+			if generic {
+				err = fmt.Errorf("%w (a /runs/<id> link can also be another app's check, which has no Actions log; github_get_ci_status marks Actions checks [actions])", err)
+			}
 			return tg, err
 		}
 		tg.job, tg.run = &j, j.RunID
@@ -249,6 +283,14 @@ func ghaLabel(repo string, job github.ActionsJob) string {
 	return fmt.Sprintf("Actions job %d in %s", job.ID, repo)
 }
 
+// stripTimestamp is a LineHead that drops the runner's timestamp.
+func stripTimestamp(_ int, head []byte) int {
+	if loc := ghaTimestamp.FindIndex(head); loc != nil {
+		return loc[1]
+	}
+	return 0
+}
+
 // ghaOpen fetches a job's log into the run's CI session, once per job (and again
 // only if the job was not finished the first time). Opens are serialised: the
 // session serialises downloads anyway, and a job's step ranges are filled in by the
@@ -260,16 +302,23 @@ func (t *githubToolBox) ghaOpen(ctx context.Context, repo string, job github.Act
 	if t.gha.jobs == nil {
 		t.gha.jobs = map[string]*ghaLog{}
 	}
+	if t.gha.reserved == nil {
+		t.gha.reserved = map[string]bool{}
+	}
 	prev, seen := t.gha.jobs[key]
 	if seen && prev.job.Status == "completed" {
 		return prev, nil
 	}
-	if !seen && len(t.gha.jobs) >= maxGHAJobs {
-		return nil, fmt.Errorf("at most %d GitHub Actions job logs per answer; use the ones already opened", maxGHAJobs)
+	// The slot is taken when the fetch is attempted, whatever its outcome: a failed,
+	// oversized or binary download spent budget too. A retry reuses it.
+	if !t.gha.reserved[key] {
+		if len(t.gha.reserved) >= maxGHAJobs {
+			return nil, fmt.Errorf("at most %d GitHub Actions job logs per answer; use the ones already opened", maxGHAJobs)
+		}
+		t.gha.reserved[key] = true
 	}
 
-	l := &ghaLog{repo: repo, job: job, steps: map[int]lineRange{}}
-	mapper := newStepMapper(job.Steps, l.steps)
+	mapper := newStepMapper(job.Steps)
 	fetch := func(ctx context.Context, w io.Writer, max int64) (int64, error) {
 		return t.gh.ActionsJobLog(ctx, t.token, repo, job.ID, w, max)
 	}
@@ -286,35 +335,66 @@ func (t *githubToolBox) ghaOpen(ctx context.Context, repo string, job github.Act
 	if f.Binary {
 		return nil, fmt.Errorf("the job log of Actions job %d is binary content", job.ID)
 	}
-	l.file = f
+	l := &ghaLog{repo: repo, job: job, file: f, steps: mapper.result()}
 	t.gha.jobs[key] = l
 	return l, nil
 }
 
-// stepMapper assigns log lines to steps by time: the runner stamps every line, and
-// the API gives each step's start (to the second). A line belongs to the latest step
-// started at or before it; unstamped lines belong to the step of the line before.
-// The ranges are approximate at step boundaries that fall within one second.
-type stepMapper struct {
-	order []github.ActionsStep // steps with output, by start
-	cur   int
-	out   map[int]lineRange
+// ghaStepLog fetches one step's own log (its lines alone, numbered from 1). It is
+// how a step is read when the job log cannot place it. It counts against the
+// session's file and byte budgets, under its job's slot.
+func (t *githubToolBox) ghaStepLog(ctx context.Context, l *ghaLog, step int) (*prow.File, error) {
+	fetch := func(ctx context.Context, w io.Writer, max int64) (int64, error) {
+		return t.gh.ActionsStepLog(ctx, t.token, l.repo, l.job.ID, step, w, max)
+	}
+	fkey := fmt.Sprintf("gha:%s/%d/step/%d/%s", l.repo, l.job.ID, step, l.job.Status)
+	f, err := t.ci.FetchWith(ctx, fkey, fmt.Sprintf("step-%d.log", step), fetch, prow.FetchOptions{LineHead: stripTimestamp})
+	if err != nil {
+		return nil, err
+	}
+	if f.Binary {
+		return nil, fmt.Errorf("the log of step %d is binary content", step)
+	}
+	return f, nil
 }
 
-func newStepMapper(steps []github.ActionsStep, out map[int]lineRange) *stepMapper {
-	m := &stepMapper{cur: -1, out: out}
+// stepMapper assigns log lines to steps by time: the runner stamps every line, and
+// the API gives each step's start (to the second). A line belongs to the latest step
+// start at or before it; unstamped lines belong with the line before. Steps that
+// started in the same second form one group, whose lines cannot be split between
+// them. The ranges are approximate at a boundary within one second.
+type stepMapper struct {
+	groups [][]int     // step numbers, by group, groups in start order
+	starts []time.Time // each group's start second
+	ranges []lineRange
+	cur    int
+}
+
+func newStepMapper(steps []github.ActionsStep) *stepMapper {
+	var order []github.ActionsStep
 	for _, s := range steps {
 		if s.StartedAt.IsZero() || s.Conclusion == "skipped" {
 			continue
 		}
-		m.order = append(m.order, s)
+		order = append(order, s)
 	}
-	sort.SliceStable(m.order, func(i, k int) bool {
-		if !m.order[i].StartedAt.Equal(m.order[k].StartedAt) {
-			return m.order[i].StartedAt.Before(m.order[k].StartedAt)
+	sec := func(s github.ActionsStep) time.Time { return s.StartedAt.Truncate(time.Second) }
+	sort.SliceStable(order, func(i, k int) bool {
+		if a, b := sec(order[i]), sec(order[k]); !a.Equal(b) {
+			return a.Before(b)
 		}
-		return m.order[i].Number < m.order[k].Number
+		return order[i].Number < order[k].Number
 	})
+	m := &stepMapper{cur: -1}
+	for _, s := range order {
+		if n := len(m.starts); n > 0 && m.starts[n-1].Equal(sec(s)) {
+			m.groups[n-1] = append(m.groups[n-1], s.Number)
+			continue
+		}
+		m.groups = append(m.groups, []int{s.Number})
+		m.starts = append(m.starts, sec(s))
+	}
+	m.ranges = make([]lineRange, len(m.groups))
 	return m
 }
 
@@ -323,22 +403,50 @@ func (m *stepMapper) lineHead(num int, head []byte) int {
 	if loc := ghaTimestamp.FindSubmatchIndex(head); loc != nil {
 		drop = loc[1]
 		if ts, err := time.Parse(time.RFC3339Nano, string(head[loc[2]:loc[3]])); err == nil {
-			sec := ts.Truncate(time.Second)
-			for m.cur+1 < len(m.order) && !sec.Before(m.order[m.cur+1].StartedAt) {
+			s := ts.Truncate(time.Second)
+			for m.cur+1 < len(m.starts) && !s.Before(m.starts[m.cur+1]) {
 				m.cur++
 			}
 		}
 	}
 	if m.cur >= 0 {
-		n := m.order[m.cur].Number
-		r, ok := m.out[n]
-		if !ok {
+		r := &m.ranges[m.cur]
+		if r.first == 0 {
 			r.first = num
 		}
 		r.last = num
-		m.out[n] = r
 	}
 	return drop
+}
+
+// result is each step's lines, by step number.
+func (m *stepMapper) result() map[int]stepLines {
+	out := map[int]stepLines{}
+	for g, nums := range m.groups {
+		r := m.ranges[g]
+		if r.first == 0 {
+			continue
+		}
+		for _, n := range nums {
+			sl := stepLines{lineRange: r}
+			for _, o := range nums {
+				if o != n {
+					sl.shared = append(sl.shared, o)
+				}
+			}
+			out[n] = sl
+		}
+	}
+	return out
+}
+
+func stepOf(job github.ActionsJob, n int) (github.ActionsStep, bool) {
+	for _, s := range job.Steps {
+		if s.Number == n {
+			return s, true
+		}
+	}
+	return github.ActionsStep{}, false
 }
 
 // ghaSummary runs gha_job_summary.
@@ -353,18 +461,18 @@ func (t *githubToolBox) ghaSummary(ctx context.Context, a ghaArgs) (string, erro
 	if tg.job != nil && len(tg.jobs) <= 1 {
 		return t.ghaJobSummary(ctx, tg.repo, *tg.job), nil
 	}
-	out := formatGHARun(tg)
+	head, list := formatGHARun(tg)
 	for _, j := range tg.jobs {
 		if j.Failing() {
-			out += "\n\nThe first failing job:\n" + t.ghaJobSummary(ctx, tg.repo, j)
+			head += "\nThe first failing job:\n" + t.ghaJobSummary(ctx, tg.repo, j) + "\n\n"
 			break
 		}
 	}
-	return out, nil
+	return head + list, nil
 }
 
-// ghaSummaryForPR lists the failing Actions checks on a pull request's head commit
-// and summarises the first.
+// ghaSummaryForPR summarises the first failing Actions check on a pull request's
+// head commit and lists the others.
 func (t *githubToolBox) ghaSummaryForPR(ctx context.Context, repo string, number int) (string, error) {
 	st, err := t.gh.CIStatusForPR(ctx, t.token, repo, number)
 	if err != nil {
@@ -380,8 +488,8 @@ func (t *githubToolBox) ghaSummaryForPR(ctx context.Context, repo string, number
 		if c.Class != github.CIFailing {
 			continue
 		}
-		ref, perr := github.ParseActionsURL(c.URL)
-		if c.Kind != "check" || perr != nil || ref.JobID == 0 {
+		ref, ok := ghaCheckRef(c)
+		if !ok || ref.JobID == 0 {
 			others++
 			continue
 		}
@@ -403,24 +511,29 @@ func (t *githubToolBox) ghaSummaryForPR(ctx context.Context, repo string, number
 	if len(fails) == 0 {
 		return b.String(), nil
 	}
-	b.WriteString("\n\n" + untrustedOpen)
-	for _, f := range fails {
+	b.WriteString("\n")
+	first := fails[0].ref
+	if job, err := t.gh.ActionsJob(ctx, t.token, first.Repo, first.JobID); err != nil {
+		fmt.Fprintf(&b, "\nThe first failing job (%d) could not be read: %s\n", first.JobID, oneLine(err.Error(), 300))
+	} else {
+		b.WriteString("\nThe first failing job:\n" + t.ghaJobSummary(ctx, first.Repo, job) + "\n")
+	}
+	b.WriteString("\nFailing GitHub Actions jobs on this pull request:\n" + untrustedOpen)
+	for i, f := range fails {
+		if i >= maxGHAJobsListed {
+			fmt.Fprintf(&b, "  … and %d more\n", len(fails)-i)
+			break
+		}
 		fmt.Fprintf(&b, "  failing  %s (job %d: %s)\n", oneLine(f.check.Name, 200), f.ref.JobID, oneLine(f.check.State, 40))
 		fmt.Fprintf(&b, "           %s\n", oneLine(f.check.URL, 500))
 	}
 	b.WriteString(untrustedClose)
-	first := fails[0].ref
-	job, err := t.gh.ActionsJob(ctx, t.token, first.Repo, first.JobID)
-	if err != nil {
-		fmt.Fprintf(&b, "\n\nThe first failing job could not be read: %s", oneLine(err.Error(), 300))
-		return b.String(), nil
-	}
-	b.WriteString("\n\nThe first failing job:\n" + t.ghaJobSummary(ctx, first.Repo, job))
 	return b.String(), nil
 }
 
-// formatGHARun renders a run's job list.
-func formatGHARun(tg ghaTarget) string {
+// formatGHARun renders a run's header (counts) and its job list, separately, so the
+// first failing job's diagnosis can go between them.
+func formatGHARun(tg ghaTarget) (head, list string) {
 	var failing, pending, passing int
 	for _, j := range tg.jobs {
 		switch {
@@ -432,14 +545,15 @@ func formatGHARun(tg ghaTarget) string {
 			passing++
 		}
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "gha_job_summary for Actions run %d in %s: %d jobs, %d failing, %d pending, %d passing.\n", tg.run, tg.repo, len(tg.jobs), failing, pending, passing)
+	var h strings.Builder
+	fmt.Fprintf(&h, "gha_job_summary for Actions run %d in %s: %d jobs, %d failing, %d pending, %d passing.\n", tg.run, tg.repo, len(tg.jobs), failing, pending, passing)
 	if !tg.whole {
-		b.WriteString("Partial: the run holds more jobs than were read.\n")
+		h.WriteString("Partial: the run holds more jobs than were read.\n")
 	}
-	b.WriteString("Open a job with gha_job_summary (its job URL or job_id).\n\n" + untrustedOpen)
+	var b strings.Builder
+	b.WriteString("Jobs of this run (open one with gha_job_summary on its job URL or job_id):\n" + untrustedOpen)
 	for i, j := range tg.jobs {
-		if i >= maxGHARunJobsShown {
+		if i >= maxGHAJobsListed {
 			fmt.Fprintf(&b, "  … and %d more jobs\n", len(tg.jobs)-i)
 			break
 		}
@@ -460,7 +574,7 @@ func formatGHARun(tg ghaTarget) string {
 		}
 	}
 	b.WriteString(untrustedClose)
-	return b.String()
+	return h.String(), b.String()
 }
 
 func ghaState(status, conclusion string) string {
@@ -488,6 +602,14 @@ func failedSteps(j github.ActionsJob) string {
 	return strings.Join(parts, "; ")
 }
 
+func joinInts(ns []int) string {
+	parts := make([]string, len(ns))
+	for i, n := range ns {
+		parts[i] = fmt.Sprint(n)
+	}
+	return strings.Join(parts, ", ")
+}
+
 // ghaJobSummary renders one job: outcome, steps, and where its log shows failure. A
 // log that cannot be fetched is reported in the summary, not as an error: the job's
 // metadata still answers part of the question.
@@ -508,7 +630,8 @@ func (t *githubToolBox) ghaJobSummary(ctx context.Context, repo string, job gith
 	b.WriteString("\n")
 	fmt.Fprintf(&b, "    result: %s\n", oneLine(ghaState(job.Status, job.Conclusion), 40))
 	if job.HeadSHA != "" || job.HeadBranch != "" {
-		fmt.Fprintf(&b, "    tested: %s @%s\n", oneLine(job.HeadBranch, 200), shortSHA(job.HeadSHA))
+		fmt.Fprintf(&b, "    workflow head: %s @%s (what the run was triggered on, not necessarily the commit tested: a pull_request run tests a merge commit, and the checkout step's log shows what was checked out)\n",
+			oneLine(job.HeadBranch, 200), shortSHA(job.HeadSHA))
 	}
 	if !job.StartedAt.IsZero() {
 		fmt.Fprintf(&b, "    started: %s", job.StartedAt.UTC().Format(time.RFC3339))
@@ -533,7 +656,11 @@ func (t *githubToolBox) ghaJobSummary(ctx context.Context, repo string, job gith
 		fmt.Fprintf(&b, "    %s %d %s: %s", mark, s.Number, oneLine(s.Name, 200), oneLine(ghaState(s.Status, s.Conclusion), 40))
 		if l != nil {
 			if r, ok := l.steps[s.Number]; ok {
-				fmt.Fprintf(&b, " (≈ log lines %d-%d)", r.first, r.last)
+				if r.ambiguous() {
+					fmt.Fprintf(&b, " (≈ log lines %d-%d, shared with step(s) %s, which started the same second; gha_read step=%d reads its own log)", r.first, r.last, joinInts(r.shared), s.Number)
+				} else {
+					fmt.Fprintf(&b, " (≈ log lines %d-%d)", r.first, r.last)
+				}
 			}
 		}
 		b.WriteString("\n")
@@ -570,32 +697,46 @@ func (t *githubToolBox) ghaJobSummary(ctx context.Context, repo string, job gith
 		}
 	}
 	if len(scan.Markers) == 0 && scan.Lines > 0 {
-		t.ghaTail(&b, l, scan.Lines)
+		t.ghaTail(ctx, &b, l, scan.Lines)
 	}
 	b.WriteString(untrustedClose)
 	return b.String()
 }
 
-// ghaTail writes the last lines of the first failing step (or of the log).
-func (t *githubToolBox) ghaTail(b *strings.Builder, l *ghaLog, total int) {
-	from, to, what := total-ghaTailLines+1, total, "the log"
+// ghaTail writes the last lines of the first failing step: from the job log when
+// it places the step, from the step's own log when it cannot, and the end of the
+// job log when there is no failing step (or its own log cannot be read).
+func (t *githubToolBox) ghaTail(ctx context.Context, b *strings.Builder, l *ghaLog, total int) {
 	for _, s := range l.job.Steps {
-		if r, ok := l.steps[s.Number]; ok && ghaStepFailed(s) {
-			from, to, what = r.last-ghaTailLines+1, r.last, fmt.Sprintf("step %d", s.Number)
-			if from < r.first {
-				from = r.first
-			}
-			break
+		if !ghaStepFailed(s) {
+			continue
 		}
+		if r, ok := l.steps[s.Number]; ok && !r.ambiguous() {
+			from := max(r.last-ghaTailLines+1, r.first, 1)
+			ghaWriteLines(t, b, l.file, ghaLogName, from, r.last-from+1, fmt.Sprintf("the end of step %d", s.Number))
+			return
+		}
+		f, err := t.ghaStepLog(ctx, l, s.Number)
+		if err == nil {
+			ghaWriteLines(t, b, f, f.Rel, -ghaTailLines, ghaTailLines,
+				fmt.Sprintf("the end of step %d, from its own log (%s, numbered within the step; the job log cannot place it)", s.Number, f.Rel))
+			return
+		}
+		fmt.Fprintf(b, "    step %d's own log could not be read: %s\n", s.Number, oneLine(err.Error(), 300))
+		break
 	}
-	from = max(from, 1)
-	res, err := t.ci.ReadFile(l.file, from, to-from+1)
+	ghaWriteLines(t, b, l.file, ghaLogName, max(total-ghaTailLines+1, 1), ghaTailLines, "the end of the log")
+}
+
+// ghaWriteLines writes a window of f as name:line: text lines under a heading.
+func ghaWriteLines(t *githubToolBox, b *strings.Builder, f *prow.File, name string, from, n int, heading string) {
+	res, err := t.ci.ReadFile(f, from, n)
 	if err != nil || len(res.Lines) == 0 {
 		return
 	}
-	fmt.Fprintf(b, "    the end of %s:\n", what)
+	fmt.Fprintf(b, "    %s:\n", heading)
 	for i, line := range res.Lines {
-		fmt.Fprintf(b, "    %s:%d: %s\n", ghaLogName, res.First+i, oneLine(line, 300))
+		fmt.Fprintf(b, "    %s:%d: %s\n", name, res.First+i, oneLine(line, 300))
 	}
 }
 
@@ -629,30 +770,45 @@ func (t *githubToolBox) ghaRead(ctx context.Context, a ghaArgs) (string, error) 
 	if err != nil {
 		return "", err
 	}
+	label := ghaLabel(tg.repo, *tg.job)
 	start, n := a.StartLine, a.MaxLines
 	step := a.Step
 	if step == 0 && start == 0 {
 		step = tg.step // the step a "#step:N" link named
 	}
-	if step > 0 && start == 0 {
-		r, ok := l.steps[step]
-		if !ok {
-			return "", fmt.Errorf("step %d has no lines in the log (skipped, no output, or no such step); see gha_job_summary for the steps", step)
+	if step > 0 {
+		s, ok := stepOf(l.job, step)
+		switch {
+		case !ok:
+			return "", fmt.Errorf("job %d has no step %d; see gha_job_summary for its steps", l.job.ID, step)
+		case s.Conclusion == "skipped" || s.StartedAt.IsZero():
+			return "", fmt.Errorf("step %d did not run (%s), so it has no log", step, oneLine(ghaState(s.Status, s.Conclusion), 40))
 		}
-		start = r.first
-		if n == 0 {
-			n = r.last - r.first + 1
+		r, mapped := l.steps[step]
+		if !mapped || r.ambiguous() {
+			// The job log cannot place this step: read its own log, in which start_line
+			// counts.
+			f, err := t.ghaStepLog(ctx, l, step)
+			if err != nil {
+				return "", err
+			}
+			res, err := t.ci.ReadFile(f, start, n)
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("Step %d's own log (the job log cannot place its lines); page it with step=%d and start_line.\n", step, step) +
+				formatCIRead("gha_read", label, res), nil
+		}
+		if start == 0 {
+			start = r.first
+			if n == 0 {
+				n = r.last - r.first + 1
+			}
 		}
 	}
 	res, err := t.ci.ReadFile(l.file, start, n)
 	if err != nil {
 		return "", err
 	}
-	return formatCIRead("gha_read", ghaLabel(tg.repo, *tg.job), res), nil
-}
-
-// ghaURLTag reports whether a check URL is an Actions job or run link.
-func ghaURLTag(u string) bool {
-	_, err := github.ParseActionsURL(u)
-	return err == nil
+	return formatCIRead("gha_read", label, res), nil
 }

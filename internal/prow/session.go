@@ -1,6 +1,7 @@
 package prow
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -330,13 +331,18 @@ func (s *Session) download(ctx context.Context, f *File, max int64, fetch FetchF
 	}
 	var size int64
 	if opt.LineHead != nil {
-		hw := &headWriter{w: out, fn: opt.LineHead, collecting: true}
-		if _, err = normalize(hw, raw); err == nil {
+		// headWriter writes line by line; buffer those writes on their way to disk.
+		bw := bufio.NewWriterSize(out, 64<<10)
+		hw := &headWriter{w: bw, fn: opt.LineHead, collecting: true}
+		if _, err = normalize(ctx, hw, raw); err == nil {
 			err = hw.finish()
+		}
+		if ferr := bw.Flush(); err == nil {
+			err = ferr
 		}
 		size = hw.n
 	} else {
-		size, err = normalize(out, raw)
+		size, err = normalize(ctx, out, raw)
 	}
 	if cerr := out.Close(); err == nil {
 		err = cerr
