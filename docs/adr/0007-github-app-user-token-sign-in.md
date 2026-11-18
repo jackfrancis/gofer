@@ -237,32 +237,75 @@ side effect of someone else's installation.
 - **Legacy items have no `RepoID` or `IssueID`, so their identity can be ambiguous.**
   A search hit with the same name and number proves nothing: if the name was reused,
   and the user took part in issue #1 in both repositories, the old conversation would
-  attach to the replacement. So ingest binds a legacy item only on historical
-  evidence, from a direct lookup.
-  - **The lookup:** `GET /repos/{stored name}/issues/{n}`. Under Issues: read it
-    answers for PRs as well, and it follows a rename redirect to the original
-    repository. It goes through the visibility gate like any other read.
-  - **The evidence:** the answer's `created_at` must equal the item's stored creation
-    time (`Signals.OpenedAt`, which ingest has always taken from GitHub's
-    `created_at`), to the second. Its kind must match the stored `Type`: a
-    `pull_request` field means a PR.
-    - An issue in a replacement repository was created after the old repository gave
-      up the name, so it cannot carry the original's creation time.
-  - **On a match:** the item binds to the answer's `id` (`IssueID`) and to the
-    repository's ID from the gate. It keeps its existing key, and reconciliation finds
-    it by `IssueID` from then on.
+  attach to the replacement. So legacy items are bound by a migration heuristic built
+  on a direct lookup, and the web tier makes the decision.
+  - **Ingest's input: a metadata-only list.** New endpoint
+    `GET /agent/worklist/legacy` lists the user's unbound legacy items: their key,
+    stored repository name and issue number, and nothing else. No title, no body, no
+    thread, no stored type or creation time.
+    - It is served whatever the filter mode, because these rows are hidden from
+      `GET /agent/worklist` until they are bound.
+    - Ingest uses the list for lookups only and never passes it to a model.
+    - Without it, ingest could not find a closed legacy issue. Such an issue appears
+      in no open search, and the repository inventory names repositories, not
+      issues.
+  - **The lookup:** `GET /repos/{stored name}/issues/{n}`, per listed item, ahead of
+    the rotating window and within the ingest's budget.
+    - Under Issues: read it answers for PRs as well, and it follows a rename redirect
+      to the repository that had the name.
+    - It goes through the visibility gate like any other read.
+    - Ingest reports what GitHub returned through a new sink call,
+      `BindLegacy(key, ...)`: the issue's `id`, `created_at`, kind (a `pull_request`
+      field means a PR), title, author login, and the repository's ID from the gate.
+      Ingest does not decide whether the item matches.
+  - **The web tier decides, atomically.** In one `worklist.Store.Update` on the stored
+    key, it compares the report with what it stored, and binds only if the row is
+    still unbound and every check below passes. It then writes `IssueID` and
+    `RepoID` onto that row. The key stays the same, and reconciliation finds the row
+    by `IssueID` from then on.
+  - **The checks.** All must pass:
+    - **Creation time:** the reported `created_at` equals the stored
+      `Signals.OpenedAt` (which ingest has always taken from GitHub's `created_at`),
+      to the second.
+    - **Kind:** it matches the stored `Type`.
+    - **Title:** it equals the stored title. A title edited since the last ingest
+      fails this check too, which is the conservative outcome.
+    - **Author:** if the stored reasons say the user authored the item, the reported
+      author is the user.
+    - **One repository per name:** every legacy item sharing a stored repository name
+      must resolve to the same repository ID. If two disagree, every item under that
+      name stays unverified.
+  - **What a match establishes, and what it does not.**
+    - An issue *created in* a replacement repository cannot carry the original's
+      creation time, because it was created after the name was given up.
+    - But GitHub lets an existing repository be renamed into a vacated name, issues
+      and all. Two distinct issues can then share a number, kind and creation second.
+      The title, author and one-repository-per-name checks make that unlikely, not
+      impossible.
+    - So a match is evidence, not proof, and the ADR treats it as a heuristic for
+      this one-time migration. New items never need it: they are keyed by `IssueID`
+      from the start.
+  - **Reuse known or suspected: leave the thread unverified.** Any of these is reason
+    enough to leave the item unverified:
+    - the lookup answers 404, is refused, or (in public-only mode) the repository is
+      private;
+    - any check above fails;
+    - the item has no stored creation time;
+    - the repository the lookup reached was created after the item's stored creation
+      time. An issue cannot predate the repository it was opened in, short of a
+      transfer, and a transfer is no reason to trust the binding either.
   - **What it covers:** renamed repositories (through the redirect), and closed legacy
     items in unchanged repositories, which produce neither an open search hit nor a
-    redirect. Legacy items are looked up from the inventory, ahead of the rotating
-    window, until each is bound or found ambiguous.
+    redirect.
 
-  A legacy item is ambiguous when the lookup fails (404, refused, private in
-  public-only mode), when the creation times or kinds differ, or when it has no stored
-  creation time. It is held back from every model input,
-  its thread is never merged onto a new item, and it stays visible to the user,
-  marked as unverified. Every item stored before rollout came through a token that
-  reads public repositories only, so this affects only items whose name changed hands
-  in the meantime.
+  An unverified legacy item is held back from every model input, its thread is never
+  merged onto another item, and it stays visible to the user, marked as unverified, so
+  they can still read the conversation. A failed lookup (rather than a failed check) is
+  retried by later ingests within their budgets, in case it was transient. A control
+  for the user to reattach a thread by hand is a possible follow-up, not designed
+  here. Every item stored before rollout came through a token that reads public
+  repositories only, so the cases above are the rare items whose repository name has
+  changed hands since.
 - **Ingest checks repositories, not just search hits.** A repository that turns
   private drops out of public search, and an item that closed before rollout never
   shows up in an open-item search again, so checking only search hits would miss both.
@@ -623,7 +666,8 @@ all user tokens" on the OAuth app's settings page once the switch is made.
      - the visibility gate and the redirect check;
      - `RepoID` and `IssueID` on items, permanent item keys (`github:issue:<IssueID>`
        for new items), reconciliation by `IssueID` in `MergeRunItems` and ingest, and
-       legacy binding by direct lookup;
+       legacy binding: `GET /agent/worklist/legacy`, direct lookups, and the web
+       tier's checks in `BindLegacy`;
      - the `repository_visibility` table with `ReportVisibility`, and the repository
        inventory;
      - ingest's unknown-visibility rule, and retirement only after a check in the
