@@ -12,7 +12,9 @@ wait_timeout=${RESTORE_TIMEOUT:-120s}
 rollout_timeout=${ROLLOUT_TIMEOUT:-180s}
 expand_timeout=${EXPAND_TIMEOUT:-300s}
 [[ $expand_timeout =~ ^([0-9]+)s?$ ]] || { echo "ERROR: EXPAND_TIMEOUT must be whole seconds, such as 300s." >&2; exit 1; }
-expand_seconds=${BASH_REMATCH[1]}
+# Force base 10: Bash arithmetic would read "08" as invalid octal.
+expand_seconds=$((10#${BASH_REMATCH[1]}))
+((expand_seconds > 0)) || { echo "ERROR: EXPAND_TIMEOUT must be at least 1s." >&2; exit 1; }
 [[ $# -gt 0 ]] || { echo "ERROR: pass kubectl and its cluster-selection flags." >&2; exit 1; }
 kubectl=("$@")
 case "$policy" in Retain|Delete) ;; *) echo "ERROR: invalid DATA_RECLAIM_POLICY: $policy" >&2; exit 1;; esac
@@ -264,6 +266,47 @@ new=$(kube -n "$namespace" get pvc "$claim" -o jsonpath='{.spec.volumeName}')
 [[ -n "$new" ]] || fail "the restored PVC has no bound volume"
 echo "5/$steps setting the restored volume $new to reclaim policy $policy"
 kube patch pv "$new" -p "{\"spec\":{\"persistentVolumeReclaimPolicy\":\"$policy\"}}" >/dev/null
+print_command() {
+    printf '    ' >&2
+    printf '%q ' "${kubectl[@]}" -n "$namespace" "$@" >&2
+    printf '\n' >&2
+}
+# Explain how to finish an expansion that did not reach the claim in time. The
+# claim's capacity changes only after the node grows the filesystem, which for an
+# offline volume happens when gofer mounts it again. So the signal to (re)start
+# gofer is the volume's own capacity, or the claim's FileSystemResizePending.
+expansion_incomplete() {
+    local capacity fs_pending=false pv_capacity=unknown pv_grown=false
+    capacity=$(jq -r '.status.capacity.storage // "unknown"' "$tmp/expanded.json" 2>/dev/null) || capacity=unknown
+    [[ -n $capacity ]] || capacity=unknown
+    if jq -e '[.status.conditions[]? | select(.type == "FileSystemResizePending" and .status == "True")] | length > 0' \
+        "$tmp/expanded.json" >/dev/null 2>&1; then
+        fs_pending=true
+    fi
+    if kube get pv "$new" -o json --request-timeout=10s > "$tmp/expanded-pv.json"; then
+        pv_capacity=$(jq -r '.spec.capacity.storage // "unknown"' "$tmp/expanded-pv.json" 2>/dev/null) || pv_capacity=unknown
+        if jq -e --arg target "$expand_to" "$jq_bytes"'(.spec.capacity.storage | bytes) >= ($target | bytes)' \
+            "$tmp/expanded-pv.json" >/dev/null 2>&1; then
+            pv_grown=true
+        fi
+    fi
+    echo "ERROR: after $expand_timeout, $claim's capacity is $capacity and volume $new's is $pv_capacity, short of $expand_to." >&2
+    if [[ $fs_pending == true || $pv_grown == true ]]; then
+        echo "The volume has grown; its filesystem grows when gofer mounts it again. Restart gofer, then check that the claim's capacity reaches $expand_to:" >&2
+        print_command rollout restart statefulset/gofer
+        print_command rollout status statefulset/gofer
+        print_command get pvc "$claim" -o "jsonpath={.status.capacity.storage}"
+    else
+        echo "If the driver expands only detached volumes, stop gofer and wait until volume $new reaches $expand_to" >&2
+        echo "(or $claim shows FileSystemResizePending); the claim's own capacity changes only after gofer mounts it." >&2
+        echo "Then start gofer and check that the claim's capacity reaches $expand_to:" >&2
+        print_command scale statefulset/gofer --replicas=0
+        printf '    ' >&2; printf '%q ' "${kubectl[@]}" get pv "$new" -o "jsonpath={.spec.capacity.storage}" >&2; printf '\n' >&2
+        print_command get pvc "$claim" -o "jsonpath={.status.conditions[?(@.type=='FileSystemResizePending')].status}"
+        print_command scale statefulset/gofer --replicas=1
+        print_command get pvc "$claim" -o "jsonpath={.status.capacity.storage}"
+    fi
+}
 if [[ -n "$expand_to" ]]; then
     echo "6/$steps expanding $claim from the snapshot's $size to $expand_to"
     kube -n "$namespace" get pvc "$claim" -o json > "$tmp/restored.json"
@@ -281,28 +324,25 @@ if [[ -n "$expand_to" ]]; then
         echo "$claim already requests at least $expand_to; leaving its request unchanged."
     fi
     # An accepted patch only changes the request. Some drivers grow the disk only
-    # while it is detached, or the filesystem only on the next mount.
+    # while it is detached, or the filesystem only on the next mount. Bound every
+    # read and sleep by the deadline: kubectl requests have no timeout by default.
     deadline=$((SECONDS + expand_seconds))
-    until kube -n "$namespace" get pvc "$claim" -o json > "$tmp/expanded.json" && \
-        jq -e --arg target "$expand_to" "$jq_bytes"'
-            (.status.capacity.storage | type == "string") and (.status.capacity.storage | bytes) >= ($target | bytes)
-        ' "$tmp/expanded.json" >/dev/null 2>&1; do
-        if ((SECONDS >= deadline)); then
-            capacity=$(jq -r '.status.capacity.storage // "unknown"' "$tmp/expanded.json" 2>/dev/null || echo unknown)
-            echo "ERROR: $claim's capacity is still $capacity after $expand_timeout, short of $expand_to." >&2
-            if jq -e '[.status.conditions[]? | select(.type == "FileSystemResizePending" and .status == "True")] | length > 0' \
-                "$tmp/expanded.json" >/dev/null 2>&1; then
-                echo "The volume grew; the filesystem grows when gofer's pod restarts:" >&2
-                printf '  ' >&2; printf '%q ' "${kubectl[@]}" -n "$namespace" rollout restart statefulset/gofer >&2; printf '\n' >&2
-            else
-                echo "If the driver expands only detached disks, stop gofer, wait for the capacity, then start it:" >&2
-                printf '  ' >&2; printf '%q ' "${kubectl[@]}" -n "$namespace" scale statefulset/gofer --replicas=0 >&2; printf '\n' >&2
-                printf '  ' >&2; printf '%q ' "${kubectl[@]}" -n "$namespace" get pvc "$claim" -o "jsonpath={.status.capacity.storage}" >&2; printf '\n' >&2
-                printf '  ' >&2; printf '%q ' "${kubectl[@]}" -n "$namespace" scale statefulset/gofer --replicas=1 >&2; printf '\n' >&2
-            fi
-            exit 1
+    : > "$tmp/expanded.json"
+    while :; do
+        # The last read, at the deadline, gets one second.
+        remaining=$((deadline - SECONDS))
+        ((remaining > 0)) || remaining=1
+        # Keep the last successful read for the diagnosis in expansion_incomplete.
+        if kube -n "$namespace" get pvc "$claim" -o json --request-timeout="${remaining}s" > "$tmp/poll.json" && \
+            mv "$tmp/poll.json" "$tmp/expanded.json" && \
+            jq -e --arg target "$expand_to" "$jq_bytes"'
+                (.status.capacity.storage | type == "string") and (.status.capacity.storage | bytes) >= ($target | bytes)
+            ' "$tmp/expanded.json" >/dev/null 2>&1; then
+            break
         fi
-        sleep $((expand_seconds < 5 ? 1 : 5))
+        ((SECONDS < deadline)) || { expansion_incomplete; exit 1; }
+        remaining=$((deadline - SECONDS))
+        sleep $((remaining < 5 ? remaining : 5))
     done
     echo "$claim now has capacity $(jq -r '.status.capacity.storage' "$tmp/expanded.json")."
 fi

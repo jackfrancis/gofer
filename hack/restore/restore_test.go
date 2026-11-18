@@ -26,7 +26,8 @@ const claimPath = "/api/v1/namespaces/gofer/persistentvolumeclaims/data-gofer-0"
 
 // Exercise the real make target and shell script. Every kubectl invocation goes
 // to this test binary in helper mode; no kubeconfig or live cluster is accessed.
-func runRestore(t *testing.T, scenario string, confirm bool) result {
+// extra make arguments come last, so they override the defaults.
+func runRestore(t *testing.T, scenario string, confirm bool, extra ...string) result {
 	t.Helper()
 	for _, tool := range []string{"make", "bash", "jq"} {
 		if _, err := exec.LookPath(tool); err != nil {
@@ -57,6 +58,7 @@ func runRestore(t *testing.T, scenario string, confirm bool) result {
 	} else {
 		cmd.Args = append(cmd.Args, "CONFIRM=")
 	}
+	cmd.Args = append(cmd.Args, extra...)
 	cmd.Dir = filepath.Clean(filepath.Join(packageDir, "../.."))
 	// Keep only the host tool search path. In particular, do not inherit Make
 	// overrides/includes, shell startup hooks, or deployment configuration.
@@ -225,7 +227,7 @@ func TestRestoreLeavesBackupsPausedAfterDestructiveFailure(t *testing.T) {
 }
 
 func TestRestoreReportsPostRolloutFinalizationFailures(t *testing.T) {
-	for _, scenario := range []string{"restored_pvc_read_error", "restored_pvc_unbound", "reclaim_policy_error", "reclaim_policy_resume_error", "paused_reclaim_policy_error", "no_cronjob_reclaim_policy_error", "expand_error", "expand_conflict", "expand_incomplete", "expand_fs_pending"} {
+	for _, scenario := range []string{"restored_pvc_read_error", "restored_pvc_unbound", "reclaim_policy_error", "reclaim_policy_resume_error", "paused_reclaim_policy_error", "no_cronjob_reclaim_policy_error", "expand_error", "expand_conflict", "expand_incomplete", "expand_fs_pending", "expand_remount", "expand_stalled"} {
 		t.Run(scenario, func(t *testing.T) {
 			r := runRestore(t, scenario, true)
 			if r.err == nil || r.created == nil || !r.has("rollout", "status", "statefulset/gofer", "--timeout=1s") {
@@ -262,11 +264,33 @@ func TestRestoreReportsPostRolloutFinalizationFailures(t *testing.T) {
 			if !strings.Contains(r.output, "verify that gofer/data-gofer-0 requests and has a capacity of at least 4Gi (it was restored at 2Gi)") {
 				t.Fatalf("missing expansion guidance: %s", r.output)
 			}
-			if scenario == "expand_incomplete" && (!strings.Contains(r.output, "capacity is still 2Gi after 1s, short of 4Gi") || !strings.Contains(r.output, "expands only detached disks")) {
-				t.Fatalf("must report the unexpanded capacity with detach instructions: %s", r.output)
-			}
-			if scenario == "expand_fs_pending" && !strings.Contains(r.output, "rollout restart statefulset/gofer") {
-				t.Fatalf("must explain how to finish a pending filesystem resize: %s", r.output)
+			switch scenario {
+			case "expand_incomplete":
+				// Neither the volume nor the claim grew: stop gofer, wait for the
+				// volume (not the claim, which grows only once mounted), then start it.
+				stop := strings.Index(r.output, "statefulset/gofer --replicas=0")
+				waitPV := strings.Index(r.output, "get pv restored-pv -o jsonpath=\\{.spec.capacity.storage\\}")
+				start := strings.Index(r.output, "statefulset/gofer --replicas=1")
+				verify := strings.LastIndex(r.output, "get pvc data-gofer-0 -o jsonpath=\\{.status.capacity.storage\\}")
+				if !strings.Contains(r.output, "after 1s, data-gofer-0's capacity is 2Gi and volume restored-pv's is 2Gi, short of 4Gi") ||
+					!strings.Contains(r.output, "expands only detached volumes") || stop < 0 || !(stop < waitPV && waitPV < start && start < verify) {
+					t.Fatalf("must report both capacities and wait for the volume while gofer is stopped: %s", r.output)
+				}
+			case "expand_fs_pending", "expand_remount":
+				// The volume grew; only the filesystem waits for a mount.
+				if !strings.Contains(r.output, "volume restored-pv's is 4Gi") || !strings.Contains(r.output, "rollout restart statefulset/gofer") || strings.Contains(r.output, "--replicas=0") {
+					t.Fatalf("must tell the operator to restart gofer to grow the filesystem: %s", r.output)
+				}
+			case "expand_stalled":
+				if !strings.Contains(r.output, "after 1s") || strings.Contains(r.output, "now has capacity") {
+					t.Fatalf("a stalled read must not outlast EXPAND_TIMEOUT: %s", r.output)
+				}
+				for _, call := range r.calls {
+					if slices.Equal(call[:min(5, len(call))], []string{"get", "pvc", "data-gofer-0", "-o", "json"}) && len(r.created) > 0 &&
+						len(call) > 5 && !strings.HasPrefix(call[5], "--request-timeout=") {
+						t.Fatalf("each capacity read must have a request timeout: %v", call)
+					}
+				}
 			}
 			if scenario == "reclaim_policy_resume_error" && !strings.Contains(r.output, "could not resume scheduled backups") {
 				t.Fatalf("must report both finalization and schedule-resume failures: %s", r.output)
@@ -352,7 +376,11 @@ func TestRestoreSuccess(t *testing.T) {
 	}
 	for scenario, w := range want {
 		t.Run(scenario, func(t *testing.T) {
-			r := runRestore(t, scenario, true)
+			var extra []string
+			if scenario == "expand_slow" {
+				extra = append(extra, "EXPAND_TIMEOUT=5s") // room for a second read
+			}
+			r := runRestore(t, scenario, true, extra...)
 			if r.err != nil {
 				t.Fatalf("restore failed: %v\n%s", r.err, r.output)
 			}
@@ -396,6 +424,26 @@ func TestRestoreSuccess(t *testing.T) {
 			}
 			if expanded < reclaim || expanded < r.index("rollout", "status") {
 				t.Fatalf("must expand the bound, protected claim to %s after rollout: %v", w.expand, r.calls)
+			}
+		})
+	}
+}
+
+// Bash arithmetic reads "08" as invalid octal; the timeout must still be 8 seconds.
+func TestRestoreExpandTimeoutIsDecimal(t *testing.T) {
+	t.Parallel()
+	r := runRestore(t, "expand_incomplete", true, "EXPAND_TIMEOUT=08s")
+	if r.err == nil || !strings.Contains(r.output, "after 08s, data-gofer-0's capacity is 2Gi") || strings.Contains(r.output, "now has capacity") {
+		t.Fatalf("must wait 8 seconds and report the incomplete expansion: %v\n%s", r.err, r.output)
+	}
+}
+
+func TestRestoreRejectsInvalidExpandTimeout(t *testing.T) {
+	for _, timeout := range []string{"0s", "00", "1m", "-1s", "1.5s"} {
+		t.Run(timeout, func(t *testing.T) {
+			r := runRestore(t, "normal", true, "EXPAND_TIMEOUT="+timeout)
+			if r.err == nil || !strings.Contains(r.output, "EXPAND_TIMEOUT must") || r.has("get", "pvc", "data-gofer-0", "-o", "json") {
+				t.Fatalf("must reject EXPAND_TIMEOUT=%q before the script reads the cluster: %v\n%s", timeout, r.calls, r.output)
 			}
 		})
 	}
@@ -500,8 +548,23 @@ func TestKubectlHelper(t *testing.T) {
 			request["storage"], capacity = "8Gi", "8Gi"
 		}
 		if patched, err := os.ReadFile(filepath.Join(dir, "expanded-to")); err == nil {
+			if scenario == "expand_stalled" {
+				// The API server answers after three seconds, unless the request
+				// times out first.
+				timeout := 3 * time.Second
+				for _, arg := range args {
+					if v, ok := strings.CutPrefix(arg, "--request-timeout="); ok {
+						if d, err := time.ParseDuration(v); err == nil && d > 0 && d < timeout {
+							time.Sleep(d)
+							fmt.Fprintln(os.Stderr, "context deadline exceeded")
+							os.Exit(1)
+						}
+					}
+				}
+				time.Sleep(timeout)
+			}
 			request["storage"] = string(patched)
-			if scenario != "expand_incomplete" && scenario != "expand_fs_pending" && (scenario != "expand_slow" || count("get", "pvc", "data-gofer-0", "-o", "json") > 5) {
+			if scenario != "expand_incomplete" && scenario != "expand_fs_pending" && scenario != "expand_remount" && (scenario != "expand_slow" || count("get", "pvc", "data-gofer-0", "-o", "json") > 5) {
 				capacity = string(patched)
 			}
 		}
@@ -683,6 +746,17 @@ func TestKubectlHelper(t *testing.T) {
 		if scenario == "delete_timeout" {
 			fail()
 		}
+	case is("get", "pv", "restored-pv", "-o", "json"):
+		// The restored volume: it grows with the controller-side expansion unless
+		// the driver is waiting for the disk to be detached.
+		data, _ := os.ReadFile(filepath.Join(dir, "created.json"))
+		var pvc map[string]any
+		_ = json.Unmarshal(data, &pvc)
+		capacity := pvc["spec"].(map[string]any)["resources"].(map[string]any)["requests"].(map[string]any)["storage"]
+		if patched, err := os.ReadFile(filepath.Join(dir, "expanded-to")); err == nil && scenario != "expand_incomplete" {
+			capacity = string(patched)
+		}
+		emit(map[string]any{"metadata": map[string]any{"name": "restored-pv"}, "spec": map[string]any{"capacity": map[string]any{"storage": capacity}}})
 	case is("auth", "can-i", "patch", "persistentvolumeclaims/data-gofer-0") && len(args) == 4:
 		if scenario == "no_patch_permission" {
 			fmt.Println("no")

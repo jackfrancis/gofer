@@ -215,10 +215,15 @@ Once the preflight succeeds, restore:
 6. if the claim was expanded after the snapshot was taken, expands the bound,
    restored claim back to its previous request (unless someone already raised it
    further; the patch is conditioned on the claim's resourceVersion), then waits up
-   to `EXPAND_TIMEOUT` (300s by default) for its `status.capacity` to reach that
-   size. Some drivers grow a disk only while it is detached, or the filesystem only
-   on the next mount; if the capacity falls short, restore exits nonzero and prints
-   how to finish (restart gofer, or stop it until the disk has grown).
+   to `EXPAND_TIMEOUT` (whole seconds, 300s by default; each read is bounded by the
+   time left) for its `status.capacity` to reach that size. Some drivers grow a
+   disk only while it is detached, and the claim's capacity changes only after the
+   node grows the filesystem, which for such a volume happens when gofer mounts it
+   again. If the capacity falls short, restore exits nonzero, reports the claim's
+   and the volume's capacity, and prints how to finish: if the volume (PV) has
+   grown, or the claim shows `FileSystemResizePending`, restart gofer; otherwise
+   stop gofer, wait for the *volume's* capacity (not the claim's) or that
+   condition, start gofer, and check the claim's capacity.
 
 Sizes are Kubernetes quantities in any valid spelling (`4Gi`, `+4Gi`, `4.Gi`,
 `4e9`, `1E`, `1Ei`, ...); an unreadable size stops the restore before anything
