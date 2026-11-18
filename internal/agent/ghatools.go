@@ -104,7 +104,7 @@ var (
 
 	schemaGHARead = json.RawMessage(`{"type":"object","properties":{` + ghaTargetProps +
 		`"step":{"type":"integer","description":"a step number (from gha_job_summary): read that step. Its lines in the job log, from its first; or, when the job log cannot place them (steps that started in the same second or ran at the same time), the step's own log (step-N.log, numbered from 1), in which start_line then counts"},` +
-		`"start_line":{"type":"integer","description":"first line, 1-based (default 1, or the step's first line); negative counts from the end, e.g. -200 reads the last 200 lines"},` +
+		`"start_line":{"type":"integer","description":"first line, 1-based (default 1, or the step's first line); negative counts from the end, e.g. -200 reads the last 200 lines. With step, a line inside that step (as a continuation hint gives it), and negative counts from the step's end"},` +
 		`"max_lines":{"type":"integer","description":"lines to return, up to 1500 (default 400, or the whole step)"}` +
 		`}}`)
 )
@@ -867,14 +867,21 @@ func (t *githubToolBox) ghaRead(ctx context.Context, a ghaArgs) (string, error) 
 		if !mapped || r.ambiguous() {
 			return t.ghaReadStepLog(ctx, l, label, step, start, n, "the job log cannot place its lines")
 		}
-		if start == 0 {
-			// The step's window: from its first line, never past its last.
-			length := r.last - r.first + 1
-			start, stepEnd = r.first, r.last
-			if n <= 0 || n > length {
-				n = length
-			}
+		// The step's window, on every page: start_line is a job-log line inside the
+		// step (as a continuation hint gives it), a negative one counts back from the
+		// step's end, and the window never runs past the step's last line.
+		switch {
+		case start == 0:
+			start = r.first
+		case start < 0:
+			start = max(r.last+start+1, r.first)
+		case start < r.first || start > r.last:
+			return "", fmt.Errorf("start_line %d is outside step %d (log lines %d-%d); omit step to read elsewhere in the log", start, step, r.first, r.last)
 		}
+		if left := r.last - start + 1; n <= 0 || n > left {
+			n = left
+		}
+		stepEnd = r.last
 	}
 	res, err := t.ci.ReadFile(l.file, start, n)
 	if err != nil {
