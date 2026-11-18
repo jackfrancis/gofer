@@ -365,6 +365,10 @@ func (s *Snapshotter) prune(ctx context.Context, failedOnly bool) ([]string, err
 			}
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err) // being stopped: start no more deletions
+			break
+		}
 		gone, err := s.delete(ctx, v, still)
 		if err != nil {
 			errs = append(errs, err)
@@ -445,114 +449,175 @@ type ownedContent struct {
 // being stopped.
 func (s *Snapshotter) delete(ctx context.Context, listed volumeSnapshot, still func(volumeSnapshot, *ownedContent) bool) (bool, error) {
 	name := listed.Metadata.Name
-	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
-	defer cancel()
 	var (
 		v       volumeSnapshot // the latest read
+		c       *ownedContent  // its content as looked up in the latest attempt
 		touched []ownedContent // contents a switch was sent for, as they were before it
+		wctx    context.Context
+		cancelW context.CancelFunc = func() {}
 	)
-	// abandon ends a deletion that did not happen (deleteErr is what stopped it, nil if
-	// it was a decision) and reports whether the snapshot went after all.
-	abandon := func(deleteErr error) (bool, error) {
-		if len(touched) == 0 {
-			return false, deleteErr
+	defer func() { cancelW() }()
+	// Until the first write, everything runs on ctx, so a job being stopped starts
+	// nothing. From the first write on, it runs to the end on its own budget.
+	writeCtx := func() context.Context {
+		if wctx == nil {
+			wctx, cancelW = context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
+		}
+		return wctx
+	}
+	readCtx := func() context.Context {
+		if wctx != nil {
+			return wctx
+		}
+		return ctx
+	}
+	// deleted finishes a deletion that went through.
+	deleted := func() (bool, error) {
+		if c == nil {
+			s.checkLeftBehind(v)
+		}
+		return true, nil
+	}
+	// abandon ends a deletion that did not go through, or may not have (err is what
+	// stopped it, nil if it was a decision; sent says whether a DELETE was sent), and
+	// reports whether the snapshot went after all.
+	abandon := func(err error, sent bool) (bool, error) {
+		if len(touched) == 0 && !sent {
+			return false, err
+		}
+		if sent && IsNotFound(err) && len(touched) == 0 {
+			return false, nil // someone else deleted it first
 		}
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recoveryTimeout)
 		defer cancel()
-		gone, err := s.goneSince(rctx, v)
-		if err != nil {
-			return false, errors.Join(deleteErr, fmt.Errorf("snapshot: could not tell whether %s is going (%w), so its content's deletion policy is as the attempt left it", name, err))
+		gone, gerr := s.goneSince(rctx, v)
+		if gerr != nil {
+			if len(touched) == 0 {
+				return false, errors.Join(err, fmt.Errorf("snapshot: could not tell whether %s went: %w", name, gerr))
+			}
+			return false, errors.Join(err, fmt.Errorf("snapshot: could not tell whether %s is going (%w), so its content's deletion policy is as the attempt left it", name, gerr))
 		}
 		if gone {
-			s.log().Info("snapshot is going; leaving its content's policy as it is", "snapshot", name)
-			// A delete whose answer was lost may have been this one.
-			uncertain := deleteErr != nil && !refused(deleteErr)
-			return uncertain, nil
+			if len(touched) > 0 {
+				s.log().Info("snapshot is going; leaving its content's policy as it is", "snapshot", name)
+			}
+			if sent && err != nil && !refused(err) {
+				return deleted() // the lost answer was a success
+			}
+			return false, nil // someone else's deletion
 		}
-		errs := []error{deleteErr}
-		for _, c := range touched {
-			errs = append(errs, s.undo(rctx, v, c))
+		errs := []error{err}
+		for _, t := range touched {
+			errs = append(errs, s.undo(rctx, v, t))
 		}
 		return false, errors.Join(errs...)
 	}
 	for attempt := 1; ; attempt++ {
 		var cur volumeSnapshot
-		if err := s.Kube.do(wctx, "GET", s.path(name), "", nil, &cur); err != nil {
+		if err := s.Kube.do(readCtx(), "GET", s.path(name), "", nil, &cur); err != nil {
 			if IsNotFound(err) {
 				if len(touched) > 0 {
-					v.Metadata.Name = name
-					return abandon(err)
+					return abandon(err, false)
 				}
 				return false, nil
 			}
-			return abandon(fmt.Errorf("snapshot: read %s before deleting it: %w", name, err))
+			return abandon(fmt.Errorf("snapshot: read %s before deleting it: %w", name, err), false)
 		}
 		v = cur
 		switch {
 		case v.Metadata.UID != listed.Metadata.UID, !v.managedBy(s.Claim):
 			s.log().Info("snapshot is no longer the one listed; leaving it alone", "snapshot", name)
-			return abandon(nil)
+			return abandon(nil, false)
 		case v.terminating():
-			return abandon(nil)
+			return abandon(nil, false)
 		}
-		c, err := s.contentOf(wctx, v)
+		var err error
+		c, err = s.contentOf(readCtx(), v)
 		if err != nil {
-			return abandon(err)
+			return abandon(err, false)
 		}
 		if still != nil && !still(v, c) {
-			return abandon(nil)
+			return abandon(nil, false)
 		}
-		if len(touched) == 0 && ctx.Err() != nil {
+		if wctx == nil && ctx.Err() != nil {
 			return false, ctx.Err() // being stopped, and nothing written yet: start nothing
 		}
 		if c != nil && c.policy != "Delete" {
 			touched = append(touched, *c)
-			_, err := s.setPolicy(wctx, c.name, c.uid, c.resourceVersion, "Delete")
+			_, err := s.setPolicy(writeCtx(), c.name, c.uid, c.resourceVersion, "Delete")
 			switch {
 			case err == nil:
 			case IsNotFound(err):
 				touched = touched[:len(touched)-1] // the content is gone: nothing switched
+				c = nil
 			case IsConflict(err):
 				touched = touched[:len(touched)-1]
 				s.log().Info("content changed since it was checked; leaving the snapshot for the next run", "snapshot", name, "content", c.name)
-				return abandon(nil)
+				return abandon(nil, false)
 			case statusCode(err) == http.StatusUnprocessableEntity:
 				touched = touched[:len(touched)-1]
 				// A different UID under the name (the content was replaced) is refused as a
 				// change to an immutable field; so is a change a validation rule or an
 				// admission policy rejects. Only the first is benign.
-				if replaced, rerr := s.replaced(wctx, *c); rerr == nil && replaced {
+				if replaced, rerr := s.replaced(readCtx(), *c); rerr == nil && replaced {
 					s.log().Info("content was replaced since it was checked; leaving the snapshot for the next run", "snapshot", name, "content", c.name)
-					return abandon(nil)
+					return abandon(nil, false)
 				}
-				return abandon(fmt.Errorf("snapshot: set %s to delete its storage: refused: %w", c.name, err))
+				return abandon(fmt.Errorf("snapshot: set %s to delete its storage: refused: %w", c.name, err), false)
 			case refused(err):
 				touched = touched[:len(touched)-1]
-				return abandon(fmt.Errorf("snapshot: set %s to delete its storage: %w", c.name, err))
+				return abandon(fmt.Errorf("snapshot: set %s to delete its storage: %w", c.name, err), false)
 			default:
 				// It may or may not have been applied; abandon reads back before undoing.
-				return abandon(fmt.Errorf("snapshot: set %s to delete its storage: %w", c.name, err))
+				return abandon(fmt.Errorf("snapshot: set %s to delete its storage: %w", c.name, err), false)
 			}
 		}
 		opts := map[string]any{
 			"kind": "DeleteOptions", "apiVersion": "v1",
 			"preconditions": map[string]any{"uid": v.Metadata.UID, "resourceVersion": v.Metadata.ResourceVersion},
 		}
-		err = s.Kube.do(wctx, "DELETE", s.path(name), "application/json", opts, nil)
+		err = s.Kube.do(writeCtx(), "DELETE", s.path(name), "application/json", opts, nil)
 		if err == nil {
-			return true, nil
+			return deleted()
 		}
-		if !IsConflict(err) || attempt == deleteAttempts {
-			if IsConflict(err) {
-				s.log().Info("snapshot kept changing; leaving it for the next run", "snapshot", name)
-				return abandon(nil)
+		if IsConflict(err) && attempt < deleteAttempts {
+			select {
+			case <-readCtx().Done():
+			case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
 			}
-			return abandon(fmt.Errorf("snapshot: delete %s: %w", name, err))
+			continue
 		}
-		select {
-		case <-wctx.Done():
-		case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+		if IsConflict(err) {
+			s.log().Info("snapshot kept changing; leaving it for the next run", "snapshot", name)
+			return abandon(nil, false)
 		}
+		return abandon(fmt.Errorf("snapshot: delete %s: %w", name, err), true)
+	}
+}
+
+// checkLeftBehind looks, after deleting a snapshot that had no content of its own,
+// for a content that turned up for it in the meantime. The controller creates a
+// content and records it in the snapshot's status in two separate writes, and a
+// binding can be repaired by hand, so one can appear between the last lookup and the
+// delete without changing the snapshot. It is left as it is (it may hold a backup
+// someone repaired) and logged, so an operator can rebind or delete it. Only the
+// dynamic name, snapcontent-<snapshot UID>, is checked: finding contents under other
+// names would need list access to every content in the cluster.
+func (s *Snapshotter) checkLeftBehind(v volumeSnapshot) {
+	if v.Metadata.UID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), recoveryTimeout)
+	defer cancel()
+	name := "snapcontent-" + v.Metadata.UID
+	c, err := s.readContent(ctx, name)
+	switch {
+	case IsNotFound(err):
+	case err != nil:
+		s.log().Warn("could not check whether a deleted snapshot left a content behind", "snapshot", v.Metadata.Name, "content", name, "err", err)
+	case s.owns(c, v):
+		s.log().Warn("a content for the deleted snapshot appeared meanwhile and was left behind; bind it to a new VolumeSnapshot to keep it, or delete it",
+			"snapshot", v.Metadata.Name, "content", name, "deletionPolicy", c.Spec.DeletionPolicy)
 	}
 }
 

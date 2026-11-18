@@ -7,7 +7,8 @@ package snapshot
 // ServiceAccount, so it exercises deploy/k8s/backup/rbac.yaml too. Environment:
 //
 //	GOFER_IT_SERVER  API server URL
-//	GOFER_IT_CA      file with the cluster CA (PEM)
+//	GOFER_IT_CA      file with the cluster CA (PEM), an absolute path: go test runs
+//	                 the test in internal/snapshot
 //	GOFER_IT_TOKEN   a gofer-snapshotter token
 //	GOFER_IT_CLASS   a Retain VolumeSnapshotClass of a working driver
 //	GOFER_IT_BOGUS   a VolumeSnapshotClass naming a driver nobody serves
@@ -26,9 +27,9 @@ package snapshot
 //	deploy/kubernetes-latest/deploy.sh
 //	# from this repository:
 //	kubectl apply -f internal/snapshot/testdata/kind-setup.yaml -f deploy/k8s/backup/rbac.yaml
-//	kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > ca.pem
+//	kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > "$PWD/ca.pem"
 //	GOFER_IT_SERVER=$(kubectl config view --raw -o jsonpath='{.clusters[0].cluster.server}') \
-//	GOFER_IT_CA=ca.pem GOFER_IT_TOKEN=$(kubectl -n gofer create token gofer-snapshotter) \
+//	GOFER_IT_CA="$PWD/ca.pem" GOFER_IT_TOKEN=$(kubectl -n gofer create token gofer-snapshotter) \
 //	GOFER_IT_CLASS=gofer-retain GOFER_IT_BOGUS=gofer-bogus \
 //	go test -tags kindintegration -run TestKind -v ./internal/snapshot
 
@@ -47,12 +48,25 @@ import (
 
 func itKube(t *testing.T) *Kube {
 	t.Helper()
-	ca, err := os.ReadFile(os.Getenv("GOFER_IT_CA"))
+	path := os.Getenv("GOFER_IT_CA")
+	if path == "" {
+		t.Skip("GOFER_IT_CA not set: no cluster to check against")
+	}
+	// Configured but unusable is a failure, not a skip: a misconfigured run must not
+	// look like a pass.
+	ca, err := os.ReadFile(path)
 	if err != nil {
-		t.Skip("GOFER_IT_CA not set")
+		t.Fatalf("GOFER_IT_CA: %v", err)
 	}
 	pool := x509.NewCertPool()
-	pool.AppendCertsFromPEM(ca)
+	if !pool.AppendCertsFromPEM(ca) {
+		t.Fatalf("GOFER_IT_CA: %s holds no PEM certificate", path)
+	}
+	for _, k := range []string{"GOFER_IT_SERVER", "GOFER_IT_TOKEN", "GOFER_IT_CLASS", "GOFER_IT_BOGUS"} {
+		if os.Getenv(k) == "" {
+			t.Fatalf("%s must be set along with GOFER_IT_CA", k)
+		}
+	}
 	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}}
 	tok := os.Getenv("GOFER_IT_TOKEN")
 	return NewKube(os.Getenv("GOFER_IT_SERVER"), func() (string, error) { return tok, nil }, client)

@@ -1,10 +1,12 @@
 package snapshot
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -946,6 +948,112 @@ func TestRecoveryHasItsOwnTime(t *testing.T) {
 	}
 	if _, ok := f.snaps["failed"]; !ok || f.contents["content-failed"] != "Retain" {
 		t.Fatalf("the surviving snapshot's content must get Retain back, have %q", f.contents["content-failed"])
+	}
+}
+
+// noContent seeds a failed snapshot that has no content at all.
+func (f *fakeAPI) noContent(name string) {
+	f.addUnbound(name, ago(time.Hour), contentRef{})
+	delete(f.refs, "snapcontent-uid-"+name)
+	delete(f.contents, "snapcontent-uid-"+name)
+}
+
+// With nothing switched, a DELETE that finds the snapshot already gone (someone else
+// deleted it) or whose successful answer was lost is not an error: the snapshot went.
+func TestDeleteGoneWithNothingSwitched(t *testing.T) {
+	t.Run("already gone", func(t *testing.T) {
+		f := newFakeAPI()
+		f.noContent("failed")
+		f.beforeDelete = func(name string) { delete(f.snaps, name) }
+		s := newSnapshotter(t, f)
+		if deleted, err := s.pruneFailed(context.Background()); err != nil || len(deleted) != 0 {
+			t.Fatalf("want no error and nothing counted, got %v %v", deleted, err)
+		}
+	})
+	t.Run("answer lost", func(t *testing.T) {
+		f := newFakeAPI()
+		f.noContent("failed")
+		f.fault = func(method, _ string) string {
+			if method == "DELETE" {
+				return "after"
+			}
+			return ""
+		}
+		s := newSnapshotter(t, f)
+		if deleted, err := s.pruneFailed(context.Background()); err != nil || !slices.Equal(deleted, []string{"failed"}) {
+			t.Fatalf("want it counted as deleted, got %v %v", deleted, err)
+		}
+	})
+	t.Run("not applied", func(t *testing.T) {
+		f := newFakeAPI()
+		f.noContent("failed")
+		f.fault = func(method, _ string) string {
+			if method == "DELETE" {
+				return "before"
+			}
+			return ""
+		}
+		s := newSnapshotter(t, f)
+		if _, err := s.pruneFailed(context.Background()); err == nil {
+			t.Fatal("want the failed delete reported")
+		}
+		if _, ok := f.snaps["failed"]; !ok {
+			t.Fatal("the snapshot must still be there")
+		}
+	})
+}
+
+// A content that turns up for a snapshot without one between the last lookup and the
+// delete (the controller creates a content and records it in the snapshot's status
+// in separate writes) does not change the snapshot, so the delete goes through. The
+// content is left as it is and logged, for an operator to rebind or delete.
+func TestDeleteLogsAContentLeftBehind(t *testing.T) {
+	f := newFakeAPI()
+	f.noContent("failed")
+	f.beforeDelete = func(name string) {
+		f.refs["snapcontent-uid-failed"] = contentRef{"failed", "gofer", "uid-failed"}
+		f.contents["snapcontent-uid-failed"] = "Retain"
+	}
+	s := newSnapshotter(t, f)
+	var logs bytes.Buffer
+	s.Log = slog.New(slog.NewTextHandler(&logs, nil))
+	if deleted, err := s.pruneFailed(context.Background()); err != nil || !slices.Equal(deleted, []string{"failed"}) {
+		t.Fatalf("want it deleted, got %v %v", deleted, err)
+	}
+	if f.contents["snapcontent-uid-failed"] != "Retain" {
+		t.Fatal("the content left behind must not be changed: it may hold a repaired backup")
+	}
+	if !strings.Contains(logs.String(), "left behind") || !strings.Contains(logs.String(), "snapcontent-uid-failed") {
+		t.Fatalf("want the content left behind logged, got %s", logs.String())
+	}
+}
+
+// Once the job is being stopped, no further candidates are read or deleted.
+func TestPruneStopsAfterCancellation(t *testing.T) {
+	f := newFakeAPI()
+	for i := range 4 {
+		f.addFailed("failed-"+string(rune('a'+i)), ago(time.Duration(i+1)*time.Hour), managed())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.onGet = func(string, map[string]any, int) { cancel() } // SIGTERM during the first read
+	s := newSnapshotter(t, f)
+	if _, err := s.pruneFailed(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("want cancellation reported, got %v", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	reads := 0
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "GET "+snapPrefix+"/") {
+			reads++
+		}
+		if strings.HasPrefix(c, "PATCH") || strings.HasPrefix(c, "DELETE") {
+			t.Fatalf("nothing may be written after cancellation: %v", f.calls)
+		}
+	}
+	if reads != 1 {
+		t.Fatalf("want only the first candidate read, got %d reads: %v", reads, f.calls)
 	}
 }
 

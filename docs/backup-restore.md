@@ -182,7 +182,12 @@ waits until it is ready to use, and then deletes the oldest beyond the newest
   (the snapshot controller itself updates it once its content's policy is `Delete`),
   the attempt starts again from a fresh read. A change the API server rejects (by
   a validation rule or an admission policy, say) fails the job rather than passing
-  silently.
+  silently. One window cannot be closed: the snapshot controller creates a
+  VolumeSnapshotContent and records it on the snapshot in two separate writes, so a
+  content can turn up for a snapshot that had none just before the job deletes it.
+  The job then leaves that content as it is (it may hold a backup someone repaired)
+  and logs a warning naming it (`left behind`), so it can be bound to a new
+  VolumeSnapshot or deleted by hand.
 - A snapshot that is merely slow (not ready after ten minutes, with no error or
   already taken and still copying) is left in
   place: it may still finish and be a good backup. If it later fails, a run deletes it
