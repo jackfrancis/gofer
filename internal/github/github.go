@@ -48,6 +48,11 @@ type Client struct {
 	http    *http.Client
 	baseURL string
 	search  searchBudget
+
+	// blob downloads Actions job logs from the pre-signed URL the API redirects to.
+	// It never carries the token (actions.go); built on first use.
+	blobOnce sync.Once
+	blob     *http.Client
 }
 
 // NewClient returns a GitHub client. A nil httpClient uses http.DefaultClient; an

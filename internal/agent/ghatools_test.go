@@ -1,0 +1,321 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+)
+
+// ghaFailLog is job 42's log: steps 1 (lines 1-2), 2 (3-5), 3 (6-14, failing), 4 (15).
+var ghaFailLog = strings.Join([]string{
+	"2026-11-01T10:00:00.1000000Z Current runner version: '2.320.0'",
+	"2026-11-01T10:00:01.5000000Z Runner name: 'runner-1'",
+	"2026-11-01T10:00:02.2000000Z ##[group]Run actions/checkout@v4",
+	"2026-11-01T10:00:03.0000000Z Syncing repository: o/r",
+	"2026-11-01T10:00:04.9000000Z ##[endgroup]",
+	"2026-11-01T10:00:05.1000000Z ##[group]Run go test ./...",
+	"2026-11-01T10:00:05.1000000Z \x1b[36;1mgo test ./...\x1b[0m",
+	"2026-11-01T10:00:06.0000000Z ##[endgroup]",
+	"2026-11-01T10:00:10.0000000Z ok  \texample.com/a\t0.1s",
+	"2026-11-01T10:00:15.0000000Z --- FAIL: TestThing (0.00s)",
+	"2026-11-01T10:00:15.0000000Z     thing_test.go:12: want 1, got 2",
+	"2026-11-01T10:00:16.0000000Z FAIL",
+	"2026-11-01T10:00:16.0000000Z FAIL\texample.com/b\t0.2s",
+	"2026-11-01T10:00:19.0000000Z ##[error]Process completed with exit code 1.",
+	"2026-11-01T10:00:21.0000000Z Post job cleanup.",
+}, "\r\n") + "\r\n"
+
+// ghaQuietLog is job 44's: it fails without a marker the scan knows.
+var ghaQuietLog = func() string {
+	var b strings.Builder
+	b.WriteString("2026-11-01T10:00:00.0000000Z Current runner version\n")
+	for i := 1; i <= 60; i++ {
+		fmt.Fprintf(&b, "2026-11-01T10:00:05.0000000Z lint output %d\n", i)
+	}
+	b.WriteString("2026-11-01T10:00:09.0000000Z something went wrong quietly\n")
+	b.WriteString("2026-11-01T10:00:21.0000000Z Post job cleanup.\n")
+	return b.String()
+}()
+
+const ghaSteps = `[
+	{"number":1,"name":"Set up job","status":"completed","conclusion":"success","started_at":"2026-11-01T10:00:00Z","completed_at":"2026-11-01T10:00:02Z"},
+	{"number":2,"name":"Checkout","status":"completed","conclusion":"success","started_at":"2026-11-01T10:00:02Z","completed_at":"2026-11-01T10:00:05Z"},
+	{"number":3,"name":"Run tests","status":"completed","conclusion":"failure","started_at":"2026-11-01T10:00:05Z","completed_at":"2026-11-01T10:00:20Z"},
+	{"number":5,"name":"Lint","status":"completed","conclusion":"skipped","started_at":"2026-11-01T10:00:20Z","completed_at":"2026-11-01T10:00:20Z"},
+	{"number":4,"name":"Post Checkout","status":"completed","conclusion":"success","started_at":"2026-11-01T10:00:21Z","completed_at":"2026-11-01T10:00:21Z"}
+]`
+
+func ghaJobJSON(id int64, name, conclusion string) string {
+	return fmt.Sprintf(`{"id":%d,"run_id":7,"run_attempt":1,"name":%q,"workflow_name":"CI","head_branch":"feature","head_sha":"0123456789abcdef0123",`+
+		`"status":"completed","conclusion":%q,"html_url":"https://github.com/o/r/actions/runs/7/job/%d",`+
+		`"started_at":"2026-11-01T10:00:00Z","completed_at":"2026-11-01T10:00:22Z","steps":%s}`, id, name, conclusion, id, ghaSteps)
+}
+
+type ghaFake struct {
+	api, blob *httptest.Server
+	logHits   atomic.Int32
+	blobCreds atomic.Bool
+}
+
+// newGHAFake serves the API (o/r: run 7 with jobs 42 failing and 43 passing; job 44
+// failing quietly; PR 5 whose head has a failing Actions check and a failing Prow
+// status) and, on a separate host, the pre-signed log blobs.
+func newGHAFake(t *testing.T) *ghaFake {
+	t.Helper()
+	f := &ghaFake{}
+	f.blob = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			f.blobCreds.Store(true)
+		}
+		if r.URL.Query().Get("sig") != "presigned" {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		switch r.URL.Path {
+		case "/42":
+			_, _ = w.Write([]byte(ghaFailLog))
+		case "/44":
+			_, _ = w.Write([]byte(ghaQuietLog))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	f.api = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer s3cret-token" {
+			t.Errorf("API call without the token: %s", r.URL.Path)
+		}
+		switch r.URL.Path {
+		case "/repos/o/r/actions/jobs/42":
+			_, _ = w.Write([]byte(ghaJobJSON(42, "test (ubuntu)", "failure")))
+		case "/repos/o/r/actions/jobs/44":
+			_, _ = w.Write([]byte(ghaJobJSON(44, "lint", "failure")))
+		case "/repos/o/r/actions/jobs/42/logs", "/repos/o/r/actions/jobs/44/logs":
+			f.logHits.Add(1)
+			id := strings.Split(r.URL.Path, "/")[6]
+			http.Redirect(w, r, f.blob.URL+"/"+id+"?sig=presigned", http.StatusFound)
+		case "/repos/o/r/actions/runs/7/jobs":
+			fmt.Fprintf(w, `{"total_count":2,"jobs":[%s,%s]}`, ghaJobJSON(43, "build", "success"), ghaJobJSON(42, "test (ubuntu)", "failure"))
+		case "/repos/o/r/actions/runs/8/jobs":
+			fmt.Fprintf(w, `{"total_count":1,"jobs":[%s]}`, ghaJobJSON(42, "test (ubuntu)", "failure"))
+		case "/repos/o/r/pulls/5":
+			_, _ = w.Write([]byte(`{"head":{"ref":"feature","sha":"0123456789abcdef0123"}}`))
+		case "/repos/o/r/commits/0123456789abcdef0123/status":
+			_, _ = w.Write([]byte(`{"sha":"0123456789abcdef0123","total_count":1,"statuses":[{"context":"pull-e2e","state":"failure","target_url":"https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/o_r/5/pull-e2e/1"}]}`))
+		case "/repos/o/r/commits/0123456789abcdef0123/check-runs":
+			_, _ = w.Write([]byte(`{"total_count":2,"check_runs":[` +
+				`{"name":"test (ubuntu)","status":"completed","conclusion":"failure","details_url":"https://github.com/o/r/actions/runs/7/job/42","app":{"slug":"github-actions"}},` +
+				`{"name":"build","status":"completed","conclusion":"success","details_url":"https://github.com/o/r/actions/runs/7/job/43","app":{"slug":"github-actions"}}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(f.api.Close)
+	t.Cleanup(f.blob.Close)
+	return f
+}
+
+func ghaBox(t *testing.T) (*githubToolBox, *ghaFake) {
+	t.Helper()
+	f := newGHAFake(t)
+	box, _ := ciBox(t, f.api)
+	return box, f
+}
+
+func ghaCheckClean(t *testing.T, f *ghaFake, out string) {
+	t.Helper()
+	if f.blobCreds.Load() {
+		t.Error("the blob host received the token")
+	}
+	for _, leak := range []string{"s3cret-token", "presigned", f.blob.URL} {
+		if strings.Contains(out, leak) {
+			t.Errorf("output contains %q:\n%s", leak, out)
+		}
+	}
+}
+
+func TestGHAToolDefinitions(t *testing.T) {
+	box, _ := ciBox(t, nil)
+	got := map[string]bool{}
+	for _, d := range box.Definitions() {
+		got[d.Name] = true
+	}
+	for _, want := range []string{"gha_job_summary", "gha_search", "gha_read"} {
+		if !got[want] {
+			t.Errorf("missing tool %q", want)
+		}
+	}
+}
+
+func TestGHAJobSummary(t *testing.T) {
+	box, f := ghaBox(t)
+	out := ciInvoke(t, box, "gha_job_summary", `{"url":"https://github.com/o/r/actions/runs/7/job/42?pr=5"}`)
+	assertFramed(t, out, ciUntrustedOpen)
+	ghaCheckClean(t, f, out)
+	for _, want := range []string{
+		"gha_job_summary for Actions job 42 in o/r (run 7).",
+		"job: test (ubuntu) (workflow CI)",
+		"result: failure",
+		"tested: feature @0123456789ab",
+		"ran 22s",
+		"  1 Set up job: success (≈ log lines 1-2)",
+		"  2 Checkout: success (≈ log lines 3-5)",
+		"✗ 3 Run tests: failure (≈ log lines 6-14)",
+		"  5 Lint: skipped\n",
+		"  4 Post Checkout: success (≈ log lines 15-15)",
+		"15 lines; 1 failure marker block(s):",
+		"log:10: --- FAIL: TestThing (0.00s)",
+		"log:14: ##[error]Process completed with exit code 1.",
+		"log:7: go test ./...", // colour codes and timestamps removed
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "2026-11-01T10:00") && strings.Contains(out, "log:") && strings.Contains(out, "Z ##[error]") {
+		t.Errorf("timestamps not stripped:\n%s", out)
+	}
+
+	// The same job again uses the fetched log.
+	ciInvoke(t, box, "gha_job_summary", `{"job_id":42}`)
+	if n := f.logHits.Load(); n != 1 {
+		t.Errorf("log fetched %d times, want 1", n)
+	}
+}
+
+func TestGHAJobSummaryTailWithoutMarkers(t *testing.T) {
+	box, f := ghaBox(t)
+	out := ciInvoke(t, box, "gha_job_summary", `{"repo":"o/r","job_id":44}`)
+	ghaCheckClean(t, f, out)
+	if !strings.Contains(out, "no failure markers found") || !strings.Contains(out, "the end of step 3:") {
+		t.Fatalf("no tail of the failing step:\n%s", out)
+	}
+	if !strings.Contains(out, "log:62: something went wrong quietly") || strings.Contains(out, "log:63:") {
+		t.Errorf("tail does not end at the failing step's last line:\n%s", out)
+	}
+	if strings.Count(out, "\n    log:") != ghaTailLines {
+		t.Errorf("tail has %d lines, want %d", strings.Count(out, "\n    log:"), ghaTailLines)
+	}
+}
+
+func TestGHARunSummary(t *testing.T) {
+	box, f := ghaBox(t)
+	out := ciInvoke(t, box, "gha_job_summary", `{"url":"https://github.com/o/r/actions/runs/7"}`)
+	ghaCheckClean(t, f, out)
+	fail := strings.Index(out, "failing  test (ubuntu) (job 42: failure) — failed step(s): 3 Run tests")
+	pass := strings.Index(out, "passing  build (job 43: success)")
+	if fail < 0 || pass < 0 || fail > pass {
+		t.Fatalf("run listing wrong or not failing-first:\n%s", out)
+	}
+	if !strings.Contains(out, "2 jobs, 1 failing, 0 pending, 1 passing") || !strings.Contains(out, "The first failing job:\ngha_job_summary for Actions job 42") {
+		t.Errorf("run summary:\n%s", out)
+	}
+}
+
+func TestGHAPRSummary(t *testing.T) {
+	box, f := ghaBox(t)
+	out := ciInvoke(t, box, "gha_job_summary", `{"number":5}`)
+	ghaCheckClean(t, f, out)
+	for _, want := range []string{
+		"gha_job_summary for o/r PR #5 (commit 0123456789ab): 1 failing GitHub Actions job(s); 1 other failing check(s)",
+		"failing  test (ubuntu) (job 42: failure)",
+		"log:14: ##[error]Process completed with exit code 1.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("PR summary lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestGHASearchAndRead(t *testing.T) {
+	box, f := ghaBox(t)
+	job := `"url":"https://github.com/o/r/actions/runs/7/job/42"`
+	out := ciInvoke(t, box, "gha_search", `{`+job+`,"pattern":"^FAIL","context_lines":1}`)
+	assertFramed(t, out, ciUntrustedOpen)
+	ghaCheckClean(t, f, out)
+	for _, want := range []string{
+		"gha_search log in Actions job 42 in o/r: 2 matching lines",
+		"log:12: FAIL\n",
+		"log-11-     thing_test.go:12: want 1, got 2",
+		"log:13: FAIL\texample.com/b\t0.2s",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("search lacks %q:\n%s", want, out)
+		}
+	}
+
+	out = ciInvoke(t, box, "gha_read", `{`+job+`,"step":3}`)
+	assertFramed(t, out, ciUntrustedOpen)
+	if !strings.Contains(out, "gha_read log in Actions job 42 in o/r: lines 6-14 of 15. Continue with start_line=15.") ||
+		!strings.Contains(out, "    14\t##[error]Process completed") || strings.Contains(out, "    15\t") {
+		t.Errorf("read of step 3:\n%s", out)
+	}
+
+	// A "#step:N" link reads that step.
+	out = ciInvoke(t, box, "gha_read", `{"url":"https://github.com/o/r/actions/runs/7/job/42#step:2:1"}`)
+	if !strings.Contains(out, "lines 3-5 of 15") {
+		t.Errorf("read from a step link:\n%s", out)
+	}
+	out = ciInvoke(t, box, "gha_read", `{"job_id":42,"start_line":-2}`)
+	if !strings.Contains(out, "lines 14-15 of 15") || !strings.Contains(out, "Post job cleanup.") {
+		t.Errorf("read from the end:\n%s", out)
+	}
+
+	// A run with one job resolves to it; with several, a job must be named.
+	out = ciInvoke(t, box, "gha_search", `{"url":"https://github.com/o/r/actions/runs/8","pattern":"TestThing","literal":true}`)
+	if !strings.Contains(out, "log:10: --- FAIL: TestThing") {
+		t.Errorf("single-job run search:\n%s", out)
+	}
+	if f.logHits.Load() != 1 {
+		t.Errorf("log fetched %d times, want 1", f.logHits.Load())
+	}
+}
+
+func TestGHAToolErrors(t *testing.T) {
+	box, _ := ghaBox(t)
+	for _, c := range []struct{ name, args, want string }{
+		{"gha_search", `{"url":"https://github.com/o/r/actions/runs/7","pattern":"x"}`, "has 2 jobs; name one"},
+		{"gha_search", `{"job_id":42}`, "pattern is required"},
+		{"gha_read", `{"job_id":42,"step":5}`, "step 5 has no lines"},
+		{"gha_read", `{}`, "url (an Actions job or run link), job_id or run_id is required"},
+		{"gha_job_summary", `{"url":"https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/o_r/5/pull-e2e/1"}`, "open it with ci_job_summary"},
+		{"gha_job_summary", `{"url":"https://example.com/o/r/actions/runs/1"}`, "not github.com"},
+		{"gha_job_summary", `{"job_id":99}`, "not found"},
+	} {
+		_, err := box.Invoke(context.Background(), c.name, json.RawMessage(c.args))
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s(%s): err = %v, want %q", c.name, c.args, err, c.want)
+		}
+	}
+}
+
+func TestGHAJobLimit(t *testing.T) {
+	box, _ := ghaBox(t)
+	for i := range maxGHAJobs {
+		box.gha.jobs = mapWith(box.gha.jobs, fmt.Sprintf("o/r/%d", 1000+i))
+	}
+	out := ciInvoke(t, box, "gha_job_summary", `{"job_id":42}`)
+	if !strings.Contains(out, "could not be read: at most 6 GitHub Actions job logs per answer") {
+		t.Errorf("job limit not reported:\n%s", out)
+	}
+}
+
+func mapWith(m map[string]*ghaLog, key string) map[string]*ghaLog {
+	if m == nil {
+		m = map[string]*ghaLog{}
+	}
+	m[key] = &ghaLog{}
+	return m
+}
+
+func TestCIStatusTagsActions(t *testing.T) {
+	box, _ := ghaBox(t)
+	out := ciInvoke(t, box, "github_get_ci_status", `{"number":5}`)
+	if !strings.Contains(out, "[actions] https://github.com/o/r/actions/runs/7/job/42") || !strings.Contains(out, "[prow] https://prow.k8s.io/") {
+		t.Errorf("status tags:\n%s", out)
+	}
+}

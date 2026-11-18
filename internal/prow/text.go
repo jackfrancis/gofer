@@ -186,3 +186,85 @@ func clipLine(s string, col, max int) string {
 	}
 	return strings.ToValidUTF8(s, "�")
 }
+
+// headWriter passes text through to w, showing fn the first bytes of every line
+// (up to MaxLineHead) and dropping as many of them as fn returns. It never holds
+// more than one line head, however long a line is. Lines are numbered as lineReader
+// numbers them: split on "\n", a final unterminated line counted too.
+type headWriter struct {
+	w          io.Writer
+	fn         func(num int, head []byte) int
+	head       []byte
+	collecting bool // at a line start, still gathering its head
+	num        int
+	n          int64 // bytes written to w
+}
+
+func (h *headWriter) put(p []byte) error {
+	if len(p) == 0 {
+		return nil
+	}
+	n, err := h.w.Write(p)
+	h.n += int64(n)
+	return err
+}
+
+// emitHead hands the gathered head to fn and writes what it keeps.
+func (h *headWriter) emitHead() error {
+	h.num++
+	drop := h.fn(h.num, h.head)
+	drop = min(max(drop, 0), len(h.head))
+	err := h.put(h.head[drop:])
+	h.head = h.head[:0]
+	return err
+}
+
+func (h *headWriter) Write(p []byte) (int, error) {
+	total := len(p)
+	for len(p) > 0 {
+		if !h.collecting {
+			i := bytes.IndexByte(p, '\n')
+			if i < 0 {
+				return total, h.put(p)
+			}
+			if err := h.put(p[:i+1]); err != nil {
+				return total, err
+			}
+			p = p[i+1:]
+			h.collecting = true
+			continue
+		}
+		room := MaxLineHead - len(h.head)
+		chunk := p[:min(room, len(p))]
+		if i := bytes.IndexByte(chunk, '\n'); i >= 0 {
+			h.head = append(h.head, chunk[:i]...)
+			p = p[i+1:]
+			if err := h.emitHead(); err != nil {
+				return total, err
+			}
+			if err := h.put([]byte{'\n'}); err != nil {
+				return total, err
+			}
+			continue
+		}
+		h.head = append(h.head, chunk...)
+		p = p[len(chunk):]
+		if len(h.head) == MaxLineHead {
+			// A long line: its head is decided (and the line counted); the rest
+			// passes straight through to its "\n".
+			if err := h.emitHead(); err != nil {
+				return total, err
+			}
+			h.collecting = false
+		}
+	}
+	return total, nil
+}
+
+// finish emits a final line that did not end in "\n".
+func (h *headWriter) finish() error {
+	if h.collecting && len(h.head) > 0 {
+		return h.emitHead()
+	}
+	return nil
+}

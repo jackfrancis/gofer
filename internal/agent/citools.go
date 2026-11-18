@@ -1,7 +1,8 @@
 // CI tools for the assistive conversation: a pull request's CI results
 // (github_get_ci_status) and the public logs and artifacts of a Prow job
 // (ci_job_summary, ci_list, ci_search, ci_read). See
-// docs/adr/0005-prow-ci-log-tools.md for the design.
+// docs/adr/0005-prow-ci-log-tools.md for the design. The GitHub Actions log tools
+// (gha_*) are in ghatools.go and share this file's session, formatting and clamping.
 //
 // The ci_* tools take a job URL exactly as a check or a bot comment shows it, and
 // internal/prow decides whether it may be opened: only allowlisted buckets, only one
@@ -78,10 +79,10 @@ var (
 
 // ciToolDefs advertises the CI tools.
 func ciToolDefs() []worklist.ToolDef {
-	return []worklist.ToolDef{
+	return append([]worklist.ToolDef{
 		{
 			Name:        "github_get_ci_status",
-			Description: "Get the CI results on a pull request's head commit (or on a ref): every commit status (Prow reports here) and check run (GitHub Actions and other apps), failing first, with each one's state, description and details URL. Use it to find which jobs failed and the links to their logs; failing Prow jobs can then be opened with ci_job_summary.",
+			Description: "Get the CI results on a pull request's head commit (or on a ref): every commit status (Prow reports here) and check run (GitHub Actions and other apps), failing first, with each one's state, description and details URL. Use it to find which jobs failed and the links to their logs; failing Prow jobs can then be opened with ci_job_summary, and failing GitHub Actions jobs with gha_job_summary.",
 			Parameters:  schemaCIStatus,
 		},
 		{
@@ -104,7 +105,7 @@ func ciToolDefs() []worklist.ToolDef {
 			Description: "Read a window of lines, with line numbers, from a file in a Prow job (build-log.txt by default). Use it to read around a ci_search match or a ci_job_summary marker; a negative start_line reads from the end.",
 			Parameters:  schemaCIRead,
 		},
-	}
+	}, ghaToolDefs()...)
 }
 
 // invokeCITool runs one CI tool. ok is false when name is not a CI tool.
@@ -139,6 +140,8 @@ func (t *githubToolBox) runCITool(ctx context.Context, name string, args json.Ra
 	case "github_get_ci_status":
 		out, err = t.ciStatus(ctx, args)
 		return out, true, err
+	case "gha_job_summary", "gha_search", "gha_read":
+		return t.runGHATool(ctx, name, args)
 	case "ci_job_summary", "ci_list", "ci_search", "ci_read":
 	default:
 		return "", false, nil
@@ -199,7 +202,7 @@ func (t *githubToolBox) runCITool(ctx context.Context, name string, args json.Ra
 			Timeout: ciSearchTimeout,
 		})
 		if err == nil {
-			out = formatCISearch(job, p, res)
+			out = formatCISearch("ci_search", ciJobLabel(job), p, res)
 		}
 	case "ci_read":
 		if p == "" {
@@ -207,7 +210,7 @@ func (t *githubToolBox) runCITool(ctx context.Context, name string, args json.Ra
 		}
 		var res prow.ReadResult
 		if res, err = t.ci.Read(ctx, job, p, a.StartLine, a.MaxLines); err == nil {
-			out = formatCIRead(job, res)
+			out = formatCIRead("ci_read", ciJobLabel(job), res)
 		}
 	}
 	return out, true, err
@@ -265,7 +268,7 @@ func formatCIStatus(label string, st github.CIStatus) string {
 		b.WriteString("No commit statuses or check runs on this commit.")
 		return b.String()
 	}
-	b.WriteString("Entries marked [prow] can be opened with ci_job_summary.\n\n" + untrustedOpen)
+	b.WriteString("Entries marked [prow] can be opened with ci_job_summary, entries marked [actions] with gha_job_summary.\n\n" + untrustedOpen)
 	passing := 0
 	for _, c := range st.Checks {
 		if c.Class == github.CIPassing {
@@ -289,6 +292,8 @@ func formatCIStatus(label string, st github.CIStatus) string {
 			tag := ""
 			if _, _, err := prow.ParseJobURL(c.URL); err == nil {
 				tag = "[prow] "
+			} else if ghaURLTag(c.URL) {
+				tag = "[actions] "
 			}
 			fmt.Fprintf(&b, "           %s%s\n", tag, oneLine(c.URL, 500))
 		}
@@ -510,9 +515,11 @@ func (t *githubToolBox) ciList(ctx context.Context, job prow.Job, dir string, de
 	return b.String(), nil
 }
 
-func formatCISearch(job prow.Job, where string, res prow.SearchResult) string {
+// formatCISearch renders a search result for tool (ci_search, gha_search); label
+// names the job and where the file or directory searched.
+func formatCISearch(tool, label, where string, res prow.SearchResult) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "ci_search %s in %s: ", where, ciJobLabel(job))
+	fmt.Fprintf(&b, "%s %s in %s: ", tool, where, label)
 	if res.TotalMatches == 0 {
 		fmt.Fprintf(&b, "no matches in %d file(s) searched.", res.FilesSearched)
 	} else {
@@ -564,9 +571,10 @@ func formatCISearch(job prow.Job, where string, res prow.SearchResult) string {
 	return b.String()
 }
 
-func formatCIRead(job prow.Job, res prow.ReadResult) string {
+// formatCIRead renders a line window for tool (ci_read, gha_read); label names the job.
+func formatCIRead(tool, label string, res prow.ReadResult) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "ci_read %s in %s: ", res.Path, ciJobLabel(job))
+	fmt.Fprintf(&b, "%s %s in %s: ", tool, res.Path, label)
 	switch {
 	case res.Binary:
 		fmt.Fprintf(&b, "binary content (%s), not shown.", prow.Human(res.Size))

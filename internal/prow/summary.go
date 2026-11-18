@@ -331,23 +331,34 @@ func stripControls(s string) string {
 	return b.String()
 }
 
-// logPatterns are the build-log lines that show where and how a job failed, by the
-// conventions of the tools Kubernetes CI runs. after is how many following lines
-// belong to the marker; last keeps only the final occurrence.
-var logPatterns = []struct {
-	kind  string
-	re    *regexp.Regexp
-	after int
-	limit int
-	last  bool
-}{
-	{"ginkgo failure summary", regexp.MustCompile(`Summarizing \d+ Failures?`), 20, 2, false},
-	{"ginkgo result", regexp.MustCompile(`^\s*Ran \d+ of \d+ Specs`), 2, 2, true},
-	{"go test failure", regexp.MustCompile(`^\s*--- FAIL: `), 6, 6, false},
-	{"go test package failure", regexp.MustCompile(`^FAIL\s+\S+`), 0, 6, false},
-	{"panic", regexp.MustCompile(`^panic: `), 12, 2, false},
-	{"timeout", regexp.MustCompile(`Process did not finish before|Entrypoint received interrupt|context deadline exceeded.*timed out|test timed out after`), 3, 3, false},
-	{"make error", regexp.MustCompile(`^make(\[\d+\])?: \*\*\* .*Error \d+`), 0, 2, true},
+// LogPattern is a kind of log line that shows where and how a job failed. Before and
+// After are how many neighbouring lines belong to its marker; Limit caps how many
+// occurrences are kept (the first ones); Last keeps only the final occurrence.
+type LogPattern struct {
+	Kind          string
+	Re            *regexp.Regexp
+	Before, After int
+	Limit         int
+	Last          bool
+}
+
+// DefaultLogPatterns are the failure lines of the tools Kubernetes CI runs. They
+// expect lines without a timestamp prefix (several are anchored at ^).
+var DefaultLogPatterns = []LogPattern{
+	{Kind: "ginkgo failure summary", Re: regexp.MustCompile(`Summarizing \d+ Failures?`), After: 20, Limit: 2},
+	{Kind: "ginkgo result", Re: regexp.MustCompile(`^\s*Ran \d+ of \d+ Specs`), After: 2, Limit: 2, Last: true},
+	{Kind: "go test failure", Re: regexp.MustCompile(`^\s*--- FAIL: `), After: 6, Limit: 6},
+	{Kind: "go test package failure", Re: regexp.MustCompile(`^FAIL\s+\S+`), Limit: 6},
+	{Kind: "panic", Re: regexp.MustCompile(`^panic: `), After: 12, Limit: 2},
+	{Kind: "timeout", Re: regexp.MustCompile(`Process did not finish before|Entrypoint received interrupt|context deadline exceeded.*timed out|test timed out after`), After: 3, Limit: 3},
+	{Kind: "make error", Re: regexp.MustCompile(`^make(\[\d+\])?: \*\*\* .*Error \d+`), Limit: 2, Last: true},
+}
+
+// LogScan is where a log shows failure.
+type LogScan struct {
+	Lines   int
+	Markers []Marker
+	Note    string // the scan is partial or its markers were cut short, if so
 }
 
 // scanBuildLog finds failure markers anywhere in build-log.txt, not only its tail:
@@ -366,19 +377,36 @@ func (s *Session) scanBuildLog(ctx context.Context, job Job, sum *Summary) {
 		sum.LogNote = "build-log.txt is binary content"
 		return
 	}
-	fh, err := s.open(f)
+	scan, err := s.ScanLog(ctx, f, DefaultLogPatterns)
 	if err != nil {
 		sum.LogNote = "build-log.txt could not be read"
 		return
 	}
+	sum.LogLines, sum.LogMarkers, sum.LogNote = scan.Lines, scan.Markers, scan.Note
+}
+
+// ScanLog finds the lines of an already-fetched text file that match patterns, with
+// their neighbouring lines, merged into marker blocks. Each line matches at most
+// one pattern (the first in order). At most maxMarkers blocks are kept, the latest
+// ones — the end of a log is where it failed — and their text is bounded so a
+// summary fits one tool result.
+func (s *Session) ScanLog(ctx context.Context, f *File, patterns []LogPattern) (LogScan, error) {
+	var scan LogScan
+	if f.Binary {
+		return scan, fmt.Errorf("%s is binary content", f.Rel)
+	}
+	fh, err := s.open(f)
+	if err != nil {
+		return scan, err
+	}
 	defer fh.Close()
 
 	type found struct {
-		kind  string
-		line  int
-		after int
+		kind          string
+		line          int
+		before, after int
 	}
-	counts := make([]int, len(logPatterns))
+	counts := make([]int, len(patterns))
 	var hits []found
 	var lastOf = map[int]int{} // pattern index → index in hits of its latest occurrence
 	lr := newLineReader(fh)
@@ -388,59 +416,86 @@ func (s *Session) scanBuildLog(ctx context.Context, job Job, sum *Summary) {
 			break
 		}
 		if lr.num%4096 == 0 && ctx.Err() != nil {
-			sum.LogNote = "the scan ran out of time; markers cover only part of the log"
+			scan.Note = "the scan ran out of time; markers cover only part of the log"
 			break
 		}
-		for i, p := range logPatterns {
-			if !p.re.Match(line) {
+		for i, p := range patterns {
+			if !p.Re.Match(line) {
 				continue
 			}
-			if p.last {
+			h := found{p.Kind, lr.num, p.Before, p.After}
+			if p.Last {
 				if j, ok := lastOf[i]; ok {
-					hits[j] = found{p.kind, lr.num, p.after}
+					hits[j] = h
 					break
 				}
 				lastOf[i] = len(hits)
-				hits = append(hits, found{p.kind, lr.num, p.after})
+				hits = append(hits, h)
 				break
 			}
-			if counts[i] < p.limit {
+			if counts[i] < p.Limit {
 				counts[i]++
-				hits = append(hits, found{p.kind, lr.num, p.after})
+				hits = append(hits, h)
 			}
 			break
 		}
 	}
-	sum.LogLines = lr.num
-	if len(hits) == 0 {
-		return
+	scan.Lines = lr.num
+	if lr.err != nil {
+		return scan, lr.err
 	}
-	sort.SliceStable(hits, func(i, j int) bool { return hits[i].line < hits[j].line })
-	// Merge overlapping windows, so a ginkgo summary and the "Ran N of M" line right
-	// after it come back as one block.
+	if len(hits) == 0 {
+		return scan, nil
+	}
+	// Each hit's window, ordered by where it starts (a Before window can start ahead
+	// of an earlier hit), then merged where they overlap or touch, so a ginkgo summary
+	// and the "Ran N of M" line right after it come back as one block.
 	type window struct {
 		kinds    []string
 		from, to int
+		at       int // the hit's own line (spans only)
 	}
+	spans := make([]window, len(hits))
+	for i, h := range hits {
+		spans[i] = window{kinds: []string{h.kind}, at: h.line,
+			from: max(h.line-min(h.before, maxMarkerLines-1), 1),
+			to:   h.line + min(h.after, maxMarkerLines-1)}
+	}
+	sort.SliceStable(spans, func(i, j int) bool { return spans[i].from < spans[j].from })
+	// A block shows at most maxMarkerLines lines, from its start; a merge that would
+	// run longer continues in an adjacent block instead, so no hit's line is cut off.
 	var wins []window
-	for _, h := range hits {
-		to := h.line + min(h.after, maxMarkerLines-1)
-		if n := len(wins); n > 0 && h.line <= wins[n-1].to+1 {
+	for _, sp := range spans {
+		if n := len(wins); n > 0 && sp.from <= wins[n-1].to+1 {
 			w := &wins[n-1]
-			w.to = max(w.to, to)
-			if !contains(w.kinds, h.kind) {
-				w.kinds = append(w.kinds, h.kind)
+			switch {
+			case sp.to <= w.to: // inside the block already
+			case sp.to-w.from < maxMarkerLines:
+				w.to = sp.to
+			default:
+				next := window{from: w.to + 1, to: sp.to}
+				if sp.at > w.to {
+					next.kinds = sp.kinds
+				}
+				wins = append(wins, next)
+				if sp.at > w.to {
+					continue
+				}
+				w = &wins[n-1]
+			}
+			if !contains(w.kinds, sp.kinds[0]) {
+				w.kinds = append(w.kinds, sp.kinds[0])
 			}
 			continue
 		}
-		wins = append(wins, window{kinds: []string{h.kind}, from: h.line, to: to})
+		wins = append(wins, sp)
 	}
 	if len(wins) > maxMarkers {
 		wins = wins[len(wins)-maxMarkers:] // the end of a log is where it failed
-		sum.LogNote = "more failure markers than shown; the earliest were dropped"
+		scan.Note = "more failure markers than shown; the earliest were dropped"
 	}
 	if _, err := fh.Seek(0, io.SeekStart); err != nil {
-		return
+		return scan, err
 	}
 	lr = newLineReader(fh)
 	wi, used := 0, 0
@@ -455,21 +510,22 @@ func (s *Session) scanBuildLog(ctx context.Context, job Job, sum *Summary) {
 			continue
 		}
 		if cur == nil {
-			sum.LogMarkers = append(sum.LogMarkers, Marker{Kind: strings.Join(w.kinds, ", "), Line: lr.num})
-			cur = &sum.LogMarkers[len(sum.LogMarkers)-1]
+			scan.Markers = append(scan.Markers, Marker{Kind: strings.Join(w.kinds, ", "), Line: lr.num})
+			cur = &scan.Markers[len(scan.Markers)-1]
 		}
 		if len(cur.Lines) < maxMarkerLines && used < maxMarkerBytes {
 			l := clipLine(string(line), 0, maxMatchLineBytes)
 			used += len(l) + 24
 			cur.Lines = append(cur.Lines, l)
-		} else if used >= maxMarkerBytes && sum.LogNote == "" {
-			sum.LogNote = "failure markers were cut short to fit; read around them with ci_read"
+		} else if used >= maxMarkerBytes && scan.Note == "" {
+			scan.Note = "failure markers were cut short to fit; read around them"
 		}
 		if lr.num >= w.to {
 			cur = nil
 			wi++
 		}
 	}
+	return scan, lr.err
 }
 
 func contains(ss []string, s string) bool {

@@ -223,7 +223,7 @@ func TestCISearchFormattedOutputBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The search's own accounting must hold: the backstop clamp should not be needed.
-	if n := len(formatCISearch(job, deep, res)); n > maxCIOutputBytes {
+	if n := len(formatCISearch("ci_search", ciJobLabel(job), deep, res)); n > maxCIOutputBytes {
 		t.Fatalf("formatted search is %d bytes, over %d", n, maxCIOutputBytes)
 	}
 

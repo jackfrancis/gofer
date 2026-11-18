@@ -179,6 +179,13 @@ Wired on the web-tier side; they define what a runtime must respect:
   `storage.googleapis.com`, anonymously, through a client that strips credentials and
   refuses other hosts: the runtime's egress is open, so never widen this into a
   general URL fetch. See `docs/adr/0005-prow-ci-log-tools.md`.
+- The GitHub Actions log tools (`gha_job_summary`/`gha_search`/`gha_read`) are in
+  `internal/agent/ghatools.go`, over `internal/github/actions.go`. They store each job
+  log in the same `prow.Session` (`FetchWith`), so the CI byte/file/time budgets, search,
+  read and marker scan are shared. The log endpoint redirects to a pre-signed blob URL:
+  the API client reads the redirect instead of following it, and a separate,
+  credential-stripping client fetches the blob, so the token never leaves the API host.
+  Never put the blob URL in an error. See `docs/adr/0006-github-actions-log-tools.md`.
 - `go test` binds httptest sockets; run it outside a restrictive sandbox.
 
 ## Build / test / run
