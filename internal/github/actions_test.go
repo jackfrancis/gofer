@@ -568,24 +568,29 @@ func TestActionsJobLogRateLimitThroughRetryTransport(t *testing.T) {
 	}
 }
 
-func TestLogAccessErrorLacksRepoScope(t *testing.T) {
+func TestLogAccessErrorScopeRefusal(t *testing.T) {
 	str := func(s string) *string { return &s }
+	admin := "Must have admin rights to Repository."
 	cases := []struct {
-		name string
-		r    reason
-		want bool
+		name   string
+		status int
+		r      reason
+		want   bool
 	}{
-		{"gofer's scopes", reason{tokenScopes: str("read:user, user:email")}, true},
-		{"no scopes", reason{tokenScopes: str("")}, true},
-		{"public_repo", reason{tokenScopes: str("public_repo, read:user")}, false},
-		{"repo", reason{tokenScopes: str("gist, read:org, repo, workflow")}, false},
-		{"no scopes header (fine-grained or app token)", reason{}, false},
-		{"SSO required", reason{tokenScopes: str("read:user"), sso: true}, false},
+		{"the observed refusal", 403, reason{message: admin, tokenScopes: str("read:user, user:email")}, true},
+		{"no scopes", 403, reason{message: admin, tokenScopes: str("")}, true},
+		{"organisation restriction, same token", 403, reason{message: "Although you appear to have the correct authorization credentials, the `example` organization has enabled OAuth App access restrictions.", tokenScopes: str("read:user, user:email")}, false},
+		{"no message", 403, reason{tokenScopes: str("read:user")}, false},
+		{"401", 401, reason{message: admin, tokenScopes: str("read:user")}, false},
+		{"public_repo", 403, reason{message: admin, tokenScopes: str("public_repo, read:user")}, false},
+		{"repo", 403, reason{message: admin, tokenScopes: str("gist, read:org, repo, workflow")}, false},
+		{"no scopes header (fine-grained or app token)", 403, reason{message: admin}, false},
+		{"SSO required", 403, reason{message: admin, tokenScopes: str("read:user"), sso: true}, false},
 	}
 	for _, c := range cases {
-		e := &LogAccessError{What: "job log", Status: 403, reason: c.r}
-		if got := e.LacksRepoScope(); got != c.want {
-			t.Errorf("%s: LacksRepoScope = %v, want %v", c.name, got, c.want)
+		e := &LogAccessError{What: "job log", Status: c.status, reason: c.r}
+		if got := e.ScopeRefusal(); got != c.want {
+			t.Errorf("%s: ScopeRefusal = %v, want %v", c.name, got, c.want)
 		}
 		if !errors.Is(e, ErrLogForbidden) {
 			t.Errorf("%s: does not match ErrLogForbidden", c.name)

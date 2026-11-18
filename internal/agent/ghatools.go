@@ -818,21 +818,29 @@ const maxGHALogErr = 900
 // ghaLogErr renders a job or step log's fetch error for a summary line.
 func ghaLogErr(err error) string { return oneLine(err.Error(), maxGHALogErr) }
 
-// ghaRefusalNote explains a log GitHub refused to a classic token without repository
-// scope, and how the user can read it with their own credentials; "" for any other
-// error. GitHub's message for that refusal ("Must have admin rights to Repository.")
-// reads as if only admins may see the log, which gofer's tests showed is not so
-// (ADR 0006), so the note says what was established instead.
+// ghaRefusalNote explains the log refusal gofer's tests pinned down (a token
+// without repository scope; ADR 0006), and how the user can read the log with their
+// own credentials; "" for any other error, whose cause may differ. GitHub's message
+// for that refusal ("Must have admin rights to Repository.") reads as if only admins
+// may see the log, which the tests showed is not so.
+//
+// The command prints the whole log of this job's attempt: --log-failed prints
+// nothing for a job that passed and can leave out the step being read, and without
+// --attempt gh can show a rerun's output, since it matches the run archive's files
+// by job name and step number.
 func ghaRefusalNote(err error, repo string, job github.ActionsJob) string {
 	var lae *github.LogAccessError
-	if !errors.As(err, &lae) || !lae.LacksRepoScope() {
+	if !errors.As(err, &lae) || !lae.ScopeRefusal() {
 		return ""
 	}
-	return fmt.Sprintf("GitHub refuses Actions logs to gofer's sign-in token, which has no repository scope, "+
-		"exactly as it refuses a request with no token; a token with the public_repo scope or a read-only "+
-		"fine-grained token can read them. Despite its wording, the message does not mean only repository "+
-		"admins can read the log. The user can read it with their own GitHub credentials: "+
-		"gh run view %d --repo %s --job %d --log-failed, or the job's page.", job.RunID, repo, job.ID)
+	cmd := fmt.Sprintf("gh run view --repo %s --job %d --log", repo, job.ID)
+	if job.RunAttempt > 0 {
+		cmd += fmt.Sprintf(" --attempt %d", job.RunAttempt)
+	}
+	return "GitHub refuses Actions logs to gofer's sign-in token, which has no repository scope, " +
+		"exactly as it refuses a request with no token; a token with the public_repo scope or a read-only " +
+		"fine-grained token can read them. Despite its wording, the message does not mean only repository " +
+		"admins can read the log. The user can read it with their own GitHub credentials: " + cmd + ", or the job's page."
 }
 
 // ghaWithNote adds the refusal note to an error a tool returns.

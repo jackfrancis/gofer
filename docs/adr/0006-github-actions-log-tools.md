@@ -198,13 +198,19 @@ personal fine-grained token is not the same as an app user token, so that still
 needs confirming; it is being designed as a separate piece of work, and no write
 scope should be requested in the meantime.
 
-Until then, when GitHub's headers show a classic token without `repo` or
-`public_repo` (and no SAML SSO requirement), the tools add a note to the refusal:
-GitHub refuses the log to gofer's token as it does to no token, a `public_repo` or
-read-only fine-grained token can read it, the message does not mean only admins can,
-and the user can read it with their own credentials (`gh run view <run> --repo
-<owner/name> --job <job> --log-failed`, or the job's page). Other refusals carry no
-note, since their cause may differ.
+Until then, the tools add a note to that refusal, and only that one: a 403 with
+GitHub's "Must have admin rights to Repository." message, to a classic token whose
+reported scopes include neither `repo` nor `public_repo`, with no SAML SSO
+requirement. The note says GitHub refuses the log to gofer's token as it does to no
+token, that a `public_repo` or read-only fine-grained token can read it, and that the
+message does not mean only admins can. It also gives the user a way to read the log
+with their own credentials: `gh run view --repo <owner/name> --job <job> --log
+--attempt <n>`, or the job's page. That's the whole log of this job's attempt:
+`--log-failed` prints nothing for a job that passed and can leave out the step being
+read, and without `--attempt` gh can show a rerun's output. The scopes header alone is
+not enough to add the note: an organisation's OAuth App restriction refuses the same
+token with a different message, and no broader token fixes that. Other refusals carry
+GitHub's reason and the scopes, but no note.
 
 The first release dropped GitHub's response body on a refusal, so the tool said only
 "status 403". A refused log request now carries GitHub's own message, the token's

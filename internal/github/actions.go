@@ -58,13 +58,23 @@ func (e *LogAccessError) Error() string {
 // Is makes a LogAccessError match ErrLogForbidden.
 func (e *LogAccessError) Is(target error) bool { return target == ErrLogForbidden }
 
-// LacksRepoScope reports a refusal to a classic OAuth token whose granted scopes,
-// as GitHub reported them, include neither repo nor public_repo, with no SAML SSO
-// requirement. That is the case gofer's tests pinned down (ADR 0006): GitHub serves
-// Actions logs to a token with public_repo or to a read-only fine-grained token,
-// and refuses one with only read:user exactly as it refuses no token at all. A
-// refusal without the scopes header (a fine-grained or app token) is not this case.
-func (e *LogAccessError) LacksRepoScope() bool {
+// adminRightsMessage is GitHub's message when it refuses an Actions log to a token
+// without repository scope (or to no token).
+const adminRightsMessage = "Must have admin rights to Repository."
+
+// ScopeRefusal reports the refusal gofer's tests pinned down (ADR 0006): a 403 with
+// GitHub's "Must have admin rights to Repository." message, to a classic OAuth token
+// whose granted scopes, as GitHub reported them, include neither repo nor
+// public_repo, with no SAML SSO requirement. GitHub refuses such a token exactly as
+// it refuses no token, and serves the log to a public_repo or read-only fine-grained
+// token. The scopes header alone is not enough: a 403 to the same token can have
+// another cause, such as an organisation's OAuth App restriction, which no broader
+// token fixes. A refusal without the scopes header (a fine-grained or app token) is
+// not this case either.
+func (e *LogAccessError) ScopeRefusal() bool {
+	if e.Status != http.StatusForbidden || e.reason.message != adminRightsMessage {
+		return false
+	}
 	if e.reason.sso || e.reason.tokenScopes == nil {
 		return false
 	}
