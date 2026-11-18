@@ -1,0 +1,32 @@
+# Objects the opt-in kind check (kind_integration_test.go) expects, on a cluster
+# with the external-snapshotter and csi-driver-host-path installed.
+apiVersion: v1
+kind: Namespace
+metadata: {name: gofer}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata: {name: csi-hostpath-sc}
+provisioner: hostpath.csi.k8s.io
+volumeBindingMode: Immediate
+reclaimPolicy: Delete
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata: {name: gofer-retain}
+driver: hostpath.csi.k8s.io
+deletionPolicy: Retain
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata: {name: gofer-bogus}
+driver: bogus.example.com
+deletionPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: snapcheck-0, namespace: gofer} # the check's own claim, not gofer's data-gofer-0
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: csi-hostpath-sc
+  resources: {requests: {storage: 1Gi}}

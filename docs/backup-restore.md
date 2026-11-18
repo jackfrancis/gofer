@@ -37,6 +37,13 @@ The additional restore preflight, backup-pause, and failure-recovery safeguards 
 covered by fake-kubectl tests; they have not yet been re-rehearsed against a live
 cluster.
 
+The scheduled job's cleanup of failed snapshots is covered by unit tests against a
+fake API server and by an opt-in check against a real snapshot controller and CSI
+driver (kind with csi-driver-host-path; see
+`internal/snapshot/kind_integration_test.go`): conditional writes, pruning with the
+stored snapshot, a failed snapshot cleaned up by its run, and a snapshot that never
+finishes left in place and then pruned. It has not yet been rehearsed on AKS.
+
 ## Protection that needs no setup
 
 `make deploy` sets the data volume's reclaim policy to **`Retain`**
@@ -129,11 +136,67 @@ Each run takes a VolumeSnapshot of `data-gofer-0` named `data-gofer-0-<UTC time>
 waits until it is ready to use, and then deletes the oldest beyond the newest
 `SNAPSHOT_KEEP` usable ones. The defaults keep a week of six-hourly snapshots.
 
-- A run whose snapshot fails, or is not ready within ten minutes, fails the job and
-  prunes nothing, so a broken backup never deletes good ones. Watch for failed jobs
-  with `kubectl -n gofer get jobs`.
+- A run whose snapshot is not ready within ten minutes (`SNAPSHOT_WAIT`) fails the
+  job and prunes no usable snapshot, so a broken backup never deletes good ones.
+  Watch for failed jobs with `kubectl -n gofer get jobs`.
+- Failed snapshots are deleted, with their stored content. An error alone is not a
+  failure: the snapshot controller records its latest attempt in `status.error`,
+  keeps retrying, and clears the error once an attempt succeeds. So a run keeps
+  waiting through errors, and a snapshot counts as failed only once its current
+  error has lasted `SNAPSHOT_WAIT`, timed from `status.error.time` (which the
+  controller keeps while the message stays the same), or once it is still erroring
+  24 hours after it was created (in case a driver's message changes on every
+  attempt, which restarts that clock). A snapshot the storage system has already
+  taken (`status.creationTime` is set) does not count as failed while it still has
+  its own VolumeSnapshotContent: a driver that copies the data in the background
+  reports success before the snapshot is ready, and the controller keeps the earlier
+  error until it is, so such a snapshot is treated as slow (below). If its content
+  has gone or belongs to another snapshot (the controller then marks a once ready
+  snapshot unready but keeps its creation time), it has no storage of its own left
+  and counts as failed like any other. Every run, successful or not, deletes the
+  labeled snapshots that have failed, even when its own snapshot could not be
+  created (a full VolumeSnapshot quota, say). A run's own snapshot rarely qualifies
+  by the time the run ends, since its error appeared during the run, so a backup
+  that fails is usually deleted by the next run.
+
+  This matters because the snapshot controller treats any not-ready snapshot as
+  still reading `data-gofer-0` and keeps the claim's `pvc-as-source-protection`
+  finalizer, so a failed snapshot left in place would block
+  [restore](#restore-from-a-snapshot). Deleting failed snapshots never lowers the
+  count of usable ones, and a snapshot someone is already deleting is left to that
+  deletion (its storage keeps whatever policy it had). Each step is conditional on
+  what the job checked: it deletes a snapshot only if it is still the labeled object
+  it listed, switches a content to `Delete` only if the content belongs to that
+  snapshot and has not changed since it was read, and deletes only the version of
+  the snapshot it checked. If anything changed in between (the snapshot became
+  ready, say), the snapshot is kept and its content gets its policy back, unless the
+  snapshot is meanwhile being deleted by someone else (another backup job, say): a
+  content's policy is never changed while its snapshot is being deleted, in either
+  direction. When a request fails without a definite answer, the job reads the
+  objects again to see what happened before undoing anything; if it cannot tell, the
+  job fails and says which content to check. Once a deletion has made its first
+  change, it runs to the end even if the job is being stopped: up to ten seconds to
+  finish its writes, then, if they did not go through, a fresh ten seconds to read
+  back what happened and undo. Each attempt decides on one reading of the snapshot
+  and its content and acts on that same content; when the snapshot changes under it
+  (the snapshot controller itself updates it once its content's policy is `Delete`),
+  the attempt starts again from a fresh read. A change the API server rejects (by
+  a validation rule or an admission policy, say) fails the job rather than passing
+  silently. One window cannot be closed: the snapshot controller creates a
+  VolumeSnapshotContent and records it on the snapshot in two separate writes, so a
+  content can turn up for a snapshot that had none just before the job deletes it.
+  The job then leaves that content as it is (it may hold a backup someone repaired)
+  and logs a warning naming it (`left behind`), so an operator can keep or discard
+  it: see [A content left behind](#a-content-left-behind).
+- A snapshot that is merely slow (not ready after ten minutes, with no error or
+  already taken and still copying) is left in
+  place: it may still finish and be a good backup. If it later fails, a run deletes it
+  once it counts as failed; if it finishes, it counts like any other. One that stays unready and
+  error-free indefinitely is only removed once it is older than the newest
+  `SNAPSHOT_KEEP` usable ones, so if restore reports it as unfinished, inspect it
+  (`kubectl -n gofer describe volumesnapshot <name>`) rather than waiting.
 - Pruning only touches snapshots of `data-gofer-0` that the job labeled. Snapshots
-  you make by hand are never pruned.
+  you make by hand are never pruned or deleted, even if they fail.
 - The job uses its own ServiceAccount, `gofer-snapshotter`: it can create, read,
   list and delete VolumeSnapshots in the `gofer` namespace, and read and patch
   VolumeSnapshotContents (cluster-scoped), which pruning needs. The web tier gains no
@@ -147,6 +210,11 @@ Take one now, for instance before an upgrade, and list them:
 make snapshot  KUBECONFIG=<file>
 make snapshots KUBECONFIG=<file>
 ```
+
+`make snapshot` refuses to start while a backup job is unfinished (no `Complete` or
+`Failed` condition yet, including one waiting for its pod or a retry), or if it cannot
+list the jobs to check: a job created from the CronJob bypasses its
+`concurrencyPolicy: Forbid`.
 
 `make backup-down` stops the schedule and keeps every snapshot.
 
@@ -190,9 +258,12 @@ unready snapshots of the source claim, and the snapshot-source protection finali
 A failed API read or invalid claim aborts rather than continuing with an empty file.
 
 Existing Jobs are not cancelled by suspending a CronJob. If one is still pending or
-running, let it finish and retry. A failed/timed-out backup Job can leave an unready
-VolumeSnapshot behind: resolve the snapshot error and wait for readiness, or
-explicitly abort that snapshot before retrying. **Do not remove PVC protection
+running, let it finish and retry. A failed backup Job usually leaves its unready
+snapshot behind: one still retrying an error is deleted by a later run once it
+counts as failed, and one that is only slow is left to finish. A snapshot taken by
+hand is never cleaned up for you. Wait for such a snapshot to become ready, or, if
+it has failed, let a later backup run delete it (or delete it yourself) before
+retrying. **Do not remove PVC protection
 finalizers manually.** The snapshot controller must release the source claim.
 These checks include manual backup Jobs and unlabelled source snapshots, and are
 repeated after shutdown. Do not start another restore, deployment, or manual
@@ -234,8 +305,20 @@ Failure handling distinguishes replacement/startup from post-restore finalizatio
   command. An already-paused or absent CronJob remains untouched.
 
 The script never force-removes storage finalizers or deletes an unfinished snapshot
-on your behalf. Automatic cleanup of abandoned snapshot attempts is a separate
-snapshot-lifecycle follow-up; this restore preflight remains strict.
+on your behalf, and this restore preflight stays strict. Cleaning up failed backup
+snapshots is the scheduled backup's job (see [Scheduled snapshots](#scheduled-snapshots)),
+so a failed backup no longer blocks restore indefinitely, but how long it does is not
+bounded. Restore can go ahead only once all of these have happened:
+
+- the snapshot counts as failed (a snapshot still retrying an error does not yet);
+- a backup run has requested its deletion;
+- its finalizers have cleared, so it is gone from `kubectl -n gofer get volumesnapshots`
+  (until then it still shows as unready);
+- the snapshot controller has removed the claim's `pvc-as-source-protection`
+  finalizer.
+
+If one of these stalls, look at the snapshot and the controller's events rather than
+working around the preflight.
 
 The restore operator needs read access to Jobs and VolumeSnapshots and get/patch
 access to the backup CronJob, in addition to the existing PVC/PV/StatefulSet rights.
@@ -317,10 +400,13 @@ StatefulSet creates an empty one:
 
 1. Create the namespace and `gofer-secrets`, with the backed-up
    `VAULT_ENCRYPTION_KEY`.
-2. Make the snapshot visible there. In the same cluster, a retained
-   VolumeSnapshotContent can be bound to a new VolumeSnapshot. Otherwise create a
-   pre-provisioned one from the stored snapshot's handle (on AKS, the Azure snapshot's
-   resource ID):
+2. Make the snapshot visible there: create a pre-provisioned VolumeSnapshotContent
+   from the stored snapshot's handle (on AKS, the Azure snapshot's resource ID; in
+   the same cluster, the retained content's `status.snapshotHandle`). A content the
+   snapshot controller created for another VolumeSnapshot cannot be bound to a new
+   one, even after that VolumeSnapshot is gone: the controller refuses it as
+   `SnapshotContentMismatch` ("dynamically provisioned while expecting a
+   pre-provisioned one"), also if its `volumeSnapshotRef` is edited.
 
    ```yaml
    apiVersion: snapshot.storage.k8s.io/v1
@@ -349,6 +435,109 @@ StatefulSet creates an empty one:
 3. Create `data-gofer-0` from it: a claim like the one `restore` creates, with
    `dataSource` naming the VolumeSnapshot.
 4. Deploy gofer (`make deploy`). The StatefulSet adopts the claim.
+
+### A content left behind
+
+The scheduled job can log that a VolumeSnapshotContent for a snapshot it deleted was
+`left behind` (see [Scheduled snapshots](#scheduled-snapshots)). Its stored snapshot
+is still there, but two things make it different from other contents:
+
+- the snapshot controller will not bind it to a new VolumeSnapshot (see step 2
+  above), so keeping it means importing its handle into a new content;
+- it turned up after its VolumeSnapshot was deleted, so the controller never marked
+  it with `snapshot.storage.kubernetes.io/volumesnapshot-being-deleted`. That is the
+  marker the controller sets on a content whose VolumeSnapshot is deleted, and the
+  CSI driver's sidecar acts on a content being deleted only when it is there.
+  Without it, deleting the content leaves it stuck terminating, and its stored
+  snapshot is not deleted even at `Delete`. The steps below add it by hand.
+
+1. Check it, and note its driver and its stored snapshot's handle:
+
+   ```sh
+   kubectl get volumesnapshotcontent <content> -o jsonpath=\
+   '{.spec.driver} {.status.snapshotHandle} {.spec.deletionPolicy} deleting={.metadata.deletionTimestamp}{"\n"}'
+   ```
+
+   Go on only if the handle is set and `deleting=` is empty (a deletion someone
+   already started is theirs to finish). If the policy says `Delete`, set it to
+   `Retain` first, so nothing below can remove the stored snapshot by accident:
+
+   ```sh
+   kubectl patch volumesnapshotcontent <content> --type merge -p '{"spec":{"deletionPolicy":"Retain"}}'
+   ```
+
+2. To keep it, import the handle: create a pre-provisioned VolumeSnapshotContent and
+   a VolumeSnapshot from that driver and handle, as in step 2 of
+   [Restoring into a new cluster or namespace](#restoring-into-a-new-cluster-or-namespace),
+   under a new name such as `gofer-recovered` (`deletionPolicy: Retain`), and wait
+   until it is ready:
+
+   ```sh
+   kubectl -n gofer wait volumesnapshot/gofer-recovered --for=jsonpath='{.status.readyToUse}'=true --timeout=2m
+   ```
+
+   Then check the old content still says `Retain` (step 1), and remove only its
+   object: the stored snapshot now belongs to `gofer-recovered`.
+
+   ```sh
+   kubectl annotate --overwrite volumesnapshotcontent <content> snapshot.storage.kubernetes.io/volumesnapshot-being-deleted=yes
+   kubectl delete volumesnapshotcontent <content> --timeout=60s
+   ```
+
+   The new VolumeSnapshot carries none of the job's labels, so the job never prunes
+   it; delete it yourself, with its content set to `Delete`, when it is no longer
+   needed.
+
+3. To discard it instead, set it to `Delete`, mark it, and delete it. Deleting a
+   content at `Retain`, or one without the marker, leaves the stored snapshot behind.
+
+   ```sh
+   kubectl patch volumesnapshotcontent <content> --type merge -p '{"spec":{"deletionPolicy":"Delete"}}'
+   kubectl annotate --overwrite volumesnapshotcontent <content> snapshot.storage.kubernetes.io/volumesnapshot-being-deleted=yes
+   kubectl delete volumesnapshotcontent <content> --timeout=60s
+   ```
+
+   Never do this to a content whose handle a recovered content (step 2) also uses:
+   both point to the same stored snapshot, and `Delete` removes it.
+
+If a `kubectl delete` above times out, the content is still terminating: look at its
+events and at the CSI driver's snapshotter sidecar logs rather than removing its
+finalizer, which would forget the stored snapshot instead of deleting it. After a
+discard, confirm in the storage system that the stored snapshot is gone.
+
+If a discard (step 3) times out and the stored snapshot is still there, discard it
+through a VolumeSnapshot instead. That path does not depend on the marker, because
+the controller sets it itself when the VolumeSnapshot is deleted:
+
+1. Set the stuck content back to `Retain`, so only the import below can delete the
+   stored snapshot:
+
+   ```sh
+   kubectl patch volumesnapshotcontent <content> --type merge -p '{"spec":{"deletionPolicy":"Retain"}}'
+   ```
+
+2. Import the handle as in the keep route above, under a new name such as
+   `gofer-discard`, but with `deletionPolicy: Delete`, and wait until it is ready.
+3. Delete the VolumeSnapshot. The controller deletes its content and the driver
+   deletes the stored snapshot:
+
+   ```sh
+   kubectl -n gofer delete volumesnapshot gofer-discard --timeout=60s
+   ```
+
+The old content object can stay terminating after this. At `Retain`, with its stored
+snapshot gone, it holds nothing; leave its finalizer alone and find out from the
+sidecar logs why it is stuck.
+
+These steps were rehearsed on kind with csi-driver-host-path (external-snapshotter
+v8.7.0 manifests), on a content stripped of the marker the way one left behind lacks
+it. Binding it directly failed with `SnapshotContentMismatch`. Setting it to `Delete`
+and deleting it without the marker left it stuck terminating with the stored
+snapshot intact. With the marker, the keep route restored a claim with its data
+intact after the old object was removed, and the discard route removed the content
+and made the driver delete the stored snapshot. The fallback was rehearsed on the
+stuck content: once it was set back to `Retain`, importing its handle at `Delete` and
+deleting that VolumeSnapshot made the driver delete the stored snapshot.
 
 ## Velero: the whole-namespace alternative
 
