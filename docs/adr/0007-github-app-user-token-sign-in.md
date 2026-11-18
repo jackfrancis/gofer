@@ -1,9 +1,9 @@
 # ADR 0007 — Sign in through a read-only GitHub App instead of an OAuth app
 
-Status: proposed — not implemented; revised through three rounds of review. The
-question it rests on is verified: a GitHub App user access token with only read
-permissions gets the job log's 302 in an organisation where the app is not installed
-(see "The question").
+Status: proposed — not implemented; revised through review, then phased (see
+"Phasing"). The question it rests on is verified: a GitHub App user access token with
+only read permissions gets the job log's 302 in an organisation where the app is not
+installed (see "The question").
 Date: 2026-11-18
 
 ## Context
@@ -86,6 +86,72 @@ Replace the GitHub OAuth app with a GitHub App that gofer uses only to sign user
 and get their user access tokens. gofer never authenticates as the app or an
 installation, so it needs no app private key. Do not generate one.
 
+### Phasing
+
+gofer serves multiple users at once, each signing in with their own GitHub account.
+That decides the app's registration: it is **public** (see "Public or private"
+below). A public app can be installed by anyone, and an installation lets that
+user's token read that account's private repositories. So phase 1 keeps private data
+out from the start, with a guard that is always on. Everything the design needs only
+once a deployment *chooses* to process private repositories waits for phase 2.
+
+**Phase 1: read-only sign-in, Actions logs, multiple users.** This phase delivers the
+feature: the `gha_*` tools read job logs with a token that cannot write.
+
+- **The app:** public, with the read-only permissions below, and expiring user tokens
+  on.
+- **Sign-in:** everything under "Sign-in": `GITHUB_CLIENT_KIND` and each kind's
+  scopes, grant revocation, logout revoking before it discards (including unconfirmed
+  revocation), the callback re-checking its token under the lock, the `client_id`
+  field, and legacy rows tagged and versioned before their first vend.
+- **Expiry and refresh:** all of that section. That covers:
+  - the refreshing credential source, early refresh, and persisting before vending;
+  - one lock and version per credential;
+  - re-vend on 401 naming the rejected version, confirmed with check-token, and one
+    forced refresh per run;
+  - "sign-in required".
+- **Discuss without GitHub access:** all of that section, including a reconnect found
+  mid-turn.
+- **Search under user tokens:** all of that section: the split `involves:@me` query,
+  `github_search` adding the type qualifier, and `is:public` on every search.
+- **The public-only guard, always on, with no setting.** These are the live parts of
+  "Private repositories", in the workload's GitHub client:
+  - `is:public` on every search;
+  - the visibility gate before every per-repository call;
+  - the redirect-destination check, with the `repository_url` backstop;
+  - in ingest, a hit whose repository is not confirmed public is not written. If the
+    check's answer is unknown, the fetch also counts as incomplete, so
+    `retireMissing` does not run.
+
+  With no private mode, private data never enters gofer, whoever installs the app.
+  The stored-data machinery therefore has nothing to protect yet.
+- **No schema migration.** The credential changes live inside the sealed JSON.
+- **Existing users, rollout, rollback:** as below, leaving out the phase 2 items in
+  rollout step 2's list.
+
+**Phase 2: private repositories as an opt-in, only if gofer offers them.** The rest of
+"Private repositories":
+- `GITHUB_PRIVATE_REPOS`, the `github:private` run scope, and `github:private` in the
+  AgentApp's `maxScopes`;
+- `private_access` stamping, and the web tier's filters on stored items and stamped
+  text;
+- the `repository_visibility` table (migration `0002`), `ReportVisibility`, and the
+  repository inventory;
+- retirement only after a check in the same pass;
+- `RepoID` and `IssueID` on items, permanent item keys and reconciliation, and legacy
+  binding (`GET /agent/worklist/legacy`, `BindLegacy`);
+- when an opt-out takes effect.
+
+The ID and key changes also fix renames and reused names on their own, so they could
+ship separately if those start to matter.
+
+**Gaps phase 1 accepts.** Both exist in today's code, so neither is a regression.
+- A repository that turns private after ingest keeps its stored items, which were
+  public when gofer stored them. They can still reach models. A complete public
+  search no longer returns them, so they can be retired.
+- A reused repository name can merge an old thread onto a new issue with the same
+  number, because item IDs are name-based.
+
 ### The app's permissions
 
 All read-only, the least that today's tools need. A user token holds only what both
@@ -112,13 +178,15 @@ credentials, and never go in this repository.
 
 **Public or private.** GitHub says a private app "can only be installed on the account
 that owns the app. Only members of the organization that owns it can authorize it."
-If anyone besides the owning account signs in to gofer, register the app as public, or
-under an organisation whose members are gofer's users. Public only means anyone can
-authorise or install the app. `ALLOWED_GITHUB_LOGINS` still decides who gets a
+gofer serves multiple users with their own accounts, so the app is registered as
+**public**. An app owned by an organisation and kept private would do only if every
+user were a member of that organisation. Public only means anyone can authorise or
+install the app. `ALLOWED_GITHUB_LOGINS` still decides who gets a
 session, and the token of a refused account is revoked, as today. An installation
 grants gofer nothing it uses, but it does let that user's token read the installed
 account's private repositories, still read-only. An org owner, not gofer's operator,
-decides that, so gofer has to enforce its own boundary (next section).
+decides that, so gofer has to enforce its own boundary (next section). Phase 1 ships
+that section's live guard, always on (see "Phasing").
 
 ### Private repositories: public only, unless the deployment opts in
 
@@ -664,7 +732,8 @@ all user tokens" on the OAuth app's settings page once the switch is made.
 
 1. The owner registers the app (permissions and settings above) and stores its client
    ID and secret wherever the OAuth app's are stored today.
-2. Ship one release that works under either app:
+2. Ship one release that works under either app. The list is the full design; phase
+   1 ships it without the phase 2 items (see "Phasing"):
    - the broker vends through the refreshing source, with the lock, early refresh and
      persist-first write;
    - one credential lock and version shared by sign-in, logout and refresh;
