@@ -1,6 +1,6 @@
 # ADR 0006 — The conversation can read GitHub Actions job logs
 
-Status: accepted — implemented and unit-tested; in prod, job logs in at least one organisation are refused to gofer's token (see Scope)
+Status: accepted — implemented and unit-tested; in prod, GitHub refuses gofer's `read:user` token the job logs ("Must have admin rights to Repository"), so reading them needs a broader credential (see Scope)
 Date: 2026-11-18
 
 ## Context
@@ -161,6 +161,19 @@ fixes: the log endpoints may need more scope than `read:user`, or the organisati
 may restrict OAuth apps it has not approved, which keeps public metadata readable
 but refuses anything that needs an authenticated identity.
 
+**It is scope.** With the reason passed through (below), a retry on the same job
+showed GitHub's answer: "Must have admin rights to Repository.", for a token whose
+scopes are `read:user, user:email`. An organisation's OAuth App restriction says so
+in a different message. Despite its wording, the message is GitHub's answer to a
+token without repository scope; it does not mean only admins can read the log. So
+reading Actions logs needs a broader credential than gofer requests. The candidate
+is `public_repo` (unverified as the minimum), which also grants write access to
+public repositories and so breaks gofer's read-only rule; `repo` is broader still.
+A read-only alternative, such as a fine-grained token limited to public
+repositories, is also unverified and would be a new credential path. Choosing
+between them is a separate decision. Until then the tools report the refusal and
+its reason, and the conversation says plainly that it cannot read the log.
+
 The first release dropped GitHub's response body on a refusal, so the tool said only
 "status 403". A refused log request now carries GitHub's own message, the token's
 granted scopes (`X-OAuth-Scopes`), the scopes the endpoint accepts
@@ -172,7 +185,8 @@ A rate-limit 403 or a 429 is reported as a rate limit instead. That needed a cha
 to `internal/httpretry`, which honours `Retry-After`: it used to drain the 429 and
 sleep, so a `Retry-After` longer than the request's deadline surfaced only as
 "context deadline exceeded". It now fixes the retry's moment before draining the
-response, returns the response it has when that moment is past the deadline, and
+response (from one clock reading, so an HTTP-date `Retry-After` equal to the
+deadline is not taken as just before it), returns the response it has when that moment is past the deadline, and
 otherwise sleeps only for what is left after the drain, so a slow body cannot push
 the retry later than `Retry-After` asked. This holds for every caller. Those headers name scopes only, and the
 body comes from the API host, never the pre-signed blob host, so none of it is a
@@ -232,7 +246,7 @@ Unit tests use `httptest` servers: the API on one server, the blob host on anoth
 
 Not yet covered:
 
-- why GitHub refuses gofer's token the logs of a `kubernetes-sigs` job (see Scope);
+- which credential is the minimum that reads Actions logs (`public_repo`, or a read-only fine-grained token), and the step-log endpoint with gofer's token (see Scope);
 - the real blob host and its redirect behaviour;
 - the step-log endpoint against real GitHub, including which scopes it needs and
   whether its lines carry the same timestamp prefix;

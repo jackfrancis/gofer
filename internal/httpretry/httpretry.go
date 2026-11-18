@@ -142,7 +142,11 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// past the request's deadline would only end in the deadline's error,
 		// discarding this result (a 429's status, Retry-After and body tell the
 		// caller more), so return it as it is instead.
-		retryAt := time.Now().Add(retryDelay(resp, base, max, attempt))
+		// One clock reading for both the delay and the moment it ends: an HTTP-date
+		// Retry-After is turned into a delay from this same reading, so a date equal
+		// to the deadline lands exactly on it rather than a hair before.
+		now := time.Now()
+		retryAt := now.Add(retryDelay(resp, base, max, attempt, now))
 		if !beforeDeadline(req.Context(), retryAt) {
 			return resp, err
 		}
@@ -186,11 +190,11 @@ func drain(resp *http.Response) {
 	_ = resp.Body.Close()
 }
 
-// retryDelay is how long to wait before a retry: a Retry-After header's delay
+// retryDelay is how long after now to retry: a Retry-After header's delay
 // (capped), otherwise an exponentially growing, half-jittered backoff.
-func retryDelay(prev *http.Response, base, max time.Duration, attempt int) time.Duration {
+func retryDelay(prev *http.Response, base, max time.Duration, attempt int, now time.Time) time.Duration {
 	wait := jitteredBackoff(base, max, attempt)
-	if d, ok := retryAfter(prev); ok {
+	if d, ok := retryAfter(prev, now); ok {
 		wait = d
 		if wait > maxRetryAfter {
 			wait = maxRetryAfter
@@ -232,8 +236,9 @@ func jitteredBackoff(base, max time.Duration, attempt int) time.Duration {
 	return half + time.Duration(rand.Int63n(int64(half)+1))
 }
 
-// retryAfter parses a response's Retry-After header (seconds or an HTTP-date).
-func retryAfter(resp *http.Response) (time.Duration, bool) {
+// retryAfter parses a response's Retry-After header (seconds, or an HTTP-date taken
+// relative to now).
+func retryAfter(resp *http.Response, now time.Time) (time.Duration, bool) {
 	if resp == nil {
 		return 0, false
 	}
@@ -248,7 +253,7 @@ func retryAfter(resp *http.Response) (time.Duration, bool) {
 		return time.Duration(secs) * time.Second, true
 	}
 	if when, err := http.ParseTime(v); err == nil {
-		d := time.Until(when)
+		d := when.Sub(now)
 		if d < 0 {
 			d = 0
 		}
