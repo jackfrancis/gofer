@@ -505,13 +505,39 @@ events and at the CSI driver's snapshotter sidecar logs rather than removing its
 finalizer, which would forget the stored snapshot instead of deleting it. After a
 discard, confirm in the storage system that the stored snapshot is gone.
 
+If a discard (step 3) times out and the stored snapshot is still there, discard it
+through a VolumeSnapshot instead. That path does not depend on the marker, because
+the controller sets it itself when the VolumeSnapshot is deleted:
+
+1. Set the stuck content back to `Retain`, so only the import below can delete the
+   stored snapshot:
+
+   ```sh
+   kubectl patch volumesnapshotcontent <content> --type merge -p '{"spec":{"deletionPolicy":"Retain"}}'
+   ```
+
+2. Import the handle as in the keep route above, under a new name such as
+   `gofer-discard`, but with `deletionPolicy: Delete`, and wait until it is ready.
+3. Delete the VolumeSnapshot. The controller deletes its content and the driver
+   deletes the stored snapshot:
+
+   ```sh
+   kubectl -n gofer delete volumesnapshot gofer-discard --timeout=60s
+   ```
+
+The old content object can stay terminating after this. At `Retain`, with its stored
+snapshot gone, it holds nothing; leave its finalizer alone and find out from the
+sidecar logs why it is stuck.
+
 These steps were rehearsed on kind with csi-driver-host-path (external-snapshotter
 v8.7.0 manifests), on a content stripped of the marker the way one left behind lacks
 it. Binding it directly failed with `SnapshotContentMismatch`. Setting it to `Delete`
 and deleting it without the marker left it stuck terminating with the stored
 snapshot intact. With the marker, the keep route restored a claim with its data
 intact after the old object was removed, and the discard route removed the content
-and made the driver delete the stored snapshot.
+and made the driver delete the stored snapshot. The fallback was rehearsed on the
+stuck content: once it was set back to `Retain`, importing its handle at `Delete` and
+deleting that VolumeSnapshot made the driver delete the stored snapshot.
 
 ## Velero: the whole-namespace alternative
 
