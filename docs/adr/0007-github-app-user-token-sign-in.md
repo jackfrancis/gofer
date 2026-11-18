@@ -1,7 +1,10 @@
 # ADR 0007 — Sign in through a read-only GitHub App instead of an OAuth app
 
 Status: proposed — not implemented; revised after review (private data, credential
-locking, revocation, rejected-token re-vend, legacy scopes, Discuss without access). The question it rests on is verified: a GitHub
+locking, revocation, rejected-token re-vend, legacy scopes, Discuss without access),
+and again (redirect destinations, stored model inputs, unknown visibility, rollback
+of revoked legacy tokens, the per-run refresh allowance, reconnect mid-turn, the
+callback under the lock, unconfirmed revocation). The question it rests on is verified: a GitHub
 App user access token with only read permissions gets the job log's 302 in an
 organisation where the app is not installed (see "The question").
 Date: 2026-11-18
@@ -133,21 +136,70 @@ side effect of someone else's installation.
 - **New setting `GITHUB_PRIVATE_REPOS`, default off.** The web tier passes it to every
   run as a run parameter, set from its own configuration; the user and the model
   cannot change it.
-- **Off: the workload enforces public-only in one place, the GitHub client**
-  (`internal/github`), so every tool and job inherits it.
-  - Every search, ingest's and `github_search`'s alike, gets `is:public` appended.
-  - Every per-repository call goes through a visibility gate first.
-    `GET /repos/{repo}` (Metadata: read) must say `"private": false`; the answer is
-    cached per run. Gated calls: contents, tarball, issues, pulls, checks, statuses,
-    Actions jobs and logs.
+- **Off: gofer enforces public-only at two points.** The live check is in the
+  workload's GitHub client (`internal/github`), so every tool and job inherits it.
+  The stored check is in the web tier, for model inputs taken from what gofer has
+  already kept.
+- **Live: search.** Every search, ingest's and `github_search`'s alike, gets
+  `is:public` appended.
+- **Live: a visibility gate before every per-repository call.**
+  - `GET /repos/{repo}` (Metadata: read) must answer `"private": false`. The gate
+    reads the final response, after any rename redirect, and returns the
+    repository's canonical `full_name` and ID. Later calls use that name, and the
+    answer is cached per run.
+  - Gated calls: contents, tarball, issues, pulls, checks, statuses, Actions jobs and
+    logs.
   - A private repository answers "gofer is configured for public repositories only",
     and nothing from it reaches the model or the sink.
-  - Ingest also drops any item whose repository fails the gate before writing back,
-    in case a search qualifier is ever missed.
-- **On:** the gate is skipped. The operator accepts that private titles, bodies, code
-  and logs reach the configured models and gofer's database. Turning it back off
-  stops new private data but does not delete what is stored. Removing that is a
-  separate clean-up step, not designed here.
+- **Live: redirects are checked by destination.** GitHub answers a transferred issue
+  with a redirect to its new repository, which may be private, and today's client
+  follows API redirects on its own. In public-only mode the GitHub client follows no
+  API-host redirect itself (`CheckRedirect` stops it). It resolves where the redirect
+  points (`/repos/{owner}/{repo}/…` or `/repositories/{id}/…`), runs the gate on that
+  repository, and follows only if it is public and still the gated repository or
+  another public one. Anything else is refused like a private repository.
+  - Redirects off the API host are unchanged. The tarball's to codeload and the logs'
+    to the blob host carry the gated repository's own content, and ADR 0006's blob
+    client already handles them.
+  - As a backstop, an issue or PR body whose `repository_url` names a repository
+    other than the gated one is dropped unless that repository passes the gate.
+- **Live: ingest keeps open work when visibility is unknown.** Every ingested item's
+  repository goes through the gate before write-back, in case a search qualifier is
+  ever missed. Three outcomes:
+  - **Public:** the item is written as usual, with `visibility=public` stored on it.
+  - **Private (a definite answer):** the item is not written. Its ID is reported to
+    the sink as withheld, so a stored copy is marked `visibility=private` and is not
+    retired as completed.
+  - **Unknown** (a timeout, rate limit or other error on the lookup): the item is
+    skipped, and the fetch counts as incomplete. A complete fetch is what lets
+    `runIngest` call `retireMissing`, so open work stays on the radar until a later
+    ingest can check it.
+- **Stored: model inputs are filtered by stored visibility.** Discuss, ranking and
+  research read items gofer has already kept: `sink.List` in `runRank` and
+  `runResearch`, and the item and its thread in `runConverse`. A live check cannot
+  catch those, so the web tier enforces the policy where it serves them.
+  - `WorkItem.GitHub` gains `Visibility` (`public`, `private` or unknown).
+  - In public-only mode, `GET /agent/worklist` serves a run only items stored as
+    `public`.
+  - The web tier refuses to dispatch Discuss, review or research on any other item,
+    and says why in the thread.
+  - The filter sits on the web tier's side of the plane, so a run cannot read past
+    it. The label itself is written by ingest's gate, so the filter guards what is
+    kept, not a runtime that has been compromised; such a runtime already holds the
+    user's token.
+  - Items written before this release have no visibility. They count as unknown, so
+    they are held back from models until the next ingest labels them. That ingest
+    runs at the first refresh after rollout. Today's token reads public repositories
+    only, so in practice every stored item gets labelled `public`.
+  - Visibility is re-checked at every ingest, so a repository that turns private is
+    relabelled and held back from then on.
+- **On:** the gate, the redirect check and the stored filter are skipped. The operator
+  accepts that private titles, bodies, code and logs reach the configured models and
+  gofer's database.
+- **On, then off again:** no further processing of private data. Retained private items
+  stay in the database, but the stored filter keeps them out of every workload from
+  the moment the setting is off. Deleting them is a separate clean-up step, not
+  designed here.
 - Org installations stay the org owners' choice. Neither setting needs one.
 
 ### Sign-in (`internal/auth`)
@@ -184,10 +236,19 @@ GitHub Apps use the same web flow and endpoints as OAuth apps
   3. Revoke the grant with the current access token.
   4. Delete the row.
 
-  A refresh that fails with `bad_refresh_token` means GitHub has already dropped the
-  authorisation, so there is nothing left to revoke. Logout is still never blocked:
-  any other failure is logged without the token, the row is deleted anyway, and the
-  session is destroyed.
+  Logout is never blocked: any failure is logged without the token, the row is deleted
+  anyway, and the session is destroyed. A failure means remote revocation is
+  *unconfirmed*:
+  - a refresh that fails with `bad_refresh_token`;
+  - a revoke call that fails.
+
+  `bad_refresh_token` does not prove the grant is gone. After a restore from backup,
+  the vault can hold a refresh token that was already spent, while the newer pair and
+  the grant are still valid at GitHub. In that case logout says the remote side was
+  not confirmed. Its response links the user to GitHub's "Authorized GitHub Apps"
+  settings, to revoke gofer there. The restore runbook
+  (`docs/backup-restore.md`) should say that a restore can do this, and that affected
+  users sign in again.
 - Record the issuing client ID in the stored credential: a new `client_id` field in
   the sealed JSON, which old rows decode without. The broker treats a credential from
   another client (or with none) as absent, so a cutover or rollback never vends a
@@ -228,6 +289,16 @@ only once the token has expired, and with no lock.
    construction, so an in-process mutex is enough. Whoever takes it re-reads the row
    and acts only on what it finds.
 
+   The callback exchanges and validates its new token *before* it can know whose lock
+   to take, so a logout that revokes the whole grant can land in between. The
+   callback would then store an already-revoked token and open a session. So, holding
+   the lock, the callback checks the token again:
+   - `POST /applications/{client_id}/token`, GitHub's check-token endpoint, which does
+     not count against failed-login limits.
+   - Only a valid answer is stored and gets a session.
+   - An invalid one restarts sign-in. The grant was revoked mid-flow, and the user
+     consents again.
+
    As a second line of defence, each stored credential gets a version: a random ID
    minted at every `Put`, kept in the sealed JSON. A refresh's write and a failed
    refresh's delete apply only if the row still holds the version they read.
@@ -249,14 +320,26 @@ only once the token has expired, and with no lock.
    The broker, under the credential lock:
    - **The stored version differs from the rejected one:** rotation already happened,
      so it returns the stored token.
-   - **It is the same:** it refreshes now, whatever the expiry. Success returns the
-     new pair. `bad_refresh_token` deletes the row and answers "sign-in required"
-     (below).
-   - **At most one forced refresh per version.** A second `rejected=` naming a version
-     that was already refreshed just gets the current token. So a misbehaving run can
-     rotate its own user's credential once, not repeatedly.
-6. **A dead refresh token** (`bad_refresh_token`: expired, revoked by the user, or the
-   app deleted) deletes the vault row (version-checked, as above).
+   - **It is the same:** the broker confirms the rejection itself with GitHub's
+     check-token endpoint (`POST /applications/{client_id}/token`, client
+     credentials). A run's say-so alone never rotates or deletes a credential.
+     - **GitHub says the token is valid:** the 401 was something else, and the broker
+       returns the same token.
+     - **Invalid, and the credential has a refresh token:** it refreshes now,
+       whatever the expiry. Success returns the new pair. `bad_refresh_token` deletes
+       the row and answers "sign-in required" (below).
+     - **Invalid, and no refresh token:** for example a legacy `gho_` row revoked at
+       rollout step 4 and matching again after a rollback. The version is dead, so the
+       broker deletes the row (version-checked) and answers "sign-in required".
+   - **At most one forced refresh per run.** Each refresh mints a new version, so a
+     version check alone would let one run rotate again and again, killing the tokens
+     concurrent runs hold. The broker keys the allowance on the run credential's run
+     ID (`Principal.JobID`, from the verified claims). A run's second `rejected=` gets
+     the current token, never another refresh. The allowance is kept in memory for the
+     run credential's lifetime.
+6. **A dead refresh token** (`bad_refresh_token`: expired, revoked by the user, the
+   app deleted, or a stale copy restored from backup) deletes the vault row
+   (version-checked, as above).
    - The broker then answers "sign-in required", for this case, a missing credential
      and one from another client alike: a distinct status and error code, not today's
      generic 404.
@@ -266,7 +349,10 @@ only once the token has expired, and with no lock.
 7. **No schema migration.** `sealedCredential` already seals the refresh token and the
    expiry. `client_id`, the version (and optionally the refresh token's expiry, so the
    UI can warn before 6 months) are new `omitempty` JSON fields inside the sealed
-   blob.
+   blob. Work items are stored as JSON documents (`work_items.doc`), so
+   `GitHub.Visibility` needs none either. It is a run-owned GitHub field, which
+   `worklist.MergeRunItems` takes from the run. Marking a withheld item is a new sink
+   call that goes through `worklist.Store.Update`.
 
 ### Discuss without GitHub access
 
@@ -281,6 +367,19 @@ stored metadata and the thread alone, with no live GitHub evidence.
   again to reconnect, then ask again". It is marked as a system notice, so the thread
   shows it as such and review state does not count it as an answer. The same marker
   lets the UI show the sign-in prompt.
+- **"Sign-in required" found mid-turn.** The first vend can succeed with a token that
+  is unexpired by its clock but revoked at GitHub. Then the first GitHub call gets a
+  401, and the holder's re-vend comes back "sign-in required". Today two paths would
+  swallow that:
+  - `runConverse` ignores errors from the snapshot fetch (`Discussion`, `Login`);
+  - the model's tool loop turns tool errors into ordinary model input.
+
+  So the token holder returns a typed reconnect error, and both paths pass it
+  through. The snapshot fetch returns it to `runConverse`, which posts the notice
+  without calling the model. A tool call that hits it ends the tool loop: the
+  converser treats it as fatal, not as a result for the model. The turn then saves
+  the reconnect notice and discards any partial model output, never a normal reply
+  or review. Other tool errors are still model input, as today.
 - **Any other vend failure** (the broker unreachable, a 5xx): the model still runs, but
   the prompt says GitHub is unavailable for this turn. The saved reply carries a
   visible "answered from stored context only" note, so the user knows to ask again.
@@ -342,12 +441,17 @@ all user tokens" on the OAuth app's settings page once the switch is made.
 2. Ship one release that works under either app:
    - the broker vends through the refreshing source, with the lock, early refresh and
      persist-first write;
-   - one credential lock and version shared by sign-in, logout and refresh, with
-     logout revoking before it deletes;
-   - the runtime re-vends once on 401, naming the rejected version;
-   - "sign-in required" from the broker, and Discuss's reconnect notice;
+   - one credential lock and version shared by sign-in, logout and refresh;
+   - logout revoking before it deletes, and reporting unconfirmed revocation;
+   - the callback re-checking its token under the lock;
+   - the runtime re-vends once on 401, naming the rejected version; the broker
+     confirms with check-token and allows one forced refresh per run;
+   - "sign-in required" from the broker, and Discuss's reconnect notice, including one
+     found mid-turn;
    - `GITHUB_CLIENT_KIND`, with each kind's scopes;
-   - `GITHUB_PRIVATE_REPOS` (off) and the visibility gate;
+   - `GITHUB_PRIVATE_REPOS` (off): the visibility gate, the redirect check, ingest's
+     unknown-visibility rule, and the web tier's stored-visibility filter on model
+     inputs;
    - ingest's involves query is split, and `github_search` adds the type qualifier;
    - the `client_id` check, with old rows matched to the OAuth app until the switch.
 
@@ -372,7 +476,10 @@ Set `GITHUB_CLIENT_KIND=oauth-app` and switch the two secrets back to the OAuth
 app's (keep it until step 6), then restart. Sign-in asks for `read:user user:email`
 again. The
 `client_id` check treats the app's `ghu_` credentials as absent, so users sign in
-again and get `gho_` tokens. Revoke the app's tokens, or delete the app. The step-2
+again and get `gho_` tokens. A user who never signed in through the app still has a
+legacy row that matches again, but its token was revoked at step 4. Its first 401 is
+confirmed with check-token, and since it has no refresh token, the row is deleted and
+the user is asked to sign in. Revoke the app's tokens, or delete the app. The step-2
 release works under both apps, so no image rollback is needed. Nothing in the schema
 changes, so there is nothing to restore.
 
@@ -434,6 +541,11 @@ Left unverified:
   the `@me` qualifiers under an app token, and the gate's `GET /repos/{repo}`
   `private` field for a private repository the app is installed on. The probe had no
   installation, so it could not exercise either.
+- **Redirects:** the exact form of the redirect for a transferred issue or a renamed
+  repository (`/repositories/{id}/…` or `/repos/{owner}/{repo}/…`, 301 or 307). The
+  check is designed for both.
+- **The check-token endpoint** (`POST /applications/{client_id}/token`) for `ghu_`
+  tokens, and its answer for a revoked grant.
 - **Who can authorise a private app** owned by a personal account: the docs speak of
   organisation-owned apps.
 - **Today's private reach:** whether the `read:user` token sees any private items in
