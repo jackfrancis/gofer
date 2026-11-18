@@ -3,6 +3,7 @@ package snapshot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -38,6 +39,12 @@ func (f *fakeAPI) add(name string, created time.Time, ready bool, labels map[str
 	f.contents["content-"+name] = "Retain"
 }
 
+// addFailed seeds a snapshot that reports an error and is not ready.
+func (f *fakeAPI) addFailed(name string, created time.Time, labels map[string]string) {
+	f.add(name, created, false, labels)
+	f.snaps[name]["status"].(map[string]any)["error"] = map[string]any{"message": "boom"}
+}
+
 func managed() map[string]string {
 	return map[string]string{LabelManagedBy: ManagedBy, LabelClaim: "data-gofer-0"}
 }
@@ -61,6 +68,7 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		name := meta["name"].(string)
 		meta["creationTimestamp"] = time.Date(2026, 11, 17, 19, 30, 5, 0, time.UTC).Format(time.RFC3339) // set by the API server
 		f.snaps[name] = obj
+		f.contents["content-"+name] = "Retain" // the class's deletionPolicy, as the controller would bind it
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write(body)
 	case r.Method == "GET" && r.URL.Path == snapPrefix:
@@ -90,7 +98,11 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.getsByKey[name]++
-		status := map[string]any{"readyToUse": f.readyAt >= 0 && f.getsByKey[name] > f.readyAt, "restoreSize": "1Gi"}
+		status := map[string]any{
+			"readyToUse":                     f.readyAt >= 0 && f.getsByKey[name] > f.readyAt,
+			"restoreSize":                    "1Gi",
+			"boundVolumeSnapshotContentName": "content-" + name,
+		}
 		if f.failWith != "" {
 			status["error"] = map[string]any{"message": f.failWith}
 		}
@@ -182,6 +194,15 @@ func TestWait(t *testing.T) {
 			t.Fatalf("want the snapshot's error, got %v", err)
 		}
 	})
+	t.Run("ready despite a stale error", func(t *testing.T) {
+		f := newFakeAPI()
+		f.readyAt, f.failWith = 0, "transient"
+		s := newSnapshotter(t, f)
+		name, _ := s.Take(context.Background())
+		if size, err := s.Wait(context.Background(), name); err != nil || size != "1Gi" {
+			t.Fatalf("a snapshot ready to use is usable, got %q %v", size, err)
+		}
+	})
 	t.Run("timeout", func(t *testing.T) {
 		f := newFakeAPI()
 		f.readyAt = -1
@@ -237,6 +258,105 @@ func TestPrune(t *testing.T) {
 	}
 }
 
+// Failed snapshots go wherever they sit; in-progress ones inside the window and
+// usable ones up to Keep stay.
+func TestPruneDeletesFailedAnywhere(t *testing.T) {
+	f := newFakeAPI()
+	base := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
+	day := func(n int) time.Time { return base.Add(time.Duration(n) * 24 * time.Hour) }
+	f.addFailed("failed-8", day(8), managed())     // newest, failed: delete
+	f.add("in-progress", day(7), false, managed()) // not ready, no error: keep
+	f.add("stale-error", day(6), true, managed())  // ready with an old error: usable #1, keep
+	f.snaps["stale-error"]["status"].(map[string]any)["error"] = map[string]any{"message": "transient"}
+	f.addFailed("failed-5", day(5), managed())          // between keepers: delete
+	f.add("good-4", day(4), true, managed())            // usable #2: keep
+	f.add("good-3", day(3), true, managed())            // beyond Keep=2: delete
+	f.addFailed("failed-2", day(2), managed())          // beyond: delete
+	f.addFailed("by-hand", day(1), map[string]string{}) // not managed: never touched
+	s := newSnapshotter(t, f)
+
+	deleted, err := s.Prune(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(deleted)
+	if !slices.Equal(deleted, []string{"failed-2", "failed-5", "failed-8", "good-3"}) {
+		t.Fatalf("deleted %v", deleted)
+	}
+	for _, name := range []string{"in-progress", "stale-error", "good-4", "by-hand"} {
+		if _, ok := f.snaps[name]; !ok {
+			t.Errorf("%s must be kept", name)
+		}
+	}
+	if f.contents["content-failed-5"] != "Delete" {
+		t.Fatal("a failed snapshot's stored content must go with it")
+	}
+}
+
+// Deleting failed snapshots never lowers the number of usable ones below Keep.
+func TestPruneFailedNeverCostsAUsableOne(t *testing.T) {
+	f := newFakeAPI()
+	base := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
+	for i := range 3 {
+		f.addFailed("failed-"+string(rune('a'+i)), base.Add(time.Duration(2*i)*time.Hour), managed())
+		f.add("good-"+string(rune('a'+i)), base.Add(time.Duration(2*i+1)*time.Hour), true, managed())
+	}
+	s := newSnapshotter(t, f)
+	s.Keep = 3
+	deleted, err := s.Prune(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(deleted)
+	if !slices.Equal(deleted, []string{"failed-a", "failed-b", "failed-c"}) {
+		t.Fatalf("deleted %v", deleted)
+	}
+	if len(f.snaps) != 3 {
+		t.Fatalf("all three usable snapshots must stay, have %v", keys(f.snaps))
+	}
+}
+
+// pruneFailed touches only failed snapshots, never usable or in-progress ones.
+func TestPruneFailedOnly(t *testing.T) {
+	f := newFakeAPI()
+	base := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
+	for i := range 4 {
+		f.add("good-"+string(rune('a'+i)), base.Add(time.Duration(i)*time.Hour), true, managed())
+	}
+	f.add("old-in-progress", base.Add(-time.Hour), false, managed())
+	f.addFailed("failed", base.Add(-2*time.Hour), managed())
+	s := newSnapshotter(t, f)
+	s.Keep = 1
+	deleted, err := s.pruneFailed(context.Background())
+	if err != nil || !slices.Equal(deleted, []string{"failed"}) {
+		t.Fatalf("want only the failed one deleted, got %v %v", deleted, err)
+	}
+	if len(f.snaps) != 5 {
+		t.Fatalf("have %v", keys(f.snaps))
+	}
+}
+
+// A snapshot already being deleted is neither counted as a backup nor deleted again.
+func TestPruneSkipsTerminating(t *testing.T) {
+	f := newFakeAPI()
+	base := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
+	f.add("going", base.Add(3*time.Hour), true, managed())
+	f.snaps["going"]["metadata"].(map[string]any)["deletionTimestamp"] = base.Format(time.RFC3339)
+	f.add("good-b", base.Add(2*time.Hour), true, managed())
+	f.add("good-a", base.Add(time.Hour), true, managed())
+	s := newSnapshotter(t, f)
+	s.Keep = 2
+	deleted, err := s.Prune(context.Background())
+	if err != nil || len(deleted) != 0 {
+		t.Fatalf("want nothing deleted, got %v %v", deleted, err)
+	}
+	for _, call := range f.calls {
+		if strings.HasPrefix(call, "DELETE") || strings.HasPrefix(call, "PATCH") {
+			t.Fatalf("unexpected call %s", call)
+		}
+	}
+}
+
 // Pruning never removes the last usable snapshot, whatever Keep says.
 func TestPruneKeepsAtLeastOne(t *testing.T) {
 	f := newFakeAPI()
@@ -248,20 +368,84 @@ func TestPruneKeepsAtLeastOne(t *testing.T) {
 	}
 }
 
-// A run whose snapshot fails does not prune, so a broken backup cannot delete good ones.
-func TestRunDoesNotPruneAfterAFailedSnapshot(t *testing.T) {
+// A run whose snapshot fails deletes that snapshot (and its stored content) and any
+// earlier failed one, but prunes nothing else, so a broken backup cannot delete good
+// ones.
+func TestRunDeletesItsFailedSnapshot(t *testing.T) {
 	f := newFakeAPI()
 	f.readyAt, f.failWith = -1, "boom"
 	for i := range 4 {
 		f.add("old-"+string(rune('a'+i)), time.Now().Add(-time.Duration(i+1)*time.Hour), true, managed())
 	}
+	f.addFailed("earlier-failed", time.Now().Add(-30*time.Minute), managed())
 	s := newSnapshotter(t, f)
 	s.Keep = 1
-	if err := s.Run(context.Background(), time.Second); err == nil {
-		t.Fatal("want the failed snapshot to fail the run")
+	err := s.Run(context.Background(), time.Second)
+	var failed *FailedError
+	if !errors.As(err, &failed) || failed.Message != "boom" {
+		t.Fatalf("want the failed snapshot to fail the run, got %v", err)
 	}
-	if len(f.snaps) != 5 {
-		t.Fatalf("nothing may be pruned after a failed snapshot, have %d", len(f.snaps))
+	const name = "data-gofer-0-20261117-193005"
+	if _, ok := f.snaps[name]; ok {
+		t.Fatal("the run's failed snapshot must be deleted")
+	}
+	if f.contents["content-"+name] != "Delete" {
+		t.Fatalf("the failed snapshot's content must be set to Delete, got %q", f.contents["content-"+name])
+	}
+	if _, ok := f.snaps["earlier-failed"]; ok {
+		t.Fatal("an earlier failed snapshot must be deleted too")
+	}
+	for i := range 4 {
+		if _, ok := f.snaps["old-"+string(rune('a'+i))]; !ok {
+			t.Fatalf("no usable snapshot may be pruned after a failed one, have %v", keys(f.snaps))
+		}
+	}
+}
+
+// A run whose snapshot is merely slow leaves it in place (it may still finish) and
+// prunes nothing usable, but still clears out snapshots that have failed.
+func TestRunLeavesASlowSnapshot(t *testing.T) {
+	f := newFakeAPI()
+	f.readyAt = -1
+	for i := range 3 {
+		f.add("old-"+string(rune('a'+i)), time.Now().Add(-time.Duration(i+1)*time.Hour), true, managed())
+	}
+	f.addFailed("earlier-failed", time.Now().Add(-30*time.Minute), managed())
+	s := newSnapshotter(t, f)
+	s.Keep = 1
+	err := s.Run(context.Background(), 20*time.Millisecond)
+	var failed *FailedError
+	if err == nil || errors.As(err, &failed) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want a timeout, got %v", err)
+	}
+	const name = "data-gofer-0-20261117-193005"
+	if _, ok := f.snaps[name]; !ok {
+		t.Fatal("a snapshot that is only slow must be left to finish")
+	}
+	if f.contents["content-"+name] != "Retain" {
+		t.Fatal("a slow snapshot's content must stay Retain")
+	}
+	if _, ok := f.snaps["earlier-failed"]; ok {
+		t.Fatal("an earlier failed snapshot must be deleted")
+	}
+	if len(f.snaps) != 4 {
+		t.Fatalf("no usable snapshot may be pruned after a slow run, have %v", keys(f.snaps))
+	}
+}
+
+// When the job itself is stopped, the run does not go on deleting things.
+func TestRunCancelledCleansNothing(t *testing.T) {
+	f := newFakeAPI()
+	f.readyAt = -1
+	f.addFailed("earlier-failed", time.Now().Add(-30*time.Minute), managed())
+	s := newSnapshotter(t, f)
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(20*time.Millisecond, cancel)
+	if err := s.Run(ctx, time.Minute); !errors.Is(err, context.Canceled) {
+		t.Fatalf("want cancellation, got %v", err)
+	}
+	if _, ok := f.snaps["earlier-failed"]; !ok {
+		t.Fatal("a cancelled run must not clean up")
 	}
 }
 

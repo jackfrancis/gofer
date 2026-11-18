@@ -1,5 +1,5 @@
 // Command snapshot takes one CSI VolumeSnapshot of gofer's data volume, waits until
-// it is usable, and prunes old ones (internal/snapshot). The backup CronJob
+// it is usable, and prunes old ones and failed ones (internal/snapshot). The backup CronJob
 // (deploy/k8s/backup) runs it in-cluster from the web image.
 //
 // Configuration (environment):

@@ -5,7 +5,13 @@
 // WAL mode with synchronous=FULL restores to the last committed transaction, so a
 // snapshot of the live volume is a valid backup with no quiescing
 // (docs/backup-restore.md). This package is what the scheduled backup runs: take one
-// snapshot, wait until it is usable, and delete the oldest beyond a retention count.
+// snapshot, wait until it is usable, and delete the oldest beyond a retention count,
+// plus any that failed.
+//
+// Failed snapshots are deleted promptly, not left to age out: the external-snapshotter
+// treats a snapshot that is not ready as still reading its source claim and keeps the
+// claim's pvc-as-source-protection finalizer, so a failed snapshot left in place would
+// block a restore (hack/restore/restore.sh refuses to run while one exists).
 //
 // It is cloud-neutral. Which storage the snapshot lands in, and where, is the
 // VolumeSnapshotClass's business, which the cluster's administrator supplies.
@@ -52,6 +58,7 @@ type volumeSnapshot struct {
 		Namespace         string            `json:"namespace,omitempty"`
 		Labels            map[string]string `json:"labels,omitempty"`
 		CreationTimestamp time.Time         `json:"creationTimestamp,omitzero"`
+		DeletionTimestamp *time.Time        `json:"deletionTimestamp,omitempty"`
 	} `json:"metadata"`
 	Spec struct {
 		VolumeSnapshotClassName string `json:"volumeSnapshotClassName,omitempty"`
@@ -73,11 +80,34 @@ func (v volumeSnapshot) ready() bool {
 	return v.Status != nil && v.Status.ReadyToUse != nil && *v.Status.ReadyToUse
 }
 
+// failure is the snapshot's error if it has failed, else "". A snapshot that is ready
+// to use has not failed, whatever stale error it still carries: readyToUse is what
+// makes a backup usable here, in Prune, and in the restore preflight alike.
 func (v volumeSnapshot) failure() string {
-	if v.Status != nil && v.Status.Error != nil && v.Status.Error.Message != "" {
-		return v.Status.Error.Message
+	if v.ready() || v.Status == nil || v.Status.Error == nil {
+		return ""
 	}
-	return ""
+	if v.Status.Error.Message == "" {
+		return "error reported without a message"
+	}
+	return v.Status.Error.Message
+}
+
+func (v volumeSnapshot) failed() bool { return v.failure() != "" }
+
+// terminating reports whether the snapshot is already being deleted.
+func (v volumeSnapshot) terminating() bool { return v.Metadata.DeletionTimestamp != nil }
+
+// FailedError is Wait's answer for a snapshot that reports an error: it failed, as
+// opposed to merely not being ready yet.
+type FailedError struct {
+	Name    string
+	Message string
+	snap    volumeSnapshot
+}
+
+func (e *FailedError) Error() string {
+	return fmt.Sprintf("snapshot: %s failed: %s", e.Name, e.Message)
 }
 
 func (s *Snapshotter) now() time.Time {
@@ -129,7 +159,8 @@ func (s *Snapshotter) Take(ctx context.Context) (string, error) {
 }
 
 // Wait polls the snapshot until it is ready to use, reports an error, or ctx ends.
-// It returns the snapshot's restore size when ready.
+// It returns the snapshot's restore size when ready, and a *FailedError when the
+// snapshot reports an error.
 func (s *Snapshotter) Wait(ctx context.Context, name string) (string, error) {
 	poll := s.Poll
 	if poll <= 0 {
@@ -141,7 +172,7 @@ func (s *Snapshotter) Wait(ctx context.Context, name string) (string, error) {
 			return "", fmt.Errorf("snapshot: read %s: %w", name, err)
 		}
 		if msg := v.failure(); msg != "" {
-			return "", fmt.Errorf("snapshot: %s failed: %s", name, msg)
+			return "", &FailedError{Name: name, Message: msg, snap: v}
 		}
 		if v.ready() {
 			return v.Status.RestoreSize, nil
@@ -154,12 +185,32 @@ func (s *Snapshotter) Wait(ctx context.Context, name string) (string, error) {
 	}
 }
 
-// Prune deletes this claim's managed snapshots beyond the newest Keep usable ones.
-// Snapshots newer than the Keep-th usable one are left alone even if not yet usable
-// (they may still be in progress); everything older goes, usable or failed. It
-// returns the names it deleted. Keep below 1 is treated as 1: pruning never removes
-// the last good backup.
+// Prune deletes this claim's managed snapshots beyond the newest Keep usable ones,
+// and every one that failed. It returns the names it deleted.
+//
+//   - A failed snapshot (one reporting an error and not ready to use) goes wherever it
+//     sits: it is not a backup, and while it exists it keeps the claim protected as a
+//     snapshot source, which blocks a restore.
+//   - Snapshots newer than the Keep-th usable one are otherwise left alone even if not
+//     yet usable: they may still be in progress.
+//   - Everything older than the Keep-th usable one goes, usable or not.
+//
+// Deleting a failed snapshot never lowers the count of usable ones, so Keep usable
+// snapshots survive whatever else is deleted. Keep below 1 is treated as 1: pruning
+// never removes the last good backup. Snapshots already being deleted are skipped and
+// not counted.
 func (s *Snapshotter) Prune(ctx context.Context) ([]string, error) {
+	return s.prune(ctx, false)
+}
+
+// pruneFailed deletes only this claim's managed snapshots that failed. A run whose
+// own snapshot did not become usable does this instead of Prune: removing failed
+// snapshots cannot touch a usable one, so it is safe after a broken backup.
+func (s *Snapshotter) pruneFailed(ctx context.Context) ([]string, error) {
+	return s.prune(ctx, true)
+}
+
+func (s *Snapshotter) prune(ctx context.Context, failedOnly bool) ([]string, error) {
 	keep := max(s.Keep, 1)
 	sel := url.Values{"labelSelector": {LabelManagedBy + "=" + ManagedBy + "," + LabelClaim + "=" + s.Claim}}
 	var list struct {
@@ -182,7 +233,14 @@ func (s *Snapshotter) Prune(ctx context.Context) ([]string, error) {
 		errs    []error
 	)
 	for _, v := range items {
-		if usable < keep {
+		switch {
+		case v.terminating():
+			continue // already going; neither a backup to count nor one to delete
+		case v.failed():
+			// Not a backup, and it blocks a restore: delete it wherever it sits.
+		case failedOnly:
+			continue
+		case usable < keep:
 			if v.ready() {
 				usable++
 			}
@@ -194,7 +252,11 @@ func (s *Snapshotter) Prune(ctx context.Context) ([]string, error) {
 		}
 		deleted = append(deleted, v.Metadata.Name)
 	}
-	if len(deleted) > 0 {
+	switch {
+	case len(deleted) == 0:
+	case failedOnly:
+		s.log().Info("failed snapshots deleted", "deleted", deleted)
+	default:
 		s.log().Info("snapshots pruned", "deleted", deleted, "kept_usable", usable)
 	}
 	return deleted, errors.Join(errs...)
@@ -221,8 +283,19 @@ func (s *Snapshotter) delete(ctx context.Context, v volumeSnapshot) error {
 }
 
 // Run is one scheduled backup: take a snapshot, wait up to wait for it to be usable,
-// then prune. A snapshot that fails or does not become usable in time fails the run
-// and skips pruning, so a broken backup never deletes good ones.
+// then prune. A snapshot that fails or does not become usable in time fails the run.
+// Such a run does not Prune, so a broken backup never deletes good ones; it only
+// deletes failed snapshots, which are never usable:
+//
+//   - If the new snapshot reports an error, it is deleted, with its stored content, so
+//     it does not linger and block a restore.
+//   - If it is merely not ready in time, it is left in place. A slow snapshot (a first
+//     full copy of a large volume, a busy storage backend) may still complete and be a
+//     good backup, and deleting it would throw that away. If it fails later, the next
+//     run deletes it as failed; if it completes, it is a backup like any other.
+//   - Either way, any earlier managed snapshot that has since failed is deleted too.
+//
+// If ctx itself ends (the job is being stopped), nothing is cleaned up.
 func (s *Snapshotter) Run(ctx context.Context, wait time.Duration) error {
 	name, err := s.Take(ctx)
 	if err != nil {
@@ -232,9 +305,32 @@ func (s *Snapshotter) Run(ctx context.Context, wait time.Duration) error {
 	defer cancel()
 	size, err := s.Wait(wctx, name)
 	if err != nil {
-		return err
+		return errors.Join(err, s.afterFailure(ctx, err))
 	}
 	s.log().Info("snapshot ready", "snapshot", name, "restore_size", size)
 	_, err = s.Prune(ctx)
 	return err
+}
+
+// afterFailure cleans up after a run whose snapshot did not become usable, given
+// Wait's error: it deletes the run's snapshot if it failed, then any other failed one.
+func (s *Snapshotter) afterFailure(ctx context.Context, waitErr error) error {
+	if ctx.Err() != nil {
+		return nil
+	}
+	var errs []error
+	var failed *FailedError
+	if errors.As(waitErr, &failed) {
+		if err := s.delete(ctx, failed.snap); err != nil {
+			errs = append(errs, err)
+		} else {
+			s.log().Info("failed snapshot deleted", "snapshot", failed.Name, "error", failed.Message)
+		}
+	} else {
+		s.log().Warn("snapshot not ready in time; leaving it to finish", "err", waitErr)
+	}
+	if _, err := s.pruneFailed(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
