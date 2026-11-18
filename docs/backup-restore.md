@@ -439,47 +439,79 @@ StatefulSet creates an empty one:
 ### A content left behind
 
 The scheduled job can log that a VolumeSnapshotContent for a snapshot it deleted was
-`left behind` (see [Scheduled snapshots](#scheduled-snapshots)). It keeps the class's
-`Retain` policy, so its stored snapshot is still there, but the snapshot controller
-will not bind it to a new VolumeSnapshot (see step 2 above). To keep it or discard it:
+`left behind` (see [Scheduled snapshots](#scheduled-snapshots)). Its stored snapshot
+is still there, but two things make it different from other contents:
 
-1. Check that it is still there, and note its driver and its stored snapshot's handle:
+- the snapshot controller will not bind it to a new VolumeSnapshot (see step 2
+  above), so keeping it means importing its handle into a new content;
+- it turned up after its VolumeSnapshot was deleted, so the controller never marked
+  it with `snapshot.storage.kubernetes.io/volumesnapshot-being-deleted`. That is the
+  marker the controller sets on a content whose VolumeSnapshot is deleted, and the
+  CSI driver's sidecar acts on a content being deleted only when it is there.
+  Without it, deleting the content leaves it stuck terminating, and its stored
+  snapshot is not deleted even at `Delete`. The steps below add it by hand.
+
+1. Check it, and note its driver and its stored snapshot's handle:
 
    ```sh
-   kubectl get volumesnapshotcontent <content> \
-       -o jsonpath='{.spec.driver} {.status.snapshotHandle} {.spec.deletionPolicy}{"\n"}'
+   kubectl get volumesnapshotcontent <content> -o jsonpath=\
+   '{.spec.driver} {.status.snapshotHandle} {.spec.deletionPolicy} deleting={.metadata.deletionTimestamp}{"\n"}'
    ```
 
-2. To keep it, create a pre-provisioned VolumeSnapshotContent and a VolumeSnapshot
-   from that driver and handle, as in step 2 of
-   [Restoring into a new cluster or namespace](#restoring-into-a-new-cluster-or-namespace),
-   under a new name such as `gofer-recovered`, and wait until the VolumeSnapshot is
-   ready to use. Then delete the old content object, leaving it at `Retain`: the
-   stored snapshot now belongs to the new content.
+   Go on only if the handle is set and `deleting=` is empty (a deletion someone
+   already started is theirs to finish). If the policy says `Delete`, set it to
+   `Retain` first, so nothing below can remove the stored snapshot by accident:
 
    ```sh
-   kubectl delete volumesnapshotcontent <content>
+   kubectl patch volumesnapshotcontent <content> --type merge -p '{"spec":{"deletionPolicy":"Retain"}}'
+   ```
+
+2. To keep it, import the handle: create a pre-provisioned VolumeSnapshotContent and
+   a VolumeSnapshot from that driver and handle, as in step 2 of
+   [Restoring into a new cluster or namespace](#restoring-into-a-new-cluster-or-namespace),
+   under a new name such as `gofer-recovered` (`deletionPolicy: Retain`), and wait
+   until it is ready:
+
+   ```sh
+   kubectl -n gofer wait volumesnapshot/gofer-recovered --for=jsonpath='{.status.readyToUse}'=true --timeout=2m
+   ```
+
+   Then check the old content still says `Retain` (step 1), and remove only its
+   object: the stored snapshot now belongs to `gofer-recovered`.
+
+   ```sh
+   kubectl annotate --overwrite volumesnapshotcontent <content> snapshot.storage.kubernetes.io/volumesnapshot-being-deleted=yes
+   kubectl delete volumesnapshotcontent <content> --timeout=60s
    ```
 
    The new VolumeSnapshot carries none of the job's labels, so the job never prunes
    it; delete it yourself, with its content set to `Delete`, when it is no longer
    needed.
 
-3. To discard it instead, set it to `Delete` first. Deleting a `Retain` content
-   removes only the object and leaves the stored snapshot behind.
+3. To discard it instead, set it to `Delete`, mark it, and delete it. Deleting a
+   content at `Retain`, or one without the marker, leaves the stored snapshot behind.
 
    ```sh
    kubectl patch volumesnapshotcontent <content> --type merge -p '{"spec":{"deletionPolicy":"Delete"}}'
-   kubectl delete volumesnapshotcontent <content>
+   kubectl annotate --overwrite volumesnapshotcontent <content> snapshot.storage.kubernetes.io/volumesnapshot-being-deleted=yes
+   kubectl delete volumesnapshotcontent <content> --timeout=60s
    ```
 
    Never do this to a content whose handle a recovered content (step 2) also uses:
    both point to the same stored snapshot, and `Delete` removes it.
 
-These steps were rehearsed on kind with csi-driver-host-path: binding the old content
-directly failed with `SnapshotContentMismatch`, the pre-provisioned route restored a
-claim with its data intact after the old content object was deleted, and the discard
-route made the driver delete the stored snapshot.
+If a `kubectl delete` above times out, the content is still terminating: look at its
+events and at the CSI driver's snapshotter sidecar logs rather than removing its
+finalizer, which would forget the stored snapshot instead of deleting it. After a
+discard, confirm in the storage system that the stored snapshot is gone.
+
+These steps were rehearsed on kind with csi-driver-host-path (external-snapshotter
+v8.7.0 manifests), on a content stripped of the marker the way one left behind lacks
+it. Binding it directly failed with `SnapshotContentMismatch`. Setting it to `Delete`
+and deleting it without the marker left it stuck terminating with the stored
+snapshot intact. With the marker, the keep route restored a claim with its data
+intact after the old object was removed, and the discard route removed the content
+and made the driver delete the stored snapshot.
 
 ## Velero: the whole-namespace alternative
 
