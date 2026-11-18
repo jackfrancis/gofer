@@ -136,6 +136,18 @@ side effect of someone else's installation.
   AEI mints that scope into the run credential, so every agent-plane request shows
   the web tier whether its run was allowed private access. It needs no record of its
   own and survives a restart.
+  - **AEI must allow the scope first.** gofer's AgentApp caps the scopes a run may
+    request (`identity.maxScopes` in `deploy/k8s/overlays/dev/agentapp.yaml`, today
+    `signals:read` and `metadata:write`). AEI answers a request outside that ceiling
+    with 403 before it creates the run (`boundScopes`, in AEI's
+    `controller/internal/dispatch/dispatch.go`). Turning the setting on without
+    widening the ceiling would break every dispatch.
+  - So `github:private` goes into `maxScopes`, in the repository's AgentApp and in
+    every cluster's applied copy, before the setting is turned on. The ceiling grants
+    nothing by itself: gofer still asks for the scope only when the setting is on.
+  - Within the ceiling, AEI copies the requested scopes into the AgentRun and mints
+    them unchanged (`agentrun_controller.go`). Turning the setting on still needs a
+    check that a dispatched run's credential actually carries `github:private`.
 - **Off: gofer enforces public-only at two points.** The live check is in the
   workload's GitHub client (`internal/github`), so every tool and job inherits it.
   The stored check is in the web tier, for model inputs taken from what gofer has
@@ -163,17 +175,23 @@ side effect of someone else's installation.
     client already handles them.
   - As a backstop, an issue or PR body whose `repository_url` names a repository
     other than the gated one is dropped unless that repository passes the gate.
-- **Visibility is a stored classification that only a check can change.**
-  - Each work item gets `GitHub.Visibility` (`public`, `private`, `inaccessible`, or
-    unset meaning unknown), plus `VisibilityCheckedAt`: when the check behind it ran.
-  - Like the thread, these are store-owned. `worklist.MergeRunItems` keeps the stored
-    values on every ordinary write-back. Otherwise a ranking run that read an item as
-    public, and finishes after ingest has marked it private, would write the old
-    classification back.
-  - Only a new sink call, `ReportVisibility(repo, verdict, checkedAt)`, changes them.
-    It goes through `worklist.Store.Update`, applies to every stored item of that
-    repository, and takes effect only when `checkedAt` is newer than the stored
-    check. So an older check finishing late cannot overwrite a newer one.
+- **Visibility is kept per repository, apart from the items.**
+  - New table `repository_visibility`, keyed by owner and repository name (the name
+    work items carry). Columns: the repository's numeric ID, the verdict (`public`,
+    `private` or `inaccessible`), and `checked_at`, when the check ran. A repository
+    with no row is unknown. This is migration `0002`, an additive table.
+  - Work items carry no visibility. A run's write-back therefore has nothing to
+    overwrite, and a ranking run that read an item as public cannot write back a stale
+    classification after ingest has found it private.
+  - A new item is classified the moment it is stored: there is no per-item label to
+    initialise. The first ingest's new rows are visible to the enrich and rank steps
+    that follow it in the same run, once their repository's verdict has been reported.
+  - Only a new sink call, `ReportVisibility(repo, id, verdict, checkedAt)`, changes a
+    row, in one transaction. It applies only when `checkedAt` is newer than the stored
+    one, so when ingests overlap, an older check finishing late cannot overwrite a
+    newer one.
+  - Ingest reports a repository's verdict before writing back that repository's
+    items.
 - **Ingest checks repositories, not just search hits.** A repository that turns
   private drops out of public search, and an item that closed before rollout never
   shows up in an open-item search again, so checking only search hits would miss both.
@@ -194,18 +212,37 @@ side effect of someone else's installation.
     reported. The repository's search hits are skipped, and the fetch counts as
     incomplete. A complete fetch is what lets `runIngest` call `retireMissing`, so
     open work stays on the radar until a later ingest can check it.
+  - **Retirement needs a check in the same ingest.** Even after a complete search, an
+    absent item is retired only if its repository was confirmed public *in this
+    ingest*. A repository that has just turned private drops out of public search, so
+    its open items would otherwise look finished. If that repository fell outside
+    this run's rotating window, it would be retired before its next check.
+    - Before retiring, ingest checks the repositories of the absent items first,
+      ahead of the rotating window.
+    - An absent item whose repository was not confirmed public in this pass is kept
+      as it is, and its retirement waits for a later ingest.
+    - `retireMissing` takes the set of repositories confirmed public in this pass.
   - Ingests after rollout work through every stored repository, the first of them
-    taking as many as its window allows. Items stored before this release start
-    unset, so they are classified then, and held back from models until they are. Today's token reads
-    public repositories only, so in practice they come out `public`.
+    taking as many as its window allows. Repositories stored before this release
+    have no row, so their items are held back from models until they are checked.
+    Today's token reads public repositories only, so in practice they come out
+    `public`.
 - **Stored model inputs: the web tier hands models only data it can show was public
   and produced without private access.**
   - Discuss, ranking and research read what gofer has kept: `sink.List` in `runRank`
     and `runResearch`, and the item and its thread in `runConverse`. A live check
     cannot catch those, so the web tier enforces the policy where it serves them, on
     its own side of the plane.
-  - **Items.** In public-only mode, `GET /agent/worklist` serves a run only items
-    whose stored visibility is `public`. The web tier refuses to dispatch Discuss,
+  - **Unfiltered data needs both the setting and the run's scope.** The web tier
+    serves a request unfiltered only when `GITHUB_PRIVATE_REPOS` is on now *and* the
+    request's verified credential carries `github:private`. Otherwise it filters.
+    - The setting alone would not be enough. A Discuss run dispatched in public-only
+      mode might still be running when the setting is turned on. It would then read
+      retained private history and save a reply with no `private_access` stamp, since
+      its credential has no `github:private`.
+    - A run is filtered for its whole life by the mode it was dispatched in.
+  - **Items.** Filtered, `GET /agent/worklist` serves a run only items whose
+    repository's verdict is `public`. The web tier refuses to dispatch Discuss,
     review or research on any other item, and says why in the thread.
   - **Text a private-access run produced.** While private access is on, a Discuss
     turn on a *public* issue can read a private PR, and its reply is saved in the
@@ -217,15 +254,15 @@ side effect of someone else's installation.
       verified credential; the runtime's word is not involved.
     - This is conservative: it marks everything such a run wrote, whether or not it
       actually touched a private repository.
-    - In public-only mode, stamped turns and fields are left out of everything served
-      to a run (thread history, research inputs). The user still sees them in the UI,
+    - Filtered, stamped turns and fields are left out of everything served to a run
+      (thread history, research inputs). The user still sees them in the UI,
       since they had access.
   - The filter guards what is kept. The labels themselves come from checks run by the
     workload, so the filter does not protect against a compromised runtime; such a
     runtime already holds the user's token.
-- **On:** the gate, the redirect check and the stored filters are skipped. The operator
-  accepts that private titles, bodies, code and logs reach the configured models and
-  gofer's database.
+- **On:** for runs dispatched with `github:private`, the gate, the redirect check and
+  the stored filters are skipped. The operator accepts that private titles, bodies,
+  code and logs reach the configured models and gofer's database.
 - **Switching it off takes effect for new runs at once, and for all runs within one run
   credential lifetime.**
   - A run dispatched before the switch keeps its `github:private` scope, and may
@@ -397,13 +434,15 @@ only once the token has expired, and with no lock.
    - The landing page should ask the user to sign in again (a small UI change: today
      it shows no such prompt).
    - Discuss treats it specially (next section).
-7. **No schema migration.** `sealedCredential` already seals the refresh token and the
-   expiry. `client_id`, the version (and optionally the refresh token's expiry, so the
-   UI can warn before 6 months) are new `omitempty` JSON fields inside the sealed
-   blob. Work items are stored as JSON documents (`work_items.doc`), so
-   `GitHub.Visibility`, `VisibilityCheckedAt` and the `private_access` stamps need none
-   either. They are store-owned fields that `worklist.MergeRunItems` preserves, and
-   only `ReportVisibility` and the sink's stamping change them.
+7. **One additive migration.** The credential changes need none: `sealedCredential`
+   already seals the refresh token and the expiry, and `client_id`, the version (and
+   optionally the refresh token's expiry, so the UI can warn before 6 months) are new
+   `omitempty` JSON fields inside the sealed blob.
+   - The `private_access` stamps need none either: work items are stored as JSON
+     documents (`work_items.doc`). They are store-owned, like the thread:
+     `worklist.MergeRunItems` preserves them, and only the sink's stamping sets them.
+   - The only new table is `repository_visibility`, migration `0002`. Older code
+     ignores it.
 
 ### Discuss without GitHub access
 
@@ -500,10 +539,17 @@ all user tokens" on the OAuth app's settings page once the switch is made.
    - "sign-in required" from the broker, and Discuss's reconnect notice, including one
      found mid-turn;
    - `GITHUB_CLIENT_KIND`, with each kind's scopes;
-   - `GITHUB_PRIVATE_REPOS` (off), with the `github:private` run scope: the visibility
-     gate, the redirect check, store-owned visibility with `ReportVisibility`, the
-     repository inventory, ingest's unknown-visibility rule, and the web tier's
-     filters on stored items and on text stamped `private_access`;
+   - `GITHUB_PRIVATE_REPOS` (off), with the `github:private` run scope:
+     - the visibility gate and the redirect check;
+     - the `repository_visibility` table with `ReportVisibility`, and the repository
+       inventory;
+     - ingest's unknown-visibility rule, and retirement only after a check in the
+       same pass;
+     - the web tier's filters on stored items and on text stamped `private_access`,
+       lifted only for a run that carries the scope while the setting is on.
+
+     Before anyone turns the setting on, `github:private` must be added to the
+     AgentApp's `maxScopes` and applied to the cluster.
    - ingest's involves query is split, and `github_search` adds the type qualifier;
    - the `client_id` check, with untagged legacy rows tagged and versioned at first
      vend under `oauth-app`, and refused under `github-app`.
@@ -533,8 +579,9 @@ again and get `gho_` tokens. A user who never signed in through the app still ha
 legacy row that matches again, but its token was revoked at step 4. Its first 401 is
 confirmed with check-token, and since it has no refresh token, the row is deleted and
 the user is asked to sign in. Revoke the app's tokens, or delete the app. The step-2
-release works under both apps, so no image rollback is needed. Nothing in the schema
-changes, so there is nothing to restore.
+release works under both apps, so no image rollback is needed. The only schema
+change is the additive `repository_visibility` table, so there is nothing to
+restore.
 
 ### The security invariants
 
@@ -599,10 +646,9 @@ Left unverified:
   check is designed for both.
 - **The check-token endpoint** (`POST /applications/{client_id}/token`) for `ghu_`
   tokens, and its answer for a revoked grant.
-- **That AEI mints a RunSpec's scopes into the run credential verbatim**, so
-  `github:private` reaches the web tier on every agent-plane request. gofer's
-  existing scopes (`signals:read`, `metadata:write`) suggest it does; a new scope has
-  not been tried.
+- **A dispatched run's credential carrying `github:private`** once the AgentApp
+  ceiling allows it. AEI's code copies requested scopes within the ceiling into the
+  minted credential, but no run with the new scope has been dispatched.
 - **Who can authorise a private app** owned by a personal account: the docs speak of
   organisation-owned apps.
 - **Today's private reach:** whether the `read:user` token sees any private items in
