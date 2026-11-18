@@ -157,6 +157,22 @@ func newGHAFake(t *testing.T) *ghaFake {
 		if r.Header.Get("Authorization") != "Bearer s3cret-token" {
 			t.Errorf("API call without the token: %s", r.URL.Path)
 		}
+		if strings.HasPrefix(r.URL.Path, "/repos/o/r/actions/jobs/52/") && strings.HasSuffix(r.URL.Path, "/logs") {
+			// Job 52's logs get the refusal gofer's tests pinned down: a token without
+			// repository scope, GitHub's "admin rights" message.
+			w.Header().Set("X-OAuth-Scopes", "read:user, user:email")
+			w.Header().Set("X-Accepted-OAuth-Scopes", "")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Must have admin rights to Repository.","status":"403"}`))
+			return
+		}
+		if r.URL.Path == "/repos/o/r/actions/jobs/51/logs" {
+			// Refused although the token has public_repo: not the scope case.
+			w.Header().Set("X-OAuth-Scopes", "public_repo, read:user")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Resource not accessible by integration"}`))
+			return
+		}
 		if r.URL.Path == "/repos/o/r/actions/jobs/50/steps/3/logs" {
 			// Job 50's whole log is served (and is too large); its step log is refused,
 			// with GitHub's full-length restriction message.
@@ -192,6 +208,10 @@ func newGHAFake(t *testing.T) *ghaFake {
 			_, _ = w.Write([]byte(ghaJobJSONSteps(45, "lint", "failure", ghaSameSecondSteps)))
 		case "/repos/o/r/actions/jobs/48":
 			_, _ = w.Write([]byte(ghaJobJSONSteps(48, "e2e", "failure", ghaBackgroundSteps)))
+		case "/repos/o/r/actions/jobs/52":
+			_, _ = w.Write([]byte(ghaJobJSON(52, "links", "failure")))
+		case "/repos/o/r/actions/jobs/51":
+			_, _ = w.Write([]byte(ghaJobJSON(51, "links", "failure")))
 		case "/repos/o/r/actions/jobs/50":
 			_, _ = w.Write([]byte(ghaJobJSON(50, "links", "failure")))
 		case "/repos/o/r/actions/jobs/49":
@@ -558,8 +578,13 @@ func TestGHAStepLogWhenJobLogTooLarge(t *testing.T) {
 
 // A log refused to the token says why, so the model reports an access problem (and
 // which one) rather than a bare 403 it could mistake for one in the job's output.
+// Only the refusal gofer's tests pinned down (no repository scope, GitHub's "admin
+// rights" message) gets the note on scope and the gh command; an organisation's
+// OAuth App restriction to the same token does not, since no broader token fixes it.
 func TestGHALogForbiddenSaysWhy(t *testing.T) {
 	box, f := ghaBox(t)
+
+	// An organisation restriction: the reason and scopes, but no scope note.
 	out := ciInvoke(t, box, "gha_job_summary", `{"job_id":49}`)
 	ghaCheckClean(t, f, out)
 	for _, want := range []string{
@@ -574,9 +599,49 @@ func TestGHALogForbiddenSaysWhy(t *testing.T) {
 			t.Errorf("summary lacks %q:\n%s", want, out)
 		}
 	}
-	_, err := box.Invoke(context.Background(), "gha_read", json.RawMessage(`{"job_id":49,"step":3}`))
-	if err == nil || !strings.Contains(err.Error(), "OAuth App access restrictions") {
-		t.Errorf("gha_read: err = %v", err)
+	if strings.Contains(out, "note:") || strings.Contains(out, "gh run view") {
+		t.Errorf("an organisation restriction got the scope note:\n%s", out)
+	}
+	for _, call := range []struct{ name, args string }{
+		{"gha_read", `{"job_id":49,"step":3}`},
+		{"gha_search", `{"job_id":49,"pattern":"x"}`},
+	} {
+		_, err := box.Invoke(context.Background(), call.name, json.RawMessage(call.args))
+		if err == nil || !strings.Contains(err.Error(), "OAuth App access restrictions") || strings.Contains(err.Error(), "gh run view") {
+			t.Errorf("%s on an organisation restriction: err = %v", call.name, err)
+		}
+	}
+
+	// The observed scope refusal: the note, with a command for this job's attempt.
+	const cmd = "gh run view --repo o/r --job 52 --log --attempt 1"
+	out = ciInvoke(t, box, "gha_job_summary", `{"job_id":52}`)
+	for _, want := range []string{
+		`GitHub says "Must have admin rights to Repository."`,
+		"note: GitHub refuses Actions logs to gofer's sign-in token, which has no repository scope",
+		"does not mean only repository admins can read the log",
+		cmd + ", or the job's page.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "--log-failed") {
+		t.Errorf("the command uses --log-failed:\n%s", out)
+	}
+	for _, call := range []struct{ name, args string }{
+		{"gha_read", `{"job_id":52,"step":3}`},
+		{"gha_search", `{"job_id":52,"pattern":"x"}`},
+	} {
+		_, err := box.Invoke(context.Background(), call.name, json.RawMessage(call.args))
+		if err == nil || !strings.Contains(err.Error(), cmd) {
+			t.Errorf("%s on a scope refusal: err = %v", call.name, err)
+		}
+	}
+
+	// A refusal to a token that has public_repo is a different problem: no note.
+	out = ciInvoke(t, box, "gha_job_summary", `{"job_id":51}`)
+	if !strings.Contains(out, "access denied (status 403)") || strings.Contains(out, "note:") {
+		t.Errorf("summary for a public_repo token's refusal:\n%s", out)
 	}
 }
 
@@ -602,6 +667,9 @@ func TestGHAStepFallbackRefusalKeepsScopes(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("summary lacks %q:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "note:") {
+		t.Errorf("an organisation restriction got the scope note:\n%s", out)
 	}
 }
 

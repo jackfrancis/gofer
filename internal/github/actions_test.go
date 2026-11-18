@@ -567,3 +567,33 @@ func TestActionsJobLogRateLimitThroughRetryTransport(t *testing.T) {
 		t.Errorf("took %s: it waited out the deadline", time.Since(start))
 	}
 }
+
+func TestLogAccessErrorScopeRefusal(t *testing.T) {
+	str := func(s string) *string { return &s }
+	admin := "Must have admin rights to Repository."
+	cases := []struct {
+		name   string
+		status int
+		r      reason
+		want   bool
+	}{
+		{"the observed refusal", 403, reason{message: admin, tokenScopes: str("read:user, user:email")}, true},
+		{"no scopes", 403, reason{message: admin, tokenScopes: str("")}, true},
+		{"organisation restriction, same token", 403, reason{message: "Although you appear to have the correct authorization credentials, the `example` organization has enabled OAuth App access restrictions.", tokenScopes: str("read:user, user:email")}, false},
+		{"no message", 403, reason{tokenScopes: str("read:user")}, false},
+		{"401", 401, reason{message: admin, tokenScopes: str("read:user")}, false},
+		{"public_repo", 403, reason{message: admin, tokenScopes: str("public_repo, read:user")}, false},
+		{"repo", 403, reason{message: admin, tokenScopes: str("gist, read:org, repo, workflow")}, false},
+		{"no scopes header (fine-grained or app token)", 403, reason{message: admin}, false},
+		{"SSO required", 403, reason{message: admin, tokenScopes: str("read:user"), sso: true}, false},
+	}
+	for _, c := range cases {
+		e := &LogAccessError{What: "job log", Status: c.status, reason: c.r}
+		if got := e.ScopeRefusal(); got != c.want {
+			t.Errorf("%s: ScopeRefusal = %v, want %v", c.name, got, c.want)
+		}
+		if !errors.Is(e, ErrLogForbidden) {
+			t.Errorf("%s: does not match ErrLogForbidden", c.name)
+		}
+	}
+}
