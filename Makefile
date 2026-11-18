@@ -585,6 +585,10 @@ backup-down: deploy-target
 snapshot: deploy-target
 	@$(KUBECTL) -n $(KUBE_NS) get cronjob gofer-snapshot >/dev/null 2>&1 || { \
 		echo "ERROR: scheduled snapshots are not set up here; run 'make backup-apply' first."; exit 1; }
+	@# A Job created from the CronJob bypasses its concurrencyPolicy (Forbid), so do
+	@# not start one while another backup Job is still running.
+	@active=$$($(KUBECTL) -n $(KUBE_NS) get jobs -o jsonpath='{range .items[?(@.spec.template.spec.serviceAccountName=="gofer-snapshotter")]}{.metadata.name}{" "}{.status.active}{"\n"}{end}' | awk '$$2 > 0 {print $$1}'); \
+		[ -z "$$active" ] || { echo "ERROR: a backup job is still running ($$active); wait for it to finish, then retry."; exit 1; }
 	@job=gofer-snapshot-manual-$$(date -u +%Y%m%d%H%M%S); \
 		$(KUBECTL) -n $(KUBE_NS) create job "$$job" --from=cronjob/gofer-snapshot >/dev/null; \
 		echo "job $$job started; waiting up to $(SNAPSHOT_TIMEOUT)s"; \

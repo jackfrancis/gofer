@@ -140,10 +140,13 @@ waits until it is ready to use, and then deletes the oldest beyond the newest
   controller keeps while the message stays the same), or once it is still erroring
   24 hours after it was created (in case a driver's message changes on every
   attempt, which restarts that clock). A snapshot the storage system has already
-  taken (`status.creationTime` is set) never counts as failed: a driver that copies
-  the data in the background reports success before the snapshot is ready, and the
-  controller keeps the earlier error until it is, so such a snapshot is treated as
-  slow (below). Every run, successful or not, deletes the
+  taken (`status.creationTime` is set) does not count as failed while it still has
+  its own VolumeSnapshotContent: a driver that copies the data in the background
+  reports success before the snapshot is ready, and the controller keeps the earlier
+  error until it is, so such a snapshot is treated as slow (below). If its content
+  has gone or belongs to another snapshot (the controller then marks a once ready
+  snapshot unready but keeps its creation time), it has no storage of its own left
+  and counts as failed like any other. Every run, successful or not, deletes the
   labeled snapshots that have failed, even when its own snapshot could not be
   created (a full VolumeSnapshot quota, say). A run's own snapshot rarely qualifies
   by the time the run ends, since its error appeared during the run, so a backup
@@ -159,10 +162,13 @@ waits until it is ready to use, and then deletes the oldest beyond the newest
   it listed, switches a content to `Delete` only if the content belongs to that
   snapshot and has not changed since it was read, and deletes only the version of
   the snapshot it checked. If anything changed in between (the snapshot became
-  ready, say), the snapshot is kept and its content gets its policy back. When a
-  request fails without a definite answer, the job reads the objects again to see
-  what happened before undoing anything; if it cannot tell, the job fails and says
-  which content to check.
+  ready, say), the snapshot is kept and its content gets its policy back, unless the
+  snapshot is meanwhile being deleted by someone else (another backup job, say): a
+  content's policy is never changed while its snapshot is being deleted, in either
+  direction. When a request fails without a definite answer, the job reads the
+  objects again to see what happened before undoing anything; if it cannot tell, the
+  job fails and says which content to check. Once a deletion has made its first
+  change, it runs to the end (within ten seconds) even if the job is being stopped.
 - A snapshot that is merely slow (not ready after ten minutes, with no error or
   already taken and still copying) is left in
   place: it may still finish and be a good backup. If it later fails, a run deletes it
@@ -185,6 +191,9 @@ Take one now, for instance before an upgrade, and list them:
 make snapshot  KUBECONFIG=<file>
 make snapshots KUBECONFIG=<file>
 ```
+
+`make snapshot` refuses to start while a backup job is still running: a job created
+from the CronJob bypasses its `concurrencyPolicy: Forbid`.
 
 `make backup-down` stops the schedule and keeps every snapshot.
 

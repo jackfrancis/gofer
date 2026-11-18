@@ -43,6 +43,11 @@ const snapshotAPI = "/apis/snapshot.storage.k8s.io/v1"
 // failed, when Snapshotter.Grace is unset.
 const DefaultGrace = 10 * time.Minute
 
+// mutationTimeout bounds the steps of a deletion once it has changed something (a
+// content's policy, then the snapshot), which run to the end even if the job is being
+// stopped, so nothing is left half done. It fits in a pod's default 30s grace period.
+const mutationTimeout = 10 * time.Second
+
 // MaxErrorAge bounds how long an erroring snapshot is kept, counted from its creation
 // rather than from its error. The controller restarts an error's clock whenever the
 // message changes, so a driver whose messages differ per attempt (a request ID, say)
@@ -134,12 +139,33 @@ func (v volumeSnapshot) terminating() bool { return v.Metadata.DeletionTimestamp
 // while the message stays the same (the snapshot's creation if it is missing or
 // earlier). A snapshot still erroring MaxErrorAge after its creation has failed too.
 //
-// A snapshot the storage system has already taken (see taken) never counts as failed,
-// whatever error it still shows: it is treated like any slow snapshot. Deciding that
-// needs no comparison of status.creationTime (the storage system's clock) with the
-// error's time (the controller's), and it errs towards keeping a backup.
-func (s *Snapshotter) failed(v volumeSnapshot) bool {
-	if v.erroring() == "" || v.taken() {
+// A snapshot the storage system has already taken (see taken) does not count as
+// failed, whatever error it still shows, as long as it still has its own content: it
+// is treated like any slow snapshot. Deciding that needs no comparison of
+// status.creationTime (the storage system's clock) with the error's time (the
+// controller's), and it errs towards keeping a backup. A taken snapshot whose content
+// has gone, or belongs to another snapshot, has failed: the controller marks a once
+// ready snapshot unready in that case but leaves its creationTime, and there is no
+// storage of its own left to lose. If its content cannot be read, it is kept.
+func (s *Snapshotter) failed(ctx context.Context, v volumeSnapshot) bool {
+	if !s.errorOutlasted(v) {
+		return false
+	}
+	if !v.taken() {
+		return true
+	}
+	c, err := s.contentOf(ctx, v)
+	if err != nil {
+		s.log().Warn("cannot tell whether an erroring snapshot still has its content; keeping it", "snapshot", v.Metadata.Name, "err", err)
+		return false
+	}
+	return c == nil
+}
+
+// errorOutlasted reports whether the snapshot reports an error that has lasted the
+// grace period, or is still erroring MaxErrorAge after its creation.
+func (s *Snapshotter) errorOutlasted(v volumeSnapshot) bool {
+	if v.erroring() == "" {
 		return false
 	}
 	created := v.Metadata.CreationTimestamp
@@ -310,11 +336,11 @@ func (s *Snapshotter) prune(ctx context.Context, failedOnly bool) ([]string, err
 		errs    []error
 	)
 	for _, v := range items {
-		var still func(volumeSnapshot) bool // re-checked on a fresh read just before deleting
+		var still func(context.Context, volumeSnapshot) bool // re-checked on a fresh read just before deleting
 		switch {
 		case v.terminating():
 			continue // already going; neither a backup to count nor one to delete
-		case s.failed(v):
+		case s.failed(ctx, v):
 			// Not a backup, and it blocks a restore: delete it wherever it sits, as long
 			// as it has not recovered in the meantime.
 			still = s.failed
@@ -387,13 +413,17 @@ type ownedContent struct {
 //   - The delete is conditional on the snapshot's UID and resourceVersion as read, so
 //     a snapshot that changes in between, say by becoming ready, is not deleted.
 //
-// If the snapshot is not deleted, the content gets its deletion policy back and the
-// snapshot is left for the next run to judge again. A write whose outcome is unknown
+// If the snapshot is not deleted and is not going, the content gets its deletion policy
+// back and the snapshot is left for the next run to judge again. If it is going (some
+// other deletion got there first), the content's policy is left as it is: a content's
+// policy is never changed while its snapshot is being deleted, in either direction.
+// Once the first write is made, the rest runs to the end under its own short timeout,
+// even if the job is being stopped. A write whose outcome is unknown
 // (the request failed without a definite answer) is not assumed either way: the
 // object is read again to see what happened before anything is undone, so a backup
 // that survives is not left at Delete and one that is going is not switched back to
 // Retain, which would strand its storage.
-func (s *Snapshotter) delete(ctx context.Context, listed volumeSnapshot, still func(volumeSnapshot) bool) (bool, error) {
+func (s *Snapshotter) delete(ctx context.Context, listed volumeSnapshot, still func(context.Context, volumeSnapshot) bool) (bool, error) {
 	name := listed.Metadata.Name
 	var v volumeSnapshot
 	if err := s.Kube.do(ctx, "GET", s.path(name), "", nil, &v); err != nil {
@@ -406,16 +436,22 @@ func (s *Snapshotter) delete(ctx context.Context, listed volumeSnapshot, still f
 	case v.Metadata.UID != listed.Metadata.UID, !v.managedBy(s.Claim):
 		s.log().Info("snapshot is no longer the one listed; leaving it alone", "snapshot", name)
 		return false, nil
-	case v.terminating(), still != nil && !still(v):
+	case v.terminating(), still != nil && !still(ctx, v):
 		return false, nil
 	}
 	c, err := s.contentOf(ctx, v)
 	if err != nil {
 		return false, err
 	}
+	if err := ctx.Err(); err != nil {
+		return false, err // being stopped: start nothing
+	}
+	// From the first write on, finish (delete, or check and undo) even if ctx ends.
+	mctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mutationTimeout)
+	defer cancel()
 	switched := false
 	if c != nil && c.policy != "Delete" {
-		_, err := s.setPolicy(ctx, c.name, c.uid, c.resourceVersion, "Delete")
+		_, err := s.setPolicy(mctx, c.name, c.uid, c.resourceVersion, "Delete")
 		switch {
 		case err == nil:
 			switched = true
@@ -426,43 +462,51 @@ func (s *Snapshotter) delete(ctx context.Context, listed volumeSnapshot, still f
 			return false, nil
 		default:
 			// The switch may or may not have been applied; undo checks.
-			return false, errors.Join(fmt.Errorf("snapshot: set %s to delete its storage: %w", c.name, err), s.undo(ctx, v, *c))
+			return false, errors.Join(fmt.Errorf("snapshot: set %s to delete its storage: %w", c.name, err), s.undo(mctx, v, *c))
 		}
 	}
 	opts := map[string]any{
 		"kind": "DeleteOptions", "apiVersion": "v1",
 		"preconditions": map[string]any{"uid": v.Metadata.UID, "resourceVersion": v.Metadata.ResourceVersion},
 	}
-	err = s.Kube.do(ctx, "DELETE", s.path(name), "application/json", opts, nil)
+	err = s.Kube.do(mctx, "DELETE", s.path(name), "application/json", opts, nil)
 	if err == nil {
 		return true, nil
 	}
-	if !IsNotFound(err) && !IsConflict(err) {
-		// No definite answer: see whether the delete happened before undoing anything.
-		gone, rerr := s.goneSince(ctx, v)
+	// Not deleted by this request, or no definite answer. A content's policy is never
+	// changed while its snapshot is going, so before undoing anything, see whether it
+	// is: gone, replaced, or being deleted (by this request if its answer was lost, by
+	// another backup job, or by someone else). Its storage then goes with the policy
+	// the deletion found.
+	gone := IsNotFound(err)
+	if !gone {
+		g, rerr := s.goneSince(mctx, v)
 		if rerr != nil {
-			return false, fmt.Errorf("snapshot: delete %s: %w; then could not tell whether it went (%v), so its content's deletion policy is as the delete left it", name, err, rerr)
+			return false, fmt.Errorf("snapshot: delete %s: %w; then could not tell whether it is going (%v), so its content's deletion policy is as the delete left it", name, err, rerr)
 		}
-		if gone {
-			return true, nil // its storage goes with it, as intended
+		gone = g
+	}
+	if gone {
+		if IsNotFound(err) || IsConflict(err) {
+			s.log().Info("snapshot is already going; leaving its content's policy as it is", "snapshot", name)
+			return false, nil
 		}
+		return true, nil // the lost answer was a success
 	}
 	var undoErr error
 	if switched {
-		undoErr = s.undo(ctx, v, *c)
+		undoErr = s.undo(mctx, v, *c)
 	}
-	switch {
-	case IsNotFound(err):
-		return false, undoErr // someone else deleted it; their choice of policy stands
-	case IsConflict(err):
+	if IsConflict(err) {
 		s.log().Info("snapshot changed since it was checked; leaving it for the next run", "snapshot", name)
 		return false, undoErr
 	}
 	return false, errors.Join(fmt.Errorf("snapshot: delete %s: %w", name, err), undoErr)
 }
 
-// goneSince reads a snapshot again after a delete whose outcome is unknown, and
-// reports whether it went: it is gone, replaced by another object, or being deleted.
+// goneSince reads a snapshot again after a delete that did not go through or whose
+// outcome is unknown, and reports whether it is going: it is gone, replaced by
+// another object, or being deleted.
 func (s *Snapshotter) goneSince(ctx context.Context, v volumeSnapshot) (bool, error) {
 	var cur volumeSnapshot
 	if err := s.Kube.do(ctx, "GET", s.path(v.Metadata.Name), "", nil, &cur); err != nil {
@@ -475,12 +519,20 @@ func (s *Snapshotter) goneSince(ctx context.Context, v volumeSnapshot) (bool, er
 }
 
 // undo gives a snapshot's content back the deletion policy it had, if it still
-// belongs to the snapshot and reads Delete. It works from fresh reads, conditional on
-// each, and retries a few times, since the write it undoes may itself have had an
-// unknown outcome.
+// belongs to the snapshot and reads Delete, and the snapshot is not going (a content's
+// policy is never changed while its snapshot is being deleted). It works from fresh
+// reads, conditional on each, and retries a few times, since the write it undoes may
+// itself have had an unknown outcome.
 func (s *Snapshotter) undo(ctx context.Context, v volumeSnapshot, c ownedContent) error {
 	var lastErr error
 	for range 3 {
+		if gone, err := s.goneSince(ctx, v); err != nil {
+			lastErr = err
+			continue
+		} else if gone {
+			s.log().Info("snapshot is already going; leaving its content's policy as it is", "snapshot", v.Metadata.Name)
+			return nil
+		}
 		cur, err := s.readContent(ctx, c.name)
 		switch {
 		case IsNotFound(err):

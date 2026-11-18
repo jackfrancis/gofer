@@ -580,23 +580,140 @@ func TestDeleteIsConditionalOnTheVersionChecked(t *testing.T) {
 	}
 }
 
-// If someone else deletes the snapshot first, its content gets its policy back too:
-// they chose what happens to its storage.
-func TestDeleteRestoresPolicyWhenBeatenToIt(t *testing.T) {
+// A content's policy is never changed while its snapshot is going. If another
+// deletion gets there between the switch and the delete (another backup job, which
+// found the content already at Delete, or anyone else), the content keeps the policy
+// that deletion found, so its storage is not stranded.
+func TestDeleteLeavesPolicyWhenBeatenToIt(t *testing.T) {
+	for name, beat := range map[string]func(f *fakeAPI){
+		"gone":        func(f *fakeAPI) { delete(f.snaps, "raced") },
+		"terminating": func(f *fakeAPI) { f.terminate(f.snaps["raced"]); bump(f.snaps["raced"]) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeAPI()
+			f.addFailed("raced", ago(time.Hour), managed())
+			f.onPatch = func(content string) {
+				if f.contents[content] == "Delete" {
+					beat(f)
+				}
+			}
+			s := newSnapshotter(t, f)
+			if deleted, err := s.pruneFailed(context.Background()); err != nil || len(deleted) != 0 {
+				t.Fatalf("want nothing reported deleted, got %v %v", deleted, err)
+			}
+			if f.contents["content-raced"] != "Delete" {
+				t.Fatalf("the content must keep the policy the deletion found, have %q", f.contents["content-raced"])
+			}
+		})
+	}
+}
+
+// The same holds when the switch's answer is lost and the snapshot is meanwhile being
+// deleted: the undo leaves the content alone.
+func TestUndoLeavesAGoingSnapshotsContent(t *testing.T) {
 	f := newFakeAPI()
 	f.addFailed("raced", ago(time.Hour), managed())
-	f.onPatch = func(content string) {
-		if f.contents[content] == "Delete" {
-			delete(f.snaps, "raced")
+	f.fault = func(method, _ string) string {
+		if method == "PATCH" {
+			return "after"
 		}
+		return ""
 	}
+	f.onPatch = func(string) { f.terminate(f.snaps["raced"]) }
 	s := newSnapshotter(t, f)
-	if deleted, err := s.pruneFailed(context.Background()); err != nil || len(deleted) != 0 {
-		t.Fatalf("want nothing reported deleted, got %v %v", deleted, err)
+	_, _ = s.pruneFailed(context.Background())
+	if f.contents["content-raced"] != "Delete" {
+		t.Fatalf("a going snapshot's content must keep its policy, have %q", f.contents["content-raced"])
 	}
-	if f.contents["content-raced"] != "Retain" {
-		t.Fatalf("the content must get Retain back, have %q", f.contents["content-raced"])
+}
+
+// A deletion that has made its first write finishes even if the job is stopped then,
+// rather than leaving the snapshot behind with its content at Delete.
+func TestDeleteFinishesAfterCancellation(t *testing.T) {
+	f := newFakeAPI()
+	f.addFailed("failed", ago(time.Hour), managed())
+	f.add("good", ago(2*time.Hour), true, managed())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.onPatch = func(string) { cancel() } // SIGTERM lands just after the switch
+	s := newSnapshotter(t, f)
+	deleted, _ := s.pruneFailed(ctx)
+	if !slices.Equal(deleted, []string{"failed"}) {
+		t.Fatalf("the started deletion must finish, deleted %v", deleted)
 	}
+	if _, ok := f.snaps["failed"]; ok {
+		t.Fatal("the snapshot must be gone, not left with its content at Delete")
+	}
+	if _, ok := f.snaps["good"]; !ok || f.contents["content-good"] != "Retain" {
+		t.Fatal("nothing else may be touched after the job is stopped")
+	}
+}
+
+// A taken snapshot whose content has gone, or belongs to another snapshot, has failed
+// once its error outlasts the grace period: it was ready once, and has no storage of
+// its own left. One whose content cannot be read is kept.
+func TestPruneTakenWithoutItsContent(t *testing.T) {
+	taken := func(f *fakeAPI, name string) {
+		f.addFailed(name, ago(48*time.Hour), managed())
+		f.status(name)["creationTime"] = ago(48 * time.Hour).Format(time.RFC3339)
+		f.status(name)["error"].(map[string]any)["time"] = ago(47 * time.Hour).Format(time.RFC3339)
+	}
+	t.Run("content missing", func(t *testing.T) {
+		f := newFakeAPI()
+		taken(f, "orphan")
+		delete(f.refs, "content-orphan")
+		delete(f.contents, "content-orphan")
+		s := newSnapshotter(t, f)
+		if deleted, err := s.pruneFailed(context.Background()); err != nil || !slices.Equal(deleted, []string{"orphan"}) {
+			t.Fatalf("want it deleted, got %v %v", deleted, err)
+		}
+	})
+	t.Run("content belongs to another", func(t *testing.T) {
+		f := newFakeAPI()
+		f.add("good", ago(49*time.Hour), true, managed())
+		taken(f, "misbound")
+		f.status("misbound")["boundVolumeSnapshotContentName"] = "content-good"
+		s := newSnapshotter(t, f)
+		if deleted, err := s.pruneFailed(context.Background()); err != nil || !slices.Equal(deleted, []string{"misbound"}) {
+			t.Fatalf("want it deleted, got %v %v", deleted, err)
+		}
+		if f.contents["content-good"] != "Retain" {
+			t.Fatal("the other snapshot's content must not be touched")
+		}
+	})
+	t.Run("content unreadable", func(t *testing.T) {
+		f := newFakeAPI()
+		taken(f, "unsure")
+		f.failGetOf = "content-unsure"
+		s := newSnapshotter(t, f)
+		if deleted, _ := s.pruneFailed(context.Background()); len(deleted) != 0 {
+			t.Fatalf("want it kept, deleted %v", deleted)
+		}
+	})
+	t.Run("content still there", func(t *testing.T) {
+		f := newFakeAPI()
+		taken(f, "copying")
+		s := newSnapshotter(t, f)
+		if deleted, err := s.pruneFailed(context.Background()); err != nil || len(deleted) != 0 {
+			t.Fatalf("want it kept, got %v %v", deleted, err)
+		}
+	})
+	// The case that matters most: it fills the last quota slot, so no new snapshot can
+	// be created and only the failed-only sweep runs.
+	t.Run("quota full", func(t *testing.T) {
+		f := newFakeAPI()
+		f.reject = "exceeded quota"
+		taken(f, "orphan")
+		delete(f.refs, "content-orphan")
+		delete(f.contents, "content-orphan")
+		s := newSnapshotter(t, f)
+		if err := s.Run(context.Background(), time.Second); err == nil {
+			t.Fatal("want the create error")
+		}
+		if _, ok := f.snaps["orphan"]; ok {
+			t.Fatal("the orphaned snapshot must be deleted even when no snapshot can be created")
+		}
+	})
 }
 
 // A content already set to Delete is not patched, and so not set back either.
