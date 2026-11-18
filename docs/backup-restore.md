@@ -155,8 +155,8 @@ waits until it is ready to use, and then deletes the oldest beyond the newest
   deletes only the version of the snapshot it checked: if the snapshot changes in
   between (becomes ready, say), it is kept and its content gets its policy back.
 - A snapshot that is merely slow (no error, not ready after ten minutes) is left in
-  place: it may still finish and be a good backup. If it later fails, the next run
-  deletes it; if it finishes, it counts like any other. One that stays unready and
+  place: it may still finish and be a good backup. If it later fails, a run deletes it
+  once it counts as failed; if it finishes, it counts like any other. One that stays unready and
   error-free indefinitely is only removed once it is older than the newest
   `SNAPSHOT_KEEP` usable ones, so if restore reports it as unfinished, inspect it
   (`kubectl -n gofer describe volumesnapshot <name>`) rather than waiting.
