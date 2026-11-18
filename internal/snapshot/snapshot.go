@@ -44,10 +44,16 @@ const snapshotAPI = "/apis/snapshot.storage.k8s.io/v1"
 // failed, when Snapshotter.Grace is unset.
 const DefaultGrace = 10 * time.Minute
 
-// mutationTimeout bounds the steps of a deletion once it has changed something (a
-// content's policy, then the snapshot), which run to the end even if the job is being
-// stopped, so nothing is left half done. It fits in a pod's default 30s grace period.
-const mutationTimeout = 10 * time.Second
+// writeTimeout and recoveryTimeout bound a deletion once it is under way: up to
+// writeTimeout to make its writes (switch the content, delete the snapshot), then, if
+// those did not go through, a fresh recoveryTimeout to read back what happened and
+// undo. Both run to the end even if the job is being stopped, so nothing is left half
+// done, and together they fit in a pod's default 30s grace period. Variables so tests
+// can shorten them.
+var (
+	writeTimeout    = 10 * time.Second
+	recoveryTimeout = 10 * time.Second
+)
 
 // MaxErrorAge bounds how long an erroring snapshot is kept, counted from its creation
 // rather than from its error. The controller restarts an error's clock whenever the
@@ -160,7 +166,13 @@ func (s *Snapshotter) failed(ctx context.Context, v volumeSnapshot) bool {
 		s.log().Warn("cannot tell whether an erroring snapshot still has its content; keeping it", "snapshot", v.Metadata.Name, "err", err)
 		return false
 	}
-	return c == nil
+	return s.failedWith(v, c)
+}
+
+// failedWith is failed for a snapshot whose own content (or nil, if it has none) has
+// already been looked up, so a deletion decides on the same content it then acts on.
+func (s *Snapshotter) failedWith(v volumeSnapshot, c *ownedContent) bool {
+	return s.errorOutlasted(v) && (!v.taken() || c == nil)
 }
 
 // errorOutlasted reports whether the snapshot reports an error that has lasted the
@@ -337,14 +349,14 @@ func (s *Snapshotter) prune(ctx context.Context, failedOnly bool) ([]string, err
 		errs    []error
 	)
 	for _, v := range items {
-		var still func(context.Context, volumeSnapshot) bool // re-checked on a fresh read just before deleting
+		var still func(volumeSnapshot, *ownedContent) bool // re-checked on each fresh read before deleting
 		switch {
 		case v.terminating():
 			continue // already going; neither a backup to count nor one to delete
 		case s.failed(ctx, v):
 			// Not a backup, and it blocks a restore: delete it wherever it sits, as long
 			// as it has not recovered in the meantime.
-			still = s.failed
+			still = s.failedWith
 		case failedOnly:
 			continue
 		case usable < keep:
@@ -402,150 +414,163 @@ type ownedContent struct {
 // content and the stored snapshot with it. (The switch has to come first: the
 // controller acts on the policy the content has when the snapshot goes.)
 //
-// Every step is conditional on what was checked, so nothing that changes in between
-// is touched:
+// Each attempt works from one consistent view, and every write is conditional on it,
+// so nothing that changes in between is touched:
 //
 //   - The snapshot is read afresh and left alone unless it is still the object that
 //     was listed (same UID, still carrying this package's labels for the claim), is
 //     not already being deleted (whoever deleted it chose what happens to its
 //     storage), and, if still is non-nil, still passes it.
-//   - The content is switched only if it belongs to the snapshot (see contentOf), and
-//     the switch is conditional on the content's UID and resourceVersion as read.
+//   - Its content is looked up once (see contentOf), and that same content is what
+//     still judges and what is switched; the switch is conditional on the content's
+//     UID and resourceVersion as read.
 //   - The delete is conditional on the snapshot's UID and resourceVersion as read, so
 //     a snapshot that changes in between, say by becoming ready, is not deleted.
 //
-// If the snapshot is not deleted and is not going, the content gets its deletion policy
-// back and the snapshot is left for the next run to judge again. If it is going (some
-// other deletion got there first), the content's policy is left as it is: a content's
-// policy is never changed while its snapshot is being deleted, in either direction.
-// Once the first write is made, the rest runs to the end under its own short timeout,
-// even if the job is being stopped. A write whose outcome is unknown
+// The snapshot controller itself changes a snapshot in answer to the switch (it adds a
+// bound-protection finalizer once the content's policy is Delete), so a delete that
+// meets a conflict starts a new attempt from a fresh read, content lookup included,
+// up to deleteAttempts times.
+//
+// If the deletion is abandoned and the snapshot is not going, every content it
+// switched gets its deletion policy back, and the snapshot is left for the next run to
+// judge again. If it is going (some other deletion got there first), the contents'
+// policies are left as they are: a content's policy is never changed while its
+// snapshot is being deleted, in either direction. A write whose outcome is unknown
 // (the request failed without a definite answer) is not assumed either way: the
-// object is read again to see what happened before anything is undone, so a backup
+// objects are read again to see what happened before anything is undone, so a backup
 // that survives is not left at Delete and one that is going is not switched back to
-// Retain, which would strand its storage.
-func (s *Snapshotter) delete(ctx context.Context, listed volumeSnapshot, still func(context.Context, volumeSnapshot) bool) (bool, error) {
+// Retain, which would strand its storage. Writes run under writeTimeout and the read
+// back and undo under a fresh recoveryTimeout, both to the end even if the job is
+// being stopped.
+func (s *Snapshotter) delete(ctx context.Context, listed volumeSnapshot, still func(volumeSnapshot, *ownedContent) bool) (bool, error) {
 	name := listed.Metadata.Name
-	var v volumeSnapshot
-	if err := s.Kube.do(ctx, "GET", s.path(name), "", nil, &v); err != nil {
-		if IsNotFound(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("snapshot: read %s before deleting it: %w", name, err)
-	}
-	switch {
-	case v.Metadata.UID != listed.Metadata.UID, !v.managedBy(s.Claim):
-		s.log().Info("snapshot is no longer the one listed; leaving it alone", "snapshot", name)
-		return false, nil
-	case v.terminating(), still != nil && !still(ctx, v):
-		return false, nil
-	}
-	c, err := s.contentOf(ctx, v)
-	if err != nil {
-		return false, err
-	}
-	if err := ctx.Err(); err != nil {
-		return false, err // being stopped: start nothing
-	}
-	// From the first write on, finish (delete, or check and undo) even if ctx ends.
-	mctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mutationTimeout)
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
 	defer cancel()
-	switched := false
-	if c != nil && c.policy != "Delete" {
-		_, err := s.setPolicy(mctx, c.name, c.uid, c.resourceVersion, "Delete")
-		switch {
-		case err == nil:
-			switched = true
-		case IsNotFound(err):
-			c = nil // the content is gone: no storage to switch
-		case refused(err):
-			// Not applied. A 409 or 422 means the content changed since it was read (a
-			// changed resourceVersion, or a different object under the name).
-			if IsConflict(err) || statusCode(err) == http.StatusUnprocessableEntity {
-				s.log().Info("content changed since it was checked; leaving the snapshot for the next run", "snapshot", name, "content", c.name)
-				return false, nil
-			}
-			return false, fmt.Errorf("snapshot: set %s to delete its storage: %w", c.name, err)
-		default:
-			// The switch may or may not have been applied; undo checks.
-			return false, errors.Join(fmt.Errorf("snapshot: set %s to delete its storage: %w", c.name, err), s.undo(mctx, v, *c))
+	var (
+		v       volumeSnapshot // the latest read
+		touched []ownedContent // contents a switch was sent for, as they were before it
+	)
+	// abandon ends a deletion that did not happen (deleteErr is what stopped it, nil if
+	// it was a decision) and reports whether the snapshot went after all.
+	abandon := func(deleteErr error) (bool, error) {
+		if len(touched) == 0 {
+			return false, deleteErr
 		}
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recoveryTimeout)
+		defer cancel()
+		gone, err := s.goneSince(rctx, v)
+		if err != nil {
+			return false, errors.Join(deleteErr, fmt.Errorf("snapshot: could not tell whether %s is going (%w), so its content's deletion policy is as the attempt left it", name, err))
+		}
+		if gone {
+			s.log().Info("snapshot is going; leaving its content's policy as it is", "snapshot", name)
+			// A delete whose answer was lost may have been this one.
+			uncertain := deleteErr != nil && !refused(deleteErr)
+			return uncertain, nil
+		}
+		errs := []error{deleteErr}
+		for _, c := range touched {
+			errs = append(errs, s.undo(rctx, v, c))
+		}
+		return false, errors.Join(errs...)
 	}
 	for attempt := 1; ; attempt++ {
+		var cur volumeSnapshot
+		if err := s.Kube.do(wctx, "GET", s.path(name), "", nil, &cur); err != nil {
+			if IsNotFound(err) {
+				if len(touched) > 0 {
+					v.Metadata.Name = name
+					return abandon(err)
+				}
+				return false, nil
+			}
+			return abandon(fmt.Errorf("snapshot: read %s before deleting it: %w", name, err))
+		}
+		v = cur
+		switch {
+		case v.Metadata.UID != listed.Metadata.UID, !v.managedBy(s.Claim):
+			s.log().Info("snapshot is no longer the one listed; leaving it alone", "snapshot", name)
+			return abandon(nil)
+		case v.terminating():
+			return abandon(nil)
+		}
+		c, err := s.contentOf(wctx, v)
+		if err != nil {
+			return abandon(err)
+		}
+		if still != nil && !still(v, c) {
+			return abandon(nil)
+		}
+		if len(touched) == 0 && ctx.Err() != nil {
+			return false, ctx.Err() // being stopped, and nothing written yet: start nothing
+		}
+		if c != nil && c.policy != "Delete" {
+			touched = append(touched, *c)
+			_, err := s.setPolicy(wctx, c.name, c.uid, c.resourceVersion, "Delete")
+			switch {
+			case err == nil:
+			case IsNotFound(err):
+				touched = touched[:len(touched)-1] // the content is gone: nothing switched
+			case IsConflict(err):
+				touched = touched[:len(touched)-1]
+				s.log().Info("content changed since it was checked; leaving the snapshot for the next run", "snapshot", name, "content", c.name)
+				return abandon(nil)
+			case statusCode(err) == http.StatusUnprocessableEntity:
+				touched = touched[:len(touched)-1]
+				// A different UID under the name (the content was replaced) is refused as a
+				// change to an immutable field; so is a change a validation rule or an
+				// admission policy rejects. Only the first is benign.
+				if replaced, rerr := s.replaced(wctx, *c); rerr == nil && replaced {
+					s.log().Info("content was replaced since it was checked; leaving the snapshot for the next run", "snapshot", name, "content", c.name)
+					return abandon(nil)
+				}
+				return abandon(fmt.Errorf("snapshot: set %s to delete its storage: refused: %w", c.name, err))
+			case refused(err):
+				touched = touched[:len(touched)-1]
+				return abandon(fmt.Errorf("snapshot: set %s to delete its storage: %w", c.name, err))
+			default:
+				// It may or may not have been applied; abandon reads back before undoing.
+				return abandon(fmt.Errorf("snapshot: set %s to delete its storage: %w", c.name, err))
+			}
+		}
 		opts := map[string]any{
 			"kind": "DeleteOptions", "apiVersion": "v1",
 			"preconditions": map[string]any{"uid": v.Metadata.UID, "resourceVersion": v.Metadata.ResourceVersion},
 		}
-		err = s.Kube.do(mctx, "DELETE", s.path(name), "application/json", opts, nil)
+		err = s.Kube.do(wctx, "DELETE", s.path(name), "application/json", opts, nil)
 		if err == nil {
 			return true, nil
 		}
 		if !IsConflict(err) || attempt == deleteAttempts {
-			break
+			if IsConflict(err) {
+				s.log().Info("snapshot kept changing; leaving it for the next run", "snapshot", name)
+				return abandon(nil)
+			}
+			return abandon(fmt.Errorf("snapshot: delete %s: %w", name, err))
 		}
-		// The snapshot changed since it was read. The snapshot controller changes it
-		// itself in answer to the switch (it adds a bound-protection finalizer once the
-		// content's policy is Delete), so read it again and, if it is still the same
-		// object and still to be deleted, try again with that version.
-		cur, ok := s.recheck(mctx, v, still)
-		if !ok {
-			break
-		}
-		v = cur
 		select {
-		case <-mctx.Done():
+		case <-wctx.Done():
 		case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
 		}
 	}
-	// Not deleted by this request, or no definite answer. A content's policy is never
-	// changed while its snapshot is going, so before undoing anything, see whether it
-	// is: gone, replaced, or being deleted (by this request if its answer was lost, by
-	// another backup job, or by someone else). Its storage then goes with the policy
-	// the deletion found.
-	gone := IsNotFound(err)
-	if !gone {
-		g, rerr := s.goneSince(mctx, v)
-		if rerr != nil {
-			return false, fmt.Errorf("snapshot: delete %s: %w; then could not tell whether it is going (%v), so its content's deletion policy is as the delete left it", name, err, rerr)
-		}
-		gone = g
-	}
-	if gone {
-		if IsNotFound(err) || IsConflict(err) {
-			s.log().Info("snapshot is already going; leaving its content's policy as it is", "snapshot", name)
-			return false, nil
-		}
-		return true, nil // the lost answer was a success
-	}
-	var undoErr error
-	if switched {
-		undoErr = s.undo(mctx, v, *c)
-	}
-	if IsConflict(err) {
-		s.log().Info("snapshot changed since it was checked; leaving it for the next run", "snapshot", name)
-		return false, undoErr
-	}
-	return false, errors.Join(fmt.Errorf("snapshot: delete %s: %w", name, err), undoErr)
 }
 
-// deleteAttempts bounds how often a delete is retried after its snapshot changed.
+// deleteAttempts bounds how many attempts a deletion makes when its snapshot keeps
+// changing under it.
 const deleteAttempts = 5
 
-// recheck reads a snapshot again after a delete conflict, and returns the fresh copy if
-// it should still be deleted: the same object, still labeled, not being deleted, and
-// still passing still if that is set.
-func (s *Snapshotter) recheck(ctx context.Context, v volumeSnapshot, still func(context.Context, volumeSnapshot) bool) (volumeSnapshot, bool) {
-	var cur volumeSnapshot
-	if err := s.Kube.do(ctx, "GET", s.path(v.Metadata.Name), "", nil, &cur); err != nil {
-		return cur, false
+// replaced reports whether a content is gone, or another object now has its name,
+// since it was read as c.
+func (s *Snapshotter) replaced(ctx context.Context, c ownedContent) (bool, error) {
+	cur, err := s.readContent(ctx, c.name)
+	if IsNotFound(err) {
+		return true, nil
 	}
-	if cur.Metadata.UID != v.Metadata.UID || !cur.managedBy(s.Claim) || cur.terminating() {
-		return cur, false
+	if err != nil {
+		return false, err
 	}
-	if still != nil && !still(ctx, cur) {
-		return cur, false
-	}
-	return cur, true
+	return cur.Metadata.UID != c.uid, nil
 }
 
 // goneSince reads a snapshot again after a delete that did not go through or whose
@@ -588,9 +613,11 @@ func (s *Snapshotter) undo(ctx context.Context, v volumeSnapshot, c ownedContent
 			return nil
 		}
 		_, err = s.setPolicy(ctx, c.name, c.uid, cur.Metadata.ResourceVersion, c.policy)
-		if err == nil || IsNotFound(err) || statusCode(err) == http.StatusUnprocessableEntity {
-			return nil // set back, or the content is gone or replaced
+		if err == nil || IsNotFound(err) {
+			return nil // set back, or the content is gone
 		}
+		// Anything else (a conflict, a 422 for a replaced content or a rejected change, an
+		// unknown outcome) is judged by the next read.
 		lastErr = err
 	}
 	return fmt.Errorf("snapshot: %s may be left with deletionPolicy Delete; set it back to %s by hand: %w", c.name, c.policy, lastErr)

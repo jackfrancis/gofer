@@ -175,7 +175,14 @@ waits until it is ready to use, and then deletes the oldest beyond the newest
   direction. When a request fails without a definite answer, the job reads the
   objects again to see what happened before undoing anything; if it cannot tell, the
   job fails and says which content to check. Once a deletion has made its first
-  change, it runs to the end (within ten seconds) even if the job is being stopped.
+  change, it runs to the end even if the job is being stopped: up to ten seconds to
+  finish its writes, then, if they did not go through, a fresh ten seconds to read
+  back what happened and undo. Each attempt decides on one reading of the snapshot
+  and its content and acts on that same content; when the snapshot changes under it
+  (the snapshot controller itself updates it once its content's policy is `Delete`),
+  the attempt starts again from a fresh read. A change the API server rejects (by
+  a validation rule or an admission policy, say) fails the job rather than passing
+  silently.
 - A snapshot that is merely slow (not ready after ten minutes, with no error or
   already taken and still copying) is left in
   place: it may still finish and be a good backup. If it later fails, a run deletes it
@@ -199,8 +206,10 @@ make snapshot  KUBECONFIG=<file>
 make snapshots KUBECONFIG=<file>
 ```
 
-`make snapshot` refuses to start while a backup job is still running: a job created
-from the CronJob bypasses its `concurrencyPolicy: Forbid`.
+`make snapshot` refuses to start while a backup job is unfinished (no `Complete` or
+`Failed` condition yet, including one waiting for its pod or a retry), or if it cannot
+list the jobs to check: a job created from the CronJob bypasses its
+`concurrencyPolicy: Forbid`.
 
 `make backup-down` stops the schedule and keeps every snapshot.
 

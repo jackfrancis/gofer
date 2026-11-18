@@ -51,9 +51,16 @@ type fakeAPI struct {
 	// quietController stops the fake controller from touching a snapshot when its
 	// content's policy changes.
 	quietController bool
-	// readUID makes reads of a content report another UID than the server checks
-	// writes against, as when the content was replaced after the read.
-	readUID   map[string]string
+	// readUID makes the next read of a content report another UID than the server
+	// holds, as when the content is replaced right after that read.
+	readUID map[string]string
+	// beforeContentGet and beforeDelete run as a content read or a snapshot DELETE
+	// arrives, before it is answered.
+	beforeContentGet func(content string)
+	beforeDelete     func(name string)
+	// delay holds a request back before it is handled; if the client gives up in the
+	// meantime, the request is dropped unapplied.
+	delay     func(method, path string) time.Duration
 	getsByKey map[string]int
 }
 
@@ -131,6 +138,8 @@ func (f *fakeAPI) deletes() []string {
 
 // deleteCalls lists every snapshot DELETE sent, retries included.
 func (f *fakeAPI) deleteCalls() []string {
+	f.mu.Lock() // a cancelled client's request may still be in the handler
+	defer f.mu.Unlock()
 	var out []string
 	for _, c := range f.calls {
 		if name, ok := strings.CutPrefix(c, "DELETE "+snapPrefix+"/"); ok {
@@ -150,6 +159,18 @@ const (
 )
 
 func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	delay := f.delay
+	f.mu.Unlock()
+	if delay != nil {
+		if d := delay(r.Method, r.URL.Path); d > 0 {
+			select {
+			case <-time.After(d):
+			case <-r.Context().Done():
+				return
+			}
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if r.Header.Get("Authorization") != "Bearer "+f.token {
@@ -244,6 +265,9 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(obj)
 	case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, snapPrefix+"/"):
 		name := strings.TrimPrefix(r.URL.Path, snapPrefix+"/")
+		if f.beforeDelete != nil {
+			f.beforeDelete(name)
+		}
 		obj, ok := f.snaps[name]
 		if !ok {
 			http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
@@ -265,6 +289,9 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, contentPrefix):
 		name := strings.TrimPrefix(r.URL.Path, contentPrefix)
+		if f.beforeContentGet != nil {
+			f.beforeContentGet(name)
+		}
 		if name == f.failGetOf {
 			http.Error(w, `{"message":"etcd unavailable"}`, http.StatusInternalServerError)
 			return
@@ -275,6 +302,7 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(f.content(name))
+		delete(f.readUID, name)
 		if f.onContentGet != nil {
 			f.onContentGet(name)
 		}
@@ -310,6 +338,10 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if fault == "forbidden" {
 			http.Error(w, `{"message":"forbidden"}`, http.StatusForbidden)
+			return
+		}
+		if fault == "invalid" { // a validation rule or admission policy rejects it
+			http.Error(w, `{"message":"ValidatingAdmissionPolicy denied request"}`, http.StatusUnprocessableEntity)
 			return
 		}
 		changed := f.contents[name] != patch.Spec.DeletionPolicy
@@ -792,6 +824,128 @@ func TestDeleteSwitchRefusedForAReplacedContent(t *testing.T) {
 	}
 	if f.contents["content-failed"] != "Retain" || len(f.deletes()) != 0 {
 		t.Fatalf("nothing may change: policy %q, deletes %v", f.contents["content-failed"], f.deletes())
+	}
+}
+
+// A 422 for a content that is still the same object is a rejected change (a validation
+// rule, an admission policy), not a replacement: the run reports it, and the failed
+// snapshot is not passed off as dealt with.
+func TestDeleteSwitchRejectedByValidation(t *testing.T) {
+	f := newFakeAPI()
+	f.addFailed("failed", ago(time.Hour), managed())
+	f.fault = func(method, _ string) string {
+		if method == "PATCH" {
+			return "invalid"
+		}
+		return ""
+	}
+	s := newSnapshotter(t, f)
+	if _, err := s.pruneFailed(context.Background()); err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("want the rejection reported, got %v", err)
+	}
+	if _, ok := f.snaps["failed"]; !ok || f.contents["content-failed"] != "Retain" {
+		t.Fatalf("nothing may change: policy %q", f.contents["content-failed"])
+	}
+}
+
+// The same on the way back: an undo the API server rejects is reported, with the
+// content to fix by hand, not taken for a replaced content.
+func TestUndoRejectedByValidation(t *testing.T) {
+	f := newFakeAPI()
+	f.addFailed("failed", ago(time.Hour), managed())
+	patches := 0
+	f.fault = func(method, _ string) string {
+		switch method {
+		case "DELETE":
+			return "before"
+		case "PATCH":
+			if patches++; patches > 1 {
+				return "invalid"
+			}
+		}
+		return ""
+	}
+	s := newSnapshotter(t, f)
+	_, err := s.pruneFailed(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "by hand") {
+		t.Fatalf("want the content to fix by hand named, got %v", err)
+	}
+	if f.contents["content-failed"] != "Delete" {
+		t.Fatalf("the fake rejected every undo; have %q", f.contents["content-failed"])
+	}
+}
+
+// A deletion decides on the same content it acts on: if a taken snapshot's content
+// turns up between the list (where it was missing, so the snapshot counted as failed)
+// and the deletion's own lookup, the snapshot is no longer failed and is kept.
+func TestDeleteDecidesOnTheContentItActsOn(t *testing.T) {
+	f := newFakeAPI()
+	f.addFailed("repaired", ago(48*time.Hour), managed())
+	f.status("repaired")["creationTime"] = ago(48 * time.Hour).Format(time.RFC3339)
+	delete(f.refs, "content-repaired")
+	delete(f.contents, "content-repaired")
+	reads := 0
+	f.beforeContentGet = func(name string) {
+		if reads++; reads == 2 { // the deletion's lookup: the binding is back
+			f.refs[name] = contentRef{"repaired", "gofer", "uid-repaired"}
+			f.contents[name] = "Retain"
+		}
+	}
+	s := newSnapshotter(t, f)
+	if deleted, err := s.pruneFailed(context.Background()); err != nil || len(deleted) != 0 {
+		t.Fatalf("want it kept, got %v %v", deleted, err)
+	}
+	if f.contents["content-repaired"] != "Retain" || len(f.deletes()) != 0 {
+		t.Fatalf("nothing may change: policy %q, deletes %v", f.contents["content-repaired"], f.deletes())
+	}
+}
+
+// Each retry prepares afresh: a content the controller binds during a conflict is
+// switched too, so it goes with the snapshot instead of being left at Retain.
+func TestDeleteRetryPreparesTheNewContent(t *testing.T) {
+	f := newFakeAPI()
+	f.addUnbound("failed", ago(time.Hour), contentRef{})
+	delete(f.refs, "snapcontent-uid-failed")
+	delete(f.contents, "snapcontent-uid-failed")
+	first := true
+	f.beforeDelete = func(name string) {
+		if first {
+			first = false
+			f.refs["snapcontent-uid-failed"] = contentRef{"failed", "gofer", "uid-failed"}
+			f.contents["snapcontent-uid-failed"] = "Retain"
+			f.status("failed")["boundVolumeSnapshotContentName"] = "snapcontent-uid-failed"
+			bump(f.snaps["failed"])
+		}
+	}
+	s := newSnapshotter(t, f)
+	if deleted, err := s.pruneFailed(context.Background()); err != nil || !slices.Equal(deleted, []string{"failed"}) {
+		t.Fatalf("want it deleted, got %v %v", deleted, err)
+	}
+	if f.contents["snapcontent-uid-failed"] != "Delete" {
+		t.Fatalf("the newly bound content must go with it, have %q", f.contents["snapcontent-uid-failed"])
+	}
+}
+
+// Reading back and undoing get their own time: a delete that uses up the write
+// budget does not leave the surviving snapshot's content at Delete.
+func TestRecoveryHasItsOwnTime(t *testing.T) {
+	w, r := writeTimeout, recoveryTimeout
+	writeTimeout, recoveryTimeout = 100*time.Millisecond, 2*time.Second
+	t.Cleanup(func() { writeTimeout, recoveryTimeout = w, r })
+	f := newFakeAPI()
+	f.addFailed("failed", ago(time.Hour), managed())
+	f.delay = func(method, _ string) time.Duration {
+		if method == "DELETE" {
+			return time.Second
+		}
+		return 0
+	}
+	s := newSnapshotter(t, f)
+	if _, err := s.pruneFailed(context.Background()); err == nil {
+		t.Fatal("want the timed-out delete reported")
+	}
+	if _, ok := f.snaps["failed"]; !ok || f.contents["content-failed"] != "Retain" {
+		t.Fatalf("the surviving snapshot's content must get Retain back, have %q", f.contents["content-failed"])
 	}
 }
 

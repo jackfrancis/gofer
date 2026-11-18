@@ -25,7 +25,7 @@ deletionPolicy: Retain
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
-metadata: {name: data-gofer-0, namespace: gofer}
+metadata: {name: snapcheck-0, namespace: gofer} # the check's own claim, not gofer's data-gofer-0
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: csi-hostpath-sc

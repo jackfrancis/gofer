@@ -586,9 +586,14 @@ snapshot: deploy-target
 	@$(KUBECTL) -n $(KUBE_NS) get cronjob gofer-snapshot >/dev/null 2>&1 || { \
 		echo "ERROR: scheduled snapshots are not set up here; run 'make backup-apply' first."; exit 1; }
 	@# A Job created from the CronJob bypasses its concurrencyPolicy (Forbid), so do
-	@# not start one while another backup Job is still running.
-	@active=$$($(KUBECTL) -n $(KUBE_NS) get jobs -o jsonpath='{range .items[?(@.spec.template.spec.serviceAccountName=="gofer-snapshotter")]}{.metadata.name}{" "}{.status.active}{"\n"}{end}' | awk '$$2 > 0 {print $$1}'); \
-		[ -z "$$active" ] || { echo "ERROR: a backup job is still running ($$active); wait for it to finish, then retry."; exit 1; }
+	@# not start one while another backup Job is unfinished: one without a true
+	@# Complete or Failed condition, which includes one still waiting for its pod or
+	@# for a retry (the same rule as the restore preflight). If the Jobs cannot be
+	@# listed, do not start one either.
+	@jobs=$$($(KUBECTL) -n $(KUBE_NS) get jobs -o jsonpath='{range .items[?(@.spec.template.spec.serviceAccountName=="gofer-snapshotter")]}{.metadata.name}{" "}{range .status.conditions[?(@.status=="True")]}{.type}{" "}{end}{"\n"}{end}') || { \
+		echo "ERROR: could not list the backup jobs to check that none is running; not starting another."; exit 1; }; \
+		unfinished=$$(printf '%s\n' "$$jobs" | awk 'NF && !/ (Complete|Failed) / {print $$1}'); \
+		[ -z "$$unfinished" ] || { echo "ERROR: a backup job has not finished ($$unfinished); wait for it to finish, then retry."; exit 1; }
 	@job=gofer-snapshot-manual-$$(date -u +%Y%m%d%H%M%S); \
 		$(KUBECTL) -n $(KUBE_NS) create job "$$job" --from=cronjob/gofer-snapshot >/dev/null; \
 		echo "job $$job started; waiting up to $(SNAPSHOT_TIMEOUT)s"; \

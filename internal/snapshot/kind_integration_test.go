@@ -12,8 +12,10 @@ package snapshot
 //	GOFER_IT_CLASS   a Retain VolumeSnapshotClass of a working driver
 //	GOFER_IT_BOGUS   a VolumeSnapshotClass naming a driver nobody serves
 //
-// The namespace gofer must hold a bound claim data-gofer-0. One way to get there, on a
-// throwaway cluster:
+// The namespace gofer must hold a bound claim snapcheck-0. The check snapshots and
+// prunes only that claim, never gofer's own data-gofer-0, so the backups of a real
+// gofer in the same namespace are never touched (pruning selects by the claim label).
+// Still, run it on a throwaway cluster; one way to get there:
 //
 //	kind create cluster --name snapcheck --kubeconfig ./snapcheck.kubeconfig
 //	export KUBECONFIG=./snapcheck.kubeconfig
@@ -56,8 +58,12 @@ func itKube(t *testing.T) *Kube {
 	return NewKube(os.Getenv("GOFER_IT_SERVER"), func() (string, error) { return tok, nil }, client)
 }
 
+// itClaim is the check's own claim: never gofer's data-gofer-0, whose backups a prune
+// with Keep=1 would otherwise cut down to one.
+const itClaim = "snapcheck-0"
+
 func itSnapshotter(t *testing.T, class string) *Snapshotter {
-	return &Snapshotter{Kube: itKube(t), Namespace: "gofer", Claim: "data-gofer-0", Class: class, Keep: 1, Poll: time.Second}
+	return &Snapshotter{Kube: itKube(t), Namespace: "gofer", Claim: itClaim, Class: class, Keep: 1, Poll: time.Second}
 }
 
 func raw(t *testing.T, k *Kube, path string) map[string]any {
@@ -245,7 +251,7 @@ func TestKind(t *testing.T) {
 		var list struct {
 			Items []volumeSnapshot `json:"items"`
 		}
-		sel := url.Values{"labelSelector": {LabelManagedBy + "=" + ManagedBy + "," + LabelClaim + "=data-gofer-0"}}
+		sel := url.Values{"labelSelector": {LabelManagedBy + "=" + ManagedBy + "," + LabelClaim + "=" + itClaim}}
 		if err := b.Kube.do(ctx, "GET", b.path("")+"?"+sel.Encode(), "", nil, &list); err != nil {
 			t.Fatal(err)
 		}
