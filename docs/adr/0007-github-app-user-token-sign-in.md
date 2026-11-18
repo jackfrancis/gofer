@@ -175,31 +175,70 @@ side effect of someone else's installation.
     client already handles them.
   - As a backstop, an issue or PR body whose `repository_url` names a repository
     other than the gated one is dropped unless that repository passes the gate.
-- **Visibility is kept per repository, apart from the items.**
-  - New table `repository_visibility`, keyed by owner and repository name (the name
-    work items carry). Columns: the repository's numeric ID, the verdict (`public`,
+- **Items and verdicts are bound to the repository's numeric ID, not its name.**
+  - A repository name is not an identity. A private repository can be renamed and a
+    new public one created under its old name; GitHub then stops redirecting the old
+    name. Keyed by name, the new repository's `public` verdict would apply to the old
+    repository's stored items.
+  - Threads have the same problem. Today an item's ID is `github:<owner>/<repo>#<n>`
+    (`internal/github/github.go`), and write-backs merge onto the stored item by that
+    ID, so an unrelated issue with the same number in the new repository would
+    inherit the old conversation.
+  - `GitHubRef` therefore gains `RepoID`, the repository's numeric ID, and `IssueID`,
+    the issue's or PR's own global numeric ID. Search hits carry the issue ID; the
+    repository ID comes from the visibility check, which already fetches the
+    repository. Ingest writes both on every item.
+  - **Matching.** An incoming item merges onto a stored one (thread, read cursor,
+    hidden flag) only when their `IssueID`s agree. If either lacks an `IssueID`, the
+    `RepoID` and number must both agree. `worklist.MergeRunItems` applies this rule.
+    - **Same IDs, new name** (a renamed repository): the stored item is re-keyed to
+      the new name, and its thread follows.
+    - **Same name and number, different IDs** (a reused name): the stored item is
+      re-keyed to an orphan key, `github:<old name>#<n>@r<old RepoID>`, and keeps its
+      thread. The incoming item is stored fresh, with an empty thread.
+- **Visibility is kept per repository ID, apart from the items.**
+  - New table `repository_visibility`, keyed by owner and `RepoID`. Columns: the
+    repository's current full name (informational only), the verdict (`public`,
     `private` or `inaccessible`), and `checked_at`, when the check ran. A repository
     with no row is unknown. This is migration `0002`, an additive table.
+  - A verdict reaches an item only through the item's `RepoID`, never by name.
   - Work items carry no visibility. A run's write-back therefore has nothing to
     overwrite, and a ranking run that read an item as public cannot write back a stale
     classification after ingest has found it private.
-  - A new item is classified the moment it is stored: there is no per-item label to
-    initialise. The first ingest's new rows are visible to the enrich and rank steps
-    that follow it in the same run, once their repository's verdict has been reported.
-  - Only a new sink call, `ReportVisibility(repo, id, verdict, checkedAt)`, changes a
-    row, in one transaction. It applies only when `checkedAt` is newer than the stored
-    one, so when ingests overlap, an older check finishing late cannot overwrite a
-    newer one.
+  - A new item counts as classified as soon as its repository has a verdict, with no
+    per-item label to set. The first ingest's new rows are therefore visible to the
+    enrich and rank steps later in the same run, once their repository's verdict has
+    been reported.
+  - Only a new sink call, `ReportVisibility(repoID, fullName, verdict, checkedAt)`,
+    changes a row, in one transaction. It applies only when `checkedAt` is newer than
+    the stored one, so when ingests overlap, an older check finishing late cannot
+    overwrite a newer one.
   - Ingest reports a repository's verdict before writing back that repository's
     items.
+- **Legacy items have no `RepoID` or `IssueID`, so their identity can be ambiguous.**
+  Ingest binds a legacy item to a `RepoID` only on evidence that it is the same
+  repository:
+  - **A search hit:** this ingest's search returns the same name and number, now with
+    IDs (the user is involved in it now). The item binds to those IDs.
+  - **A rename redirect:** looking up the stored name redirects to a renamed
+    repository. GitHub redirects only to the original, so that repository's ID is
+    the item's.
+
+  A legacy item with neither is ambiguous. It is held back from every model input,
+  its thread is never merged onto a new item, and it stays visible to the user,
+  marked as unverified. Every item stored before rollout came through a token that
+  reads public repositories only, so this affects only items whose name changed hands
+  in the meantime.
 - **Ingest checks repositories, not just search hits.** A repository that turns
   private drops out of public search, and an item that closed before rollout never
   shows up in an open-item search again, so checking only search hits would miss both.
   - Each ingest checks the repositories of its search hits, plus an inventory of the
     repositories gofer has stored for the user. The inventory comes from a new
-    endpoint, `GET /agent/worklist/repositories`: repository names and numeric IDs,
-    with no item bodies or threads.
-  - The ID follows a renamed repository; the gate's canonical name updates it.
+    endpoint, `GET /agent/worklist/repositories`: repository IDs and names, with no
+    item bodies or threads.
+  - A repository with a known ID is checked by ID (`GET /repositories/{id}`), which
+    follows renames and can never land on a different repository that took the old
+    name. Only legacy names go through the binding rules above.
   - Large inventories are checked in a rotating window per run, oldest check first.
 - **What each check outcome does:**
   - **Public:** reported as `public`; the repository's search hits are written as
@@ -213,15 +252,22 @@ side effect of someone else's installation.
     incomplete. A complete fetch is what lets `runIngest` call `retireMissing`, so
     open work stays on the radar until a later ingest can check it.
   - **Retirement needs a check in the same ingest.** Even after a complete search, an
-    absent item is retired only if its repository was confirmed public *in this
-    ingest*. A repository that has just turned private drops out of public search, so
-    its open items would otherwise look finished. If that repository fell outside
-    this run's rotating window, it would be retired before its next check.
+    absent item is retired only if this ingest confirmed that its search could have
+    seen the item.
+    - A repository that has just turned private drops out of public search, so its
+      open items would otherwise look finished. If that repository fell outside this
+      run's rotating window, it would be retired before its next check.
+    - **Public-only run:** the repository must be confirmed `public` in this pass.
+    - **Private-enabled run** (credential carries `github:private`, searches carry no
+      `is:public`): the repository must be confirmed *accessible*, public or private,
+      in this pass. A private PR gofer legitimately ingested is then retired once it
+      closes, instead of staying on the radar for ever.
     - Before retiring, ingest checks the repositories of the absent items first,
       ahead of the rotating window.
-    - An absent item whose repository was not confirmed public in this pass is kept
-      as it is, and its retirement waits for a later ingest.
-    - `retireMissing` takes the set of repositories confirmed public in this pass.
+    - An absent item whose repository's check in this pass was missing, unknown or
+      `inaccessible` is kept as it is, and its retirement waits for a later ingest.
+      So is an ambiguous legacy item.
+    - `retireMissing` takes the set of repository IDs that qualify in this pass.
   - Ingests after rollout work through every stored repository, the first of them
     taking as many as its window allows. Repositories stored before this release
     have no row, so their items are held back from models until they are checked.
@@ -541,6 +587,8 @@ all user tokens" on the OAuth app's settings page once the switch is made.
    - `GITHUB_CLIENT_KIND`, with each kind's scopes;
    - `GITHUB_PRIVATE_REPOS` (off), with the `github:private` run scope:
      - the visibility gate and the redirect check;
+     - `RepoID` and `IssueID` on items, ID-based matching in `MergeRunItems`, and the
+       legacy binding rules;
      - the `repository_visibility` table with `ReportVisibility`, and the repository
        inventory;
      - ingest's unknown-visibility rule, and retirement only after a check in the
@@ -646,6 +694,10 @@ Left unverified:
   check is designed for both.
 - **The check-token endpoint** (`POST /applications/{client_id}/token`) for `ghu_`
   tokens, and its answer for a revoked grant.
+- **ID lookups under an app token:** `GET /repositories/{id}` for a public repository
+  the app is not installed on, and whether an issue keeps its global `id` when it is
+  transferred. If it does not, a transferred issue arrives as a new item, and its old
+  copy waits for its own repository's check before it is retired.
 - **A dispatched run's credential carrying `github:private`** once the AgentApp
   ceiling allows it. AEI's code copies requested scopes within the ceiling into the
   minted credential, but no run with the new scope has been dispatched.
