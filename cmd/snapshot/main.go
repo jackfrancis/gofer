@@ -8,8 +8,8 @@
 //	SNAPSHOT_CLAIM  the claim to snapshot (default data-gofer-0)
 //	SNAPSHOT_KEEP   usable snapshots to keep (default 28)
 //	SNAPSHOT_WAIT   how long to wait for the snapshot to be usable (default 10m); also
-//	                how long any snapshot may keep reporting an error before it is
-//	                deleted as failed
+//	                how long a snapshot's error may last before it is deleted as
+//	                failed
 package main
 
 import (

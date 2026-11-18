@@ -84,6 +84,13 @@ func IsNotFound(err error) bool {
 	return errors.As(err, &se) && se.Code == http.StatusNotFound
 }
 
+// IsConflict reports whether err is a 409 from the API server, as for a delete whose
+// preconditions no longer hold.
+func IsConflict(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.Code == http.StatusConflict
+}
+
 // do sends one request with an optional JSON body and decodes a JSON answer into out
 // (if non-nil).
 func (k *Kube) do(ctx context.Context, method, path, contentType string, body, out any) error {
