@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackfrancis/gofer/internal/httpretry"
 )
 
 func TestParseActionsURL(t *testing.T) {
@@ -476,7 +478,7 @@ func TestActionsJobLogForbiddenCarriesReason(t *testing.T) {
 			r: resp{403, map[string]string{"X-OAuth-Scopes": "read:user, user:email", "X-Accepted-OAuth-Scopes": ""},
 				`{"message":"Although you appear to have the correct authorization credentials, the ` + "`example`" + ` organization has enabled OAuth App access restrictions."}`},
 			is: ErrLogForbidden,
-			want: []string{"status 403", "GitHub refused this token access to the job log",
+			want: []string{"job log: access denied (status 403)", "GitHub refused this token access to the job log",
 				`GitHub says "Although you appear to have the correct authorization credentials`,
 				"the token's scopes: read:user, user:email", "scopes this endpoint accepts: (none)",
 				"not anything the job itself printed"},
@@ -541,5 +543,27 @@ func TestReasonClipsMessage(t *testing.T) {
 	r := reason{message: clipReason(strings.Repeat("é", 400))}
 	if len(r.message) > 304 || !strings.HasSuffix(r.message, "…") {
 		t.Errorf("message not clipped: %d bytes", len(r.message))
+	}
+}
+
+// With the production retry transport, a 429 whose Retry-After outlasts the request
+// deadline still reaches the caller as a rate limit, with GitHub's reason, instead
+// of a bare deadline error.
+func TestActionsJobLogRateLimitThroughRetryTransport(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"message":"You have exceeded a secondary rate limit."}`))
+	}))
+	defer api.Close()
+	c := NewClient(httpretry.Wrap(&http.Client{Timeout: 2 * time.Second}), api.URL)
+	start := time.Now()
+	_, err := c.ActionsJobLog(context.Background(), "tok", "o/r", 42, &bytes.Buffer{}, 1<<20)
+	if !errors.Is(err, ErrLogRateLimited) || !strings.Contains(err.Error(), "status 429") ||
+		!strings.Contains(err.Error(), `GitHub says "You have exceeded a secondary rate limit."`) {
+		t.Fatalf("err = %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Errorf("took %s: it waited out the deadline", time.Since(start))
 	}
 }

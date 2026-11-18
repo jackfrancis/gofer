@@ -141,6 +141,8 @@ func newGHAFake(t *testing.T) *ghaFake {
 			_, _ = w.Write([]byte(ghaSameSecondStep3))
 		case "/48":
 			_, _ = w.Write([]byte(ghaBackgroundLog))
+		case "/50":
+			_, _ = w.Write([]byte(ghaFailLog))
 		case "/48-2":
 			_, _ = w.Write([]byte(ghaBackgroundStep2))
 		case "/48-3":
@@ -154,6 +156,15 @@ func newGHAFake(t *testing.T) *ghaFake {
 	f.api = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer s3cret-token" {
 			t.Errorf("API call without the token: %s", r.URL.Path)
+		}
+		if r.URL.Path == "/repos/o/r/actions/jobs/50/steps/3/logs" {
+			// Job 50's whole log is served (and is too large); its step log is refused,
+			// with GitHub's full-length restriction message.
+			w.Header().Set("X-OAuth-Scopes", "read:user, user:email")
+			w.Header().Set("X-Accepted-OAuth-Scopes", "")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":` + strconvQuote(ghaRestrictionMessage) + `}`))
+			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/repos/o/r/actions/jobs/49/") && strings.HasSuffix(r.URL.Path, "/logs") {
 			// Job 49's logs are refused to this token, as an organisation's OAuth App
@@ -181,6 +192,8 @@ func newGHAFake(t *testing.T) *ghaFake {
 			_, _ = w.Write([]byte(ghaJobJSONSteps(45, "lint", "failure", ghaSameSecondSteps)))
 		case "/repos/o/r/actions/jobs/48":
 			_, _ = w.Write([]byte(ghaJobJSONSteps(48, "e2e", "failure", ghaBackgroundSteps)))
+		case "/repos/o/r/actions/jobs/50":
+			_, _ = w.Write([]byte(ghaJobJSON(50, "links", "failure")))
 		case "/repos/o/r/actions/jobs/49":
 			_, _ = w.Write([]byte(ghaJobJSON(49, "links", "failure")))
 		case "/repos/o/r/actions/jobs/47":
@@ -551,7 +564,7 @@ func TestGHALogForbiddenSaysWhy(t *testing.T) {
 	ghaCheckClean(t, f, out)
 	for _, want := range []string{
 		"✗ 3 Run tests: failure",
-		"could not be read: job log access denied (status 403): GitHub refused this token access to the job log",
+		"could not be read: job log: access denied (status 403): GitHub refused this token access to the job log",
 		`GitHub says "the example organization has enabled OAuth App access restrictions"`,
 		"the token's scopes: read:user, user:email",
 		"scopes this endpoint accepts: (none)",
@@ -564,6 +577,31 @@ func TestGHALogForbiddenSaysWhy(t *testing.T) {
 	_, err := box.Invoke(context.Background(), "gha_read", json.RawMessage(`{"job_id":49,"step":3}`))
 	if err == nil || !strings.Contains(err.Error(), "OAuth App access restrictions") {
 		t.Errorf("gha_read: err = %v", err)
+	}
+}
+
+// ghaRestrictionMessage is the length of GitHub's organisation-restriction message.
+const ghaRestrictionMessage = "Although you appear to have the correct authorization credentials, the `example` organization has enabled OAuth App access restrictions, meaning that data access to third-parties is limited. For more information on these restrictions, including how to enable this app, visit https://docs.github.com/articles/restricting-access-to-your-organization-s-data/"
+
+func strconvQuote(s string) string { b, _ := json.Marshal(s); return string(b) }
+
+// When the job log is too large and the step-log fallback is refused, the summary
+// keeps the refusal's scope details, as it does for a refused job log.
+func TestGHAStepFallbackRefusalKeepsScopes(t *testing.T) {
+	box, f := ghaBox(t)
+	box.ci.Close()
+	box.ci = prow.NewSession(prow.NewClient("http://127.0.0.1:1"), prow.Limits{MaxObjectBytes: int64(len(ghaStep42of3))})
+	out := ciInvoke(t, box, "gha_job_summary", `{"job_id":50}`)
+	ghaCheckClean(t, f, out)
+	for _, want := range []string{
+		"could not be read: job log too large",
+		"step 3's own log could not be read: step log: access denied (status 403): GitHub refused this token access to the step log",
+		"the token's scopes: read:user, user:email; scopes this endpoint accepts: (none)",
+		"has enabled OAuth App access restrictions",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary lacks %q:\n%s", want, out)
+		}
 	}
 }
 

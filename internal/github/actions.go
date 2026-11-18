@@ -40,7 +40,7 @@ var ErrLogTooLarge = errors.New("job log too large")
 // rate limit). The error carries GitHub's own reason and the token's and endpoint's
 // OAuth scopes, which is what tells a missing scope from an organisation's OAuth App
 // access restriction.
-var ErrLogForbidden = errors.New("job log access denied")
+var ErrLogForbidden = errors.New("access denied")
 
 // ErrLogRateLimited reports a log request refused by a GitHub rate limit.
 var ErrLogRateLimited = errors.New("GitHub rate limit")
@@ -324,7 +324,7 @@ func (c *Client) logLocation(ctx context.Context, token, path, what string, w io
 		if r.rateLimited || resp.StatusCode == http.StatusTooManyRequests {
 			return nil, 0, fmt.Errorf("%s: %w (status %d)%s", what, ErrLogRateLimited, resp.StatusCode, r.String())
 		}
-		return nil, 0, fmt.Errorf("%w (status %d): GitHub refused this token access to the %s (gofer's access to GitHub, not anything the job itself printed)%s", ErrLogForbidden, resp.StatusCode, what, r.String())
+		return nil, 0, fmt.Errorf("%s: %w (status %d): GitHub refused this token access to the %s (gofer's access to GitHub, not anything the job itself printed)%s", what, ErrLogForbidden, resp.StatusCode, what, r.String())
 	case resp.StatusCode < 300 || resp.StatusCode > 399:
 		return nil, 0, fmt.Errorf("%s: status %d%s", what, resp.StatusCode, apiReason(resp).String())
 	}
@@ -372,12 +372,11 @@ func apiReason(resp *http.Response) reason {
 	return r
 }
 
-// String renders the reason as a suffix for an error ("" when there is none).
+// String renders the reason as a suffix for an error ("" when there is none). The
+// scopes come first: they are short and decide the diagnosis, and GitHub's message
+// can run to hundreds of bytes, so a caller that clips the error keeps them.
 func (r reason) String() string {
 	var parts []string
-	if r.message != "" {
-		parts = append(parts, fmt.Sprintf("GitHub says %q", r.message))
-	}
 	scopes := func(s string) string {
 		if strings.TrimSpace(s) == "" {
 			return "(none)"
@@ -392,6 +391,9 @@ func (r reason) String() string {
 	}
 	if r.sso {
 		parts = append(parts, "the organisation requires SAML SSO authorisation for this token")
+	}
+	if r.message != "" {
+		parts = append(parts, fmt.Sprintf("GitHub says %q", r.message))
 	}
 	if len(parts) == 0 {
 		return ""

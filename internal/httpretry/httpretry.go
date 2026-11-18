@@ -137,6 +137,13 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return resp, err
 		}
 		attempt := total - *left
+		// A wait that cannot finish before the request's deadline would only end in
+		// the deadline's error, discarding this result: a 429's status, Retry-After
+		// and body tell the caller more. Return it as it is instead.
+		wait := retryDelay(resp, base, max, attempt)
+		if !fitsDeadline(req.Context(), wait) {
+			return resp, err
+		}
 		*left--
 
 		rewound, rerr := rewind(req)
@@ -145,7 +152,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		req = rewound
 		drain(resp)
-		if werr := waitBeforeRetry(req.Context(), resp, base, max, attempt); werr != nil {
+		if werr := sleepCtx(req.Context(), wait); werr != nil {
 			return nil, werr
 		}
 	}
@@ -177,10 +184,9 @@ func drain(resp *http.Response) {
 	_ = resp.Body.Close()
 }
 
-// waitBeforeRetry blocks before a retry, returning early if the context is
-// cancelled. A 429 with a Retry-After header uses that delay (capped);
-// otherwise an exponentially growing, half-jittered backoff.
-func waitBeforeRetry(ctx context.Context, prev *http.Response, base, max time.Duration, attempt int) error {
+// retryDelay is how long to wait before a retry: a Retry-After header's delay
+// (capped), otherwise an exponentially growing, half-jittered backoff.
+func retryDelay(prev *http.Response, base, max time.Duration, attempt int) time.Duration {
 	wait := jitteredBackoff(base, max, attempt)
 	if d, ok := retryAfter(prev); ok {
 		wait = d
@@ -188,10 +194,22 @@ func waitBeforeRetry(ctx context.Context, prev *http.Response, base, max time.Du
 			wait = maxRetryAfter
 		}
 	}
-	if wait <= 0 {
+	return wait
+}
+
+// fitsDeadline reports whether a wait of d ends before ctx's deadline (always,
+// without one).
+func fitsDeadline(ctx context.Context, d time.Duration) bool {
+	deadline, ok := ctx.Deadline()
+	return !ok || time.Until(deadline) > d
+}
+
+// sleepCtx blocks for d, returning early if the context is cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
 		return nil
 	}
-	timer := time.NewTimer(wait)
+	timer := time.NewTimer(d)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
