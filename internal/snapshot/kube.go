@@ -91,6 +91,23 @@ func IsConflict(err error) bool {
 	return errors.As(err, &se) && se.Code == http.StatusConflict
 }
 
+// statusCode is the HTTP status of an API server error, or 0 if err is not one.
+func statusCode(err error) int {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code
+	}
+	return 0
+}
+
+// refused reports whether the API server answered a request with a 4xx: the request
+// was not applied. Anything else that fails (a transport error, a 5xx) may or may not
+// have been applied.
+func refused(err error) bool {
+	c := statusCode(err)
+	return c >= 400 && c < 500
+}
+
 // do sends one request with an optional JSON body and decodes a JSON answer into out
 // (if non-nil).
 func (k *Kube) do(ctx context.Context, method, path, contentType string, body, out any) error {

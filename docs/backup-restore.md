@@ -37,6 +37,13 @@ The additional restore preflight, backup-pause, and failure-recovery safeguards 
 covered by fake-kubectl tests; they have not yet been re-rehearsed against a live
 cluster.
 
+The scheduled job's cleanup of failed snapshots is covered by unit tests against a
+fake API server and by an opt-in check against a real snapshot controller and CSI
+driver (kind with csi-driver-host-path; see
+`internal/snapshot/kind_integration_test.go`): conditional writes, pruning with the
+stored snapshot, a failed snapshot cleaned up by its run, and a snapshot that never
+finishes left in place and then pruned. It has not yet been rehearsed on AKS.
+
 ## Protection that needs no setup
 
 `make deploy` sets the data volume's reclaim policy to **`Retain`**

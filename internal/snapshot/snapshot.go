@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"sort"
 	"time"
@@ -457,21 +458,44 @@ func (s *Snapshotter) delete(ctx context.Context, listed volumeSnapshot, still f
 			switched = true
 		case IsNotFound(err):
 			c = nil // the content is gone: no storage to switch
-		case IsConflict(err):
-			s.log().Info("content changed since it was checked; leaving the snapshot for the next run", "snapshot", name, "content", c.name)
-			return false, nil
+		case refused(err):
+			// Not applied. A 409 or 422 means the content changed since it was read (a
+			// changed resourceVersion, or a different object under the name).
+			if IsConflict(err) || statusCode(err) == http.StatusUnprocessableEntity {
+				s.log().Info("content changed since it was checked; leaving the snapshot for the next run", "snapshot", name, "content", c.name)
+				return false, nil
+			}
+			return false, fmt.Errorf("snapshot: set %s to delete its storage: %w", c.name, err)
 		default:
 			// The switch may or may not have been applied; undo checks.
 			return false, errors.Join(fmt.Errorf("snapshot: set %s to delete its storage: %w", c.name, err), s.undo(mctx, v, *c))
 		}
 	}
-	opts := map[string]any{
-		"kind": "DeleteOptions", "apiVersion": "v1",
-		"preconditions": map[string]any{"uid": v.Metadata.UID, "resourceVersion": v.Metadata.ResourceVersion},
-	}
-	err = s.Kube.do(mctx, "DELETE", s.path(name), "application/json", opts, nil)
-	if err == nil {
-		return true, nil
+	for attempt := 1; ; attempt++ {
+		opts := map[string]any{
+			"kind": "DeleteOptions", "apiVersion": "v1",
+			"preconditions": map[string]any{"uid": v.Metadata.UID, "resourceVersion": v.Metadata.ResourceVersion},
+		}
+		err = s.Kube.do(mctx, "DELETE", s.path(name), "application/json", opts, nil)
+		if err == nil {
+			return true, nil
+		}
+		if !IsConflict(err) || attempt == deleteAttempts {
+			break
+		}
+		// The snapshot changed since it was read. The snapshot controller changes it
+		// itself in answer to the switch (it adds a bound-protection finalizer once the
+		// content's policy is Delete), so read it again and, if it is still the same
+		// object and still to be deleted, try again with that version.
+		cur, ok := s.recheck(mctx, v, still)
+		if !ok {
+			break
+		}
+		v = cur
+		select {
+		case <-mctx.Done():
+		case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+		}
 	}
 	// Not deleted by this request, or no definite answer. A content's policy is never
 	// changed while its snapshot is going, so before undoing anything, see whether it
@@ -502,6 +526,26 @@ func (s *Snapshotter) delete(ctx context.Context, listed volumeSnapshot, still f
 		return false, undoErr
 	}
 	return false, errors.Join(fmt.Errorf("snapshot: delete %s: %w", name, err), undoErr)
+}
+
+// deleteAttempts bounds how often a delete is retried after its snapshot changed.
+const deleteAttempts = 5
+
+// recheck reads a snapshot again after a delete conflict, and returns the fresh copy if
+// it should still be deleted: the same object, still labeled, not being deleted, and
+// still passing still if that is set.
+func (s *Snapshotter) recheck(ctx context.Context, v volumeSnapshot, still func(context.Context, volumeSnapshot) bool) (volumeSnapshot, bool) {
+	var cur volumeSnapshot
+	if err := s.Kube.do(ctx, "GET", s.path(v.Metadata.Name), "", nil, &cur); err != nil {
+		return cur, false
+	}
+	if cur.Metadata.UID != v.Metadata.UID || !cur.managedBy(s.Claim) || cur.terminating() {
+		return cur, false
+	}
+	if still != nil && !still(ctx, cur) {
+		return cur, false
+	}
+	return cur, true
 }
 
 // goneSince reads a snapshot again after a delete that did not go through or whose
@@ -544,8 +588,8 @@ func (s *Snapshotter) undo(ctx context.Context, v volumeSnapshot, c ownedContent
 			return nil
 		}
 		_, err = s.setPolicy(ctx, c.name, c.uid, cur.Metadata.ResourceVersion, c.policy)
-		if err == nil || IsNotFound(err) {
-			return nil
+		if err == nil || IsNotFound(err) || statusCode(err) == http.StatusUnprocessableEntity {
+			return nil // set back, or the content is gone or replaced
 		}
 		lastErr = err
 	}

@@ -48,6 +48,12 @@ type fakeAPI struct {
 	// applying it, "after" applies it and answers 500 (a lost response).
 	fault     func(method, path string) string
 	contentRV map[string]int // content name -> resourceVersion
+	// quietController stops the fake controller from touching a snapshot when its
+	// content's policy changes.
+	quietController bool
+	// readUID makes reads of a content report another UID than the server checks
+	// writes against, as when the content was replaced after the read.
+	readUID   map[string]string
 	getsByKey map[string]int
 }
 
@@ -112,7 +118,19 @@ func (f *fakeAPI) terminate(obj map[string]any) {
 	obj["metadata"].(map[string]any)["deletionTimestamp"] = now.Format(time.RFC3339)
 }
 
+// deletes lists the snapshots a DELETE was sent for, each once, in order.
 func (f *fakeAPI) deletes() []string {
+	var out []string
+	for _, name := range f.deleteCalls() {
+		if !slices.Contains(out, name) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// deleteCalls lists every snapshot DELETE sent, retries included.
+func (f *fakeAPI) deleteCalls() []string {
 	var out []string
 	for _, c := range f.calls {
 		if name, ok := strings.CutPrefix(c, "DELETE "+snapPrefix+"/"); ok {
@@ -280,12 +298,28 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			} `json:"spec"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&patch)
-		if m := patch.Metadata; (m.UID != "" && m.UID != contentUID(name)) || (m.ResourceVersion != "" && m.ResourceVersion != strconv.Itoa(f.contentRV[name])) {
+		// As the real API server answers: a different UID is an invalid change to an
+		// immutable field (422), a stale resourceVersion a conflict (409).
+		if m := patch.Metadata; m.UID != "" && m.UID != contentUID(name) {
+			http.Error(w, `{"message":"metadata.uid: Invalid value: field is immutable"}`, http.StatusUnprocessableEntity)
+			return
+		}
+		if m := patch.Metadata; m.ResourceVersion != "" && m.ResourceVersion != strconv.Itoa(f.contentRV[name]) {
 			http.Error(w, `{"message":"the object has been modified"}`, http.StatusConflict)
 			return
 		}
+		if fault == "forbidden" {
+			http.Error(w, `{"message":"forbidden"}`, http.StatusForbidden)
+			return
+		}
+		changed := f.contents[name] != patch.Spec.DeletionPolicy
 		f.contents[name] = patch.Spec.DeletionPolicy
 		f.contentRV[name]++
+		// The snapshot controller answers a policy change by adding or removing the
+		// snapshot's bound-protection finalizer, which changes its resourceVersion.
+		if snap, ok := f.snaps[f.refs[name].name]; ok && changed && !f.quietController {
+			bump(snap)
+		}
 		if f.onPatch != nil {
 			f.onPatch(name)
 		}
@@ -298,8 +332,12 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // content is a content object as the fake serves it.
 func (f *fakeAPI) content(name string) map[string]any {
 	ref := f.refs[name]
+	uid := contentUID(name)
+	if u, ok := f.readUID[name]; ok {
+		uid = u
+	}
 	return map[string]any{
-		"metadata": map[string]any{"name": name, "uid": contentUID(name), "resourceVersion": strconv.Itoa(f.contentRV[name])},
+		"metadata": map[string]any{"name": name, "uid": uid, "resourceVersion": strconv.Itoa(f.contentRV[name])},
 		"spec": map[string]any{
 			"deletionPolicy":    f.contents[name],
 			"volumeSnapshotRef": map[string]any{"name": ref.name, "namespace": ref.namespace, "uid": ref.uid},
@@ -447,8 +485,12 @@ func TestPrune(t *testing.T) {
 	if f.contents["content-good-3"] != "Retain" {
 		t.Fatal("a kept snapshot's content must stay Retain")
 	}
-	for i, call := range f.calls {
-		if strings.HasPrefix(call, "DELETE") && !strings.HasPrefix(f.calls[i-1], "PATCH") {
+	patched := map[string]bool{}
+	for _, call := range f.calls {
+		if c, ok := strings.CutPrefix(call, "PATCH "+contentPrefix+"content-"); ok {
+			patched[c] = true
+		}
+		if name, ok := strings.CutPrefix(call, "DELETE "+snapPrefix+"/"); ok && !patched[name] {
 			t.Fatalf("every delete must follow its content patch: %v", f.calls)
 		}
 	}
@@ -716,6 +758,63 @@ func TestPruneTakenWithoutItsContent(t *testing.T) {
 	})
 }
 
+// The snapshot controller changes a snapshot (adding a finalizer) as soon as its
+// content's policy becomes Delete, so the first, conditional delete meets a conflict.
+// The snapshot is read again and, still the same and still failed, deleted on the
+// next try. (Found on a real cluster: without the retry, pruning mostly failed.)
+func TestDeleteRetriesAfterTheControllersUpdate(t *testing.T) {
+	f := newFakeAPI()
+	f.addFailed("failed", ago(time.Hour), managed())
+	s := newSnapshotter(t, f)
+	if deleted, err := s.pruneFailed(context.Background()); err != nil || !slices.Equal(deleted, []string{"failed"}) {
+		t.Fatalf("want it deleted, got %v %v", deleted, err)
+	}
+	if !slices.Equal(f.deleteCalls(), []string{"failed", "failed"}) {
+		t.Fatalf("want a conflict and then a delete, got %v", f.deleteCalls())
+	}
+	if f.contents["content-failed"] != "Delete" {
+		t.Fatal("its storage must go with it")
+	}
+}
+
+// A content replaced under the same name between the read and the switch: the API
+// server refuses the switch as a change to the immutable UID (422). Nothing was
+// applied, so the snapshot is just left for the next run.
+func TestDeleteSwitchRefusedForAReplacedContent(t *testing.T) {
+	f := newFakeAPI()
+	f.addFailed("failed", ago(time.Hour), managed())
+	// The read sees the old object's UID; the server now holds a new object.
+	f.readUID = map[string]string{"content-failed": "cuid-the-object-that-was-replaced"}
+	s := newSnapshotter(t, f)
+	deleted, err := s.pruneFailed(context.Background())
+	if err != nil || len(deleted) != 0 {
+		t.Fatalf("want nothing deleted and no error, got %v %v", deleted, err)
+	}
+	if f.contents["content-failed"] != "Retain" || len(f.deletes()) != 0 {
+		t.Fatalf("nothing may change: policy %q, deletes %v", f.contents["content-failed"], f.deletes())
+	}
+}
+
+// A switch the API server refuses outright (403, say) was not applied: the run reports
+// it and has nothing to undo.
+func TestDeleteSwitchForbidden(t *testing.T) {
+	f := newFakeAPI()
+	f.addFailed("failed", ago(time.Hour), managed())
+	f.fault = func(method, _ string) string {
+		if method == "PATCH" {
+			return "forbidden"
+		}
+		return ""
+	}
+	s := newSnapshotter(t, f)
+	if _, err := s.pruneFailed(context.Background()); err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("want the 403 reported, got %v", err)
+	}
+	if f.contents["content-failed"] != "Retain" || len(f.deletes()) != 0 {
+		t.Fatalf("nothing may change: policy %q, deletes %v", f.contents["content-failed"], f.deletes())
+	}
+}
+
 // A content already set to Delete is not patched, and so not set back either.
 func TestDeleteLeavesADeletePolicyAlone(t *testing.T) {
 	f := newFakeAPI()
@@ -838,6 +937,7 @@ func TestDeleteUncertainWrites(t *testing.T) {
 	})
 	t.Run("delete applied, answer lost", func(t *testing.T) {
 		f := newFakeAPI()
+		f.quietController = true // so the first delete applies
 		f.addFailed("failed", ago(time.Hour), managed())
 		f.fault = func(method, _ string) string {
 			if method == "DELETE" {
