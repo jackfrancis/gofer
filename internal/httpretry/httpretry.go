@@ -137,11 +137,13 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return resp, err
 		}
 		attempt := total - *left
-		// A wait that cannot finish before the request's deadline would only end in
-		// the deadline's error, discarding this result: a 429's status, Retry-After
-		// and body tell the caller more. Return it as it is instead.
-		wait := retryDelay(resp, base, max, attempt)
-		if !fitsDeadline(req.Context(), wait) {
+		// The retry's moment is fixed now, before the body is drained: draining a
+		// slow body must not push the retry later than Retry-After asked. A moment
+		// past the request's deadline would only end in the deadline's error,
+		// discarding this result (a 429's status, Retry-After and body tell the
+		// caller more), so return it as it is instead.
+		retryAt := time.Now().Add(retryDelay(resp, base, max, attempt))
+		if !beforeDeadline(req.Context(), retryAt) {
 			return resp, err
 		}
 		*left--
@@ -152,7 +154,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		req = rewound
 		drain(resp)
-		if werr := sleepCtx(req.Context(), wait); werr != nil {
+		if werr := sleepCtx(req.Context(), time.Until(retryAt)); werr != nil {
 			return nil, werr
 		}
 	}
@@ -197,11 +199,11 @@ func retryDelay(prev *http.Response, base, max time.Duration, attempt int) time.
 	return wait
 }
 
-// fitsDeadline reports whether a wait of d ends before ctx's deadline (always,
-// without one).
-func fitsDeadline(ctx context.Context, d time.Duration) bool {
+// beforeDeadline reports whether t comes before ctx's deadline (always, without
+// one).
+func beforeDeadline(ctx context.Context, t time.Time) bool {
 	deadline, ok := ctx.Deadline()
-	return !ok || time.Until(deadline) > d
+	return !ok || t.Before(deadline)
 }
 
 // sleepCtx blocks for d, returning early if the context is cancelled.

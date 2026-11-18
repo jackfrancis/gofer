@@ -171,8 +171,10 @@ show up to 900 bytes of a job- or step-log error, so a clipped one still keeps t
 A rate-limit 403 or a 429 is reported as a rate limit instead. That needed a change
 to `internal/httpretry`, which honours `Retry-After`: it used to drain the 429 and
 sleep, so a `Retry-After` longer than the request's deadline surfaced only as
-"context deadline exceeded". When the next wait cannot finish before the deadline,
-it now returns the response it has, for every caller. Those headers name scopes only, and the
+"context deadline exceeded". It now fixes the retry's moment before draining the
+response, returns the response it has when that moment is past the deadline, and
+otherwise sleeps only for what is left after the drain, so a slow body cannot push
+the retry later than `Retry-After` asked. This holds for every caller. Those headers name scopes only, and the
 body comes from the API host, never the pre-signed blob host, so none of it is a
 credential.
 

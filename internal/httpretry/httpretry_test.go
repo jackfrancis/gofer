@@ -63,3 +63,36 @@ func TestRetryThatFitsRetries(t *testing.T) {
 		}
 	}
 }
+
+// The retry goes out when Retry-After asked, not that long after the 429's body has
+// been drained: a slow body must not push it past the deadline.
+func TestRetryAfterCountsDrainTime(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) > 1 {
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
+		w.Header().Set("Retry-After", "2")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"message":`))
+		w.(http.Flusher).Flush()
+		time.Sleep(time.Second) // the body takes a second to drain
+		_, _ = w.Write([]byte(`"slow down"}`))
+	}))
+	defer srv.Close()
+	// Retry-After (2s) fits the deadline; Retry-After after a 1s drain (3s) would not.
+	c := Wrap(&http.Client{Timeout: 2600 * time.Millisecond})
+	start := time.Now()
+	resp, err := c.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("err = %v after %s, want the retry's 200", err, time.Since(start))
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || hits.Load() != 2 {
+		t.Errorf("status %d after %d hits", resp.StatusCode, hits.Load())
+	}
+	if d := time.Since(start); d < 2*time.Second || d > 2500*time.Millisecond {
+		t.Errorf("retried after %s, want about 2s", d)
+	}
+}
