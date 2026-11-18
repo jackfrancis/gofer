@@ -155,6 +155,15 @@ func newGHAFake(t *testing.T) *ghaFake {
 		if r.Header.Get("Authorization") != "Bearer s3cret-token" {
 			t.Errorf("API call without the token: %s", r.URL.Path)
 		}
+		if strings.HasPrefix(r.URL.Path, "/repos/o/r/actions/jobs/49/") && strings.HasSuffix(r.URL.Path, "/logs") {
+			// Job 49's logs are refused to this token, as an organisation's OAuth App
+			// access restriction refuses them.
+			w.Header().Set("X-OAuth-Scopes", "read:user, user:email")
+			w.Header().Set("X-Accepted-OAuth-Scopes", "")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"the example organization has enabled OAuth App access restrictions"}`))
+			return
+		}
 		if rest, ok := strings.CutPrefix(r.URL.Path, "/repos/o/r/actions/jobs/"); ok && strings.HasSuffix(rest, "/logs") {
 			// …/jobs/<id>/logs → blob /<id>; …/jobs/<id>/steps/<n>/logs → blob /<id>-<n>
 			parts := strings.Split(strings.TrimSuffix(rest, "/logs"), "/")
@@ -172,6 +181,8 @@ func newGHAFake(t *testing.T) *ghaFake {
 			_, _ = w.Write([]byte(ghaJobJSONSteps(45, "lint", "failure", ghaSameSecondSteps)))
 		case "/repos/o/r/actions/jobs/48":
 			_, _ = w.Write([]byte(ghaJobJSONSteps(48, "e2e", "failure", ghaBackgroundSteps)))
+		case "/repos/o/r/actions/jobs/49":
+			_, _ = w.Write([]byte(ghaJobJSON(49, "links", "failure")))
 		case "/repos/o/r/actions/jobs/47":
 			_, _ = w.Write([]byte(ghaJobJSON(47, "no log", "failure")))
 		case "/repos/o/r/actions/runs/9/jobs":
@@ -529,6 +540,30 @@ func TestGHAStepLogWhenJobLogTooLarge(t *testing.T) {
 		!strings.Contains(out, "the end of step 3, from its own log (step-3.log, numbered within the step; the job log is too large to fetch)") ||
 		!strings.Contains(out, "step-3.log:2: ##[error]Process completed with exit code 1.") {
 		t.Errorf("summary with an oversized job log:\n%s", out)
+	}
+}
+
+// A log refused to the token says why, so the model reports an access problem (and
+// which one) rather than a bare 403 it could mistake for one in the job's output.
+func TestGHALogForbiddenSaysWhy(t *testing.T) {
+	box, f := ghaBox(t)
+	out := ciInvoke(t, box, "gha_job_summary", `{"job_id":49}`)
+	ghaCheckClean(t, f, out)
+	for _, want := range []string{
+		"✗ 3 Run tests: failure",
+		"could not be read: job log access denied (status 403): GitHub refused this token access to the job log",
+		`GitHub says "the example organization has enabled OAuth App access restrictions"`,
+		"the token's scopes: read:user, user:email",
+		"scopes this endpoint accepts: (none)",
+		"not anything the job itself printed",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("summary lacks %q:\n%s", want, out)
+		}
+	}
+	_, err := box.Invoke(context.Background(), "gha_read", json.RawMessage(`{"job_id":49,"step":3}`))
+	if err == nil || !strings.Contains(err.Error(), "OAuth App access restrictions") {
+		t.Errorf("gha_read: err = %v", err)
 	}
 }
 

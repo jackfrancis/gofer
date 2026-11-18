@@ -36,6 +36,15 @@ var ErrLogNotFound = errors.New("job log not found")
 // ErrLogTooLarge reports a job log over the caller's byte bound.
 var ErrLogTooLarge = errors.New("job log too large")
 
+// ErrLogForbidden reports a log the API refused to this token (401/403, other than a
+// rate limit). The error carries GitHub's own reason and the token's and endpoint's
+// OAuth scopes, which is what tells a missing scope from an organisation's OAuth App
+// access restriction.
+var ErrLogForbidden = errors.New("job log access denied")
+
+// ErrLogRateLimited reports a log request refused by a GitHub rate limit.
+var ErrLogRateLimited = errors.New("GitHub rate limit")
+
 // ActionsRef is what an Actions URL names: a run, optionally one job in it, and
 // optionally a step of that job (a "#step:N:L" link).
 type ActionsRef struct {
@@ -307,11 +316,17 @@ func (c *Client) logLocation(ctx context.Context, token, path, what string, w io
 		n, err := copyBounded(w, resp, max, func(err error) error { return fmt.Errorf("%s: %w", what, stripURL(err)) })
 		return nil, n, err
 	case resp.StatusCode == http.StatusNotFound:
-		return nil, 0, fmt.Errorf("%w (status 404): the job or step does not exist, or its repository is not visible with this token", ErrLogNotFound)
+		return nil, 0, fmt.Errorf("%w (status 404): the job or step does not exist, or its repository is not visible with this token%s", ErrLogNotFound, apiReason(resp).String())
 	case resp.StatusCode == http.StatusGone:
-		return nil, 0, fmt.Errorf("%w (status 410): the log has expired or was deleted", ErrLogNotFound)
+		return nil, 0, fmt.Errorf("%w (status 410): the log has expired or was deleted%s", ErrLogNotFound, apiReason(resp).String())
+	case resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests:
+		r := apiReason(resp)
+		if r.rateLimited || resp.StatusCode == http.StatusTooManyRequests {
+			return nil, 0, fmt.Errorf("%s: %w (status %d)%s", what, ErrLogRateLimited, resp.StatusCode, r.String())
+		}
+		return nil, 0, fmt.Errorf("%w (status %d): GitHub refused this token access to the %s (gofer's access to GitHub, not anything the job itself printed)%s", ErrLogForbidden, resp.StatusCode, what, r.String())
 	case resp.StatusCode < 300 || resp.StatusCode > 399:
-		return nil, 0, fmt.Errorf("%s: status %d", what, resp.StatusCode)
+		return nil, 0, fmt.Errorf("%s: status %d%s", what, resp.StatusCode, apiReason(resp).String())
 	}
 	loc, err := resp.Location()
 	if err != nil {
@@ -319,6 +334,82 @@ func (c *Client) logLocation(ctx context.Context, token, path, what string, w io
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	return loc, 0, nil
+}
+
+// reason is what an API error response says about itself: GitHub's message, the
+// token's granted OAuth scopes and the scopes the endpoint accepts. None of it is a
+// credential: the body comes from the API host (never the blob host), and scope
+// headers hold scope names only.
+type reason struct {
+	message     string
+	tokenScopes *string // X-OAuth-Scopes, when sent
+	accepted    *string // X-Accepted-OAuth-Scopes, when sent
+	sso         bool    // X-GitHub-SSO: the organisation requires SAML SSO for this token
+	rateLimited bool
+}
+
+const maxReasonBody = 8 << 10
+
+// apiReason reads an API error response's reason (a bounded read of its body).
+func apiReason(resp *http.Response) reason {
+	var r reason
+	var body struct {
+		Message string `json:"message"`
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxReasonBody))
+	if json.Unmarshal(raw, &body) == nil {
+		r.message = clipReason(body.Message)
+	}
+	if v, ok := resp.Header["X-Oauth-Scopes"]; ok && len(v) > 0 {
+		r.tokenScopes = &v[0]
+	}
+	if v, ok := resp.Header["X-Accepted-Oauth-Scopes"]; ok && len(v) > 0 {
+		r.accepted = &v[0]
+	}
+	r.sso = resp.Header.Get("X-GitHub-SSO") != ""
+	r.rateLimited = resp.Header.Get("X-RateLimit-Remaining") == "0" ||
+		strings.Contains(strings.ToLower(r.message), "rate limit")
+	return r
+}
+
+// String renders the reason as a suffix for an error ("" when there is none).
+func (r reason) String() string {
+	var parts []string
+	if r.message != "" {
+		parts = append(parts, fmt.Sprintf("GitHub says %q", r.message))
+	}
+	scopes := func(s string) string {
+		if strings.TrimSpace(s) == "" {
+			return "(none)"
+		}
+		return clipReason(s)
+	}
+	if r.tokenScopes != nil {
+		parts = append(parts, "the token's scopes: "+scopes(*r.tokenScopes))
+	}
+	if r.accepted != nil {
+		parts = append(parts, "scopes this endpoint accepts: "+scopes(*r.accepted))
+	}
+	if r.sso {
+		parts = append(parts, "the organisation requires SAML SSO authorisation for this token")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "; " + strings.Join(parts, "; ")
+}
+
+// clipReason flattens s to one line of at most 300 bytes of valid UTF-8.
+func clipReason(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 300 {
+		cut := 300
+		for cut > 0 && (s[cut]&0xC0) == 0x80 {
+			cut--
+		}
+		s = s[:cut] + "…"
+	}
+	return strings.ToValidUTF8(s, "\uFFFD")
 }
 
 // fetchBlob downloads a pre-signed location with the credential-free client. status

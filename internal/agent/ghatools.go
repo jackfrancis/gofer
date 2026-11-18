@@ -726,7 +726,8 @@ func (t *githubToolBox) ghaJobSummary(ctx context.Context, repo string, job gith
 
 	b.WriteString("  log:\n")
 	if logErr != nil {
-		fmt.Fprintf(&b, "    could not be read: %s\n", oneLine(logErr.Error(), 300))
+		// Room for GitHub's reason and the scope headers a refusal carries.
+		fmt.Fprintf(&b, "    could not be read: %s\n", oneLine(logErr.Error(), 600))
 		if tooLarge(logErr) {
 			// The failing step's own log is usually far smaller than the job's.
 			for _, s := range job.Steps {
