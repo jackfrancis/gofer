@@ -100,14 +100,33 @@ kube -n "$namespace" get volumesnapshot "$snapshot" -o json > "$tmp/snapshot.jso
 jq -e '.status.readyToUse == true and .metadata.deletionTimestamp == null and (.metadata.uid | type == "string" and length > 0)' "$tmp/snapshot.json" >/dev/null || \
     fail "snapshot $snapshot is no longer ready to use. Nothing changed."
 size=$(jq -er '.status.restoreSize // "" | select(type == "string")' "$tmp/snapshot.json")
+# Request the larger of the current claim's request and the snapshot's restoreSize:
+# the restored claim must be at least restoreSize, and must not lose capacity the
+# claim gained (by expansion) after the snapshot was taken. An unparseable quantity
+# fails here, before anything changes.
 jq -e --arg snap "$snapshot" --arg size "$size" '
+    def bytes:
+        (capture("^(?<n>[0-9]+(\\.[0-9]+)?)(?<s>[eE][+-]?[0-9]+|Ki|Mi|Gi|Ti|Pi|Ei|n|u|m|k|M|G|T|P|E)?$")
+         // error("invalid storage quantity: \(.)")) as $q
+        | ($q.n | tonumber) * (
+            if $q.s == null then 1
+            elif ($q.s | test("^[eE]")) then pow(10; $q.s[1:] | tonumber)
+            else {Ki: 1024, Mi: 1048576, Gi: 1073741824, Ti: 1099511627776,
+                  Pi: 1125899906842624, Ei: 1152921504606846976,
+                  n: 1e-9, u: 1e-6, m: 1e-3, k: 1e3, M: 1e6, G: 1e9,
+                  T: 1e12, P: 1e15, E: 1e18}[$q.s] end);
     select((.spec.accessModes | type == "array" and length > 0)
         and (.spec.resources.requests.storage | type == "string" and length > 0))
+    | .spec.resources.requests.storage as $current
+    | ($current | bytes) as $current_bytes
+    | (if $size == "" then $current
+       elif ($size | bytes) > $current_bytes then $size
+       else $current end) as $storage
     | {apiVersion: "v1", kind: "PersistentVolumeClaim",
        metadata: {name: .metadata.name, namespace: .metadata.namespace, labels: (.metadata.labels // {})},
        spec: {accessModes: .spec.accessModes, storageClassName: .spec.storageClassName,
               volumeMode: (.spec.volumeMode // "Filesystem"),
-              resources: {requests: {storage: (if $size != "" then $size else .spec.resources.requests.storage end)}},
+              resources: {requests: {storage: $storage}},
               dataSource: {apiGroup: "snapshot.storage.k8s.io", kind: "VolumeSnapshot", name: $snap}}}
 ' "$tmp/original.json" > "$tmp/claim.json" || fail "could not build a valid replacement claim. Nothing changed."
 replicas=$(kube -n "$namespace" get statefulset gofer -o jsonpath='{.spec.replicas}')

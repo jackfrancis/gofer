@@ -203,7 +203,10 @@ Once the preflight succeeds, restore:
 1. sets the current volume's reclaim policy to `Retain`, so it survives the swap;
 2. scales gofer to zero and waits for the pod to go (the volume is ReadWriteOnce);
 3. deletes the claim `data-gofer-0` and creates it again, with the same name,
-   labels, storage class and access mode, from the snapshot;
+   labels, storage class and access mode, from the snapshot. It requests the larger
+   of the current claim's size and the snapshot's `restoreSize`, so a volume
+   expanded after the snapshot was taken keeps its capacity (an unreadable size
+   stops the restore before anything changes);
 4. scales gofer back to one; the StatefulSet adopts the restored claim;
 5. sets the restored volume to `DATA_RECLAIM_POLICY` and prints the old volume's
    name, with how to delete it or go back to it.
@@ -347,7 +350,8 @@ StatefulSet creates an empty one:
    ```
 
 3. Create `data-gofer-0` from it: a claim like the one `restore` creates, with
-   `dataSource` naming the VolumeSnapshot.
+   `dataSource` naming the VolumeSnapshot and a storage request of at least its
+   `restoreSize`.
 4. Deploy gofer (`make deploy`). The StatefulSet adopts the claim.
 
 ## Velero: the whole-namespace alternative

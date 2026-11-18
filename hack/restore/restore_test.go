@@ -81,7 +81,7 @@ func (r result) has(parts ...string) bool {
 }
 
 func TestRestoreRejectsInvalidInputBeforeMutating(t *testing.T) {
-	for _, scenario := range []string{"claim_read_error", "claim_empty", "claim_invalid", "claim_no_access", "snapshot_read_error", "snapshot_unready", "cronjob_read_error"} {
+	for _, scenario := range []string{"claim_read_error", "claim_empty", "claim_invalid", "claim_no_access", "snapshot_read_error", "snapshot_unready", "invalid_restore_size", "cronjob_read_error"} {
 		t.Run(scenario, func(t *testing.T) {
 			r := runRestore(t, scenario, true)
 			if r.err == nil {
@@ -246,7 +246,15 @@ func TestRestoreIgnoresCallerConfiguration(t *testing.T) {
 }
 
 func TestRestoreSuccess(t *testing.T) {
-	for _, scenario := range []string{"normal", "already_suspended", "no_cronjob", "no_restore_size"} {
+	// The fake claim requests 4Gi; the fake snapshot's restoreSize is 2Gi unless a
+	// scenario changes it. The replacement requests the larger of the two.
+	wantSizes := map[string]string{
+		"larger_restore_size": "8Gi",        // the snapshot needs more than the claim asks
+		"byte_restore_size":   "5000000000", // plain bytes, larger than 4Gi (4294967296)
+		"equal_restore_size":  "4Gi",        // 4294967296 bytes == 4Gi: keep the claim's form
+		"zero_restore_size":   "4Gi",        // some drivers report 0
+	}
+	for _, scenario := range []string{"normal", "already_suspended", "no_cronjob", "no_restore_size", "larger_restore_size", "byte_restore_size", "equal_restore_size", "zero_restore_size"} {
 		t.Run(scenario, func(t *testing.T) {
 			r := runRestore(t, scenario, true)
 			if r.err != nil {
@@ -263,9 +271,10 @@ func TestRestoreSuccess(t *testing.T) {
 				t.Fatalf("changed the original backup schedule state: %v", r.calls)
 			}
 			spec := r.created["spec"].(map[string]any)
-			wantSize := "2Gi"
-			if scenario == "no_restore_size" {
-				wantSize = "4Gi"
+			// The claim was expanded to 4Gi after the 2Gi snapshot: keep 4Gi.
+			wantSize := "4Gi"
+			if size, ok := wantSizes[scenario]; ok {
+				wantSize = size
 			}
 			if spec["storageClassName"] != "test-storage-class" || spec["volumeMode"] != "Filesystem" || spec["accessModes"].([]any)[0] != "ReadWriteOnce" || spec["volumeName"] != nil || spec["dataSource"].(map[string]any)["name"] != "backup" || spec["resources"].(map[string]any)["requests"].(map[string]any)["storage"] != wantSize {
 				t.Fatalf("incorrect replacement claim: %v", spec)
@@ -400,6 +409,12 @@ func TestKubectlHelper(t *testing.T) {
 		v := snap("backup", "data-gofer-0", scenario != "snapshot_unready")
 		if scenario == "no_restore_size" {
 			delete(v["status"].(map[string]any), "restoreSize")
+		}
+		if size, ok := map[string]string{
+			"larger_restore_size": "8Gi", "byte_restore_size": "5000000000",
+			"equal_restore_size": "4294967296", "zero_restore_size": "0", "invalid_restore_size": "bogus",
+		}[scenario]; ok {
+			v["status"].(map[string]any)["restoreSize"] = size
 		}
 		if count("get", "volumesnapshot", "backup", "-o", "json") >= 2 {
 			if scenario == "snapshot_changed" {
