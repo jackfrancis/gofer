@@ -91,16 +91,7 @@ func Resolve(ctx context.Context, store Store, ingestor Ingestor, now time.Time,
 		return Resolution{Status: StatusProcessing}, nil
 	}
 	for i := range items {
-		if items[i].Meta.Origin == OriginUser {
-			continue // human overrides are preserved verbatim
-		}
-		hidden := items[i].Meta.HiddenAt       // survives the rescore below
-		completed := items[i].Meta.CompletedAt // survives the rescore below
-		scored := Score(items[i], now)
-		scored.UpdatedAt = items[i].Meta.UpdatedAt // preserve persisted write time
-		scored.HiddenAt = hidden
-		scored.CompletedAt = completed
-		items[i].Meta = scored
+		items[i].Meta = Rescore(items[i], now) // human overrides are preserved verbatim
 	}
 	// Hidden items (user-set) and completed items (closed/merged, agent-set) stay
 	// in the store so an agent can still see and revive them, but are dropped from
