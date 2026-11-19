@@ -5,6 +5,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -34,6 +35,9 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	sessions := session.NewManager(cfg.SessionSecret, cfg.CookieSecure, session.WithStore(sessionStore),
 		session.WithAllow(func(u *session.User) bool { return cfg.SignInAllowed(u.Provider, u.Login) }))
 	authH := auth.NewHandler(cfg, sessions, vlt)
+	// Finish any logout a previous process began and did not complete (ADR 0007):
+	// its credential stays unvendable until then.
+	authH.ResumePendingLogouts(context.Background())
 	// The web tier holds only the run-credential verification key: it authenticates a
 	// runtime's bearer but cannot mint one. Minting is a runtime/control-plane concern;
 	// gofer keeps only the verifier.

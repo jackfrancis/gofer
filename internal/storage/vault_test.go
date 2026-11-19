@@ -367,3 +367,63 @@ func TestVaultOpensALegacyRow(t *testing.T) {
 		t.Fatalf("legacy row = %+v", got)
 	}
 }
+
+// The pending-logout ledger: marked, listed and cleared independently of the
+// credential row, in both vaults, and durable across a reopen in SQLite. It lives
+// under a reserved provider name that no credential can take.
+func TestLogoutLedger(t *testing.T) {
+	dir := t.TempDir()
+	impls := map[string]vault.Vault{
+		"memory": vault.NewMemoryVault(),
+		"sqlite": open(t, dir).Vault(keyring(t, testKey(1))),
+	}
+	for name, v := range impls {
+		t.Run(name, func(t *testing.T) {
+			l := v.(vault.LogoutLedger)
+			if err := v.Put(ctx, "alice", cred("tok")); err != nil {
+				t.Fatal(err)
+			}
+			if p, err := l.LogoutPending(ctx, "alice", "github"); err != nil || p {
+				t.Fatalf("pending before marking = %v, %v", p, err)
+			}
+			if err := l.MarkLogout(ctx, "alice", "github"); err != nil {
+				t.Fatal(err)
+			}
+			if p, err := l.LogoutPending(ctx, "alice", "github"); err != nil || !p {
+				t.Fatalf("pending after marking = %v, %v", p, err)
+			}
+			keys, err := l.PendingLogouts(ctx)
+			if err != nil || len(keys) != 1 || keys[0] != (vault.LogoutKey{UserID: "alice", Provider: "github"}) {
+				t.Fatalf("pending logouts = %v, %v", keys, err)
+			}
+			if mustGet(t, v, "alice", "github").AccessToken != "tok" {
+				t.Fatal("marking touched the credential")
+			}
+			// Deleting the credential leaves the marker; clearing the marker leaves
+			// the credential.
+			if err := l.ClearLogout(ctx, "alice", "github"); err != nil {
+				t.Fatal(err)
+			}
+			if p, _ := l.LogoutPending(ctx, "alice", "github"); p {
+				t.Fatal("still pending after clearing")
+			}
+			mustGet(t, v, "alice", "github")
+		})
+	}
+
+	// SQLite: a marker survives reopening the database, and the reserved name is not
+	// a credential anyone can write.
+	dir2 := t.TempDir()
+	first := open(t, dir2)
+	if err := first.Vault(keyring(t, testKey(1))).MarkLogout(ctx, "bob", "github"); err != nil {
+		t.Fatal(err)
+	}
+	_ = first.Close()
+	reopened := open(t, dir2).Vault(keyring(t, testKey(1)))
+	if p, err := reopened.LogoutPending(ctx, "bob", "github"); err != nil || !p {
+		t.Fatalf("marker lost on reopen: %v, %v", p, err)
+	}
+	if err := reopened.Put(ctx, "bob", vault.Credential{Provider: logoutMarkerPrefix + "github", AccessToken: "x"}); err == nil {
+		t.Error("a credential was written under the reserved marker name")
+	}
+}

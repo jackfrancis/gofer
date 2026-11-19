@@ -16,6 +16,7 @@ import (
 
 	"github.com/jackfrancis/gofer/internal/config"
 	"github.com/jackfrancis/gofer/internal/session"
+	"github.com/jackfrancis/gofer/internal/storage"
 	"github.com/jackfrancis/gofer/internal/vault"
 )
 
@@ -540,7 +541,7 @@ func TestLogoutDuringRefresh(t *testing.T) {
 
 	// The deferred logout revokes with the rotated token and deletes the row.
 	deadline := time.Now().Add(5 * time.Second)
-	for h.locks.isLoggedOut(user, "github") && time.Now().Before(deadline) {
+	for logoutIsPending(h) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if _, err := vlt.Get(bg, user, "github"); !errors.Is(err, vault.ErrNotFound) {
@@ -557,7 +558,7 @@ func TestPendingLogoutKeepsCredentialForRevocation(t *testing.T) {
 	gh := newFakeGitHub(t)
 	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
 	put(t, gh, vlt, appCred("ghu_a", "ghr_a", "v1", 4*time.Hour))
-	h.locks.markLoggedOut(user, "github")
+	h.markLogout(bg, user, "github")
 	if _, err := h.Credential(bg, user, "github", VendRequest{}); !errors.Is(err, vault.ErrSignInRequired) {
 		t.Fatalf("vend during logout: err = %v", err)
 	}
@@ -589,10 +590,10 @@ func TestFailedSignInWriteKeepsPendingLogout(t *testing.T) {
 	gh := newFakeGitHub(t)
 	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
 	put(t, gh, vlt, appCred("ghu_old", "ghr_old", "v1", 4*time.Hour))
-	h.locks.markLoggedOut(user, "github")
+	h.markLogout(bg, user, "github")
 	h.vault = failingPutVault{vlt}
 	signIn(t, h)
-	if !h.locks.isLoggedOut(user, "github") {
+	if !logoutIsPending(h) {
 		t.Fatal("a failed sign-in write cleared the pending logout")
 	}
 	if _, err := h.Credential(bg, user, "github", VendRequest{}); !errors.Is(err, vault.ErrSignInRequired) {
@@ -630,6 +631,14 @@ type sessionSpy struct {
 	deleted   bool
 }
 
+// Load fails on a done context, as the SQLite store does.
+func (s *sessionSpy) Load(ctx context.Context, key string) (session.User, time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		return session.User{}, time.Time{}, err
+	}
+	return s.Store.Load(ctx, key)
+}
+
 func (s *sessionSpy) Delete(ctx context.Context, key string) error {
 	s.mu.Lock()
 	s.deleted, s.deleteErr = true, ctx.Err()
@@ -658,13 +667,21 @@ func TestLogoutDeletesSessionWhenBrowserDisconnects(t *testing.T) {
 	if h.sessions.CurrentUser(next) != nil {
 		t.Error("the session survived logout")
 	}
+	// Review P2 (third round): the owner was still found, so the credential was
+	// revoked and deleted.
+	if gh.revoked.Load() != 1 {
+		t.Errorf("grant revocations = %d, want 1: the owner lookup was cancelled with the browser", gh.revoked.Load())
+	}
+	if _, err := h.vault.Get(bg, user, "github"); !errors.Is(err, vault.ErrNotFound) {
+		t.Error("credential kept after logout")
+	}
 }
 
 // A new sign-in supersedes a logout still pending: its credential is kept.
 func TestSignInClearsPendingLogout(t *testing.T) {
 	gh := newFakeGitHub(t)
 	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
-	h.locks.markLoggedOut(user, "github")
+	h.markLogout(bg, user, "github")
 	signIn(t, h)
 	if _, err := h.Credential(bg, user, "github", VendRequest{}); err != nil {
 		t.Fatalf("vend after a new sign-in: %v", err)
@@ -784,5 +801,89 @@ func TestRefreshExpiryFormEncoded(t *testing.T) {
 	js := (&oauth2.Token{}).WithExtra(map[string]any{"refresh_token_expires_in": float64(15897600)})
 	if got := refreshExpiry(js, now); !got.Equal(want) {
 		t.Errorf("json: %v, want %v", got, want)
+	}
+}
+
+func logoutIsPending(h *Handler) bool {
+	pending, _, _ := h.logoutPending(bg, user, "github")
+	return pending
+}
+
+// sqliteHandler is a GitHub App handler over the SQLite vault in dir, as the web tier
+// runs with DATA_DIR set. Opening the same dir again is a restart.
+func sqliteHandler(t *testing.T, gh *fakeGitHub, dir string) (*Handler, vault.Vault) {
+	t.Helper()
+	db, err := storage.Open(bg, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	keys, err := storage.NewKeyring(make([]byte, storage.KeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	vlt := db.Vault(keys)
+	h, _, _, _ := newKindHandler(t, gh, config.GitHubApp)
+	h.vault = vlt
+	h.ledger = vlt
+	return h, vlt
+}
+
+// Review P1 (third round): a pending logout survives a restart. The pod dies after
+// logout recorded it and before the credential was revoked and deleted; the next
+// process, over the same database, refuses to vend (the broker's sign_in_required),
+// and finishes the logout: grant revoked, row deleted, marker cleared.
+func TestPendingLogoutSurvivesRestart(t *testing.T) {
+	gh := newFakeGitHub(t)
+	dir := t.TempDir()
+	before, vlt := sqliteHandler(t, gh, dir)
+	put(t, gh, vlt, appCred("ghu_a", "ghr_a", "v1", 4*time.Hour))
+	before.markLogout(bg, user, "github") // what Logout does before discarding the session
+	// ...and the process is gone.
+
+	after, vlt2 := sqliteHandler(t, gh, dir)
+	if _, err := after.Credential(bg, user, "github", VendRequest{}); !errors.Is(err, vault.ErrSignInRequired) {
+		t.Fatalf("vend after restart: err = %v, want sign-in required", err)
+	}
+	if _, err := vlt2.Get(bg, user, "github"); !errors.Is(err, vault.ErrNotFound) {
+		t.Fatalf("the orphaned logout was not finished (err=%v)", err)
+	}
+	if gh.revoked.Load() != 1 || gh.revokedWith.Load().(string) != "ghu_a" {
+		t.Errorf("revocations = %d with %q, want one with the stored token", gh.revoked.Load(), gh.revokedWith.Load())
+	}
+	if logoutIsPending(after) {
+		t.Error("marker left after the logout finished")
+	}
+}
+
+// At startup, the web tier finishes pending logouts without waiting for a vend.
+func TestResumePendingLogoutsAtStartup(t *testing.T) {
+	gh := newFakeGitHub(t)
+	dir := t.TempDir()
+	before, vlt := sqliteHandler(t, gh, dir)
+	put(t, gh, vlt, appCred("ghu_a", "ghr_a", "v1", 4*time.Hour))
+	before.markLogout(bg, user, "github")
+
+	after, vlt2 := sqliteHandler(t, gh, dir)
+	after.ResumePendingLogouts(bg)
+	deadline := time.Now().Add(5 * time.Second)
+	for logoutIsPending(after) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := vlt2.Get(bg, user, "github"); !errors.Is(err, vault.ErrNotFound) || gh.revoked.Load() != 1 {
+		t.Fatalf("resumed logout: row err=%v, revocations=%d", err, gh.revoked.Load())
+	}
+}
+
+// A sign-in after the restart replaces the credential and clears the durable marker.
+func TestSignInAfterRestartClearsMarker(t *testing.T) {
+	gh := newFakeGitHub(t)
+	dir := t.TempDir()
+	before, _ := sqliteHandler(t, gh, dir)
+	before.markLogout(bg, user, "github")
+	after, _ := sqliteHandler(t, gh, dir)
+	signIn(t, after)
+	if _, err := after.Credential(bg, user, "github", VendRequest{}); err != nil {
+		t.Fatalf("vend after a new sign-in: %v", err)
 	}
 }

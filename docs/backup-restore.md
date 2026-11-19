@@ -405,6 +405,13 @@ user's grant to the app, are still valid at GitHub. What follows:
 Tokens from a classic OAuth app (`GITHUB_CLIENT_KIND=oauth-app`) never expire and are
 never refreshed, so a restore does not affect them.
 
+**Sign-outs after the snapshot are undone locally.** A user who signed out after the
+snapshot was taken has their stored credential back. If GitHub confirmed the
+revocation at the time, that token is dead: its first use is refused, confirmed with
+GitHub, and the credential deleted. If their sign-out reported revocation as
+unconfirmed, the restored credential may still work. Ask those users to revoke gofer
+in GitHub's settings, or to sign in and out again.
+
 ### Going back to the previous volume
 
 The old volume is kept as a `Released` PersistentVolume (`restore` prints its name).

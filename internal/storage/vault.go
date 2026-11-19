@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackfrancis/gofer/internal/vault"
@@ -22,7 +23,17 @@ type VaultStore struct {
 // Vault returns the credential vault over this database, sealing with keys.
 func (db *DB) Vault(keys *Keyring) *VaultStore { return &VaultStore{db: db, keys: keys} }
 
-var _ vault.Vault = (*VaultStore)(nil)
+var (
+	_ vault.Vault        = (*VaultStore)(nil)
+	_ vault.LogoutLedger = (*VaultStore)(nil)
+)
+
+// logoutMarkerPrefix is the reserved provider prefix of a pending-logout marker
+// (vault.LogoutLedger), kept in the credentials table so it needs no schema change:
+// a migration would stop an older binary from starting against this database, and
+// older code never reads a provider it does not know. The marker is sealed like any
+// row, though it holds nothing secret.
+const logoutMarkerPrefix = "logout-pending:"
 
 // sealedCredential is the plaintext that gets sealed: the whole credential, so
 // nothing about a token (not even its expiry) is stored in the clear.
@@ -55,6 +66,9 @@ func credentialAAD(userID, provider string) []byte {
 func (v *VaultStore) Put(ctx context.Context, userID string, cred vault.Credential) error {
 	if userID == "" || cred.Provider == "" {
 		return errors.New("vault: userID and provider are required")
+	}
+	if strings.HasPrefix(cred.Provider, logoutMarkerPrefix) {
+		return errors.New("vault: reserved provider name")
 	}
 	plaintext, err := json.Marshal(sealedCredential{
 		AccessToken:   cred.AccessToken,
@@ -126,4 +140,66 @@ func (v *VaultStore) Delete(ctx context.Context, userID, provider string) error 
 		return fmt.Errorf("storage: delete credential: %w", err)
 	}
 	return nil
+}
+
+// MarkLogout records a pending logout for the user and provider.
+func (v *VaultStore) MarkLogout(ctx context.Context, userID, provider string) error {
+	if userID == "" || provider == "" {
+		return errors.New("vault: userID and provider are required")
+	}
+	marker := logoutMarkerPrefix + provider
+	keyID, sealed := v.keys.Seal([]byte(`{}`), credentialAAD(userID, marker))
+	_, err := v.db.sql.ExecContext(ctx, `
+		INSERT INTO credentials (user_id, provider, key_id, sealed, updated_at) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (user_id, provider) DO UPDATE SET
+			key_id = excluded.key_id, sealed = excluded.sealed, updated_at = excluded.updated_at`,
+		userID, marker, keyID, sealed, time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("storage: mark logout: %w", err)
+	}
+	return nil
+}
+
+// ClearLogout removes a pending logout; a missing one is not an error.
+func (v *VaultStore) ClearLogout(ctx context.Context, userID, provider string) error {
+	if _, err := v.db.sql.ExecContext(ctx,
+		`DELETE FROM credentials WHERE user_id = ? AND provider = ?`, userID, logoutMarkerPrefix+provider); err != nil {
+		return fmt.Errorf("storage: clear logout: %w", err)
+	}
+	return nil
+}
+
+// LogoutPending reports whether a logout is pending for the user and provider.
+func (v *VaultStore) LogoutPending(ctx context.Context, userID, provider string) (bool, error) {
+	var one int
+	err := v.db.sql.QueryRowContext(ctx,
+		`SELECT 1 FROM credentials WHERE user_id = ? AND provider = ?`, userID, logoutMarkerPrefix+provider).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("storage: read logout marker: %w", err)
+	}
+	return true, nil
+}
+
+// PendingLogouts lists every pending logout.
+func (v *VaultStore) PendingLogouts(ctx context.Context) ([]vault.LogoutKey, error) {
+	rows, err := v.db.sql.QueryContext(ctx,
+		`SELECT user_id, provider FROM credentials WHERE substr(provider, 1, ?) = ?`,
+		len(logoutMarkerPrefix), logoutMarkerPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list logout markers: %w", err)
+	}
+	defer rows.Close()
+	var out []vault.LogoutKey
+	for rows.Next() {
+		var k vault.LogoutKey
+		if err := rows.Scan(&k.UserID, &k.Provider); err != nil {
+			return nil, fmt.Errorf("storage: list logout markers: %w", err)
+		}
+		k.Provider = strings.TrimPrefix(k.Provider, logoutMarkerPrefix)
+		out = append(out, k)
+	}
+	return out, rows.Err()
 }

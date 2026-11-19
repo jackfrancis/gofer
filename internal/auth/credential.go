@@ -70,47 +70,134 @@ var logoutLockWait = 15 * time.Second
 // construction, so an in-process lock serialises every writer of a credential. A
 // lock waits on its context, so a stuck holder cannot wedge a request forever.
 //
-// It also keeps the logout tombstones: a (user, provider) whose logout has begun
-// but not finished. While one is set, logout alone revokes and deletes the
-// credential; every other holder refuses to vend it and deletes nothing, so the
-// token logout needs for revocation stays in place. A refresh already in flight
-// still stores its pair, so logout revokes with the newest token.
+// It also keeps this process's side of pending logouts (see logoutPending): whether
+// a logout of the (user, provider) is pending here, and whether an operation in this
+// process is still running it. The durable side is the vault's LogoutLedger.
 type credLocks struct {
-	mu        sync.Mutex
-	m         map[string]*credLock
-	loggedOut map[string]bool
-}
-
-func credKey(userID, provider string) string { return userID + "\x00" + provider }
-
-// markLoggedOut sets the tombstone. It needs no credential lock: holders read it
-// under theirs, before every write and vend.
-func (l *credLocks) markLoggedOut(userID, provider string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.loggedOut == nil {
-		l.loggedOut = make(map[string]bool)
-	}
-	l.loggedOut[credKey(userID, provider)] = true
-}
-
-// clearLoggedOut removes the tombstone: logout deleted the row, or a new sign-in
-// stored its replacement. Call it holding the credential lock.
-func (l *credLocks) clearLoggedOut(userID, provider string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	delete(l.loggedOut, credKey(userID, provider))
-}
-
-func (l *credLocks) isLoggedOut(userID, provider string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.loggedOut[credKey(userID, provider)]
+	mu      sync.Mutex
+	m       map[string]*credLock
+	logouts map[string]*localLogout
 }
 
 type credLock struct {
 	ch   chan struct{}
 	refs int // holders and waiters; the entry is dropped at zero
+}
+
+// localLogout is a logout pending in this process.
+type localLogout struct {
+	running bool // an operation here owns its revoke-then-delete
+}
+
+func credKey(userID, provider string) string { return userID + "\x00" + provider }
+
+// beginLogout records a logout pending here, owned by the caller.
+func (l *credLocks) beginLogout(userID, provider string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.logouts == nil {
+		l.logouts = make(map[string]*localLogout)
+	}
+	l.logouts[credKey(userID, provider)] = &localLogout{running: true}
+}
+
+// localLogoutState reports whether a logout is pending here, and whether an
+// operation here is running it.
+func (l *credLocks) localLogoutState(userID, provider string) (pending, running bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lo := l.logouts[credKey(userID, provider)]
+	return lo != nil, lo != nil && lo.running
+}
+
+// releaseLogout says no operation here runs the pending logout any more (it gave
+// up, or its delete failed): the next lock holder finishes it.
+func (l *credLocks) releaseLogout(userID, provider string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if lo := l.logouts[credKey(userID, provider)]; lo != nil {
+		lo.running = false
+	}
+}
+
+// dropLogout forgets the pending logout: it finished, or a new sign-in replaced
+// the credential.
+func (l *credLocks) dropLogout(userID, provider string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.logouts, credKey(userID, provider))
+}
+
+// stepTimeout bounds one ledger read or write, detached from the caller.
+const stepTimeout = 5 * time.Second
+
+// markLogout records a pending logout, here and durably in the ledger, so the
+// refusal to vend survives a restart. Logout calls it before it discards the
+// session. A ledger failure is logged: the logout still proceeds, protected in this
+// process only.
+func (h *Handler) markLogout(ctx context.Context, userID, providerName string) {
+	h.locks.beginLogout(userID, providerName)
+	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
+	defer cancel()
+	if err := h.ledger.MarkLogout(lctx, userID, providerName); err != nil {
+		slog.ErrorContext(ctx, "logout: recording the pending logout failed; it will not survive a restart", "user", userID, "provider", providerName, "err", err)
+	}
+}
+
+// clearLogout forgets a pending logout, here and in the ledger: logout deleted the
+// credential, or a new sign-in stored its replacement. A ledger failure is retried
+// once; if it persists the marker stays, which fails closed (the user signs in
+// again).
+func (h *Handler) clearLogout(ctx context.Context, userID, providerName string) {
+	h.locks.dropLogout(userID, providerName)
+	for attempt := 0; attempt < 2; attempt++ {
+		lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
+		err := h.ledger.ClearLogout(lctx, userID, providerName)
+		cancel()
+		if err == nil {
+			return
+		}
+		slog.WarnContext(ctx, "clearing a pending logout failed", "user", userID, "provider", providerName, "attempt", attempt+1, "err", err)
+	}
+}
+
+// logoutPending reports whether a logout of the (user, provider) has begun and not
+// finished — pending in this process, or recorded in the ledger by one before a
+// restart — and whether it is orphaned: pending, with no operation in this process
+// running it. While a logout is pending, logout alone revokes and deletes the
+// credential; every other holder refuses to vend it and deletes nothing, so the token
+// logout needs for revocation stays in place. An orphan is finished by the next lock
+// holder. A ledger that cannot be read counts as pending, not orphaned: it fails
+// closed.
+func (h *Handler) logoutPending(ctx context.Context, userID, providerName string) (pending, orphan bool, err error) {
+	local, running := h.locks.localLogoutState(userID, providerName)
+	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
+	defer cancel()
+	marked, err := h.ledger.LogoutPending(lctx, userID, providerName)
+	if err != nil {
+		return true, false, err
+	}
+	pending = local || marked
+	return pending, pending && !running, nil
+}
+
+// ResumePendingLogouts finishes, in the background, every logout the ledger says a
+// previous process began and did not finish. The web tier calls it at startup.
+func (h *Handler) ResumePendingLogouts(ctx context.Context) {
+	lctx, cancel := context.WithTimeout(ctx, stepTimeout)
+	keys, err := h.ledger.PendingLogouts(lctx)
+	cancel()
+	if err != nil {
+		slog.WarnContext(ctx, "listing pending logouts failed; they finish at the next credential access", "err", err)
+		return
+	}
+	for _, k := range keys {
+		if pending, _ := h.locks.localLogoutState(k.UserID, k.Provider); pending {
+			continue
+		}
+		h.locks.beginLogout(k.UserID, k.Provider)
+		go h.pendingLogout(context.WithoutCancel(ctx), k.UserID, k.Provider)
+	}
 }
 
 func (l *credLocks) lock(ctx context.Context, userID, provider string) (func(), error) {
@@ -214,8 +301,10 @@ func (h *Handler) Credential(ctx context.Context, userID, providerName string, r
 	// Checked again after the work above, which can block (a refresh, check-token):
 	// a logout that began meanwhile must not see a token vended after it. Logout's
 	// grant revocation kills anything vended before it.
-	if err == nil && h.locks.isLoggedOut(userID, providerName) {
-		return vault.Credential{}, vault.ErrSignInRequired
+	if err == nil {
+		if pending, _, perr := h.logoutPending(ctx, userID, providerName); pending || perr != nil {
+			return vault.Credential{}, vault.ErrSignInRequired
+		}
 	}
 	return cred, err
 }
@@ -223,9 +312,19 @@ func (h *Handler) Credential(ctx context.Context, userID, providerName string, r
 // credentialLocked is Credential's work, holding the credential lock.
 func (h *Handler) credentialLocked(ctx context.Context, userID string, p *provider, req VendRequest) (vault.Credential, error) {
 	providerName := p.name
-	if h.locks.isLoggedOut(userID, providerName) {
-		// A logout is pending: refuse, and leave the credential to logout, which
-		// needs its token to revoke the grant.
+	pending, orphan, err := h.logoutPending(ctx, userID, providerName)
+	if err != nil {
+		// Fail closed: a logout may be pending.
+		return vault.Credential{}, fmt.Errorf("read pending logout: %w", err)
+	}
+	if pending {
+		// Refuse. A logout running here owns the credential, and needs its token to
+		// revoke the grant. One nobody runs (begun before a restart, or whose
+		// background wait gave up) is finished now, holding the lock.
+		if orphan {
+			res := h.logoutLocked(ctx, userID, providerName)
+			slog.InfoContext(ctx, "finished a pending logout", "user", userID, "provider", providerName, "confirmed", res.confirmed)
+		}
 		return vault.Credential{}, vault.ErrSignInRequired
 	}
 	cred, err := h.vault.Get(ctx, userID, providerName)
@@ -451,7 +550,7 @@ func (h *Handler) putIfVersion(ctx context.Context, userID, expect string, cred 
 // deleteIfVersion deletes the credential only if the row still holds cred's
 // version, so a failed refresh never deletes what a newer sign-in wrote.
 func (h *Handler) deleteIfVersion(ctx context.Context, userID string, cred vault.Credential) {
-	if h.locks.isLoggedOut(userID, cred.Provider) {
+	if pending, _, err := h.logoutPending(ctx, userID, cred.Provider); pending || err != nil {
 		return // a pending logout deletes it, after trying to revoke with it
 	}
 	cur, err := h.vault.Get(ctx, userID, cred.Provider)
@@ -586,7 +685,7 @@ func (h *Handler) storeSignIn(ctx context.Context, p *provider, userID string, t
 		return false, nil
 	}
 	// The new credential replaced whatever a pending logout was going to remove.
-	h.locks.clearLoggedOut(userID, p.name)
+	h.clearLogout(ctx, userID, p.name)
 	return false, nil
 }
 
@@ -599,23 +698,28 @@ type logoutResult struct {
 	settings []string
 }
 
-// revokeAndDelete is logout's credential step. It sets the logout tombstone first,
-// which makes logout the credential's only remaining writer: from then on every
-// other holder refuses to vend it and deletes nothing. Then, under the credential
-// lock (logoutLocked): read the credential, refresh it if it has expired or is about
-// to (revoking the grant needs a valid access token, and a session outlives one),
-// revoke the grant, and delete the row.
+// revokeAndDelete is logout's credential step. The logout is marked pending first
+// (markLogout; Logout does it before discarding the session), which makes logout the
+// credential's only remaining writer: from then on every other holder refuses to
+// vend it and deletes nothing. Then, under the credential lock (logoutLocked): read
+// the credential, refresh it if it has expired or is about to (revoking the grant
+// needs a valid access token, and a session outlives one), revoke the grant, and
+// delete the row.
 //
 // The lock is waited for detached from the browser request, for logoutLockWait. If
 // it is still busy, logout reports revocation unconfirmed and a background wait
-// (pendingLogout) does the same revoke-then-delete once the lock is free.
+// (pendingLogout) does the same revoke-then-delete once the lock is free. If that
+// wait gives up, or the process restarts, the pending mark (durable in the ledger)
+// keeps the credential unvendable, and the next lock holder finishes the logout.
 //
 // Revocation is confirmed only when GitHub confirmed it, or for a provider gofer
 // revokes nothing at. A missing GitHub credential is unconfirmed: the broker deletes
 // a row whose refresh token is dead, which after a restore from backup does not mean
 // the grant is gone.
 func (h *Handler) revokeAndDelete(ctx context.Context, userID, providerName string) logoutResult {
-	h.locks.markLoggedOut(userID, providerName)
+	if pending, _ := h.locks.localLogoutState(userID, providerName); !pending {
+		h.markLogout(ctx, userID, providerName)
+	}
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), logoutLockWait)
 	defer cancel()
 	unlock, err := h.locks.lock(wctx, userID, providerName)
@@ -625,23 +729,31 @@ func (h *Handler) revokeAndDelete(ctx context.Context, userID, providerName stri
 		return h.unconfirmed(providerName, h.providers[providerName], nil)
 	}
 	defer unlock()
+	defer h.locks.releaseLogout(userID, providerName) // still pending only if the delete failed
+	if pending, _ := h.locks.localLogoutState(userID, providerName); !pending {
+		// A new sign-in stored a replacement while logout waited: leave it, and say
+		// gofer's access was not revoked.
+		return h.unconfirmed(providerName, h.providers[providerName], nil)
+	}
 	return h.logoutLocked(ctx, userID, providerName)
 }
 
-// pendingLogout finishes a logout that could not take the lock in time: it waits
-// for the lock and runs the same revoke-then-delete, unless a new sign-in stored a
-// replacement first (which clears the tombstone).
+// pendingLogout finishes a logout that could not take the lock in time, or one
+// resumed after a restart: it waits for the lock and runs the same
+// revoke-then-delete, unless a new sign-in stored a replacement first.
 func (h *Handler) pendingLogout(ctx context.Context, userID, providerName string) {
+	defer h.locks.releaseLogout(userID, providerName)
 	wctx, cancel := context.WithTimeout(ctx, pendingLogoutWait)
 	defer cancel()
 	unlock, err := h.locks.lock(wctx, userID, providerName)
 	if err != nil {
-		// The tombstone stays: nothing is vended until the user signs in again.
-		slog.WarnContext(ctx, "logout: deferred revocation timed out; credential left unvendable", "user", userID, "provider", providerName)
+		// Still pending, and durable: nothing is vended, and the next lock holder
+		// finishes the logout.
+		slog.WarnContext(ctx, "logout: deferred revocation timed out; left to the next credential access", "user", userID, "provider", providerName)
 		return
 	}
 	defer unlock()
-	if !h.locks.isLoggedOut(userID, providerName) {
+	if pending, _ := h.locks.localLogoutState(userID, providerName); !pending {
 		return
 	}
 	res := h.logoutLocked(ctx, userID, providerName)
@@ -705,9 +817,9 @@ func (h *Handler) logoutLocked(ctx context.Context, userID, providerName string)
 	return logoutResult{confirmed: true}
 }
 
-// finishLogout deletes the row and clears the tombstone, holding the credential
-// lock. If the delete fails the tombstone stays, so the credential is still never
-// vended.
+// finishLogout deletes the row and clears the pending logout, holding the
+// credential lock. If the delete fails the logout stays pending, so the credential
+// is still never vended, and the next lock holder tries again.
 func (h *Handler) finishLogout(ctx context.Context, userID, providerName string) {
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
@@ -715,7 +827,7 @@ func (h *Handler) finishLogout(ctx context.Context, userID, providerName string)
 		slog.WarnContext(ctx, "deleting a credential on logout failed", "user", userID, "provider", providerName, "err", err)
 		return
 	}
-	h.locks.clearLoggedOut(userID, providerName)
+	h.clearLogout(ctx, userID, providerName)
 }
 
 // unconfirmed is an unconfirmed logoutResult, with the settings pages for the

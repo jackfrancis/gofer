@@ -55,6 +55,8 @@ type Handler struct {
 	// locks serialises every write of one (user, provider) credential: the
 	// callback's Put, logout, and the broker's refresh (credential.go).
 	locks credLocks
+	// ledger records pending logouts durably: the vault's own, when it keeps one.
+	ledger vault.LogoutLedger
 	// forced records the runs that have used their one forced refresh.
 	forcedMu sync.Mutex
 	forced   map[string]time.Time
@@ -71,6 +73,11 @@ func NewHandler(cfg *config.Config, sessions *session.Manager, vlt vault.Vault) 
 		vault:         vlt,
 		githubAPIBase: "https://api.github.com",
 		now:           time.Now,
+	}
+	if l, ok := vlt.(vault.LogoutLedger); ok {
+		h.ledger = l
+	} else {
+		h.ledger = vault.NewMemoryVault() // in memory, like the vault itself
 	}
 
 	redirect := func(name string) string {
@@ -331,11 +338,17 @@ func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 // revoke gofer themselves (settings_urls; settings_url is the first).
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	res := logoutResult{confirmed: true}
-	u := h.sessions.CurrentUser(r)
-	// End the session first, with its own deadline: a browser that disconnects
-	// during the GitHub work below must not leave its session valid.
+	// Find the owner and end the session on their own deadline: a browser that
+	// disconnects must neither hide whose credential to revoke nor leave its session
+	// valid. The pending logout is recorded durably before the session goes, so the
+	// credential is never vended again, even across a restart.
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-	h.sessions.Destroy(w, r.WithContext(sctx))
+	sr := r.WithContext(sctx)
+	u := h.sessions.CurrentUser(sr)
+	if u != nil && h.vault != nil {
+		h.markLogout(sctx, u.ID, u.Provider)
+	}
+	h.sessions.Destroy(w, sr)
 	cancel()
 	if u != nil && h.vault != nil {
 		res = h.revokeAndDelete(r.Context(), u.ID, u.Provider)

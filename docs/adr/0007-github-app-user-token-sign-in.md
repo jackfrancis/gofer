@@ -935,7 +935,12 @@ GitHub's endpoints only:
   refresh or check) and deletes nothing, while a refresh in flight still stores its
   pair so logout revokes with the newest token. If logout cannot take the lock in
   time, the same revoke-then-delete runs in the background once it is free; a new
-  sign-in clears the tombstone only once its credential is stored. Logout answers
+  sign-in clears the tombstone only once its credential is stored. The pending
+  logout is recorded durably (the vault's `LogoutLedger`, a marker row in the
+  `credentials` table under a reserved provider name, so still no migration) before
+  the session is discarded. After a restart, or once the background wait gives up,
+  the credential stays unvendable and the next lock holder finishes the logout; the
+  web tier also resumes pending logouts at startup. Logout answers
   200 with `revocation: unconfirmed` when GitHub did not confirm, including when no
   GitHub credential is stored, with the settings page of the credential's issuer
   (both pages when unknown).

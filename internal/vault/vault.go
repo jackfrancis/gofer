@@ -43,6 +43,24 @@ type Credential struct {
 	Version string
 }
 
+// LogoutKey names one pending logout.
+type LogoutKey struct {
+	UserID   string
+	Provider string
+}
+
+// LogoutLedger records logouts that have begun and not finished: the credential is
+// still stored, but must never be vended again, and the logout's revoke-then-delete
+// is still owed. It is kept wherever the vault keeps credentials, so a durable vault
+// keeps it across a restart. A vault may implement it; the auth handler falls back
+// to an in-memory one.
+type LogoutLedger interface {
+	MarkLogout(ctx context.Context, userID, provider string) error
+	ClearLogout(ctx context.Context, userID, provider string) error
+	LogoutPending(ctx context.Context, userID, provider string) (bool, error)
+	PendingLogouts(ctx context.Context) ([]LogoutKey, error)
+}
+
 // Vault stores and retrieves delegated provider credentials, scoped by user.
 type Vault interface {
 	Put(ctx context.Context, userID string, cred Credential) error
@@ -53,9 +71,12 @@ type Vault interface {
 // MemoryVault is an in-memory Vault for development and tests. The KMS-backed
 // backend will implement the same interface.
 type MemoryVault struct {
-	mu    sync.RWMutex
-	creds map[string]map[string]Credential // userID -> provider -> credential
+	mu      sync.RWMutex
+	creds   map[string]map[string]Credential // userID -> provider -> credential
+	logouts map[LogoutKey]bool
 }
+
+var _ LogoutLedger = (*MemoryVault)(nil)
 
 // NewMemoryVault returns an empty in-memory vault.
 func NewMemoryVault() *MemoryVault {
@@ -101,4 +122,41 @@ func (v *MemoryVault) Delete(_ context.Context, userID, provider string) error {
 		}
 	}
 	return nil
+}
+
+// MarkLogout records a pending logout.
+func (v *MemoryVault) MarkLogout(_ context.Context, userID, provider string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.logouts == nil {
+		v.logouts = make(map[LogoutKey]bool)
+	}
+	v.logouts[LogoutKey{userID, provider}] = true
+	return nil
+}
+
+// ClearLogout removes a pending logout; a missing one is not an error.
+func (v *MemoryVault) ClearLogout(_ context.Context, userID, provider string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	delete(v.logouts, LogoutKey{userID, provider})
+	return nil
+}
+
+// LogoutPending reports whether a logout is pending.
+func (v *MemoryVault) LogoutPending(_ context.Context, userID, provider string) (bool, error) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.logouts[LogoutKey{userID, provider}], nil
+}
+
+// PendingLogouts lists the pending logouts.
+func (v *MemoryVault) PendingLogouts(context.Context) ([]LogoutKey, error) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	out := make([]LogoutKey, 0, len(v.logouts))
+	for k := range v.logouts {
+		out = append(out, k)
+	}
+	return out, nil
 }
