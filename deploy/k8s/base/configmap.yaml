@@ -54,4 +54,4 @@ data:
   # connection speaks: .../chat/completions or .../responses. A model listed under an
   # endpoint that does not serve it fails at call time, not at startup. Model ids go
   # stale; list the current ones with GET https://api.githubcopilot.com/models.
-  AI_CONNECTIONS: '[{"endpoint":"https://api.githubcopilot.com/chat/completions","models":["claude-opus-5.5","gemini-4-carbon"]},{"endpoint":"https://api.githubcopilot.com/responses","models":["gpt-6-astra"]}]'
+  AI_CONNECTIONS: '[{"endpoint":"https://api.githubcopilot.com/chat/completions","models":["claude-opus-5.5","gemini-4-carbon"]},{"endpoint":"https://api.githubcopilot.com/responses","models":["gpt-6.2-astra"]}]'
