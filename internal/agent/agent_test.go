@@ -121,7 +121,8 @@ func TestRunIngestPreservesThreads(t *testing.T) {
 			{Role: worklist.RoleUser, Content: "Can you review this PR?", Kind: worklist.KindReviewRequest},
 			{Role: worklist.RoleAgent, Content: "Looks good."},
 		},
-		Meta: worklist.Metadata{HiddenAt: hidden},
+		ThreadReadThrough: "pos:1",
+		Meta:              worklist.Metadata{HiddenAt: hidden},
 	}}}
 
 	if err := Run(context.Background(),
@@ -144,6 +145,9 @@ func TestRunIngestPreservesThreads(t *testing.T) {
 	}
 	if got.Meta.HiddenAt.IsZero() {
 		t.Error("re-ingest dropped the user's hidden override")
+	}
+	if got.ThreadReadThrough != "pos:1" || got.HasUnreadReply() {
+		t.Errorf("re-ingest dropped the read cursor, got %q", got.ThreadReadThrough)
 	}
 	if got.GitHub.Title != "Fresh title" {
 		t.Errorf("re-ingest should refresh GitHub fields, got title %q", got.GitHub.Title)

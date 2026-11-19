@@ -349,7 +349,8 @@ func TestResetConversationsClearsThreads(t *testing.T) {
 			{Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest},
 			{Role: worklist.RoleAgent, Content: "Looks good.", Model: "default"},
 		},
-		ThreadReadAt: read,
+		ThreadReadAt:      read,
+		ThreadReadThrough: "pos:1",
 	}
 	hidden := worklist.WorkItem{ID: "pr2", Type: worklist.TypePullRequest,
 		Thread: []worklist.Message{{Role: worklist.RoleAgent, Content: "old reply"}}}
@@ -378,8 +379,8 @@ func TestResetConversationsClearsThreads(t *testing.T) {
 		if len(it.Thread) != 0 {
 			t.Errorf("%s: thread = %d messages, want 0", it.ID, len(it.Thread))
 		}
-		if !it.ThreadReadAt.IsZero() {
-			t.Errorf("%s: ThreadReadAt = %v, want zero", it.ID, it.ThreadReadAt)
+		if !it.ThreadReadAt.IsZero() || it.ThreadReadThrough != "" {
+			t.Errorf("%s: read cursor = %v / %q, want none", it.ID, it.ThreadReadAt, it.ThreadReadThrough)
 		}
 		byID[it.ID] = it
 	}

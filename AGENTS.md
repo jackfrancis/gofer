@@ -154,7 +154,11 @@ Wired on the web-tier side; they define what a runtime must respect:
   read-modify-write), never `List` then `Upsert`, which overwrites anything written
   in between. A run's write-back is merged into the stored item
   (`worklist.MergeRunItems`): runs own the GitHub fields, signals and scoring; the
-  thread, read cursor, hidden flag and creation time always come from the store. A
+  thread, read cursor, hidden flag and creation time always come from the store,
+  except that a hidden item resurfaces when the run's GitHub update time is after
+  the hide (`worklist.HiddenAfter`). Hidden and closed items are off the radar
+  (`WorkItem.OnRadar`), and no bulk action (Review all, the second-opinion batch)
+  draws from them. A
   run adds a thread turn only through `POST /agent/worklist/reply`
   (`worklist.AppendReply`). The web and runtime images must ship together: a runtime
   from before this rule posts its reply inside the item, where it is now ignored.
@@ -164,6 +168,16 @@ Wired on the web-tier side; they define what a runtime must respect:
   parameter `turn`). Review and pending state (`HasReview`, `ReplyPending`, …) follow
   those links. Turns stored before IDs are keyed by position (`WorkItem.TurnKey`),
   and a legacy reply answers the user turn directly before it.
+- The read cursor (`WorkItem.ThreadReadThrough`) is the key of the newest agent
+  turn the owner has seen, never a time: reply times are stamped by the run and
+  replies land out of order. Delivering the thread page is the read receipt (the UI
+  has no script): after a GET renders and flushes to the client without error,
+  `webui.Thread` acknowledges the newest reply in the snapshot it rendered
+  (`worklist.MarkThreadRead`), so a reply landing mid-request stays unread, and a
+  HEAD or failed write marks nothing. A middleware that wraps the
+  `http.ResponseWriter` must implement `Unwrap` (as `statusRecorder` does), or the
+  flush fails and no thread is ever marked read. The
+  cursor only moves forward; a re-render of an already-read thread skips the store.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,
