@@ -2,6 +2,7 @@ package webui
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -194,5 +195,72 @@ func TestThreadRenderSignedOutMarksNothing(t *testing.T) {
 	h.Thread(rec, httptest.NewRequest(http.MethodGet, "/items/thread?id="+low.ID, nil))
 	if got := stored(t, store, low.ID); got.ThreadReadThrough != "" || !got.HasUnreadReply() {
 		t.Fatal("a signed-out request must not mark a thread read")
+	}
+}
+
+// updateCounter counts Store.Update calls.
+type updateCounter struct {
+	worklist.Store
+	updates int
+}
+
+func (s *updateCounter) Update(ctx context.Context, owner string, fn func([]worklist.WorkItem) ([]worklist.WorkItem, error)) error {
+	s.updates++
+	return s.Store.Update(ctx, owner, fn)
+}
+
+// failingWriter is a client that went away: every body write fails.
+type failingWriter struct{ header http.Header }
+
+func (f *failingWriter) Header() http.Header       { return f.header }
+func (f *failingWriter) WriteHeader(int)           {}
+func (f *failingWriter) Write([]byte) (int, error) { return 0, errors.New("connection reset") }
+
+// The receipt is for a delivered page: a HEAD (empty body) or a GET whose page
+// fails to reach the client marks nothing read.
+func TestThreadUndeliveredPageMarksNothing(t *testing.T) {
+	_, low := readFixture()
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", low)
+	h := readHandler(store)
+
+	rec := httptest.NewRecorder()
+	h.Thread(rec, httptest.NewRequest(http.MethodHead, "/items/thread?id="+low.ID, nil))
+	if got := stored(t, store, low.ID); got.ThreadReadThrough != "" || !got.HasUnreadReply() {
+		t.Fatal("a HEAD request must not mark the thread read")
+	}
+
+	h.Thread(&failingWriter{header: http.Header{}}, httptest.NewRequest(http.MethodGet, "/items/thread?id="+low.ID, nil))
+	if got := stored(t, store, low.ID); got.ThreadReadThrough != "" || !got.HasUnreadReply() {
+		t.Fatal("a page that failed to reach the client must not mark the thread read")
+	}
+
+	openThread(t, h, low.ID)
+	if got := stored(t, store, low.ID); got.ThreadReadThrough != "r1" {
+		t.Fatalf("a delivered GET must mark the reply read, cursor = %q", got.ThreadReadThrough)
+	}
+}
+
+// Re-rendering a thread whose shown reply is already read (the auto-refresh while a
+// follow-up is pending) takes no store write at all.
+func TestThreadReRenderOfReadThreadSkipsUpdate(t *testing.T) {
+	_, low := readFixture()
+	low.Thread = append(low.Thread, worklist.Message{ID: "u2", Role: worklist.RoleUser, Content: "and the tests?", At: readNow})
+	mem := worklist.NewMemoryStore()
+	mem.Seed("u1", low)
+	store := &updateCounter{Store: mem}
+	h := readHandler(store)
+
+	if body := openThread(t, h, low.ID); !strings.Contains(body, `http-equiv="refresh"`) {
+		t.Fatal("a pending follow-up should auto-refresh the page")
+	}
+	if store.updates != 1 {
+		t.Fatalf("first render: %d updates, want 1 (the receipt)", store.updates)
+	}
+	for range 3 {
+		openThread(t, h, low.ID)
+	}
+	if store.updates != 1 {
+		t.Fatalf("re-rendering an already-read thread made %d more updates, want 0", store.updates-1)
 	}
 }

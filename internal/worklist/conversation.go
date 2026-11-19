@@ -122,7 +122,10 @@ func (w WorkItem) HasUnreadReply() bool {
 		return false
 	}
 	if w.ThreadReadThrough != "" {
-		return w.turnPosition(w.ThreadReadThrough) < last
+		// The cursor names an agent turn (MarkRead), so it is at the latest one or
+		// before it, or names a turn no longer in the thread: unread unless it is
+		// the latest.
+		return w.TurnKey(last) != w.ThreadReadThrough
 	}
 	return w.Thread[last].At.After(w.ThreadReadAt)
 }
