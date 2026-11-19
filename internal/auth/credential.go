@@ -36,6 +36,18 @@ const (
 	// errBadRefreshToken is GitHub's token-endpoint error for a refresh token that
 	// is spent, expired or revoked.
 	errBadRefreshToken = "bad_refresh_token"
+	// exchangeTimeout bounds a refresh exchange and the write that persists its
+	// result. Both run detached from the requesting run's context: once GitHub has
+	// rotated the pair the old refresh token is spent, so a run that disconnects must
+	// not abandon the new pair. It also bounds how long a refresh holds the lock.
+	exchangeTimeout = 20 * time.Second
+	// pendingLogoutWait bounds the background deletion that finishes a logout which
+	// could not take the lock in time.
+	pendingLogoutWait = 2 * time.Minute
+
+	// GitHub's settings pages where a user revokes gofer by hand.
+	githubAppsSettings = "https://github.com/settings/apps/authorizations"
+	oauthAppsSettings  = "https://github.com/settings/applications"
 )
 
 // VendRequest qualifies a broker vend.
@@ -48,12 +60,51 @@ type VendRequest struct {
 	RunID string
 }
 
+// logoutLockWait is how long logout waits for the credential lock, detached from the
+// browser request. Every holder's work is bounded (exchangeTimeout, the HTTP client's
+// timeouts), so this is normally enough; if not, the deletion is handed to the next
+// lock holder (the logout tombstone). A variable so tests can shorten it.
+var logoutLockWait = 15 * time.Second
+
 // credLocks is one mutex per (user, provider). The web tier is a single replica by
 // construction, so an in-process lock serialises every writer of a credential. A
 // lock waits on its context, so a stuck holder cannot wedge a request forever.
+//
+// It also keeps the logout tombstones: a (user, provider) whose logout has begun
+// but not yet deleted the row. Every lock holder checks it, so a refresh that was
+// already in flight when the user signed out can neither write its pair back nor
+// vend it, whether or not logout got the lock in time.
 type credLocks struct {
-	mu sync.Mutex
-	m  map[string]*credLock
+	mu        sync.Mutex
+	m         map[string]*credLock
+	loggedOut map[string]bool
+}
+
+func credKey(userID, provider string) string { return userID + "\x00" + provider }
+
+// markLoggedOut sets the tombstone. It needs no credential lock: holders read it
+// under theirs, before every write and vend.
+func (l *credLocks) markLoggedOut(userID, provider string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.loggedOut == nil {
+		l.loggedOut = make(map[string]bool)
+	}
+	l.loggedOut[credKey(userID, provider)] = true
+}
+
+// clearLoggedOut removes the tombstone: the row is gone, or a new sign-in replaced
+// it. Call it holding the credential lock.
+func (l *credLocks) clearLoggedOut(userID, provider string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.loggedOut, credKey(userID, provider))
+}
+
+func (l *credLocks) isLoggedOut(userID, provider string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.loggedOut[credKey(userID, provider)]
 }
 
 type credLock struct {
@@ -62,7 +113,7 @@ type credLock struct {
 }
 
 func (l *credLocks) lock(ctx context.Context, userID, provider string) (func(), error) {
-	key := userID + "\x00" + provider
+	key := credKey(userID, provider)
 	l.mu.Lock()
 	if l.m == nil {
 		l.m = make(map[string]*credLock)
@@ -158,6 +209,11 @@ func (h *Handler) Credential(ctx context.Context, userID, providerName string, r
 	}
 	defer unlock()
 
+	if h.locks.isLoggedOut(userID, providerName) {
+		// A logout has begun and not finished: finish its deletion, vend nothing.
+		h.finishLogout(ctx, userID, providerName)
+		return vault.Credential{}, vault.ErrSignInRequired
+	}
 	cred, err := h.vault.Get(ctx, userID, providerName)
 	if errors.Is(err, vault.ErrNotFound) {
 		return vault.Credential{}, vault.ErrSignInRequired
@@ -248,12 +304,27 @@ func (h *Handler) confirmRejection(ctx context.Context, userID string, p *provid
 }
 
 // refresher is a token source that always spends refreshToken: with no access
-// token in it, oauth2 has nothing to reuse.
+// token in it, oauth2 has nothing to reuse. The exchange runs detached from ctx's
+// cancellation, under exchangeTimeout: cancelling a run after GitHub has rotated the
+// pair would otherwise leave the spent pair stored and the user signed out.
 func (h *Handler) refresher(ctx context.Context, p *provider, refreshToken string) oauth2.TokenSource {
-	if h.client != nil {
-		ctx = context.WithValue(ctx, oauth2.HTTPClient, h.client)
+	return detachedSource{h: h, p: p, ctx: ctx, refreshToken: refreshToken}
+}
+
+type detachedSource struct {
+	h            *Handler
+	p            *provider
+	ctx          context.Context
+	refreshToken string
+}
+
+func (d detachedSource) Token() (*oauth2.Token, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), exchangeTimeout)
+	defer cancel()
+	if d.h.client != nil {
+		ctx = context.WithValue(ctx, oauth2.HTTPClient, d.h.client)
 	}
-	return p.oauth.TokenSource(ctx, &oauth2.Token{RefreshToken: refreshToken})
+	return d.p.oauth.TokenSource(ctx, &oauth2.Token{RefreshToken: d.refreshToken}).Token()
 }
 
 // refreshDead reports whether err says the refresh token is dead, and if so
@@ -305,6 +376,21 @@ func (h *Handler) storeRefreshed(ctx context.Context, userID string, p *provider
 		fresh.RefreshToken = old.RefreshToken
 		fresh.RefreshExpiry = old.RefreshExpiry
 	}
+	// The old refresh token is spent: finish this write even if the requesting run
+	// goes away.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), exchangeTimeout)
+	defer cancel()
+	if h.locks.isLoggedOut(userID, old.Provider) {
+		// The user signed out while this refresh was in flight. Store nothing, and
+		// revoke the grant with the fresh token, which logout never saw.
+		if p.name == "github" {
+			if err := h.revokeGrant(ctx, p, fresh.AccessToken); err != nil {
+				slog.WarnContext(ctx, "revoking a pair refreshed during logout failed", "user", userID, "err", err)
+			}
+		}
+		h.finishLogout(ctx, userID, old.Provider)
+		return vault.Credential{}, vault.ErrSignInRequired
+	}
 	for attempt := 0; attempt < 2; attempt++ {
 		stored, err := h.putIfVersion(ctx, userID, old.Version, fresh)
 		if err == nil && !stored {
@@ -322,10 +408,18 @@ func (h *Handler) storeRefreshed(ctx context.Context, userID string, p *provider
 // refreshExpiry is when tok's refresh token expires, from GitHub's
 // refresh_token_expires_in, or zero.
 func refreshExpiry(tok *oauth2.Token, now time.Time) time.Time {
+	// A JSON response gives a float64; a form-encoded one gives the pinned oauth2
+	// package's int64 (or a string, for a value it cannot parse as one).
 	var secs float64
 	switch v := tok.Extra("refresh_token_expires_in").(type) {
 	case float64:
 		secs = v
+	case int64:
+		secs = float64(v)
+	case int:
+		secs = float64(v)
+	case json.Number:
+		secs, _ = v.Float64()
 	case string:
 		secs, _ = strconv.ParseFloat(v, 64)
 	}
@@ -386,7 +480,9 @@ func (h *Handler) useForced(runID string) {
 // checkToken asks GitHub whether accessToken is valid for p's client
 // (POST /applications/{client_id}/token, authenticated with the client's own
 // credentials; it does not count against failed-login limits). 200 is valid; 404
-// or 422 is not; anything else is an error.
+// is not. Anything else is inconclusive and an error: 422 can mean a validation
+// failure or abuse protection, and treating it as "revoked" would delete or rotate a
+// good credential.
 func (h *Handler) checkToken(ctx context.Context, p *provider, accessToken string) (bool, error) {
 	status, err := h.applicationCall(ctx, p, http.MethodPost, "/token", accessToken)
 	if err != nil {
@@ -395,7 +491,7 @@ func (h *Handler) checkToken(ctx context.Context, p *provider, accessToken strin
 	switch status {
 	case http.StatusOK:
 		return true, nil
-	case http.StatusNotFound, http.StatusUnprocessableEntity:
+	case http.StatusNotFound:
 		return false, nil
 	}
 	return false, fmt.Errorf("github check token: status %d", status)
@@ -473,6 +569,9 @@ func (h *Handler) storeSignIn(ctx context.Context, p *provider, userID string, t
 		ClientID:      p.oauth.ClientID,
 		Version:       newVersion(),
 	}
+	// A new sign-in supersedes a logout still pending: its credential is the
+	// user's current one.
+	h.locks.clearLoggedOut(userID, p.name)
 	// Best-effort, as before: a vault failure must not block interactive login. The
 	// broker then answers "sign-in required", and the page says so.
 	if err := h.vault.Put(ctx, userID, cred); err != nil {
@@ -481,49 +580,69 @@ func (h *Handler) storeSignIn(ctx context.Context, p *provider, userID string, t
 	return false, nil
 }
 
-// revokeAndDelete is logout's credential step, under the credential lock: read the
-// credential, refresh it if it has expired or is about to (revoking the grant needs
-// a valid access token, and a session outlives one), revoke the grant, then delete
-// the row. The row is deleted whatever happens. It reports whether revocation at
-// GitHub is confirmed; nothing stored, or a provider gofer revokes nothing at, is
-// confirmed.
-func (h *Handler) revokeAndDelete(ctx context.Context, userID, providerName string) (confirmed bool) {
-	del := func() {
-		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		if err := h.vault.Delete(dctx, userID, providerName); err != nil {
-			slog.WarnContext(ctx, "deleting a credential on logout failed", "user", userID, "provider", providerName, "err", err)
-		}
+// logoutResult is what logout learned about revocation at GitHub.
+type logoutResult struct {
+	confirmed bool
+	// settings lists the GitHub settings pages where the user can revoke gofer by
+	// hand when revocation is not confirmed: the issuing client's kind, or both
+	// pages when gofer cannot tell which client issued the credential.
+	settings []string
+}
+
+// revokeAndDelete is logout's credential step. It sets the logout tombstone first,
+// then, under the credential lock: reads the credential, refreshes it if it has
+// expired or is about to (revoking the grant needs a valid access token, and a
+// session outlives one), revokes the grant, and deletes the row. The row is deleted
+// whatever happens, and always under the lock, so no refresh can write a pair back
+// after it.
+//
+// The lock is waited for detached from the browser request, for logoutLockWait. If
+// it is still busy, logout reports revocation unconfirmed and leaves the deletion to
+// a background wait and to the tombstone, which the next holder honours.
+//
+// Revocation is confirmed only when GitHub confirmed it, or for a provider gofer
+// revokes nothing at. A missing GitHub credential is unconfirmed: the broker deletes
+// a row whose refresh token is dead, which after a restore from backup does not mean
+// the grant is gone.
+func (h *Handler) revokeAndDelete(ctx context.Context, userID, providerName string) logoutResult {
+	p, ok := h.providers[providerName]
+	if providerName != "github" {
+		ok = false
 	}
-	unlock, err := h.locks.lock(ctx, userID, providerName)
+	h.locks.markLoggedOut(userID, providerName)
+	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), logoutLockWait)
+	defer cancel()
+	unlock, err := h.locks.lock(lctx, userID, providerName)
 	if err != nil {
-		// Logout is never blocked: delete anyway; a refresh in flight may write back.
-		del()
-		return false
+		slog.WarnContext(ctx, "logout: credential lock busy; deletion deferred", "user", userID, "provider", providerName)
+		go h.pendingLogout(context.WithoutCancel(ctx), userID, providerName)
+		return h.unconfirmed(providerName, p, nil)
 	}
 	defer unlock()
-	cred, err := h.vault.Get(ctx, userID, providerName)
-	if errors.Is(err, vault.ErrNotFound) {
-		return true
-	}
-	defer del()
-	if err != nil {
+	defer h.finishLogout(lctx, userID, providerName)
+
+	cred, err := h.vault.Get(lctx, userID, providerName)
+	switch {
+	case providerName != "github":
+		return logoutResult{confirmed: true} // gofer revokes nothing at other providers
+	case errors.Is(err, vault.ErrNotFound):
+		slog.InfoContext(ctx, "logout: no stored github credential; revocation unconfirmed", "user", userID)
+		return h.unconfirmed(providerName, p, nil)
+	case err != nil:
 		slog.WarnContext(ctx, "reading a credential on logout failed", "user", userID, "provider", providerName, "err", err)
-		return providerName != "github"
-	}
-	p, ok := h.providers[providerName]
-	if providerName != "github" || !ok {
-		return true // gofer revokes nothing at other providers
-	}
-	if !fromConfiguredClient(p, cred) {
+		return h.unconfirmed(providerName, p, nil)
+	case !ok:
+		slog.InfoContext(ctx, "logout: github sign-in is not configured; revocation unconfirmed", "user", userID)
+		return h.unconfirmed(providerName, nil, &cred)
+	case !fromConfiguredClient(p, cred):
 		// Issued by another client (before a cutover or rollback): this client's
 		// credentials cannot revoke it.
 		slog.InfoContext(ctx, "logout: credential is from another client; revocation unconfirmed", "user", userID)
-		return false
+		return h.unconfirmed(providerName, p, &cred)
 	}
 	token := cred.AccessToken
 	if cred.RefreshToken != "" && !cred.Expiry.IsZero() && h.now().Add(earlyRefresh).After(cred.Expiry) {
-		tok, err := h.refresher(ctx, p, cred.RefreshToken).Token()
+		tok, err := h.refresher(lctx, p, cred.RefreshToken).Token()
 		switch {
 		case err == nil:
 			token = tok.AccessToken
@@ -531,23 +650,76 @@ func (h *Handler) revokeAndDelete(ctx context.Context, userID, providerName stri
 			// This does not prove the grant is gone: after a restore from backup the
 			// vault can hold a spent refresh token while a newer pair still works.
 			slog.InfoContext(ctx, "logout: refresh token is dead; revocation unconfirmed", "user", userID)
-			return false
+			return h.unconfirmed(providerName, p, &cred)
 		case !h.now().Before(cred.Expiry):
 			slog.WarnContext(ctx, "logout: refresh failed and the token has expired; revocation unconfirmed", "user", userID, "code", refreshErrorCode(err))
-			return false
+			return h.unconfirmed(providerName, p, &cred)
 		}
 	}
-	if err := h.revokeGrant(ctx, p, token); err != nil {
+	if err := h.revokeGrant(lctx, p, token); err != nil {
 		slog.WarnContext(ctx, "logout: grant revocation failed; unconfirmed", "user", userID, "err", err)
-		return false
+		return h.unconfirmed(providerName, p, &cred)
 	}
-	return true
+	return logoutResult{confirmed: true}
 }
 
-// authorizedAppsURL is where a user revokes gofer at GitHub by hand.
-func (h *Handler) authorizedAppsURL() string {
-	if h.cfg != nil && h.cfg.Providers.IsGitHubApp() {
-		return "https://github.com/settings/apps/authorizations"
+// finishLogout deletes the row and clears the tombstone. Call it holding the
+// credential lock.
+func (h *Handler) finishLogout(ctx context.Context, userID, providerName string) {
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := h.vault.Delete(dctx, userID, providerName); err != nil {
+		// Keep the tombstone: the next holder tries again, and vends nothing.
+		slog.WarnContext(ctx, "deleting a credential on logout failed", "user", userID, "provider", providerName, "err", err)
+		return
 	}
-	return "https://github.com/settings/applications"
+	h.locks.clearLoggedOut(userID, providerName)
+}
+
+// pendingLogout finishes a logout that could not take the lock in time: it waits
+// for the lock and deletes the row, unless a new sign-in cleared the tombstone
+// first.
+func (h *Handler) pendingLogout(ctx context.Context, userID, providerName string) {
+	ctx, cancel := context.WithTimeout(ctx, pendingLogoutWait)
+	defer cancel()
+	unlock, err := h.locks.lock(ctx, userID, providerName)
+	if err != nil {
+		// The tombstone stays: the next holder deletes the row and vends nothing.
+		slog.WarnContext(ctx, "logout: deferred deletion timed out; left to the next credential access", "user", userID, "provider", providerName)
+		return
+	}
+	defer unlock()
+	if h.locks.isLoggedOut(userID, providerName) {
+		h.finishLogout(ctx, userID, providerName)
+	}
+}
+
+// unconfirmed is an unconfirmed logoutResult, with the settings pages for the
+// credential's issuer. Non-GitHub providers get none: gofer revokes nothing there.
+func (h *Handler) unconfirmed(providerName string, p *provider, cred *vault.Credential) logoutResult {
+	if providerName != "github" {
+		return logoutResult{confirmed: true}
+	}
+	return logoutResult{settings: h.revocationSettings(p, cred)}
+}
+
+// revocationSettings picks where a user revokes gofer by hand, from the client that
+// issued cred: a legacy row (no client recorded) came from the OAuth app; a row from
+// the configured client follows GITHUB_CLIENT_KIND; anything else — another client
+// after a cutover or rollback, or no credential at all — could be either, so both
+// pages are offered.
+func (h *Handler) revocationSettings(p *provider, cred *vault.Credential) []string {
+	both := []string{githubAppsSettings, oauthAppsSettings}
+	switch {
+	case cred == nil:
+		return both
+	case cred.ClientID == "":
+		return []string{oauthAppsSettings}
+	case p != nil && cred.ClientID == p.oauth.ClientID:
+		if h.cfg != nil && h.cfg.Providers.IsGitHubApp() {
+			return []string{githubAppsSettings}
+		}
+		return []string{oauthAppsSettings}
+	}
+	return both
 }

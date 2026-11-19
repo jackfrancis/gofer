@@ -325,27 +325,27 @@ func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 // destroyed whatever happens.
 //
 // It answers 204 when revocation is confirmed (or there was nothing to revoke).
-// When it is not — a dead refresh token, a failed revoke call, or a credential from
-// another client — it answers 200 with a JSON body that says so and links the user
-// to GitHub's settings, where they can revoke gofer themselves.
+// When it is not — no stored GitHub credential, a dead refresh token, a failed
+// revoke call, or a credential from another client — it answers 200 with a JSON body
+// that says so and links the user to the GitHub settings page(s) where they can
+// revoke gofer themselves (settings_urls; settings_url is the first).
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
-	confirmed := true
+	res := logoutResult{confirmed: true}
 	if u := h.sessions.CurrentUser(r); u != nil && h.vault != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-		defer cancel()
-		confirmed = h.revokeAndDelete(ctx, u.ID, u.Provider)
+		res = h.revokeAndDelete(r.Context(), u.ID, u.Provider)
 	}
 	h.sessions.Destroy(w, r)
-	if confirmed {
+	if res.confirmed {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"revocation":   "unconfirmed",
-		"message":      "You are signed out of gofer, but GitHub did not confirm that gofer's access was revoked. Revoke gofer in GitHub's settings to be sure.",
-		"settings_url": h.authorizedAppsURL(),
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"revocation":    "unconfirmed",
+		"message":       "You are signed out of gofer, but GitHub did not confirm that gofer's access was revoked. Revoke gofer in GitHub's settings to be sure.",
+		"settings_url":  res.settings[0],
+		"settings_urls": res.settings,
 	})
 }
 

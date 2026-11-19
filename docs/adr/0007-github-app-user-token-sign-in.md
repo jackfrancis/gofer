@@ -920,19 +920,29 @@ GitHub's endpoints only:
   retried once; `client_id` and a credential version in the sealed JSON
   (`internal/storage/vault.go`); legacy rows tagged under the lock, or "sign-in
   required" under the app; `rejected=<version>` confirmed with check-token, with one
-  forced refresh per run ID; version-checked writes and deletes.
+  forced refresh per run ID; version-checked writes and deletes. Check-token's 404
+  alone means invalid; a 422 or any other answer is inconclusive and changes
+  nothing. A refresh exchange and the write that stores its pair run on their own
+  deadline, so a run that disconnects cannot strand a spent pair.
 - The callback re-checks its token with check-token under the lock. If the grant
   was revoked mid-flow it stores nothing and answers with a "Sign in again" link
   rather than an automatic redirect, so an unexpected "invalid" from GitHub cannot
   loop. A refused account's grant is revoked.
-- Logout refreshes if needed, revokes the grant, then deletes the row, and answers
-  200 with `revocation: unconfirmed` and a link to GitHub's settings when GitHub did
-  not confirm.
+- Logout refreshes if needed, revokes the grant, then deletes the row, always under
+  the lock. It first sets a logout tombstone that every lock holder checks, so a
+  refresh in flight stores nothing (and revokes the pair it got) and nothing is
+  vended; if logout cannot take the lock in time, the deletion finishes in the
+  background or at the next access. It answers 200 with `revocation: unconfirmed`
+  when GitHub did not confirm, including when no GitHub credential is stored, with
+  the settings page of the credential's issuer (both pages when unknown).
 - The broker (`internal/api/credential.go`) returns `credential_version`, and answers
   "sign-in required" with 410 and code `sign_in_required`.
 - The runtime (`internal/agent/credential.go`): a token holder, as the GitHub client's
   transport, that re-vends once on 401 and turns "sign-in required" into a typed
-  `ReconnectError`; the converser's tool loop stops on it; Discuss posts a
+  `ReconnectError`; a re-vend that fails otherwise puts Discuss in its
+  stored-context fallback (or marks a reply that lost access mid-turn); enrich and
+  ingest stop on a reconnect found by any request; the converser's tool loop stops on
+  it; Discuss posts a
   `reconnect` system notice (at vend, in the snapshot, or from a tool call), and
   marks a reply made without GitHub "answered from stored context only". The landing
   page and the thread prompt the user to sign in again.

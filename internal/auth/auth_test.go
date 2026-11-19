@@ -34,6 +34,10 @@ type fakeGitHub struct {
 	n         int
 	killNext  bool // the next issued token is dead on arrival (a grant revoked mid-flow)
 	revokeErr bool // grant revocation fails
+	// checkStatus, when set, is check-token's answer whatever the token.
+	checkStatus int
+	// onRefresh runs when a refresh is served, after the pair has rotated.
+	onRefresh func()
 
 	refreshes   atomic.Int32
 	checks      atomic.Int32
@@ -63,6 +67,9 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 				}
 				delete(f.refresh, r.Form.Get("refresh_token"))
 				delete(f.valid, old) // rotation kills the old access token
+				if f.onRefresh != nil {
+					f.onRefresh()
+				}
 			}
 			_ = json.NewEncoder(w).Encode(f.issueLocked())
 		case r.URL.Path == "/user":
@@ -72,6 +79,13 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 			f.checks.Add(1)
 			if !f.basicAuthOK(r) {
 				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			f.mu.Lock()
+			forced := f.checkStatus
+			f.mu.Unlock()
+			if forced != 0 {
+				w.WriteHeader(forced)
 				return
 			}
 			if f.isValid(bodyToken(r)) {

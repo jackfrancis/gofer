@@ -390,3 +390,56 @@ func TestHolderCoversActionsLogHop(t *testing.T) {
 		t.Fatalf("log %q, rejections %v", buf.String(), plane.rejections())
 	}
 }
+
+// Review P2: enrich checks for a reconnect after its workers finish. Login works,
+// a timeline lookup finds the access gone, and the pass fails without writing.
+func TestEnrichReconnectAfterWorkers(t *testing.T) {
+	plane := newFakePlane(t, planeAnswer{token: "tok", version: "v1"}, planeAnswer{status: signInRequiredStatus})
+	api := newFakeAPI(t, "tok")
+	api.unauthorized = func(path string) bool { return strings.HasSuffix(path, "/timeline") }
+	sink := &memSink{items: []worklist.WorkItem{
+		{ID: "github:o/r#1", Source: "github", GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1}},
+		{ID: "github:o/r#2", Source: "github", GitHub: worklist.GitHubRef{Repo: "o/r", Number: 2}},
+	}}
+	err := Run(context.Background(), Params{JobType: JobEnrich, GitHubBaseURL: api.srv.URL}, plane.vendor(), sink)
+	if !isSignInRequired(err) {
+		t.Fatalf("err = %v, want sign-in required", err)
+	}
+	if sink.ingests != 0 {
+		t.Error("enrich wrote partial results")
+	}
+}
+
+// Review P2: GitHub refuses the token and the broker fails on the re-vend (not
+// "sign-in required"). Discuss falls back as for a failed vend: no tools, the model
+// told GitHub is unavailable, and the reply says it used stored context only.
+func TestConverseReVendFailureFallsBack(t *testing.T) {
+	plane := newFakePlane(t, planeAnswer{token: "tok", version: "v1"}, planeAnswer{status: http.StatusBadGateway})
+	api := newFakeAPI(t) // rejects the token
+	sink := converseSink()
+	fc := &fakeConverser{reply: "From what gofer stored, probably a flake."}
+	if err := Run(context.Background(), Params{JobType: JobConverse, ItemID: "github:o/r#1", Converser: fc, GitHubBaseURL: api.srv.URL}, plane.vendor(), sink); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fc.gotUser, "GitHub is unavailable for this turn") || fc.gotTools != nil {
+		t.Errorf("model was asked %q with tools %v", fc.gotUser, fc.gotTools)
+	}
+	if m := lastTurn(t, sink); !strings.Contains(m.Content, "Answered from stored context only") || m.Notice != "" {
+		t.Errorf("reply = %+v", m)
+	}
+}
+
+// A re-vend that fails mid-tool-loop marks the reply as partly unchecked.
+func TestConverseReVendFailureMidTurnIsDisclosed(t *testing.T) {
+	plane := newFakePlane(t, planeAnswer{token: "tok", version: "v1"}, planeAnswer{status: http.StatusBadGateway})
+	api := newFakeAPI(t, "tok")
+	api.unauthorized = func(path string) bool { return strings.Contains(path, "/contents/") }
+	sink := converseSink()
+	tc := &toolConverser{tool: "github_read_file", args: `{"repo":"o/r","path":"README.md"}`}
+	if err := Run(context.Background(), Params{JobType: JobConverse, ItemID: "github:o/r#1", Converser: tc, GitHubBaseURL: api.srv.URL}, plane.vendor(), sink); err != nil {
+		t.Fatal(err)
+	}
+	if m := lastTurn(t, sink); !strings.Contains(m.Content, "lost access to GitHub partway") {
+		t.Errorf("reply = %+v", m)
+	}
+}

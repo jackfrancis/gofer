@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/oauth2"
+
 	"github.com/jackfrancis/gofer/internal/config"
 	"github.com/jackfrancis/gofer/internal/vault"
 )
@@ -417,12 +419,9 @@ func TestLogoutReportsUnconfirmedRevocation(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	var out map[string]string
-	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	if out["revocation"] != "unconfirmed" || out["settings_url"] != "https://github.com/settings/apps/authorizations" {
-		t.Errorf("answer = %v", out)
+	out := decodeLogout(t, rec)
+	if out.Revocation != "unconfirmed" || out.SettingsURL != githubAppsSettings || len(out.SettingsURLs) != 1 {
+		t.Errorf("answer = %+v", out)
 	}
 	if _, err := vlt.Get(bg, user, "github"); !errors.Is(err, vault.ErrNotFound) {
 		t.Error("row kept after logout")
@@ -471,10 +470,9 @@ func TestLogoutOtherClientIsUnconfirmed(t *testing.T) {
 	if rec.Code != http.StatusOK || gh.revoked.Load() != 0 {
 		t.Fatalf("status = %d, revocations = %d", rec.Code, gh.revoked.Load())
 	}
-	var out map[string]string
-	_ = json.NewDecoder(rec.Body).Decode(&out)
-	if out["settings_url"] == "" {
-		t.Error("no settings link")
+	// The legacy row came from the OAuth app, so its settings page is the one to use.
+	if out := decodeLogout(t, rec); out.SettingsURL != oauthAppsSettings {
+		t.Errorf("settings = %+v, want the OAuth app page", out)
 	}
 }
 
@@ -488,5 +486,194 @@ func TestLogoutConfirmed(t *testing.T) {
 	}
 	if _, err := vlt.Get(bg, user, "github"); !errors.Is(err, vault.ErrNotFound) {
 		t.Error("row kept after logout")
+	}
+}
+
+type logoutAnswer struct {
+	Revocation   string   `json:"revocation"`
+	SettingsURL  string   `json:"settings_url"`
+	SettingsURLs []string `json:"settings_urls"`
+}
+
+func decodeLogout(t *testing.T, rec *httptest.ResponseRecorder) logoutAnswer {
+	t.Helper()
+	var out logoutAnswer
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatalf("logout body: %v", err)
+	}
+	return out
+}
+
+// Review P1: a logout that cannot take the lock in time never deletes outside it.
+// It sets a tombstone instead: a refresh already in flight stores nothing (and
+// revokes the pair it got), no vend follows, and the row is deleted under the lock.
+func TestLogoutDuringRefreshLeavesNoCredential(t *testing.T) {
+	defer func(d time.Duration) { logoutLockWait = d }(logoutLockWait)
+	logoutLockWait = 50 * time.Millisecond
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
+	old := put(t, gh, vlt, appCred("ghu_old", "ghr_old", "v1", time.Minute))
+
+	// A refresh holds the lock and has already exchanged its refresh token.
+	unlock, err := h.locks.lock(bg, user, "github")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := h.revokeAndDelete(bg, user, "github")
+	if res.confirmed || len(res.settings) == 0 {
+		t.Fatalf("logout that could not take the lock = %+v, want unconfirmed", res)
+	}
+	if _, err := vlt.Get(bg, user, "github"); err != nil {
+		t.Fatalf("the row was deleted outside the lock (err=%v)", err)
+	}
+	tok, err := h.refresher(bg, h.providers["github"], old.RefreshToken).Token()
+	if err != nil {
+		t.Fatal(err)
+	}
+	revokedBefore := gh.revoked.Load()
+	if _, err := h.storeRefreshed(bg, user, h.providers["github"], old, tok); !errors.Is(err, vault.ErrSignInRequired) {
+		t.Fatalf("refresh during logout: err = %v, want sign-in required", err)
+	}
+	if _, err := vlt.Get(bg, user, "github"); !errors.Is(err, vault.ErrNotFound) {
+		t.Fatalf("the refreshed pair survived logout (err=%v)", err)
+	}
+	if gh.revoked.Load() != revokedBefore+1 || gh.isValid(tok.AccessToken) {
+		t.Error("the pair refreshed during logout was not revoked")
+	}
+	unlock()
+
+	// Nothing is vended afterwards, and the deferred deletion finishes.
+	if _, err := h.Credential(bg, user, "github", VendRequest{}); !errors.Is(err, vault.ErrSignInRequired) {
+		t.Fatalf("vend after logout: err = %v", err)
+	}
+	if h.locks.isLoggedOut(user, "github") {
+		t.Error("tombstone left after the deletion finished")
+	}
+}
+
+// A new sign-in supersedes a logout still pending: its credential is kept.
+func TestSignInClearsPendingLogout(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
+	h.locks.markLoggedOut(user, "github")
+	signIn(t, h)
+	if _, err := h.Credential(bg, user, "github", VendRequest{}); err != nil {
+		t.Fatalf("vend after a new sign-in: %v", err)
+	}
+	stored(t, vlt)
+}
+
+// Review P2: logout with no stored GitHub credential (the broker deleted a dead
+// one, say after a restore) is unconfirmed, with both settings pages since gofer
+// cannot tell which client issued the grant.
+func TestLogoutWithoutCredentialIsUnconfirmed(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
+	_, next := signIn(t, h)
+	_ = vlt.Delete(bg, user, "github")
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	for _, ck := range next.Cookies() {
+		req.AddCookie(ck)
+	}
+	rec := httptest.NewRecorder()
+	h.Logout(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 unconfirmed", rec.Code)
+	}
+	if out := decodeLogout(t, rec); len(out.SettingsURLs) != 2 {
+		t.Errorf("settings = %+v, want both pages", out)
+	}
+}
+
+// Review P2: the settings page follows the credential's issuer, not the configured
+// kind; an unknown issuer gets both pages.
+func TestRevocationSettings(t *testing.T) {
+	gh := newFakeGitHub(t)
+	app, _, _, _ := newKindHandler(t, gh, config.GitHubApp)
+	oauth, _, _, _ := newKindHandler(t, gh, config.GitHubOAuthApp)
+	cases := []struct {
+		name string
+		h    *Handler
+		cred *vault.Credential
+		want []string
+	}{
+		{"app, own row", app, &vault.Credential{ClientID: "cid"}, []string{githubAppsSettings}},
+		{"app, legacy OAuth row after cutover", app, &vault.Credential{}, []string{oauthAppsSettings}},
+		{"oauth, app row after rollback", oauth, &vault.Credential{ClientID: "Iv1.app"}, []string{githubAppsSettings, oauthAppsSettings}},
+		{"oauth, own row", oauth, &vault.Credential{ClientID: "cid"}, []string{oauthAppsSettings}},
+		{"no credential", app, nil, []string{githubAppsSettings, oauthAppsSettings}},
+	}
+	for _, c := range cases {
+		got := c.h.revocationSettings(c.h.providers["github"], c.cred)
+		if strings.Join(got, ",") != strings.Join(c.want, ",") {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// Review P2: a 422 from check-token is inconclusive. The credential is kept and not
+// rotated, the vend fails as temporary, and a callback does not call the grant
+// revoked.
+func TestCheckToken422IsInconclusive(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, sessions, _, vlt := newKindHandler(t, gh, config.GitHubApp)
+	put(t, gh, vlt, appCred("ghu_a", "ghr_a", "v1", 4*time.Hour))
+	gh.mu.Lock()
+	gh.checkStatus = http.StatusUnprocessableEntity
+	gh.mu.Unlock()
+	_, err := h.Credential(bg, user, "github", VendRequest{Rejected: "v1", RunID: "r"})
+	if err == nil || errors.Is(err, vault.ErrSignInRequired) {
+		t.Fatalf("err = %v, want a temporary failure", err)
+	}
+	if s := stored(t, vlt); s.Version != "v1" || gh.refreshes.Load() != 0 {
+		t.Fatalf("a 422 changed the credential: %+v, refreshes=%d", s, gh.refreshes.Load())
+	}
+
+	rec, next := signIn(t, h)
+	if rec.Code != http.StatusBadGateway || sessions.CurrentUser(next) != nil {
+		t.Fatalf("callback on a 422 check: status %d", rec.Code)
+	}
+}
+
+// ctxVault fails a write whose context is done, as the SQLite vault does.
+type ctxVault struct{ vault.Vault }
+
+func (v ctxVault) Put(ctx context.Context, userID string, c vault.Credential) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return v.Vault.Put(ctx, userID, c)
+}
+
+// Review P2: once GitHub has rotated the pair, a run that disconnects does not
+// abandon it: the exchange and the write finish on their own deadline.
+func TestRefreshSurvivesCancelledRun(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
+	h.vault = ctxVault{vlt}
+	put(t, gh, vlt, appCred("ghu_old", "ghr_old", "v1", time.Minute))
+	ctx, cancel := context.WithCancel(bg)
+	gh.onRefresh = cancel // the run goes away while GitHub is rotating the pair
+	c, err := h.Credential(ctx, user, "github", VendRequest{})
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if s := stored(t, vlt); s.AccessToken != c.AccessToken || s.AccessToken == "ghu_old" {
+		t.Fatalf("the rotated pair was not stored: %+v", s)
+	}
+}
+
+// Review P3: a form-encoded token response's refresh_token_expires_in (int64 in
+// the pinned oauth2) is decoded like the JSON one.
+func TestRefreshExpiryFormEncoded(t *testing.T) {
+	now := time.Date(2026, 11, 18, 0, 0, 0, 0, time.UTC)
+	want := now.Add(15897600 * time.Second)
+	form := (&oauth2.Token{}).WithExtra(url.Values{"refresh_token_expires_in": {"15897600"}})
+	if got := refreshExpiry(form, now); !got.Equal(want) {
+		t.Errorf("form: %v, want %v", got, want)
+	}
+	js := (&oauth2.Token{}).WithExtra(map[string]any{"refresh_token_expires_in": float64(15897600)})
+	if got := refreshExpiry(js, now); !got.Equal(want) {
+		t.Errorf("json: %v, want %v", got, want)
 	}
 }

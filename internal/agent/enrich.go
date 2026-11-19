@@ -114,6 +114,11 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 		}(i)
 	}
 	wg.Wait()
+	// A worker that found the user's access gone stops the pass: its results are
+	// partial, and the run should say why rather than write them.
+	if rerr := holder.Reconnect(); rerr != nil {
+		return fmt.Errorf("enrich: %w", rerr)
+	}
 	p.logger().Info("enrich: updated work items", "changed", len(changed), "skipped_out_of_time", skipped)
 	if len(changed) == 0 {
 		return nil

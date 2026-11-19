@@ -24,11 +24,13 @@ type fakeConverser struct {
 	reply      string
 	gotUser    string
 	gotHistory []worklist.Message
+	gotTools   worklist.ToolBox
 }
 
-func (f *fakeConverser) Reply(_ context.Context, _ worklist.WorkItem, _ string, _ string, history []worklist.Message, userText string, _ worklist.ToolBox) (string, error) {
+func (f *fakeConverser) Reply(_ context.Context, _ worklist.WorkItem, _ string, _ string, history []worklist.Message, userText string, tools worklist.ToolBox) (string, error) {
 	f.gotUser = userText
 	f.gotHistory = history
+	f.gotTools = tools
 	return f.reply, nil
 }
 

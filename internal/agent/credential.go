@@ -84,6 +84,7 @@ type tokenHolder struct {
 	issued    map[string]bool // every token this holder handed out
 	revended  bool
 	reconnect error // sticky ReconnectError
+	failed    error // the re-vend after a 401 failed for another reason (broker down)
 }
 
 // newTokenHolder vends the run's first token. A "sign-in required" answer is a
@@ -121,6 +122,15 @@ func (h *tokenHolder) Token() string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.current
+}
+
+// Failed returns the error of a re-vend after a 401 that failed for a reason other
+// than "sign-in required" (the broker unreachable, a 5xx), else nil. The 401 stood,
+// so the run is effectively without GitHub from then on.
+func (h *tokenHolder) Failed() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.failed
 }
 
 // Reconnect returns the ReconnectError once the broker has answered "sign-in
@@ -168,6 +178,7 @@ func (h *tokenHolder) reject(ctx context.Context, rejected string) (string, erro
 			return "", err
 		}
 		slog.WarnContext(ctx, "re-vend after a 401 failed", "provider", h.provider, "err", err)
+		h.failed = err
 		return "", nil
 	}
 	if vc.AccessToken == "" {

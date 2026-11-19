@@ -97,10 +97,17 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		if holder.Reconnect() != nil {
 			return postReconnect(ctx, sink, item.ID, triggerKey)
 		}
-		box := newGitHubToolBox(gh, token, item.GitHub.Repo)
-		// Repository checkouts live on the sandbox's scratch disk for this turn only.
-		defer box.Close()
-		tools = reconnectBox{ToolBox: box, h: holder}
+		if ferr := holder.Failed(); ferr != nil {
+			// GitHub refused the token and the broker could not be asked for a new
+			// one: the same as a failed vend.
+			p.logger().Warn("converse: GitHub unavailable for this turn; answering from stored context", "err", ferr)
+			viewerLogin, sourceContext, noGitHub = "", "", true
+		} else {
+			box := newGitHubToolBox(gh, token, item.GitHub.Repo)
+			// Repository checkouts live on the sandbox's scratch disk for this turn only.
+			defer box.Close()
+			tools = reconnectBox{ToolBox: box, h: holder}
+		}
 	}
 	if noGitHub {
 		userText += githubUnavailableNote
@@ -122,8 +129,12 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	if triggerKind == worklist.KindSynthesisRequest {
 		verdict, content = worklist.ParseVerdict(reply)
 	}
-	if noGitHub {
+	switch {
+	case noGitHub:
 		content += storedContextOnlyNote
+	case holder != nil && holder.Failed() != nil:
+		// Access was lost partway through the tool loop.
+		content += lostGitHubNote
 	}
 	msg := worklist.Message{
 		ID:      worklist.NewMessageID(),
@@ -162,6 +173,10 @@ const githubUnavailableNote = "\n\n[gofer: GitHub is unavailable for this turn, 
 // storedContextOnlyNote is appended to a reply the model gave without GitHub access,
 // so the user knows to ask again for an answer with live evidence.
 const storedContextOnlyNote = "\n\n---\n_Answered from stored context only: gofer couldn't reach GitHub for this turn. Ask again later for an answer backed by live GitHub data._"
+
+// lostGitHubNote is appended to a reply whose tool calls lost GitHub access partway
+// through the turn (a token GitHub refused, and no broker to replace it).
+const lostGitHubNote = "\n\n---\n_gofer lost access to GitHub partway through this turn, so parts of this answer may rest on stored context only. Ask again later to check it against live GitHub data._"
 
 // postReconnect saves a reconnect notice in reply to the turn: the run could not
 // reach GitHub for the user, who must sign in again. It is a system notice, not an
