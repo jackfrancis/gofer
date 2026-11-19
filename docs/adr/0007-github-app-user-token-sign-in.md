@@ -861,7 +861,10 @@ today's OAuth-app tokens, which it does not depend on:
 - **The gate** (`internal/github/visibility.go`): every `/repos/{owner}/{name}/…` call
   goes through it, as do the tarball and the Actions logs, which do not use the shared
   GET. Every entry point checks that its repository argument is exactly `owner/name`
-  first. The canonical `full_name` replaces the name asked for. Definite answers are
+  first, by one rule: neither component may be `.` or `..`. Other dots are allowed,
+  since GitHub allows them (a public repository can be called `...`). In ingest, a
+  hit whose repository cannot be named that way is left out and counts as unknown,
+  so the fetch is incomplete. The canonical `full_name` replaces the name asked for. Definite answers are
   cached for the life of the `Client`, which each job creates once; an unknown answer
   is not cached, so a later call in the run asks again. The ingest job's chained
   enrich builds its own client and so checks again. Answers:
@@ -874,17 +877,21 @@ today's OAuth-app tokens, which it does not depend on:
   - A refusal names only the repository the caller asked for. One the caller did not
     name (a redirect's destination, another repository named in a response) is
     refused without its name, and a rename is worded with the old name: the model
-    never learns a private repository's name from gofer.
+    never learns a private repository's name from gofer. A lookup that followed a
+    rename and ended in a 403 keeps only the status, not GitHub's message.
 - **Paths:** no request goes out with a `.` or `..` path segment, percent-encoded or
   inside an encoded slash, or a backslash, so a server or proxy normalising the path
   cannot serve a repository other than the gated one. `github_read_file` escapes the
-  model's file path segment by segment.
+  model's file path segment by segment, and the tarball's ref goes through the same
+  check.
 - **Redirects:** the shared GET follows no redirect itself. An API-host redirect is
   followed only after its destination (`/repos/{o}/{r}/…` or `/repositories/{id}/…`)
   passes the gate, and one naming no repository only when the original request named
   none either (`/user`). A redirect off the API host is refused on the JSON path. The
   tarball still follows its off-host hop to codeload, with an API-host hop gated the
-  same way. An Actions log's API-host redirect is followed with the token once its
+  same way. The client removes every credential header from the codeload hop itself:
+  net/http drops `Authorization` only when the hostname changes, not for another port
+  or a subdomain. An Actions log's API-host redirect is followed with the token once its
   destination passes the gate; only the off-host download link goes to the
   credential-free blob client. The gate's own lookup follows a rename redirect only to another repository
   metadata path, and judges the answer it ends on.

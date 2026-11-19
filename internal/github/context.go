@@ -458,12 +458,12 @@ var repoName = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 // token goes to the API host only. The pre-signed URL is itself a credential, so a
 // transport error is returned WITHOUT the URL net/http would embed in it.
 func (c *Client) Tarball(ctx context.Context, token, repo, ref string) (io.ReadCloser, error) {
-	if !repoName.MatchString(repo) || strings.Contains(repo, "..") {
+	if !validRepo(repo) {
 		return nil, fmt.Errorf("repo must be owner/name")
 	}
 	if ref != "" {
 		for _, seg := range strings.Split(ref, "/") {
-			if seg == "" || seg == "." || seg == ".." || strings.ContainsAny(seg, "\x00\r\n ") {
+			if seg == "" || seg == "." || seg == ".." || strings.ContainsAny(seg, "\x00\r\n \\") {
 				return nil, fmt.Errorf("invalid ref %q", ref)
 			}
 		}
@@ -477,6 +477,9 @@ func (c *Client) Tarball(ctx context.Context, token, repo, ref string) (io.ReadC
 		for _, seg := range strings.Split(ref, "/") { // validated above
 			p += "/" + url.PathEscape(seg)
 		}
+	}
+	if unsafePath(p) { // the rule every other request passes through Client.get
+		return nil, fmt.Errorf("invalid ref %q", ref)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+p, nil)
 	if err != nil {

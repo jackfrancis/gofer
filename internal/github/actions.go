@@ -123,7 +123,7 @@ func ParseActionsURL(raw string) (ActionsRef, error) {
 		return ref, fmt.Errorf("not a GitHub Actions run or job URL")
 	}
 	ref.Repo = segs[0] + "/" + segs[1]
-	if !repoName.MatchString(ref.Repo) || strings.Contains(ref.Repo, "..") {
+	if !validRepo(ref.Repo) {
 		return ref, fmt.Errorf("not a GitHub Actions URL: bad repository %q", ref.Repo)
 	}
 	id := func(s string) (int64, bool) {
@@ -216,7 +216,7 @@ func (j ActionsJob) Failing() bool {
 }
 
 func checkActionsRepo(repo string) error {
-	if !repoName.MatchString(repo) || strings.Contains(repo, "..") {
+	if !validRepo(repo) {
 		return fmt.Errorf("repo must be owner/name")
 	}
 	return nil

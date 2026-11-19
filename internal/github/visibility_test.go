@@ -68,6 +68,10 @@ func (s *gateStub) serve(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		if vis == "403" {
+			http.Error(w, fmt.Sprintf(`{"message":"Access to %s is blocked"}`, full), http.StatusForbidden)
+			return
+		}
 		fmt.Fprintf(w, `{"id":%s,"full_name":%q,"private":%v}`, segs[1], full, vis == "private")
 	default:
 		s.other(w, r)
@@ -530,5 +534,74 @@ func TestFetchWorklistChecksAfterSlowSearch(t *testing.T) {
 	items, complete, err = s.client().FetchWorklist(ctx2, "tok")
 	if err != nil || len(items) != 0 || complete {
 		t.Errorf("items = %d, complete = %v, err = %v; want none, incomplete", len(items), complete, err)
+	}
+}
+
+// A repository name may contain dots, even be "...": only a component that is "." or
+// ".." is refused, by every entry point alike. Ingest keeps such a repository's
+// public hits; a hit whose repository it cannot name at all is left out and makes
+// the fetch incomplete, rather than counting as a definite refusal.
+func TestDottedRepositoryNames(t *testing.T) {
+	s := newGateStub(t, map[string]string{"manx/...": "public", "o/a..b": "public"}, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case "/search/issues":
+			_, _ = w.Write([]byte(`{"items":[` +
+				`{"number":1,"title":"t","html_url":"u","state":"open","repository_url":"https://api.github.com/repos/manx/..."},` +
+				`{"number":2,"title":"t","html_url":"u","state":"open","repository_url":"https://api.github.com/repos/o/a..b"}]}`))
+		case "/repos/manx/.../issues/1":
+			_, _ = w.Write([]byte(`{"number":1,"state":"open","title":"dots","repository_url":"https://api.github.com/repos/manx/..."}`))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	c := s.client()
+	ctx := context.Background()
+	items, complete, err := c.FetchWorklist(ctx, "tok")
+	if err != nil || len(items) != 2 || !complete {
+		t.Fatalf("items = %d, complete = %v, err = %v; want both dotted repositories, complete", len(items), complete, err)
+	}
+	if got, err := c.IssueStatus(ctx, "tok", "manx/...", 1); err != nil || !strings.Contains(got, "dots") {
+		t.Errorf("IssueStatus(manx/...) = %q, %v", got, err)
+	}
+	if _, err := ParseActionsURL("https://github.com/manx/.../actions/runs/7"); err != nil {
+		t.Errorf("ParseActionsURL with a dotted repository: %v", err)
+	}
+	for _, bad := range []string{"o/..", "../r", "o/.", "./r"} {
+		if validRepo(bad) {
+			t.Errorf("validRepo(%q) = true", bad)
+		}
+	}
+
+	// A hit whose repository_url names no owner/name cannot be checked.
+	s2 := newGateStub(t, map[string]string{"o/pub": "public"}, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case "/search/issues":
+			_, _ = w.Write([]byte(`{"items":[` +
+				`{"number":1,"title":"t","html_url":"u","state":"open","repository_url":"https://api.github.com/repos/o/pub"},` +
+				`{"number":2,"title":"t","html_url":"u","state":"open","repository_url":"https://elsewhere.example/weird"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	items, complete, err = s2.client().FetchWorklist(ctx, "tok")
+	if err != nil || len(items) != 1 || complete {
+		t.Errorf("items = %d, complete = %v, err = %v; want the public hit only, incomplete", len(items), complete, err)
+	}
+}
+
+// A metadata lookup that follows a rename and ends in a 403 is refused with the
+// status alone: GitHub's message there could name the destination.
+func TestGateRedirected403KeepsNoFreeText(t *testing.T) {
+	s := newGateStub(t, map[string]string{"old/name": "rename:new/secret:42"}, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("request past the gate: %s", r.URL.Path)
+	})
+	s.ids["42"] = "403:new/secret"
+	_, err := s.client().IssueStatus(context.Background(), "tok", "old/name", 1)
+	if err == nil || !strings.Contains(err.Error(), "status 403") || strings.Contains(err.Error(), "secret") {
+		t.Errorf("err = %v, want a 403 refusal without the destination's name", err)
 	}
 }

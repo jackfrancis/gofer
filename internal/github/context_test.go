@@ -235,8 +235,15 @@ func TestDiscussionIssueSkipsPRFetches(t *testing.T) {
 // ref per path segment, and never surfaces the (pre-signed) download URL in an error.
 func TestTarball(t *testing.T) {
 	var gotAuth, gotPath string
-	// The archive is on another host, as codeload is.
+	// The archive is on another origin, as codeload is. This one shares the API's
+	// hostname on another port, where net/http would keep Authorization by itself.
+	var dlAuth []string
 	dl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, h := range []string{"Authorization", "Cookie", "Proxy-Authorization"} {
+			if v := r.Header.Get(h); v != "" {
+				dlAuth = append(dlAuth, h+": "+v)
+			}
+		}
 		_, _ = w.Write([]byte("archive-bytes"))
 	}))
 	defer dl.Close()
@@ -264,6 +271,9 @@ func TestTarball(t *testing.T) {
 	if string(b) != "archive-bytes" || gotAuth != "Bearer tok" || gotPath != "/repos/o/r/tarball/release/v1%23x" {
 		t.Errorf("body=%q auth=%q path=%q", b, gotAuth, gotPath)
 	}
+	if len(dlAuth) != 0 {
+		t.Errorf("the archive download received credentials: %q", dlAuth)
+	}
 
 	for _, bad := range []struct{ repo, ref, want string }{
 		{"o", "", "owner/name"},
@@ -273,6 +283,8 @@ func TestTarball(t *testing.T) {
 		{"o/r", "a/../b", "invalid ref"},
 		{"o/r", "a//b", "invalid ref"},
 		{"o/r", "a b", "invalid ref"},
+		{"o/r", `a\..\b`, "invalid ref"},
+		{"o/r", `v1\x`, "invalid ref"},
 		{"o/missing", "v1", "not found"},
 	} {
 		if _, err := c.Tarball(ctx, "tok", bad.repo, bad.ref); err == nil || !strings.Contains(err.Error(), bad.want) {

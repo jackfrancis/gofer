@@ -144,13 +144,15 @@ func (g *repoGate) store(r gateResult, id int64, names ...string) {
 }
 
 // validRepo reports whether repo is a plain owner/name, the only shape the client
-// puts in a /repos/ path.
+// puts in a /repos/ path. It is the one rule for a repository name across the client.
+// Only a component that IS "." or ".." is refused, as unsafePath refuses such a path
+// segment: GitHub allows dots in names, and a repository can be called "...".
 func validRepo(repo string) bool {
-	if !repoName.MatchString(repo) || strings.Contains(repo, "..") {
+	if !repoName.MatchString(repo) {
 		return false
 	}
 	owner, name, _ := strings.Cut(repo, "/")
-	return owner != "." && name != "."
+	return owner != "." && owner != ".." && name != "." && name != ".."
 }
 
 // gate checks that repo is public and returns its canonical owner/name. Any other
@@ -234,7 +236,13 @@ func (c *Client) lookupRepo(ctx context.Context, token, path string) (gateResult
 		case status == http.StatusNotFound || status == http.StatusGone:
 			return gateResult{verdict: verdictInaccessible, status: status}, 0
 		case status == http.StatusForbidden && !why.rateLimited:
-			return gateResult{verdict: verdictInaccessible, status: status, detail: why.String()}, 0
+			r := gateResult{verdict: verdictInaccessible, status: status}
+			// GitHub's free text can name the repository. After a rename redirect that
+			// is not the name the caller asked for, so only the status is kept.
+			if hop == 0 {
+				r.detail = why.String()
+			}
+			return r, 0
 		default: // 401 (a token to refresh), 429 and rate-limited 403s, 5xx
 			return unknown("status %d", status), 0
 		}
@@ -509,6 +517,12 @@ func (c *Client) followGated(token string) func(*http.Request, []*http.Request) 
 			return errors.New("stopped after 10 redirects")
 		}
 		if _, on := c.apiRelPath(req.URL); !on {
+			// Off the API origin (codeload): no credential goes along. net/http drops
+			// Authorization only when the hostname changes, so it would keep it for
+			// another port on the same host, or for a subdomain.
+			for _, h := range []string{"Authorization", "Cookie", "Proxy-Authorization"} {
+				req.Header.Del(h)
+			}
 			return nil
 		}
 		return c.gateLocation(req.Context(), token, req.URL, true)

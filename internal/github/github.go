@@ -401,7 +401,13 @@ func (c *Client) publicHits(ctx context.Context, token string, items []worklist.
 			if gctx.Err() != nil {
 				return
 			}
-			v := c.checkRepo(gctx, token, repo).verdict
+			r := c.checkRepo(gctx, token, repo)
+			v := r.verdict
+			if r.invalid {
+				// A name gofer cannot put in a request was never checked: that says
+				// nothing about the item, so it must not let the fetch count as complete.
+				v = verdictUnknown
+			}
 			mu.Lock()
 			verdicts[repo] = v
 			mu.Unlock()
