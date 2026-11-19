@@ -383,9 +383,27 @@ refresh to confirm the stored GitHub token still opens; a failure there with
 everything else intact means the encryption key does not match.
 
 **What a restore rolls back:** everything written after the snapshot. Users who
-signed in after it are signed out. A GitHub token refreshed after it may have been
-rotated at the provider, in which case that user signs in again. Worklist items come
-back on the next refresh; conversation turns after the snapshot are gone.
+signed in after it are signed out. Worklist items come back on the next refresh;
+conversation turns after the snapshot are gone.
+
+**GitHub App tokens after a restore** (`GITHUB_CLIENT_KIND=github-app`, ADR 0007).
+A GitHub App's refresh tokens work once, and gofer refreshes each user's token every
+few hours. So a restored database usually holds, for an active user, a refresh token
+that was already spent after the snapshot was taken, while the newer pair, and the
+user's grant to the app, are still valid at GitHub. What follows:
+
+- That user's next refresh fails with `bad_refresh_token`. gofer deletes the stored
+  credential and asks them to sign in again: the landing page shows the prompt, and a
+  Discuss turn posts a "sign in again to reconnect" notice instead of an answer.
+  Nothing else is lost; their worklist and threads stay.
+- A user who signs out before signing in again is told that gofer could not confirm
+  GitHub revoked its access, because logout cannot revoke the grant with a spent
+  token. The response links to GitHub's Authorized GitHub Apps settings
+  (`https://github.com/settings/apps/authorizations`), where they can revoke gofer
+  themselves.
+
+Tokens from a classic OAuth app (`GITHUB_CLIENT_KIND=oauth-app`) never expire and are
+never refreshed, so a restore does not affect them.
 
 ### Going back to the previous volume
 

@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -174,6 +175,11 @@ func (c *Converser) Reply(ctx context.Context, item worklist.WorkItem, viewerLog
 				c.log.Info("converse tool call", "name", tc.Function.Name)
 			}
 			result, err := tools.Invoke(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
+			if errors.Is(err, worklist.ErrSignInRequired) {
+				// The user's GitHub access is gone: that ends the turn, it is not a
+				// result for the model. The run posts a reconnect notice instead.
+				return "", err
+			}
 			if err != nil {
 				result = "tool error: " + err.Error()
 			}

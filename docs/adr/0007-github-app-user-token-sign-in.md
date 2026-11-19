@@ -1,11 +1,12 @@
 # ADR 0007 — Sign in through a read-only GitHub App instead of an OAuth app
 
-Status: proposed — phase 1 in progress; revised through review, then phased (see
-"Phasing"). Phase 1's workload part (search under user tokens and the public-only
-guard, in `internal/github`) is implemented; sign-in, expiry and refresh are not yet
-(see "Verification"). The question it rests on is verified: a GitHub App user access
-token with only read permissions gets the job log's 302 in an organisation where the
-app is not installed (see "The question").
+Status: proposed — phase 1 implemented, phase 2 not; revised through review, then
+phased (see "Phasing"). Both parts of phase 1 are in: the workload part (search under
+user tokens and the public-only guard, in `internal/github`) and the credential part
+(sign-in, expiry and refresh, Discuss without GitHub access; see "Verification").
+Neither has been run against real GitHub with an app token yet. The question it rests
+on is verified: a GitHub App user access token with only read permissions gets the
+job log's 302 in an organisation where the app is not installed (see "The question").
 Date: 2026-11-18
 
 ## Context
@@ -908,6 +909,33 @@ today's OAuth-app tokens, which it does not depend on:
   result incomplete, so `runIngest` does not call `retireMissing`. A definite refusal
   drops the hit without that; a stored item from that repository can then be retired
   by a complete fetch, as "Gaps phase 1 accepts" allows.
+
+Implemented (phase 1, credential part), and unit-tested against stand-ins for
+GitHub's endpoints only:
+
+- `GITHUB_CLIENT_KIND` (`internal/config`) and each kind's scopes (`internal/auth`).
+- The credential source, `auth.Handler.Credential` (`internal/auth/credential.go`):
+  one per-(user, provider) lock shared by the callback, logout and refresh; refresh
+  with 30 minutes left (`oauth2.ReuseTokenSourceWithExpiry`); persist before vend,
+  retried once; `client_id` and a credential version in the sealed JSON
+  (`internal/storage/vault.go`); legacy rows tagged under the lock, or "sign-in
+  required" under the app; `rejected=<version>` confirmed with check-token, with one
+  forced refresh per run ID; version-checked writes and deletes.
+- The callback re-checks its token with check-token under the lock. If the grant
+  was revoked mid-flow it stores nothing and answers with a "Sign in again" link
+  rather than an automatic redirect, so an unexpected "invalid" from GitHub cannot
+  loop. A refused account's grant is revoked.
+- Logout refreshes if needed, revokes the grant, then deletes the row, and answers
+  200 with `revocation: unconfirmed` and a link to GitHub's settings when GitHub did
+  not confirm.
+- The broker (`internal/api/credential.go`) returns `credential_version`, and answers
+  "sign-in required" with 410 and code `sign_in_required`.
+- The runtime (`internal/agent/credential.go`): a token holder, as the GitHub client's
+  transport, that re-vends once on 401 and turns "sign-in required" into a typed
+  `ReconnectError`; the converser's tool loop stops on it; Discuss posts a
+  `reconnect` system notice (at vend, in the snapshot, or from a tool call), and
+  marks a reply made without GitHub "answered from stored context only". The landing
+  page and the thread prompt the user to sign in again.
 
 Left unverified:
 

@@ -19,6 +19,11 @@ data:
   # ALLOWED_GITHUB_LOGINS (comma-separated GitHub logins) restricts who may sign in;
   # deliberately absent here so a deploy never resets it. `make deploy
   # ALLOWED_GITHUB_LOGINS=you,colleague` writes it. Absent: any account may sign in.
+  # GITHUB_CLIENT_KIND says what GITHUB_CLIENT_ID/SECRET name: "oauth-app" (the
+  # default when absent; asks for read:user user:email) or "github-app" (a read-only
+  # GitHub App used only for sign-in; expiring tokens refreshed by the web tier). Also
+  # deliberately absent, so a deploy never flips it: set it on the live ConfigMap
+  # together with the client secrets, then restart gofer-0 (ADR 0007, "Rollout").
   # false because the dev port-forward is plain http; set true behind TLS.
   COOKIE_SECURE: "false"
   # Binds a run credential to gofer's agent plane; a runtime's token must carry this

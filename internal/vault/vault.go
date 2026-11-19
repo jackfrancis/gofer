@@ -16,6 +16,13 @@ import (
 // ErrNotFound is returned when no credential exists for a user/provider.
 var ErrNotFound = errors.New("vault: credential not found")
 
+// ErrSignInRequired reports that gofer holds no usable credential for the user: none
+// is stored, the stored one was issued by a different OAuth client than the one
+// configured now, or GitHub has said it is dead (revoked, or its refresh token spent
+// or expired). Only the user signing in again fixes it. The credential broker
+// answers it with a distinct status, and a run that gets it stops asking GitHub.
+var ErrSignInRequired = errors.New("sign-in required")
+
 // Credential is a delegated provider credential held on a user's behalf.
 type Credential struct {
 	Provider     string
@@ -23,6 +30,17 @@ type Credential struct {
 	RefreshToken string
 	TokenType    string
 	Expiry       time.Time
+	// RefreshExpiry is when the refresh token stops working, when the provider says
+	// (GitHub's refresh_token_expires_in); zero when unknown or there is none.
+	RefreshExpiry time.Time
+	// ClientID is the OAuth client that issued the credential. Empty on a row stored
+	// before gofer recorded it. A credential from another client is never vended.
+	ClientID string
+	// Version is a random ID minted at every write of the credential (sign-in,
+	// refresh, legacy tagging). A conditional write or delete applies only while the
+	// row still holds the version it read, and a run names the version GitHub
+	// rejected. Not a secret. Empty on a row stored before gofer recorded it.
+	Version string
 }
 
 // Vault stores and retrieves delegated provider credentials, scoped by user.

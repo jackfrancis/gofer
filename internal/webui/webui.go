@@ -38,6 +38,14 @@ type Providers interface {
 	Providers() []string
 }
 
+// Reconnector reports whether a signed-in user must sign in again before gofer can
+// reach their provider: no stored credential, or one from a client gofer no longer
+// uses (ADR 0007). auth.Handler implements it; with Providers that do not, the page
+// never shows the prompt.
+type Reconnector interface {
+	SignInRequired(ctx context.Context, userID, provider string) bool
+}
+
 // Pipeline triggers a user's backfill when the worklist is empty, schedules an
 // assistant turn for the Discuss action, and launches a concurrent batch of review
 // turns for the "Review all PRs" action. It is the same Ingestor the JSON API uses.
@@ -71,6 +79,7 @@ type Handler struct {
 	providers   Providers
 	convEnabled bool
 	options     []ModelOption // model picker options, default first (options[0]); nil when AI is disabled
+	reconnect   Reconnector   // nil: never prompt to sign in again
 	now         func() time.Time
 }
 
@@ -82,7 +91,7 @@ type Handler struct {
 // non-default option, a "2nd opinion" review.
 func New(sessions Sessions, store worklist.Store, pipeline Pipeline, providers Providers, convEnabled bool, options []ModelOption) *Handler {
 	tmpl := template.Must(template.New("webui").Funcs(funcs).ParseFS(templatesFS, "templates/*.html"))
-	return &Handler{
+	h := &Handler{
 		tmpl:        tmpl,
 		sessions:    sessions,
 		store:       store,
@@ -92,6 +101,16 @@ func New(sessions Sessions, store worklist.Store, pipeline Pipeline, providers P
 		options:     options,
 		now:         time.Now,
 	}
+	if rc, ok := providers.(Reconnector); ok {
+		h.reconnect = rc
+	}
+	return h
+}
+
+// signInRequired reports whether the page should ask the user to sign in again.
+func (h *Handler) signInRequired(r *http.Request, user *session.User) bool {
+	return h.reconnect != nil && user != nil && user.Provider != "" &&
+		h.reconnect.SignInRequired(r.Context(), user.ID, user.Provider)
 }
 
 // defaultOption returns the default picker option (the first configured); ok is false
@@ -222,6 +241,7 @@ type pageData struct {
 	RefreshSecs              int               // when > 0, the page auto-refreshes after this many seconds
 	ReplyStalled             bool              // a pending reply has not arrived within reviewStaleAfter (thread view)
 	Message                  string            // failure detail rendered on the error view
+	SignInRequired           bool              // gofer holds no usable credential: prompt the user to sign in again
 }
 
 // Index handles GET /. It renders the sign-in view for anonymous visitors, the
@@ -251,6 +271,7 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 	for _, it := range items {
 		if it.ID == id {
 			data := pageData{View: "thread", User: user, Item: it, ConvEnabled: h.convEnabled, ModelOptions: h.options, SecondOpinionEnabled: h.secondOpinionEnabled(), SecondOpinionOptions: h.alternativeOptions()}
+			data.SignInRequired = h.signInRequired(r, user)
 			now := h.now().UTC()
 			if it.ReplyPending(now, reviewStaleAfter) {
 				data.RefreshSecs = 3 // a reply is plausibly in flight — poll for it
@@ -590,6 +611,13 @@ func (h *Handler) view(r *http.Request) (pageData, int) {
 	if user == nil {
 		return pageData{View: "signin", Providers: h.providers.Providers()}, http.StatusOK
 	}
+	data, status := h.signedInView(r, user)
+	data.SignInRequired = h.signInRequired(r, user)
+	return data, status
+}
+
+// signedInView renders the views for a signed-in user.
+func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, int) {
 
 	res, err := worklist.Resolve(r.Context(), h.store, h.pipeline, h.now(), user.ID, worklist.DefaultSort, true)
 	if err != nil {

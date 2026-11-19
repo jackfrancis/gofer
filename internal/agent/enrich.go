@@ -35,13 +35,17 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	if provider == "" {
 		provider = "github"
 	}
-	token, err := vendor.Vend(ctx, provider)
+	holder, err := newTokenHolder(ctx, vendor, provider, p.GitHubBaseURL)
 	if err != nil {
 		return fmt.Errorf("vend credential: %w", err)
 	}
-	gh := github.NewClient(p.Client, p.GitHubBaseURL)
+	token := holder.Token()
+	gh := github.NewClient(holder.client(p.Client), p.GitHubBaseURL)
 	login, err := gh.Login(ctx, token)
 	if err != nil {
+		if rerr := holder.Reconnect(); rerr != nil {
+			return fmt.Errorf("github login: %w", rerr)
+		}
 		return fmt.Errorf("github login: %w", err)
 	}
 	items, err := sink.List(ctx)

@@ -26,11 +26,16 @@ var _ vault.Vault = (*VaultStore)(nil)
 
 // sealedCredential is the plaintext that gets sealed: the whole credential, so
 // nothing about a token (not even its expiry) is stored in the clear.
+// Fields added after the first release are omitempty/omitzero, so a row written
+// before them decodes with them empty (ADR 0007: no schema migration).
 type sealedCredential struct {
-	AccessToken  string    `json:"access_token"`
-	RefreshToken string    `json:"refresh_token,omitempty"`
-	TokenType    string    `json:"token_type,omitempty"`
-	Expiry       time.Time `json:"expiry"`
+	AccessToken   string    `json:"access_token"`
+	RefreshToken  string    `json:"refresh_token,omitempty"`
+	TokenType     string    `json:"token_type,omitempty"`
+	Expiry        time.Time `json:"expiry"`
+	RefreshExpiry time.Time `json:"refresh_expiry,omitzero"`
+	ClientID      string    `json:"client_id,omitempty"`
+	Version       string    `json:"version,omitempty"`
 }
 
 // credentialAAD is the associated data bound to a sealed credential: a domain tag
@@ -52,10 +57,13 @@ func (v *VaultStore) Put(ctx context.Context, userID string, cred vault.Credenti
 		return errors.New("vault: userID and provider are required")
 	}
 	plaintext, err := json.Marshal(sealedCredential{
-		AccessToken:  cred.AccessToken,
-		RefreshToken: cred.RefreshToken,
-		TokenType:    cred.TokenType,
-		Expiry:       cred.Expiry,
+		AccessToken:   cred.AccessToken,
+		RefreshToken:  cred.RefreshToken,
+		TokenType:     cred.TokenType,
+		Expiry:        cred.Expiry,
+		RefreshExpiry: cred.RefreshExpiry,
+		ClientID:      cred.ClientID,
+		Version:       cred.Version,
 	})
 	if err != nil {
 		return fmt.Errorf("storage: encode credential: %w", err)
@@ -99,11 +107,14 @@ func (v *VaultStore) Get(ctx context.Context, userID, provider string) (vault.Cr
 		return vault.Credential{}, errors.New("storage: decode credential: malformed record")
 	}
 	return vault.Credential{
-		Provider:     provider,
-		AccessToken:  sc.AccessToken,
-		RefreshToken: sc.RefreshToken,
-		TokenType:    sc.TokenType,
-		Expiry:       sc.Expiry,
+		Provider:      provider,
+		AccessToken:   sc.AccessToken,
+		RefreshToken:  sc.RefreshToken,
+		TokenType:     sc.TokenType,
+		Expiry:        sc.Expiry,
+		RefreshExpiry: sc.RefreshExpiry,
+		ClientID:      sc.ClientID,
+		Version:       sc.Version,
 	}, nil
 }
 

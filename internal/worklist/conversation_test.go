@@ -146,3 +146,44 @@ func TestLegacyTurns(t *testing.T) {
 		t.Fatalf("TurnIndex(TurnKey(2)) = %d, %v", i, ok)
 	}
 }
+
+// A reconnect notice replies to a turn without answering it: review state does not
+// count it, the turn is neither pending nor stalled, and a later real answer still
+// counts. AppendReply keeps the notice marker, but no marker gofer does not know.
+func TestReconnectNotice(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	it := WorkItem{ID: "a", Type: TypePullRequest, Thread: []Message{
+		{ID: "q1", Role: RoleUser, Kind: KindReviewRequest, Content: "review", At: now.Add(-time.Minute)},
+	}}
+	notice := Message{ID: "n1", Role: RoleAgent, Notice: NoticeReconnect, Content: ReconnectNotice, At: now}
+	if changed, err := AppendReply(&it, "q1", notice); err != nil || !changed {
+		t.Fatalf("append notice: %v %v", changed, err)
+	}
+	if it.Thread[1].Notice != NoticeReconnect {
+		t.Fatal("the notice marker was dropped")
+	}
+	if it.Answered("q1") || it.HasReview() {
+		t.Error("a notice counted as an answer")
+	}
+	if it.ReplyPending(now, time.Hour) || it.ReplyStalled(now.Add(2*time.Hour), time.Hour) {
+		t.Error("a noticed turn reads as pending or stalled")
+	}
+	if !it.NeedsReconnect() {
+		t.Error("NeedsReconnect = false after a reconnect notice")
+	}
+	if !it.NeedsReview(now, time.Hour) {
+		t.Error("a PR whose review got only a notice should still need a review")
+	}
+	if changed, _ := AppendReply(&it, "q1", Message{ID: "r1", Content: "the review", At: now.Add(time.Minute)}); !changed {
+		t.Fatal("a real answer after a notice was dropped")
+	}
+	if !it.Answered("q1") || !it.HasReview() || it.NeedsReconnect() {
+		t.Error("the real answer after the notice does not count")
+	}
+
+	forged := WorkItem{ID: "b", Thread: []Message{{ID: "q", Role: RoleUser, Content: "q", At: now}}}
+	_, _ = AppendReply(&forged, "q", Message{ID: "x", Notice: "something-else", Content: "hi", At: now})
+	if forged.Thread[1].Notice != "" || !forged.Answered("q") {
+		t.Errorf("an unknown notice marker survived: %+v", forged.Thread[1])
+	}
+}

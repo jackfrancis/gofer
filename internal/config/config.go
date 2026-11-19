@@ -264,10 +264,38 @@ func connID(endpoint string) string {
 // Providers holds the OAuth client credentials for each supported provider. A
 // provider with empty credentials is treated as disabled.
 type Providers struct {
-	Google          OAuthApp
-	GitHub          OAuthApp
-	Microsoft       OAuthApp
+	Google    OAuthApp
+	GitHub    OAuthApp
+	Microsoft OAuthApp
+	// GitHubKind says what kind of client GitHub names (GITHUB_CLIENT_KIND):
+	// GitHubOAuthApp (the default) or GitHubApp. gofer never guesses it from the
+	// client ID. See ADR 0007.
+	GitHubKind      string
 	MicrosoftTenant string
+}
+
+// GITHUB_CLIENT_KIND values.
+const (
+	// GitHubOAuthApp is a classic OAuth app: sign-in asks for read:user user:email,
+	// and its tokens never expire.
+	GitHubOAuthApp = "oauth-app"
+	// GitHubApp is a GitHub App used only for user sign-in: no scopes (the app's
+	// permissions decide), expiring user tokens with a rotating refresh token.
+	GitHubApp = "github-app"
+)
+
+// IsGitHubApp reports whether the GitHub client is a GitHub App.
+func (p Providers) IsGitHubApp() bool { return p.GitHubKind == GitHubApp }
+
+// parseGitHubKind validates GITHUB_CLIENT_KIND; empty means GitHubOAuthApp.
+func parseGitHubKind(v string) (string, error) {
+	switch v = strings.TrimSpace(v); v {
+	case "", GitHubOAuthApp:
+		return GitHubOAuthApp, nil
+	case GitHubApp:
+		return GitHubApp, nil
+	}
+	return "", fmt.Errorf("GITHUB_CLIENT_KIND must be %q or %q, not %q", GitHubOAuthApp, GitHubApp, v)
 }
 
 // OAuthApp holds the credentials for a single OAuth application.
@@ -301,6 +329,11 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	githubKind, err := parseGitHubKind(os.Getenv("GITHUB_CLIENT_KIND"))
+	if err != nil {
+		return nil, err
+	}
+
 	dataDir := strings.TrimSpace(os.Getenv("DATA_DIR"))
 	vaultKey, err := loadVaultKey(dataDir, os.Getenv)
 	if err != nil {
@@ -324,6 +357,7 @@ func Load() (*Config, error) {
 				ClientID:     os.Getenv("GITHUB_CLIENT_ID"),
 				ClientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
 			},
+			GitHubKind: githubKind,
 			Microsoft: OAuthApp{
 				ClientID:     os.Getenv("MICROSOFT_CLIENT_ID"),
 				ClientSecret: os.Getenv("MICROSOFT_CLIENT_SECRET"),

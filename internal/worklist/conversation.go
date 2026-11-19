@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,24 @@ const (
 	KindReviewRequest    = "review_request"    // "review this PR" (Review-all, or an independent 2nd-opinion review)
 	KindSynthesisRequest = "synthesis_request" // the consensus turn that weighs the reviews
 )
+
+// Message.Notice values: an agent turn that is a system notice rather than an
+// answer. A notice does not answer the turn it replies to (review and pending state
+// ignore it), and the thread shows it as a notice.
+const (
+	// NoticeReconnect: gofer could not reach GitHub for the user, who must sign in
+	// again. The UI shows a sign-in prompt with it.
+	NoticeReconnect = "reconnect"
+)
+
+// ReconnectNotice is the text of a NoticeReconnect turn.
+const ReconnectNotice = "gofer can't reach GitHub for you: sign in again to reconnect, then ask again."
+
+// ErrSignInRequired is the error a ToolBox returns (wrapped) when the user's
+// provider credential is gone and only signing in again helps. A Conversationalist
+// must not feed it to the model as a tool result: it ends the turn and returns it,
+// and the run posts a NoticeReconnect turn instead of a reply.
+var ErrSignInRequired = errors.New("sign-in required: gofer can't reach GitHub for this user")
 
 // Message.Verdict values: the consensus outcome stamped on a synthesis agent reply.
 const (
@@ -64,7 +83,10 @@ type Message struct {
 	// also withheld from the model as future conversation context (see splitThread), so
 	// a long review thread can be pared down to its definitive turns without deleting
 	// the history. It is reversible — the user can unhide it.
-	Hidden bool      `json:"hidden,omitempty"`
+	Hidden bool `json:"hidden,omitempty"`
+	// Notice marks an agent turn that is a system notice (NoticeReconnect), not an
+	// answer: it does not answer the turn it replies to. Empty on every other turn.
+	Notice string    `json:"notice,omitempty"`
 	At     time.Time `json:"at"`
 }
 
@@ -131,11 +153,12 @@ func (w WorkItem) TurnKey(i int) string {
 
 // replies maps each answered user turn's key to the position of the first agent
 // turn answering it. An agent turn answers the turn its ReplyTo names; one stored
-// before replies recorded that answers the user turn directly before it.
+// before replies recorded that answers the user turn directly before it. A system
+// notice answers nothing (see noticed).
 func (w WorkItem) replies() map[string]int {
 	out := make(map[string]int)
 	for i, m := range w.Thread {
-		if m.Role != RoleAgent {
+		if m.Role != RoleAgent || m.Notice != "" {
 			continue
 		}
 		key := m.ReplyTo
@@ -150,6 +173,29 @@ func (w WorkItem) replies() map[string]int {
 		}
 	}
 	return out
+}
+
+// noticed is the set of user turns a system notice replied to: the run that took
+// the turn finished, without answering it.
+func (w WorkItem) noticed() map[string]bool {
+	out := make(map[string]bool)
+	for _, m := range w.Thread {
+		if m.Role == RoleAgent && m.Notice != "" && m.ReplyTo != "" {
+			out[m.ReplyTo] = true
+		}
+	}
+	return out
+}
+
+// NeedsReconnect reports whether the item's latest agent turn is a reconnect
+// notice: the thread view then offers a sign-in prompt.
+func (w WorkItem) NeedsReconnect() bool {
+	for i := len(w.Thread) - 1; i >= 0; i-- {
+		if m := w.Thread[i]; m.Role == RoleAgent {
+			return m.Notice == NoticeReconnect
+		}
+	}
+	return false
 }
 
 // Answered reports whether the user turn with key has a reply.
@@ -243,13 +289,16 @@ func (w WorkItem) hasSynthesisRequest() bool {
 // ReplyPending reports whether some user turn has no reply yet and is still
 // plausibly in flight (younger than staleAfter). Past that window the run has almost
 // certainly finished or failed, so the turn is eligible for a retry.
+//
+// A turn a system notice replied to is not pending: its run is done.
 func (w WorkItem) ReplyPending(now time.Time, staleAfter time.Duration) bool {
-	answered := w.replies()
+	answered, noticed := w.replies(), w.noticed()
 	for i, m := range w.Thread {
 		if m.Role != RoleUser || now.Sub(m.At) >= staleAfter {
 			continue
 		}
-		if _, ok := answered[w.TurnKey(i)]; !ok {
+		key := w.TurnKey(i)
+		if _, ok := answered[key]; !ok && !noticed[key] {
 			return true
 		}
 	}
@@ -257,13 +306,15 @@ func (w WorkItem) ReplyPending(now time.Time, staleAfter time.Duration) bool {
 }
 
 // ReplyStalled reports whether the most recent user turn has no reply and is past
-// staleAfter, so its run has almost certainly failed and the turn can be retried.
+// staleAfter, so its run has almost certainly failed and the turn can be retried. A
+// turn a system notice replied to has not stalled: the notice says what to do.
 func (w WorkItem) ReplyStalled(now time.Time, staleAfter time.Duration) bool {
 	i, ok := w.LastUserTurn()
 	if !ok {
 		return false
 	}
-	return now.Sub(w.Thread[i].At) >= staleAfter && !w.Answered(w.TurnKey(i))
+	key := w.TurnKey(i)
+	return now.Sub(w.Thread[i].At) >= staleAfter && !w.Answered(key) && !w.noticed()[key]
 }
 
 // NeedsReview reports whether the pull request still needs a first review dispatched

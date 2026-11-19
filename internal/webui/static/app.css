@@ -141,6 +141,9 @@ body {
 .zz-hidden { align-self: center; display: flex; gap: 8px; align-items: center; font-size: 12px; font-style: italic; color: var(--muted); }
 .zz-hidden form { margin: 0; }
 .zz-notice { align-self: center; margin: 2px 0; font-size: 12px; font-style: italic; color: var(--muted); }
+.zz-notice--reconnect { font-style: normal; color: var(--danger); }
+.zz-reconnect { margin: 0 0 16px; padding: 10px 14px; border: 1px solid var(--danger); border-radius: 6px; color: var(--danger); font-size: 14px; }
+.zz-reconnect a { color: inherit; font-weight: 600; }
 
 .zz-chat-form { display: flex; flex-direction: column; gap: 8px; }
 .zz-chat-form textarea {

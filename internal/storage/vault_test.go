@@ -23,6 +23,10 @@ func cred(access string) vault.Credential {
 		RefreshToken: "refresh-" + access,
 		TokenType:    "bearer",
 		Expiry:       time.Date(2027, 1, 2, 3, 4, 5, 0, time.UTC),
+		// ADR 0007's fields, sealed with the rest.
+		RefreshExpiry: time.Date(2027, 6, 2, 3, 4, 5, 0, time.UTC),
+		ClientID:      "client-1",
+		Version:       "v-" + access,
 	}
 }
 
@@ -54,7 +58,10 @@ func TestVaultParity(t *testing.T) {
 			if !got.Expiry.Equal(want.Expiry) {
 				t.Fatalf("expiry = %v, want %v", got.Expiry, want.Expiry)
 			}
-			got.Expiry = want.Expiry
+			if !got.RefreshExpiry.Equal(want.RefreshExpiry) {
+				t.Fatalf("refresh expiry = %v, want %v", got.RefreshExpiry, want.RefreshExpiry)
+			}
+			got.Expiry, got.RefreshExpiry = want.Expiry, want.RefreshExpiry
 			if got != want {
 				t.Fatalf("got %+v, want %+v", got, want)
 			}
@@ -339,4 +346,24 @@ func flip(b []byte, i int) []byte {
 	out := bytes.Clone(b)
 	out[i] ^= 0x01
 	return out
+}
+
+// A row sealed before ADR 0007 has no client_id, version or refresh expiry. It still
+// opens, with those fields empty, so no migration is needed and the broker can tell
+// it is a legacy row.
+func TestVaultOpensALegacyRow(t *testing.T) {
+	db := open(t, t.TempDir())
+	keys := keyring(t, testKey(1))
+	v := db.Vault(keys)
+	legacy := []byte(`{"access_token":"gho_legacy","token_type":"bearer","expiry":"0001-01-01T00:00:00Z"}`)
+	keyID, sealed := keys.Seal(legacy, credentialAAD("alice", "github"))
+	if _, err := db.sql.ExecContext(ctx,
+		`INSERT INTO credentials (user_id, provider, key_id, sealed, updated_at) VALUES (?, ?, ?, ?, ?)`,
+		"alice", "github", keyID, sealed, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	got := mustGet(t, v, "alice", "github")
+	if got.AccessToken != "gho_legacy" || got.ClientID != "" || got.Version != "" || !got.RefreshExpiry.IsZero() || !got.Expiry.IsZero() {
+		t.Fatalf("legacy row = %+v", got)
+	}
 }

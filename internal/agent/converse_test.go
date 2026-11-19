@@ -2,11 +2,23 @@ package agent
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
+
+// deadGitHub is a GitHub that answers 404 to everything: a turn runs with a vended
+// token but gets no live context (the snapshot fetch is best-effort), the shape of
+// these tests before runs told "GitHub unavailable" apart from "no context found".
+func deadGitHub(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
 
 type fakeConverser struct {
 	reply      string
@@ -27,8 +39,8 @@ func TestRunConverseAppendsReply(t *testing.T) {
 	}}}
 	fc := &fakeConverser{reply: "Sure — here's a draft."}
 	err := Run(context.Background(),
-		Params{JobType: JobConverse, ItemID: "github:o/r#1", Converser: fc},
-		fakeVendor{}, sink)
+		Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Converser: fc},
+		fakeVendor{token: "t"}, sink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +63,7 @@ func TestRunConverseNothingPending(t *testing.T) {
 		},
 	}}}
 	fc := &fakeConverser{reply: "should not be called"}
-	if err := Run(context.Background(), Params{JobType: JobConverse, ItemID: "github:o/r#1", Converser: fc}, fakeVendor{}, sink); err != nil {
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Converser: fc}, fakeVendor{token: "t"}, sink); err != nil {
 		t.Fatal(err)
 	}
 	if len(sink.items[0].Thread) != 2 {
@@ -60,7 +72,7 @@ func TestRunConverseNothingPending(t *testing.T) {
 }
 
 func TestRunConverseNoConverser(t *testing.T) {
-	if err := Run(context.Background(), Params{JobType: JobConverse, ItemID: "x"}, fakeVendor{}, &memSink{}); err == nil {
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "x"}, fakeVendor{token: "t"}, &memSink{}); err == nil {
 		t.Fatal("expected an error when no converser is configured")
 	}
 }
@@ -79,7 +91,7 @@ func TestRunConverseExcludesHiddenHistory(t *testing.T) {
 		},
 	}}}
 	fc := &fakeConverser{reply: "ok"}
-	if err := Run(context.Background(), Params{JobType: JobConverse, ItemID: "github:o/r#1", Converser: fc}, fakeVendor{}, sink); err != nil {
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Converser: fc}, fakeVendor{token: "t"}, sink); err != nil {
 		t.Fatal(err)
 	}
 	if fc.gotUser != "q3" {
@@ -103,7 +115,7 @@ func TestRunConverseSynthesisVerdict(t *testing.T) {
 		Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "synthesize", Kind: worklist.KindSynthesisRequest}},
 	}}}
 	fc := &fakeConverser{reply: "AGREEMENT\nBoth reviews say it's ready."}
-	if err := Run(context.Background(), Params{JobType: JobConverse, ItemID: "github:o/r#1", Converser: fc}, fakeVendor{}, sink); err != nil {
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Converser: fc}, fakeVendor{token: "t"}, sink); err != nil {
 		t.Fatal(err)
 	}
 	th := sink.items[0].Thread
@@ -140,8 +152,8 @@ func TestRunConverseKeepsTurnsPostedMeanwhile(t *testing.T) {
 		sink.items[0].Thread = append(sink.items[0].Thread, worklist.Message{Role: worklist.RoleUser, Content: "follow-up", At: t0.Add(time.Minute)})
 	}}
 	err := Run(context.Background(),
-		Params{JobType: JobConverse, ItemID: "github:o/r#1", Converser: fc, Researcher: &fakeResearcher{}},
-		fakeVendor{}, sink)
+		Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Converser: fc, Researcher: &fakeResearcher{}},
+		fakeVendor{token: "t"}, sink)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +174,7 @@ func TestRunConverseDropsReplyToClearedThread(t *testing.T) {
 		Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "q", At: time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)}},
 	}}}
 	fc := &sideEffectConverser{reply: "too late", during: func() { sink.items[0].Thread = nil }}
-	if err := Run(context.Background(), Params{JobType: JobConverse, ItemID: "github:o/r#1", Converser: fc}, fakeVendor{}, sink); err != nil {
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Converser: fc}, fakeVendor{token: "t"}, sink); err != nil {
 		t.Fatal(err)
 	}
 	if n := len(sink.items[0].Thread); n != 0 {
@@ -201,12 +213,12 @@ func TestConverseFollowUpAfterOutOfOrderReply(t *testing.T) {
 
 	// Run A: the follow-up is posted while the model answers the review.
 	a := &sideEffectConverser{reply: "the review", during: postFollowUp}
-	if err := Run(ctx, Params{JobType: JobConverse, ItemID: "pr", Turn: "r", Model: "x", Converser: a}, fakeVendor{}, sink); err != nil {
+	if err := Run(ctx, Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "pr", Turn: "r", Model: "x", Converser: a}, fakeVendor{token: "t"}, sink); err != nil {
 		t.Fatal(err)
 	}
 	// Run B starts only now, with the thread ending on A's reply.
 	b := &recordingConverser{reply: "the answer"}
-	if err := Run(ctx, Params{JobType: JobConverse, ItemID: "pr", Turn: "f", Model: "y", Converser: b}, fakeVendor{}, sink); err != nil {
+	if err := Run(ctx, Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "pr", Turn: "f", Model: "y", Converser: b}, fakeVendor{token: "t"}, sink); err != nil {
 		t.Fatal(err)
 	}
 	if len(b.asked) != 1 || b.asked[0] != "follow-up" {
@@ -233,7 +245,7 @@ func TestConverseAnswersTheDispatchedTurn(t *testing.T) {
 		{ID: "f", Role: worklist.RoleUser, Content: "follow-up"},
 	}}}}
 	a := &recordingConverser{reply: "the review"}
-	if err := Run(context.Background(), Params{JobType: JobConverse, ItemID: "pr", Turn: "r", Converser: a}, fakeVendor{}, sink); err != nil {
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "pr", Turn: "r", Converser: a}, fakeVendor{token: "t"}, sink); err != nil {
 		t.Fatal(err)
 	}
 	if len(a.asked) != 1 || a.asked[0] != "review this" {
@@ -253,7 +265,7 @@ func TestConverseSkipsAnsweredOrMissingTurn(t *testing.T) {
 				{ID: "a", ReplyTo: "r", Role: worklist.RoleAgent, Content: "done"},
 			}}}}
 			c := &recordingConverser{reply: "again"}
-			if err := Run(context.Background(), Params{JobType: JobConverse, ItemID: "pr", Turn: turn, Converser: c}, fakeVendor{}, sink); err != nil {
+			if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "pr", Turn: turn, Converser: c}, fakeVendor{token: "t"}, sink); err != nil {
 				t.Fatal(err)
 			}
 			if len(c.asked) != 0 || len(sink.items[0].Thread) != 2 {
