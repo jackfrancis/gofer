@@ -113,13 +113,15 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		userText += githubUnavailableNote
 	}
 
-	// An independent review must not see the prior thread through the item either:
-	// the converser explains the item's ranking, and a research adjustment summarizes
-	// the thread, so the model's copy carries none (the converser then withholds it).
-	// What this run writes back is unchanged.
+	// The converser explains the item's ranking, and a research adjustment summarizes
+	// the turns it read, so the model's copy of the item carries only the thread this
+	// turn may see: the turns up to the one being answered (hidden ones still flagged),
+	// or none for an independent review. The converser withholds research that read
+	// anything else. What this run writes back is unchanged.
 	model := item
-	if p.Independent {
-		model.Thread = nil
+	model.Thread = nil
+	if i, ok := item.TurnIndex(triggerKey); ok && !p.Independent {
+		model.Thread = item.Thread[: i+1 : i+1]
 	}
 	reply, err := p.Converser.Reply(ctx, model, viewerLogin, sourceContext, history, userText, tools)
 	if isSignInRequired(err) || (holder != nil && holder.Reconnect() != nil) {

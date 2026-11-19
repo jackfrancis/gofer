@@ -56,7 +56,7 @@ func TestItemContextRanking(t *testing.T) {
 			t.Errorf("ranking block missing %q:\n%s", s, got)
 		}
 	}
-	for _, s := range []string{"stale stored rationale", "priority low", "model ranker", "discussion adjustment", "by hand"} {
+	for _, s := range []string{"stale stored rationale", "priority low", "ranker", "discussion adjustment", "by hand"} {
 		if strings.Contains(got, s) {
 			t.Errorf("ranking block should not contain %q:\n%s", s, got)
 		}
@@ -84,19 +84,18 @@ func TestItemContextNamesModelAndResearchProvenance(t *testing.T) {
 		Signals: worklist.Signals{
 			Reasons:  []worklist.Reason{worklist.ReasonReviewRequested}, // baseline relevance 1.00
 			Proposed: &worklist.AxisProposal{Relevance: 0.1, Impact: 0.5, Engagement: 0.2, Urgency: 0.4, Confidence: 0.8, Rationale: "routine dependency bump"},
-			Research: &worklist.ResearchAdjustment{Relevance: 1, Impact: 1, Engagement: 1, Urgency: 2, Rationale: "the author is blocked on you"},
+			Research: &worklist.ResearchAdjustment{Relevance: 1, Impact: 1, Engagement: 1, Urgency: 2, Rationale: "the author is blocked on you", Turns: []string{"q"}},
 		},
-		Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "is this blocking anyone?", At: ctxNow.Add(-2 * time.Hour)}},
+		Thread: []worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: "is this blocking anyone?"}},
 	}
-	item.Signals.Research.AppliedAt = ctxNow.Add(-time.Hour)
 	got := block(t, itemContext(item, ctxNow))
 	for _, s := range []string{
 		"axes: relevance 0.10, urgency 0.80, impact 0.50, engagement 0.20\n",
-		"source: gofer's model ranker set all four axes (confidence 0.80)\n",
-		"model ranker rationale: routine dependency bump\n",
+		"source: gofer's ranker set all four axes (confidence 0.80)\n",
+		"ranker rationale: routine dependency bump\n",
 		"discussion adjustment (scaled those axes): relevance x1.00, urgency x2.00, impact x1.00, engagement x1.00\n",
 		"discussion adjustment rationale: the author is blocked on you\n",
-		"baseline signals (evidence only; the model ranker's axes replace what they would give): relevance 1.00",
+		"baseline signals (evidence only; the ranker's axes replace what they would give): relevance 1.00",
 	} {
 		if !strings.Contains(got, s) {
 			t.Errorf("ranking block missing %q:\n%s", s, got)
@@ -107,36 +106,40 @@ func TestItemContextNamesModelAndResearchProvenance(t *testing.T) {
 	}
 }
 
-// A research adjustment summarizes the thread, so it reaches the model only while
-// the turns it read are all visible: not after one of them is hidden, not after the
-// conversation is reset, and not in an independent review (whose copy has no thread).
+// A research adjustment summarizes the turns it read, so it reaches the model only
+// while every one of them is in the thread the model may see, and visible: not after
+// one is hidden, not after the conversation is reset (even if a new turn follows),
+// not when it read a turn past the one being answered, and not in an independent
+// review (whose copy has no thread). Research that recorded no turns is refused.
 func TestItemContextWithholdsResearchOffTheVisibleThread(t *testing.T) {
-	applied := ctxNow.Add(-time.Hour)
-	base := func(thread ...worklist.Message) worklist.WorkItem {
+	q := worklist.Message{ID: "q", Role: worklist.RoleUser, Content: "review"}
+	a := worklist.Message{ID: "a", ReplyTo: "q", Role: worklist.RoleAgent, Content: "it is broken"}
+	hidden := a
+	hidden.Hidden = true
+	n := worklist.Message{ID: "n", Role: worklist.RoleUser, Content: "and now?"}
+	hiddenN := n
+	hiddenN.Hidden = true
+	item := func(turns []string, thread ...worklist.Message) worklist.WorkItem {
 		return worklist.WorkItem{
 			Signals: worklist.Signals{
 				Reasons:  []worklist.Reason{worklist.ReasonAuthor},
-				Research: &worklist.ResearchAdjustment{Relevance: 2, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "the first reviewer says it is broken", AppliedAt: applied},
+				Research: &worklist.ResearchAdjustment{Relevance: 2, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "the first reviewer says it is broken", Turns: turns},
 			},
 			Thread: thread,
 		}
 	}
-	before := ctxNow.Add(-2 * time.Hour)
-	q := worklist.Message{Role: worklist.RoleUser, Content: "review", At: before}
-	a := worklist.Message{Role: worklist.RoleAgent, Content: "it is broken", At: before}
-	hidden := a
-	hidden.Hidden = true
-	later := worklist.Message{Role: worklist.RoleUser, Content: "and now?", At: ctxNow}
-
+	read := []string{"q", "a"}
 	for name, tc := range map[string]struct {
 		item worklist.WorkItem
 		keep bool
 	}{
-		"visible thread":           {base(q, a), true},
-		"turn hidden":              {base(q, hidden), false},
-		"reset (no thread)":        {base(), false},
-		"reset, then a new turn":   {base(later), false},
-		"hidden turn after it ran": {base(q, a, func() worklist.Message { m := later; m.Hidden = true; return m }()), true},
+		"visible thread":              {item(read, q, a, n), true},
+		"a later turn hidden":         {item(read, q, a, hiddenN), true},
+		"turn hidden":                 {item(read, q, hidden), false},
+		"reset (no thread)":           {item(read), false},
+		"reset, then a new turn":      {item(read, n), false},
+		"read past the answered turn": {item(read, q), false},
+		"recorded no turns":           {item(nil, q, a), false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			got := block(t, itemContext(tc.item, ctxNow))
@@ -159,12 +162,50 @@ func TestItemContextWithholdsResearchOffTheVisibleThread(t *testing.T) {
 	}
 }
 
+// Research that changes nothing and says nothing is left out silently: there is
+// nothing to withhold.
+func TestItemContextNeutralResearchNeedsNoNote(t *testing.T) {
+	item := worklist.WorkItem{Signals: worklist.Signals{Research: &worklist.ResearchAdjustment{Relevance: 1, Impact: 1, Engagement: 1, Urgency: 1}}}
+	if got := block(t, itemContext(item, ctxNow)); strings.Contains(got, "left out") || strings.Contains(got, "discussion adjustment") {
+		t.Errorf("neutral research needs no mention:\n%s", got)
+	}
+}
+
+// The explanation reports the multiplier Score applied (bounded to [0,2]), so it
+// agrees with the axis it produced.
+func TestItemContextShowsAppliedMultiplier(t *testing.T) {
+	item := worklist.WorkItem{
+		Signals: worklist.Signals{
+			Proposed: &worklist.AxisProposal{Urgency: 0.2, Confidence: 1},
+			Research: &worklist.ResearchAdjustment{Relevance: 1, Impact: 1, Engagement: 1, Urgency: 4, Turns: []string{"q"}},
+		},
+		Thread: []worklist.Message{{ID: "q", Role: worklist.RoleUser}},
+	}
+	got := block(t, itemContext(item, ctxNow))
+	if !strings.Contains(got, "urgency x2.00") || !strings.Contains(got, "urgency 0.40") || strings.Contains(got, "x4.00") {
+		t.Errorf("the applied (clamped) multiplier should be shown:\n%s", got)
+	}
+}
+
+// A stored proposal does not record whether a model or the deterministic stub
+// produced it, so the block does not attribute it to a model.
+func TestItemContextStubProposalIsNotCalledAModel(t *testing.T) {
+	item := worklist.WorkItem{Signals: worklist.Signals{
+		Reasons:  []worklist.Reason{worklist.ReasonAssignee},
+		Proposed: &worklist.AxisProposal{Relevance: 0.9, Confidence: 1, Rationale: "baseline (stub ranker)"},
+	}}
+	got := block(t, itemContext(item, ctxNow))
+	if strings.Contains(got, "model") || !strings.Contains(got, "source: gofer's ranker set all four axes (confidence 1.00)") {
+		t.Errorf("a stored proposal should get a neutral label:\n%s", got)
+	}
+}
+
 // A scored zero is still a ranking: the radar shows "unranked" and the axes, and so
 // does the block.
 func TestItemContextShowsScoredZeroRank(t *testing.T) {
 	item := worklist.WorkItem{Signals: worklist.Signals{Proposed: &worklist.AxisProposal{Confidence: 0.9, Rationale: "not relevant to you"}}}
 	got := block(t, itemContext(item, ctxNow))
-	for _, s := range []string{"rank: 0.00 of 1 (unranked)\n", "axes: relevance 0.00, urgency 0.00, impact 0.00, engagement 0.00\n", "model ranker rationale: not relevant to you\n"} {
+	for _, s := range []string{"rank: 0.00 of 1 (unranked)\n", "axes: relevance 0.00, urgency 0.00, impact 0.00, engagement 0.00\n", "ranker rationale: not relevant to you\n"} {
 		if !strings.Contains(got, s) {
 			t.Errorf("ranking block missing %q:\n%s", s, got)
 		}
@@ -217,7 +258,7 @@ func TestItemContextHumanOverride(t *testing.T) {
 			t.Errorf("ranking block missing %q:\n%s", s, got)
 		}
 	}
-	if strings.Contains(got, "research rationale") || strings.Contains(got, "model ranker") {
+	if strings.Contains(got, "research rationale") || strings.Contains(got, "ranker") {
 		t.Errorf("a hand-set ranking is not explained by research or the model:\n%s", got)
 	}
 }

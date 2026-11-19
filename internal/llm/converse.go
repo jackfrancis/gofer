@@ -297,7 +297,7 @@ const maxRankingDrivers = 6
 // rankingContext renders gofer's ranking of item at now, one fact per line, omitting
 // what gofer does not hold. The ranking is the radar's — re-derived from the item's
 // signals at read time (worklist.Rescore), not the possibly stale stored Meta — and
-// says where its axes came from: the user (a hand-set override), gofer's model ranker
+// says where its axes came from: the user (a hand-set override), gofer's ranker
 // (which replaces the signal-based axes), the signals themselves, and any discussion
 // adjustment that scaled them. A discussion adjustment that does not stand for the
 // visible thread is left out, and the axes are re-derived without it: it summarizes
@@ -331,8 +331,10 @@ func rankingContext(item worklist.WorkItem, now time.Time) string {
 	}
 
 	withheld := false
-	if item.Meta.Origin != worklist.OriginUser && s.Research != nil && !worklist.ResearchReflectsVisibleThread(item) {
-		item.Signals.Research, withheld = nil, true
+	if r := s.Research; item.Meta.Origin != worklist.OriginUser && r != nil && !worklist.ResearchReflectsVisibleThread(item) {
+		// Say so only when leaving it out changes or hides something.
+		withheld = r.Rationale != "" || !isNeutralResearch(*r)
+		item.Signals.Research = nil
 	}
 	m := worklist.Rescore(item, now)
 	// The signal-based contributions, which Score records even when a model proposal
@@ -362,16 +364,19 @@ func rankingContext(item worklist.WorkItem, now time.Time) string {
 		}
 		return b.String()
 	case p != nil:
-		fmt.Fprintf(&b, "source: gofer's model ranker set all four axes (confidence %.2f)\n", p.Confidence)
+		// Neutral: a stored proposal may come from the model or from the
+		// deterministic stub ranker, and it does not record which.
+		fmt.Fprintf(&b, "source: gofer's ranker set all four axes (confidence %.2f)\n", p.Confidence)
 		if p.Rationale != "" {
-			fmt.Fprintf(&b, "model ranker rationale: %s\n", dataLine(p.Rationale))
+			fmt.Fprintf(&b, "ranker rationale: %s\n", dataLine(p.Rationale))
 		}
 	default:
 		b.WriteString("source: gofer's scoring of the item's signals\n")
 	}
 	if r != nil {
+		rel, imp, eng, urg := r.Multipliers() // as Score applies them
 		fmt.Fprintf(&b, "discussion adjustment (scaled those axes): relevance x%.2f, urgency x%.2f, impact x%.2f, engagement x%.2f\n",
-			r.Relevance, r.Urgency, r.Impact, r.Engagement)
+			rel, urg, imp, eng)
 		if r.Rationale != "" {
 			fmt.Fprintf(&b, "discussion adjustment rationale: %s\n", dataLine(r.Rationale))
 		}
@@ -381,12 +386,18 @@ func rankingContext(item worklist.WorkItem, now time.Time) string {
 	}
 	if drivers != "" {
 		if p != nil {
-			fmt.Fprintf(&b, "baseline signals (evidence only; the model ranker's axes replace what they would give): %s\n", drivers)
+			fmt.Fprintf(&b, "baseline signals (evidence only; the ranker's axes replace what they would give): %s\n", drivers)
 		} else {
 			fmt.Fprintf(&b, "signals behind the axes: %s\n", drivers)
 		}
 	}
 	return b.String()
+}
+
+// isNeutralResearch reports whether r, as Score applies it, changes no axis.
+func isNeutralResearch(r worklist.ResearchAdjustment) bool {
+	rel, imp, eng, urg := r.Multipliers()
+	return rel == 1 && imp == 1 && eng == 1 && urg == 1
 }
 
 // rankingDrivers lists the signal-based contributions to the axes, strongest first,

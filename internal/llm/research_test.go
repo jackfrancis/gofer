@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/jackfrancis/gofer/internal/worklist"
@@ -40,5 +41,25 @@ func TestResearchParsesMultipliers(t *testing.T) {
 	}
 	if adj.Impact != 1 || adj.Engagement != 1 {
 		t.Fatalf("omitted multipliers should default to 1.0, got imp=%v eng=%v", adj.Impact, adj.Engagement)
+	}
+}
+
+// The adjustment records the keys of the turns it read, positional for a turn
+// stored before turns had IDs, so a reader can check they still belong.
+func TestResearchRecordsTheTurnsItRead(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"relevance\":1.2,\"rationale\":\"x\"}"}}]}`))
+	}))
+	defer srv.Close()
+	r := NewResearchRanker(Config{Endpoint: srv.URL, Token: "t", Client: srv.Client()})
+	adj, err := r.Research(context.Background(), worklist.WorkItem{Thread: []worklist.Message{
+		{Role: worklist.RoleUser, Content: "legacy"},
+		{ID: "a", Role: worklist.RoleAgent, Content: "answer"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(adj.Turns, ",") != "pos:0,a" {
+		t.Fatalf("Turns = %v, want [pos:0 a]", adj.Turns)
 	}
 }
