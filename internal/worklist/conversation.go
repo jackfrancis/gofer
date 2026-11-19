@@ -318,17 +318,17 @@ func (w WorkItem) ReplyStalled(now time.Time, staleAfter time.Duration) bool {
 }
 
 // NeedsReview reports whether the pull request still needs a first review dispatched
-// now: it has no completed review and none is currently in flight (a stale pending
-// request is treated as failed, so it is eligible again).
+// now: it is on the radar (OnRadar), has no completed review, and none is currently
+// in flight (a stale pending request is treated as failed, so it is eligible again).
 func (w WorkItem) NeedsReview(now time.Time, staleAfter time.Duration) bool {
-	return w.Type == TypePullRequest && !w.HasReview() && !w.ReplyPending(now, staleAfter)
+	return w.Type == TypePullRequest && w.OnRadar() && !w.HasReview() && !w.ReplyPending(now, staleAfter)
 }
 
 // NeedsSecondOpinion reports whether the pull request has been reviewed once but has
-// no consensus synthesis yet (and none in flight) — the pool the bulk "Get 2nd
-// Opinion" action draws from.
+// no consensus synthesis yet (and none in flight), and is on the radar (OnRadar) —
+// the pool the bulk "Get 2nd Opinion" action draws from.
 func (w WorkItem) NeedsSecondOpinion(now time.Time, staleAfter time.Duration) bool {
-	return w.Type == TypePullRequest && w.HasReview() && !w.hasSynthesisRequest() && !w.ReplyPending(now, staleAfter)
+	return w.Type == TypePullRequest && w.OnRadar() && w.HasReview() && !w.hasSynthesisRequest() && !w.ReplyPending(now, staleAfter)
 }
 
 // ToolDef describes a read-only tool the assistant may call during a turn.

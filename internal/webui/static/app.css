@@ -117,6 +117,12 @@ body {
 
 /* Discuss affordance + assistive conversation thread. */
 .zz-item-actions { display: flex; gap: 8px; align-items: flex-start; }
+.zz-item-actions form { margin: 0; }
+.zz-thread-head .zz-meta form { margin: 0; }
+.zz-hidden-item { font-style: italic; }
+.zz-undo { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 16px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; }
+.zz-undo form { margin: 0; }
+.zz-undo .zz-linkbtn { font-size: 14px; color: var(--accent); }
 .btn-sm { padding: 2px 8px; font-size: 12px; }
 .zz-discuss { white-space: nowrap; }
 .zz-discuss--unread { border-color: var(--accent); color: var(--accent); font-weight: 600; }
