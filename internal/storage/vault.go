@@ -64,6 +64,21 @@ func credentialAAD(userID, provider string) []byte {
 // Put seals and stores the credential for a user and provider, replacing any
 // existing one. It always seals under the primary key, so a Put re-keys the row.
 func (v *VaultStore) Put(ctx context.Context, userID string, cred vault.Credential) error {
+	return v.putWith(ctx, v.db.sql, userID, cred)
+}
+
+// execer is a *sql.DB or a *sql.Tx.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// upsertRow writes one credentials row.
+const upsertRow = `
+		INSERT INTO credentials (user_id, provider, key_id, sealed, updated_at) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (user_id, provider) DO UPDATE SET
+			key_id = excluded.key_id, sealed = excluded.sealed, updated_at = excluded.updated_at`
+
+func (v *VaultStore) putWith(ctx context.Context, ex execer, userID string, cred vault.Credential) error {
 	if userID == "" || cred.Provider == "" {
 		return errors.New("vault: userID and provider are required")
 	}
@@ -83,12 +98,7 @@ func (v *VaultStore) Put(ctx context.Context, userID string, cred vault.Credenti
 		return fmt.Errorf("storage: encode credential: %w", err)
 	}
 	keyID, sealed := v.keys.Seal(plaintext, credentialAAD(userID, cred.Provider))
-	_, err = v.db.sql.ExecContext(ctx, `
-		INSERT INTO credentials (user_id, provider, key_id, sealed, updated_at) VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT (user_id, provider) DO UPDATE SET
-			key_id = excluded.key_id, sealed = excluded.sealed, updated_at = excluded.updated_at`,
-		userID, cred.Provider, keyID, sealed, time.Now().Unix())
-	if err != nil {
+	if _, err := ex.ExecContext(ctx, upsertRow, userID, cred.Provider, keyID, sealed, time.Now().Unix()); err != nil {
 		return fmt.Errorf("storage: store credential: %w", err)
 	}
 	return nil
@@ -144,18 +154,69 @@ func (v *VaultStore) Delete(ctx context.Context, userID, provider string) error 
 
 // MarkLogout records a pending logout for the user and provider.
 func (v *VaultStore) MarkLogout(ctx context.Context, userID, provider string) error {
+	return v.markWith(ctx, v.db.sql, userID, provider)
+}
+
+func (v *VaultStore) markWith(ctx context.Context, ex execer, userID, provider string) error {
 	if userID == "" || provider == "" {
 		return errors.New("vault: userID and provider are required")
 	}
 	marker := logoutMarkerPrefix + provider
 	keyID, sealed := v.keys.Seal([]byte(`{}`), credentialAAD(userID, marker))
-	_, err := v.db.sql.ExecContext(ctx, `
-		INSERT INTO credentials (user_id, provider, key_id, sealed, updated_at) VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT (user_id, provider) DO UPDATE SET
-			key_id = excluded.key_id, sealed = excluded.sealed, updated_at = excluded.updated_at`,
-		userID, marker, keyID, sealed, time.Now().Unix())
-	if err != nil {
+	if _, err := ex.ExecContext(ctx, upsertRow, userID, marker, keyID, sealed, time.Now().Unix()); err != nil {
 		return fmt.Errorf("storage: mark logout: %w", err)
+	}
+	return nil
+}
+
+// MarkLogoutEndingSession records a pending logout and deletes the session whose
+// hashed id is sessionKey (the sessions table of this database), in one transaction:
+// either the logout is recorded and the session gone, or neither. An empty
+// sessionKey records the logout alone.
+func (v *VaultStore) MarkLogoutEndingSession(ctx context.Context, sessionKey, userID, provider string) error {
+	return v.inTx(ctx, func(tx *sql.Tx) error {
+		if err := v.markWith(ctx, tx, userID, provider); err != nil {
+			return err
+		}
+		if sessionKey == "" {
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE id_hash = ?`, sessionKey); err != nil {
+			return fmt.Errorf("storage: delete session: %w", err)
+		}
+		return nil
+	})
+}
+
+// PutClearingLogout stores a new credential and clears any pending logout for its
+// user and provider, in one transaction, so a restart sees either the pending
+// logout or the sign-in that replaced it, never the new credential paired with the
+// old logout.
+func (v *VaultStore) PutClearingLogout(ctx context.Context, userID string, cred vault.Credential) error {
+	return v.inTx(ctx, func(tx *sql.Tx) error {
+		if err := v.putWith(ctx, tx, userID, cred); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM credentials WHERE user_id = ? AND provider = ?`, userID, logoutMarkerPrefix+cred.Provider); err != nil {
+			return fmt.Errorf("storage: clear logout: %w", err)
+		}
+		return nil
+	})
+}
+
+// inTx runs fn in one transaction, committing only if it succeeds.
+func (v *VaultStore) inTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	tx, err := v.db.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("storage: begin: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("storage: commit: %w", err)
 	}
 	return nil
 }

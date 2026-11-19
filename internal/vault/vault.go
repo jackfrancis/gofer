@@ -59,6 +59,9 @@ type LogoutLedger interface {
 	ClearLogout(ctx context.Context, userID, provider string) error
 	LogoutPending(ctx context.Context, userID, provider string) (bool, error)
 	PendingLogouts(ctx context.Context) ([]LogoutKey, error)
+	// PutClearingLogout stores a credential and clears the pending logout for its
+	// user and provider together: atomically, in a durable vault.
+	PutClearingLogout(ctx context.Context, userID string, cred Credential) error
 }
 
 // Vault stores and retrieves delegated provider credentials, scoped by user.
@@ -159,4 +162,19 @@ func (v *MemoryVault) PendingLogouts(context.Context) ([]LogoutKey, error) {
 		out = append(out, k)
 	}
 	return out, nil
+}
+
+// PutClearingLogout stores the credential and clears any pending logout.
+func (v *MemoryVault) PutClearingLogout(_ context.Context, userID string, cred Credential) error {
+	if userID == "" || cred.Provider == "" {
+		return errors.New("vault: userID and provider are required")
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.creds[userID] == nil {
+		v.creds[userID] = make(map[string]Credential)
+	}
+	v.creds[userID][cred.Provider] = cred
+	delete(v.logouts, LogoutKey{userID, cred.Provider})
+	return nil
 }

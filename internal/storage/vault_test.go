@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackfrancis/gofer/internal/session"
 	"github.com/jackfrancis/gofer/internal/vault"
 )
 
@@ -425,5 +426,69 @@ func TestLogoutLedger(t *testing.T) {
 	}
 	if err := reopened.Put(ctx, "bob", vault.Credential{Provider: logoutMarkerPrefix + "github", AccessToken: "x"}); err == nil {
 		t.Error("a credential was written under the reserved marker name")
+	}
+}
+
+// Review (fourth round): recording a pending logout and deleting the browser session
+// commit together. If the session delete fails, the marker is rolled back too.
+func TestMarkLogoutEndingSessionIsAtomic(t *testing.T) {
+	db := open(t, t.TempDir())
+	v := db.Vault(keyring(t, testKey(1)))
+	sessions := db.Sessions()
+	if err := sessions.Save(ctx, "sess-hash", session.User{ID: "alice"}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.sql.ExecContext(ctx, `CREATE TRIGGER no_session_delete BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.MarkLogoutEndingSession(ctx, "sess-hash", "alice", "github"); err == nil {
+		t.Fatal("commit succeeded although the session delete failed")
+	}
+	if p, _ := v.LogoutPending(ctx, "alice", "github"); p {
+		t.Error("the marker survived a failed commit")
+	}
+	if _, err := db.sql.ExecContext(ctx, `DROP TRIGGER no_session_delete`); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.MarkLogoutEndingSession(ctx, "sess-hash", "alice", "github"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := v.LogoutPending(ctx, "alice", "github"); !p {
+		t.Error("no marker after the commit")
+	}
+	if _, _, err := sessions.Load(ctx, "sess-hash"); !errors.Is(err, session.ErrNotFound) {
+		t.Errorf("session kept after the commit (err=%v)", err)
+	}
+}
+
+// Review (fourth round): a sign-in's credential and the clearing of the old
+// logout commit together. If clearing fails, the credential write is rolled back.
+func TestPutClearingLogoutIsAtomic(t *testing.T) {
+	db := open(t, t.TempDir())
+	v := db.Vault(keyring(t, testKey(1)))
+	if err := v.Put(ctx, "alice", cred("old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.MarkLogout(ctx, "alice", "github"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.sql.ExecContext(ctx, `CREATE TRIGGER keep_marker BEFORE DELETE ON credentials
+		WHEN OLD.provider = 'logout-pending:github' BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.PutClearingLogout(ctx, "alice", cred("new")); err == nil {
+		t.Fatal("commit succeeded although clearing the marker failed")
+	}
+	if got := mustGet(t, v, "alice", "github").AccessToken; got != "old" {
+		t.Errorf("credential = %q after a failed commit, want the old one", got)
+	}
+	if _, err := db.sql.ExecContext(ctx, `DROP TRIGGER keep_marker`); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.PutClearingLogout(ctx, "alice", cred("new")); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := v.LogoutPending(ctx, "alice", "github"); p || mustGet(t, v, "alice", "github").AccessToken != "new" {
+		t.Error("sign-in did not replace the credential and clear the marker")
 	}
 }

@@ -937,8 +937,13 @@ GitHub's endpoints only:
   time, the same revoke-then-delete runs in the background once it is free; a new
   sign-in clears the tombstone only once its credential is stored. The pending
   logout is recorded durably (the vault's `LogoutLedger`, a marker row in the
-  `credentials` table under a reserved provider name, so still no migration) before
-  the session is discarded. After a restart, or once the background wait gives up,
+  `credentials` table under a reserved provider name, so still no migration) in the
+  same SQLite transaction that deletes the browser session; if that commit fails,
+  logout answers 503 and changes nothing. Each logout is one operation, recorded
+  once: a sign-in that replaces the credential clears the marker in the same
+  transaction as its write, and the rest of that logout then leaves the replacement
+  alone. A pair logout rotates is stored, still unvendable, before the revocation
+  request. After a restart, or once the background wait gives up,
   the credential stays unvendable and the next lock holder finishes the logout; the
   web tier also resumes pending logouts at startup. Logout answers
   200 with `revocation: unconfirmed` when GitHub did not confirm, including when no

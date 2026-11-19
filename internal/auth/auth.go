@@ -328,8 +328,10 @@ func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 // Logout ends the interactive session and discards the delegated provider
 // credential the login left in the vault. For GitHub it first revokes the grant at
 // GitHub, refreshing the token first if it has expired or is about to (see
-// revokeAndDelete). Logout is never blocked: the row is deleted and the session
-// destroyed whatever happens.
+// revokeAndDelete). The pending logout and the end of the session are committed
+// together first; if that commit fails, logout answers 503 and changes nothing.
+// After it, logout is never blocked: the credential is revoked and deleted, now or
+// in the background.
 //
 // It answers 204 when revocation is confirmed (or there was nothing to revoke).
 // When it is not — no stored GitHub credential, a dead refresh token, a failed
@@ -338,20 +340,32 @@ func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 // revoke gofer themselves (settings_urls; settings_url is the first).
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	res := logoutResult{confirmed: true}
-	// Find the owner and end the session on their own deadline: a browser that
-	// disconnects must neither hide whose credential to revoke nor leave its session
-	// valid. The pending logout is recorded durably before the session goes, so the
-	// credential is never vended again, even across a restart.
-	sctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-	sr := r.WithContext(sctx)
-	u := h.sessions.CurrentUser(sr)
-	if u != nil && h.vault != nil {
-		h.markLogout(sctx, u.ID, u.Provider)
-	}
-	h.sessions.Destroy(w, sr)
+	// Find the owner on a deadline of its own: a browser that disconnects must not
+	// hide whose credential to revoke.
+	lctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+	u := h.sessions.CurrentUser(r.WithContext(lctx))
 	cancel()
-	if u != nil && h.vault != nil {
-		res = h.revokeAndDelete(r.Context(), u.ID, u.Provider)
+	// Record the pending logout and end the session together (one commit with the
+	// SQLite vault), again detached from the browser. If that fails nothing changed:
+	// the session stands, nothing is revoked, and the user is told to try again.
+	op := ""
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+	err := h.sessions.EndWith(w, r.WithContext(cctx), func(ctx context.Context, sessionKey string) error {
+		if u == nil || h.vault == nil {
+			return nil
+		}
+		var err error
+		op, err = h.beginLogout(ctx, sessionKey, u.ID, u.Provider)
+		return err
+	})
+	cancel()
+	if err != nil {
+		slog.ErrorContext(r.Context(), "logout could not be recorded; the session stands", "user", u.ID, "err", err)
+		writeLogoutError(w)
+		return
+	}
+	if op != "" {
+		res = h.revokeAndDelete(r.Context(), u.ID, u.Provider, op)
 	}
 	if res.confirmed {
 		w.WriteHeader(http.StatusNoContent)
@@ -364,6 +378,15 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 		"message":       "You are signed out of gofer, but GitHub did not confirm that gofer's access was revoked. Revoke gofer in GitHub's settings to be sure.",
 		"settings_url":  res.settings[0],
 		"settings_urls": res.settings,
+	})
+}
+
+// writeLogoutError answers a logout that changed nothing.
+func writeLogoutError(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"error": "gofer could not sign you out right now; you are still signed in. Try again.",
 	})
 }
 

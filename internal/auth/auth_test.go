@@ -38,6 +38,8 @@ type fakeGitHub struct {
 	checkStatus int
 	// onRefresh runs when a refresh is served, after the pair has rotated.
 	onRefresh func()
+	// onRevoke runs when a grant revocation arrives, with the token it carries.
+	onRevoke func(token string)
 
 	refreshes   atomic.Int32
 	checks      atomic.Int32
@@ -97,6 +99,9 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 			f.revoked.Add(1)
 			tok := bodyToken(r)
 			f.revokedWith.Store(tok)
+			if f.onRevoke != nil {
+				f.onRevoke(tok)
+			}
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			if f.revokeErr || !f.valid[tok] || !f.basicAuthOK(r) {

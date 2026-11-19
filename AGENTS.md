@@ -208,7 +208,10 @@ Wired on the web-tier side; they define what a runtime must respect:
   and logout revokes, then deletes, under the lock (or in the background once the
   lock frees). The pending logout is also recorded durably (`vault.LogoutLedger`: a
   marker row under a reserved provider name in `credentials`, no migration), so the
-  refusal survives a restart; the next lock holder, or startup, finishes it.
+  refusal survives a restart; the next lock holder, or startup, finishes it. Pairs
+  that must agree after a crash commit in one SQLite transaction: the logout marker
+  with the session delete (`MarkLogoutEndingSession`), and a sign-in's credential
+  with clearing the marker (`PutClearingLogout`).
   Never write the vault from anywhere else. A
   credential from another client is never vended. The broker answers "sign-in
   required" with 410 and code `sign_in_required`; the workload (`internal/agent`,

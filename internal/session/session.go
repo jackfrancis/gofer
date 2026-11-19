@@ -252,8 +252,35 @@ func (m *Manager) CurrentUser(r *http.Request) *User {
 }
 
 // Destroy removes the session and clears the cookie.
+// EndWith ends the request's session through commit, which must delete the stored
+// session (storeKey, the hashed id a Store sees) together with whatever the caller
+// records about the session's end, in one commit where the store allows it. Only if
+// commit succeeds is the session forgotten and its cookie cleared; if it fails,
+// nothing changes and its error is returned, so the caller can report that sign-out
+// did not happen. The store's own Delete follows a successful commit as a backstop
+// for a commit that could not reach this manager's store (an in-memory one); its
+// failure is logged. storeKey is "" when the request carries no session.
+func (m *Manager) EndWith(w http.ResponseWriter, r *http.Request, commit func(ctx context.Context, storeKey string) error) error {
+	id := m.id(r)
+	key := ""
+	if id != "" {
+		key = storeKey(id)
+	}
+	if err := commit(r.Context(), key); err != nil {
+		return err
+	}
+	m.drop(r)
+	m.clearCookie(w)
+	return nil
+}
+
 func (m *Manager) Destroy(w http.ResponseWriter, r *http.Request) {
 	m.drop(r)
+	m.clearCookie(w)
+}
+
+// clearCookie expires the session cookie.
+func (m *Manager) clearCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieName,
 		Value:    "",
