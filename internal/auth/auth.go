@@ -344,7 +344,9 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	// Find the owner on a deadline of its own: a browser that disconnects must not
 	// hide whose credential to revoke.
 	lctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-	u, lerr := h.sessions.Lookup(r.WithContext(lctx))
+	// LookupOwner, not CurrentUser: an account dropped from ALLOWED_GITHUB_LOGINS
+	// gets no interactive access, but must still be able to revoke its grant.
+	u, lerr := h.sessions.LookupOwner(r.WithContext(lctx))
 	cancel()
 	if lerr != nil {
 		// The store could not say whose session this is. Ending it now could leave
@@ -356,14 +358,14 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	// Record the pending logout and end the session together (one commit with the
 	// SQLite vault), again detached from the browser. If that fails nothing changed:
 	// the session stands, nothing is revoked, and the user is told to try again.
-	op := ""
+	var lo *localLogout
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
 	err := h.sessions.EndWith(w, r.WithContext(cctx), func(ctx context.Context, sessionKey string) error {
 		if u == nil || h.vault == nil {
 			return nil
 		}
 		var err error
-		op, err = h.beginLogout(ctx, sessionKey, u.ID, u.Provider)
+		lo, err = h.beginLogout(ctx, sessionKey, u.ID, u.Provider)
 		return err
 	})
 	cancel()
@@ -380,8 +382,8 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 		writeLogoutError(w)
 		return
 	}
-	if op != "" {
-		res = h.revokeAndDelete(r.Context(), u.ID, u.Provider, op)
+	if lo != nil {
+		res = h.revokeAndDelete(r.Context(), u.ID, u.Provider, lo)
 	}
 	if res.confirmed {
 		w.WriteHeader(http.StatusNoContent)

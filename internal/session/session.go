@@ -241,6 +241,18 @@ func (m *Manager) CurrentUser(r *http.Request) *User {
 // could not answer (nil, err). A caller about to end the session needs the
 // difference: a store failure must not look like a missing session.
 func (m *Manager) Lookup(r *http.Request) (*User, error) {
+	return m.lookup(r, true)
+}
+
+// LookupOwner is Lookup without the sign-in allow-list: whose valid, unexpired
+// session this is, by its signed cookie, even if the account may no longer sign in.
+// Logout uses it, so an account removed from the allow-list can still revoke what
+// it granted. Never use it to grant interactive access.
+func (m *Manager) LookupOwner(r *http.Request) (*User, error) {
+	return m.lookup(r, false)
+}
+
+func (m *Manager) lookup(r *http.Request, applyAllow bool) (*User, error) {
 	id := m.id(r)
 	if id == "" {
 		return nil, nil
@@ -257,7 +269,7 @@ func (m *Manager) Lookup(r *http.Request) (*User, error) {
 		_ = m.store.Delete(r.Context(), key)
 		return nil, nil
 	}
-	if m.allow != nil && !m.allow(&u) {
+	if applyAllow && m.allow != nil && !m.allow(&u) {
 		return nil, nil
 	}
 	return &u, nil

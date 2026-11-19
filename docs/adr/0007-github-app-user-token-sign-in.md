@@ -942,7 +942,13 @@ GitHub's endpoints only:
   transaction is what removed the session, so each session starts at most one
   logout; if the commit or the session lookup fails, logout answers 503 and changes
   nothing. The marker's transitions and this process's ownership of it change
-  together under a short per-(user, provider) lock. Each logout is one operation, recorded
+  together under a short per-(user, provider) lock. A logout's in-process record is
+  published only after its commit; a second logout of the same credential joins the
+  running one; whoever performs the revoke-then-delete records the outcome, which
+  every waiting request reports; and the broker classifies and claims an orphaned
+  logout in one locked section. Logout finds the session's owner without applying
+  the allow-list, so an account removed from `ALLOWED_GITHUB_LOGINS` can still
+  revoke its grant. Each logout is one operation, recorded
   once: a sign-in that replaces the credential clears the marker in the same
   transaction as its write, and the rest of that logout then leaves the replacement
   alone. A pair logout rotates is stored, still unvendable, before the revocation

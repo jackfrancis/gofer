@@ -199,3 +199,25 @@ func TestWithAllowGatesExistingSessions(t *testing.T) {
 		t.Error("an account the allow check rejects was honoured")
 	}
 }
+
+// LookupOwner finds whose valid session it is even when the allow-list now refuses
+// the account (so logout can revoke what it granted); Lookup and CurrentUser do not.
+// A forged cookie finds no one either way.
+func TestLookupOwnerIgnoresOnlyTheAllowList(t *testing.T) {
+	allowed := true
+	m := NewManager([]byte("test-session-secret-0123456789ab"), false,
+		WithAllow(func(*User) bool { return allowed }))
+	r := login(t, m, &User{ID: "github:1", Login: "octocat"})
+	allowed = false
+	if u, err := m.Lookup(r); u != nil || err != nil {
+		t.Fatalf("Lookup = %v, %v; want no access for a refused account", u, err)
+	}
+	if u, err := m.LookupOwner(r); err != nil || u == nil || u.ID != "github:1" {
+		t.Fatalf("LookupOwner = %v, %v; want the session's owner", u, err)
+	}
+	forged := httptest.NewRequest(http.MethodGet, "/", nil)
+	forged.AddCookie(&http.Cookie{Name: cookieName, Value: "not-a-session.sig"})
+	if u, _ := m.LookupOwner(forged); u != nil {
+		t.Fatal("LookupOwner accepted an unsigned cookie")
+	}
+}

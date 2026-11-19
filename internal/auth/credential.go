@@ -17,7 +17,6 @@ import (
 
 	"golang.org/x/oauth2"
 
-	"github.com/jackfrancis/gofer/internal/session"
 	"github.com/jackfrancis/gofer/internal/vault"
 )
 
@@ -105,185 +104,6 @@ func (l *credLocks) markerLock(userID, provider string) func() {
 type credLock struct {
 	ch   chan struct{}
 	refs int // holders and waiters; the entry is dropped at zero
-}
-
-// localLogout is a logout pending in this process.
-type localLogout struct {
-	op      string // the logout operation that owns it
-	running bool   // that operation still runs its revoke-then-delete
-}
-
-func credKey(userID, provider string) string { return userID + "\x00" + provider }
-
-// beginLogout records a logout pending here, owned by a new operation, and returns
-// that operation's ID. The operation's later steps act only while they still own
-// it: a sign-in that replaced the credential drops it, and must not be undone.
-func (l *credLocks) beginLogout(userID, provider string) string {
-	op := newVersion()
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.logouts == nil {
-		l.logouts = make(map[string]*localLogout)
-	}
-	l.logouts[credKey(userID, provider)] = &localLogout{op: op, running: true}
-	return op
-}
-
-// localLogoutState reports whether a logout is pending here, and whether an
-// operation here is running it.
-func (l *credLocks) localLogoutState(userID, provider string) (pending, running bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	lo := l.logouts[credKey(userID, provider)]
-	return lo != nil, lo != nil && lo.running
-}
-
-// owns reports whether op still owns the pending logout.
-func (l *credLocks) owns(userID, provider, op string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	lo := l.logouts[credKey(userID, provider)]
-	return lo != nil && lo.op == op
-}
-
-// releaseLogout says op no longer runs the pending logout (it gave up, or its
-// delete failed): the next lock holder finishes it.
-func (l *credLocks) releaseLogout(userID, provider, op string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if lo := l.logouts[credKey(userID, provider)]; lo != nil && lo.op == op {
-		lo.running = false
-	}
-}
-
-// abandonLogout forgets op's pending logout, if op still owns it: its commit
-// failed, so nothing was recorded.
-func (l *credLocks) abandonLogout(userID, provider, op string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if lo := l.logouts[credKey(userID, provider)]; lo != nil && lo.op == op {
-		delete(l.logouts, credKey(userID, provider))
-	}
-}
-
-// dropLogout forgets the pending logout, whoever owns it: it finished, or a new
-// sign-in replaced the credential.
-func (l *credLocks) dropLogout(userID, provider string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	delete(l.logouts, credKey(userID, provider))
-}
-
-// stepTimeout bounds one ledger read or write, detached from the caller.
-const stepTimeout = 5 * time.Second
-
-// logoutCommitter is a vault that records a pending logout and deletes the browser
-// session in one commit (storage.VaultStore, over the database that also holds the
-// sessions).
-type logoutCommitter interface {
-	MarkLogoutEndingSession(ctx context.Context, sessionKey, userID, provider string) error
-}
-
-// beginLogout starts one logout operation: it records the pending logout here and
-// durably, and ends the browser session (sessionKey, the hashed id a session store
-// sees; "" for none) in the same commit where the vault allows it. It returns the
-// operation's ID, or an error if nothing was committed, in which case nothing has
-// changed: the session stands and the caller reports that sign-out failed.
-func (h *Handler) beginLogout(ctx context.Context, sessionKey, userID, providerName string) (string, error) {
-	defer h.locks.markerLock(userID, providerName)()
-	op := h.locks.beginLogout(userID, providerName)
-	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
-	defer cancel()
-	var err error
-	if c, ok := h.vault.(logoutCommitter); ok {
-		// Records the logout only if this call consumed the session
-		// (session.ErrNotFound otherwise).
-		err = c.MarkLogoutEndingSession(lctx, sessionKey, userID, providerName)
-	} else {
-		// An in-memory vault: there is no restart to survive. Consume the session
-		// from the manager's own store first, so each session still starts at most
-		// one logout.
-		if sessionKey != "" {
-			consumed, cerr := h.sessions.ConsumeStored(lctx, sessionKey)
-			switch {
-			case cerr != nil:
-				err = cerr
-			case !consumed:
-				err = session.ErrNotFound
-			}
-		}
-		if err == nil {
-			err = h.ledger.MarkLogout(lctx, userID, providerName)
-		}
-	}
-	if err != nil {
-		h.locks.abandonLogout(userID, providerName, op)
-		return "", err
-	}
-	return op, nil
-}
-
-// markLogout records a pending logout with no session to end, and returns its
-// operation ID.
-func (h *Handler) markLogout(ctx context.Context, userID, providerName string) (string, error) {
-	return h.beginLogout(ctx, "", userID, providerName)
-}
-
-// clearLogout forgets a pending logout, here and in the ledger: logout deleted the
-// credential, or a new sign-in stored its replacement. A ledger failure is retried
-// once; if it persists the marker stays, which fails closed (the user signs in
-// again).
-func (h *Handler) clearLogout(ctx context.Context, userID, providerName string) {
-	defer h.locks.markerLock(userID, providerName)()
-	h.locks.dropLogout(userID, providerName)
-	for attempt := 0; attempt < 2; attempt++ {
-		lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
-		err := h.ledger.ClearLogout(lctx, userID, providerName)
-		cancel()
-		if err == nil {
-			return
-		}
-		slog.WarnContext(ctx, "clearing a pending logout failed", "user", userID, "provider", providerName, "attempt", attempt+1, "err", err)
-	}
-}
-
-// logoutPending reports whether a logout of the (user, provider) has begun and not
-// finished — pending in this process, or recorded in the ledger by one before a
-// restart — and whether it is orphaned: pending, with no operation in this process
-// running it. While a logout is pending, logout alone revokes and deletes the
-// credential; every other holder refuses to vend it and deletes nothing, so the token
-// logout needs for revocation stays in place. An orphan is finished by the next lock
-// holder. A ledger that cannot be read counts as pending, not orphaned: it fails
-// closed.
-func (h *Handler) logoutPending(ctx context.Context, userID, providerName string) (pending, orphan bool, err error) {
-	local, running := h.locks.localLogoutState(userID, providerName)
-	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
-	defer cancel()
-	marked, err := h.ledger.LogoutPending(lctx, userID, providerName)
-	if err != nil {
-		return true, false, err
-	}
-	pending = local || marked
-	return pending, pending && !running, nil
-}
-
-// ResumePendingLogouts finishes, in the background, every logout the ledger says a
-// previous process began and did not finish. The web tier calls it at startup.
-func (h *Handler) ResumePendingLogouts(ctx context.Context) {
-	lctx, cancel := context.WithTimeout(ctx, stepTimeout)
-	keys, err := h.ledger.PendingLogouts(lctx)
-	cancel()
-	if err != nil {
-		slog.WarnContext(ctx, "listing pending logouts failed; they finish at the next credential access", "err", err)
-		return
-	}
-	for _, k := range keys {
-		if pending, _ := h.locks.localLogoutState(k.UserID, k.Provider); pending {
-			continue
-		}
-		op := h.locks.beginLogout(k.UserID, k.Provider)
-		go h.pendingLogout(context.WithoutCancel(ctx), k.UserID, k.Provider, op)
-	}
 }
 
 func (l *credLocks) lock(ctx context.Context, userID, provider string) (func(), error) {
@@ -388,7 +208,7 @@ func (h *Handler) Credential(ctx context.Context, userID, providerName string, r
 	// a logout that began meanwhile must not see a token vended after it. Logout's
 	// grant revocation kills anything vended before it.
 	if err == nil {
-		pending, _, perr := h.logoutPending(ctx, userID, providerName)
+		pending, perr := h.logoutPending(ctx, userID, providerName)
 		if perr != nil {
 			// Withheld, but not "sign-in required": the ledger could not be read, so
 			// this is a temporary failure, not a confirmed reason to reconnect.
@@ -404,17 +224,17 @@ func (h *Handler) Credential(ctx context.Context, userID, providerName string, r
 // credentialLocked is Credential's work, holding the credential lock.
 func (h *Handler) credentialLocked(ctx context.Context, userID string, p *provider, req VendRequest) (vault.Credential, error) {
 	providerName := p.name
-	pending, orphan, err := h.logoutPending(ctx, userID, providerName)
+	pending, mine, err := h.claimLogout(ctx, userID, providerName)
 	if err != nil {
 		// Fail closed: a logout may be pending.
 		return vault.Credential{}, fmt.Errorf("read pending logout: %w", err)
 	}
 	if pending {
 		// Refuse. A logout running here owns the credential, and needs its token to
-		// revoke the grant. One nobody runs (begun before a restart, or whose
-		// background wait gave up) is finished now, holding the lock.
-		if orphan {
-			res := h.logoutLocked(ctx, userID, providerName)
+		// revoke the grant. One nobody ran (begun before a restart, or whose
+		// background wait gave up) was just claimed: finish it, holding the lock.
+		if mine != nil {
+			res := h.runLogout(ctx, userID, providerName, mine)
 			slog.InfoContext(ctx, "finished a pending logout", "user", userID, "provider", providerName, "confirmed", res.confirmed)
 		}
 		return vault.Credential{}, vault.ErrSignInRequired
@@ -661,7 +481,7 @@ func (h *Handler) putIfVersion(ctx context.Context, userID, expect string, cred 
 // deleteIfVersion deletes the credential only if the row still holds cred's
 // version, so a failed refresh never deletes what a newer sign-in wrote.
 func (h *Handler) deleteIfVersion(ctx context.Context, userID string, cred vault.Credential) {
-	if pending, _, err := h.logoutPending(ctx, userID, cred.Provider); pending || err != nil {
+	if pending, err := h.logoutPending(ctx, userID, cred.Provider); pending || err != nil {
 		return // a pending logout deletes it, after trying to revoke with it
 	}
 	cur, err := h.vault.Get(ctx, userID, cred.Provider)
@@ -808,184 +628,6 @@ func (h *Handler) storeSignIn(ctx context.Context, p *provider, userID string, t
 		slog.WarnContext(ctx, "storing the sign-in credential failed", "user", userID, "provider", p.name, "err", err)
 		return false, nil
 	}
-	h.locks.dropLogout(userID, p.name)
+	h.supersedeLogoutLocked(userID, p.name)
 	return false, nil
-}
-
-// logoutResult is what logout learned about revocation at GitHub.
-type logoutResult struct {
-	confirmed bool
-	// settings lists the GitHub settings pages where the user can revoke gofer by
-	// hand when revocation is not confirmed: the issuing client's kind, or both
-	// pages when gofer cannot tell which client issued the credential.
-	settings []string
-}
-
-// revokeAndDelete is the rest of logout operation op, begun by beginLogout (which
-// recorded the pending logout and ended the session). Being pending makes logout the
-// credential's only remaining writer: every other holder refuses to vend it and
-// deletes nothing. Then, under the credential lock (logoutLocked): read the
-// credential, refresh it if it has expired or is about to (revoking the grant needs
-// a valid access token, and a session outlives one), store the rotated pair, revoke
-// the grant, and delete the row. It never records the logout again: if a sign-in
-// replaced the credential meanwhile, op no longer owns the logout and leaves it.
-//
-// The lock is waited for detached from the browser request, for logoutLockWait. If
-// it is still busy, logout reports revocation unconfirmed and a background wait
-// (pendingLogout) does the same revoke-then-delete once the lock is free. If that
-// wait gives up, or the process restarts, the pending mark (durable in the ledger)
-// keeps the credential unvendable, and the next lock holder finishes the logout.
-//
-// Revocation is confirmed only when GitHub confirmed it, or for a provider gofer
-// revokes nothing at. A missing GitHub credential is unconfirmed: the broker deletes
-// a row whose refresh token is dead, which after a restore from backup does not mean
-// the grant is gone.
-func (h *Handler) revokeAndDelete(ctx context.Context, userID, providerName, op string) logoutResult {
-	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), logoutLockWait)
-	defer cancel()
-	unlock, err := h.locks.lock(wctx, userID, providerName)
-	if err != nil {
-		slog.WarnContext(ctx, "logout: credential lock busy; revocation deferred", "user", userID, "provider", providerName)
-		go h.pendingLogout(context.WithoutCancel(ctx), userID, providerName, op)
-		return h.unconfirmed(providerName, h.providers[providerName], nil)
-	}
-	defer unlock()
-	defer h.locks.releaseLogout(userID, providerName, op) // still pending only if the delete failed
-	if !h.locks.owns(userID, providerName, op) {
-		// A new sign-in stored a replacement while logout waited: leave it, and say
-		// gofer's access was not revoked.
-		return h.unconfirmed(providerName, h.providers[providerName], nil)
-	}
-	return h.logoutLocked(ctx, userID, providerName)
-}
-
-// pendingLogout finishes logout operation op when it could not take the lock in
-// time, or one resumed after a restart: it waits for the lock and runs the same
-// revoke-then-delete, unless a new sign-in stored a replacement first.
-func (h *Handler) pendingLogout(ctx context.Context, userID, providerName, op string) {
-	defer h.locks.releaseLogout(userID, providerName, op)
-	wctx, cancel := context.WithTimeout(ctx, pendingLogoutWait)
-	defer cancel()
-	unlock, err := h.locks.lock(wctx, userID, providerName)
-	if err != nil {
-		// Still pending, and durable: nothing is vended, and the next lock holder
-		// finishes the logout.
-		slog.WarnContext(ctx, "logout: deferred revocation timed out; left to the next credential access", "user", userID, "provider", providerName)
-		return
-	}
-	defer unlock()
-	if !h.locks.owns(userID, providerName, op) {
-		return
-	}
-	res := h.logoutLocked(ctx, userID, providerName)
-	slog.InfoContext(ctx, "logout: deferred revocation finished", "user", userID, "provider", providerName, "confirmed", res.confirmed)
-}
-
-// logoutLocked revokes and deletes the credential, holding the credential lock.
-// Each step gets its own deadline, detached from the caller's: waiting for the lock
-// must not leave too little time to read the row or to revoke with a token a
-// refresh has just rotated.
-func (h *Handler) logoutLocked(ctx context.Context, userID, providerName string) logoutResult {
-	defer h.finishLogout(ctx, userID, providerName)
-	step := func() (context.Context, context.CancelFunc) {
-		return context.WithTimeout(context.WithoutCancel(ctx), exchangeTimeout)
-	}
-	if providerName != "github" {
-		return logoutResult{confirmed: true} // gofer revokes nothing at other providers
-	}
-	p, ok := h.providers[providerName]
-	rctx, cancel := step()
-	cred, err := h.vault.Get(rctx, userID, providerName)
-	cancel()
-	switch {
-	case errors.Is(err, vault.ErrNotFound):
-		slog.InfoContext(ctx, "logout: no stored github credential; revocation unconfirmed", "user", userID)
-		return h.unconfirmed(providerName, p, nil)
-	case err != nil:
-		slog.WarnContext(ctx, "reading a credential on logout failed", "user", userID, "provider", providerName, "err", err)
-		return h.unconfirmed(providerName, p, nil)
-	case !ok:
-		slog.InfoContext(ctx, "logout: github sign-in is not configured; revocation unconfirmed", "user", userID)
-		return h.unconfirmed(providerName, nil, &cred)
-	case !fromConfiguredClient(p, cred):
-		// Issued by another client (before a cutover or rollback): this client's
-		// credentials cannot revoke it.
-		slog.InfoContext(ctx, "logout: credential is from another client; revocation unconfirmed", "user", userID)
-		return h.unconfirmed(providerName, p, &cred)
-	}
-	token := cred.AccessToken
-	if cred.RefreshToken != "" && !cred.Expiry.IsZero() && h.now().Add(earlyRefresh).After(cred.Expiry) {
-		tok, err := h.refresher(ctx, p, cred.RefreshToken).Token() // its own deadline
-		switch {
-		case err == nil:
-			token = tok.AccessToken
-			// The old refresh token is spent. Store the rotated pair (still under the
-			// pending logout, so never vended) before asking GitHub to revoke: if the
-			// process stops in between, recovery revokes with this token instead of
-			// finding only the spent one.
-			sctx, scancel := step()
-			if _, err := h.storeRotated(sctx, userID, p, cred, tok); err != nil {
-				slog.WarnContext(ctx, "logout: storing the rotated pair failed; revoking anyway", "user", userID, "err", err)
-			}
-			scancel()
-		case refreshErrorCode(err) == errBadRefreshToken:
-			// This does not prove the grant is gone: after a restore from backup the
-			// vault can hold a spent refresh token while a newer pair still works.
-			slog.InfoContext(ctx, "logout: refresh token is dead; revocation unconfirmed", "user", userID)
-			return h.unconfirmed(providerName, p, &cred)
-		case !h.now().Before(cred.Expiry):
-			slog.WarnContext(ctx, "logout: refresh failed and the token has expired; revocation unconfirmed", "user", userID, "code", refreshErrorCode(err))
-			return h.unconfirmed(providerName, p, &cred)
-		}
-	}
-	rctx, cancel = step()
-	defer cancel()
-	if err := h.revokeGrant(rctx, p, token); err != nil {
-		slog.WarnContext(ctx, "logout: grant revocation failed; unconfirmed", "user", userID, "err", err)
-		return h.unconfirmed(providerName, p, &cred)
-	}
-	return logoutResult{confirmed: true}
-}
-
-// finishLogout deletes the row and clears the pending logout, holding the
-// credential lock. If the delete fails the logout stays pending, so the credential
-// is still never vended, and the next lock holder tries again.
-func (h *Handler) finishLogout(ctx context.Context, userID, providerName string) {
-	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	if err := h.vault.Delete(dctx, userID, providerName); err != nil {
-		slog.WarnContext(ctx, "deleting a credential on logout failed", "user", userID, "provider", providerName, "err", err)
-		return
-	}
-	h.clearLogout(ctx, userID, providerName)
-}
-
-// unconfirmed is an unconfirmed logoutResult, with the settings pages for the
-// credential's issuer. Non-GitHub providers get none: gofer revokes nothing there.
-func (h *Handler) unconfirmed(providerName string, p *provider, cred *vault.Credential) logoutResult {
-	if providerName != "github" {
-		return logoutResult{confirmed: true}
-	}
-	return logoutResult{settings: h.revocationSettings(p, cred)}
-}
-
-// revocationSettings picks where a user revokes gofer by hand, from the client that
-// issued cred: a legacy row (no client recorded) came from the OAuth app; a row from
-// the configured client follows GITHUB_CLIENT_KIND; anything else — another client
-// after a cutover or rollback, or no credential at all — could be either, so both
-// pages are offered.
-func (h *Handler) revocationSettings(p *provider, cred *vault.Credential) []string {
-	both := []string{githubAppsSettings, oauthAppsSettings}
-	switch {
-	case cred == nil:
-		return both
-	case cred.ClientID == "":
-		return []string{oauthAppsSettings}
-	case p != nil && cred.ClientID == p.oauth.ClientID:
-		if h.cfg != nil && h.cfg.Providers.IsGitHubApp() {
-			return []string{githubAppsSettings}
-		}
-		return []string{oauthAppsSettings}
-	}
-	return both
 }

@@ -807,7 +807,7 @@ func TestRefreshExpiryFormEncoded(t *testing.T) {
 }
 
 func logoutIsPending(h *Handler) bool {
-	pending, _, _ := h.logoutPending(bg, user, "github")
+	pending, _ := h.logoutPending(bg, user, "github")
 	return pending
 }
 
@@ -891,7 +891,7 @@ func TestSignInAfterRestartClearsMarker(t *testing.T) {
 }
 
 // mustMark records a pending logout with no session, as an operation would.
-func mustMark(t *testing.T, h *Handler) string {
+func mustMark(t *testing.T, h *Handler) *localLogout {
 	t.Helper()
 	op, err := h.markLogout(bg, user, "github")
 	if err != nil {
@@ -1199,7 +1199,7 @@ func sessionKeyFor(t *testing.T, _ *config.Config, c *http.Cookie) string {
 type racingSignInVault struct {
 	*vault.MemoryVault
 	h      *Handler
-	logout chan string
+	logout chan *localLogout
 }
 
 func (v *racingSignInVault) PutClearingLogout(ctx context.Context, userID string, c vault.Credential) error {
@@ -1219,11 +1219,11 @@ func (v *racingSignInVault) PutClearingLogout(ctx context.Context, userID string
 func TestLogoutAfterSignInWriteKeepsOwnership(t *testing.T) {
 	gh := newFakeGitHub(t)
 	h, _, _, _ := newKindHandler(t, gh, config.GitHubApp)
-	rv := &racingSignInVault{MemoryVault: vault.NewMemoryVault(), h: h, logout: make(chan string, 1)}
+	rv := &racingSignInVault{MemoryVault: vault.NewMemoryVault(), h: h, logout: make(chan *localLogout, 1)}
 	h.vault, h.ledger = rv, rv
 	signIn(t, h)
 	op := <-rv.logout
-	if op == "" || !h.locks.owns(user, "github", op) {
+	if op == nil || !h.locks.isCurrent(user, "github", op) {
 		t.Fatal("the sign-in erased the newer logout's ownership")
 	}
 	if !logoutIsPending(h) {
@@ -1231,5 +1231,119 @@ func TestLogoutAfterSignInWriteKeepsOwnership(t *testing.T) {
 	}
 	if res := h.revokeAndDelete(bg, user, "github", op); !res.confirmed || gh.revoked.Load() != 1 {
 		t.Fatalf("logout = %+v, revocations = %d; want its worker to revoke", res, gh.revoked.Load())
+	}
+}
+
+// Review P2 (sixth round): a duplicate logout of a session the first one consumed
+// fails without touching the first one's ownership, which then revokes.
+func TestDuplicateLogoutKeepsFirstOwner(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, cfg, _ := newKindHandler(t, gh, config.GitHubApp)
+	_, next := signIn(t, h)
+	var ck *http.Cookie
+	for _, c := range next.Cookies() {
+		ck = c
+	}
+	key := sessionKeyFor(t, cfg, ck)
+	first, err := h.beginLogout(bg, key, user, "github")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.beginLogout(bg, key, user, "github"); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("duplicate: err = %v, want session.ErrNotFound", err)
+	}
+	if !h.locks.isCurrent(user, "github", first) {
+		t.Fatal("the failed duplicate replaced the first logout's ownership")
+	}
+	if res := h.revokeAndDelete(bg, user, "github", first); !res.confirmed || gh.revoked.Load() != 1 {
+		t.Fatalf("first logout = %+v, revocations = %d; want it to revoke", res, gh.revoked.Load())
+	}
+}
+
+// interleavingLedger tries to slip a logout in between the broker's read of this
+// process's logout state and its read of the durable marker.
+type interleavingLedger struct {
+	vault.LogoutLedger
+	h       *Handler
+	once    sync.Once
+	started chan *localLogout
+}
+
+func (l *interleavingLedger) LogoutPending(ctx context.Context, userID, provider string) (bool, error) {
+	l.once.Do(func() {
+		go func() {
+			lo, _ := l.h.markLogout(bg, userID, provider)
+			l.started <- lo
+		}()
+		time.Sleep(50 * time.Millisecond)
+	})
+	return l.LogoutLedger.LogoutPending(ctx, userID, provider)
+}
+
+// Review P2 (sixth round): the broker classifies a pending logout with both reads in
+// one marker-lock section, so a logout that starts meanwhile is never taken for an
+// orphan. The broker withholds the credential and leaves revocation to the logout,
+// which then reports GitHub's confirmation.
+func TestBrokerDoesNotAdoptStartingLogout(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
+	put(t, gh, vlt, appCred("ghu_a", "ghr_a", "v1", 4*time.Hour))
+	il := &interleavingLedger{LogoutLedger: h.ledger, h: h, started: make(chan *localLogout, 1)}
+	h.ledger = il
+	// Either outcome of the vend is correct: refused, if the logout committed before
+	// the broker's last check, or served, if it committed after the vend (the
+	// logout's revocation then kills that token). What must not happen is the broker
+	// performing the logout itself.
+	if _, err := h.Credential(bg, user, "github", VendRequest{}); err != nil && !errors.Is(err, vault.ErrSignInRequired) {
+		t.Fatalf("vend while a logout started: err = %v", err)
+	}
+	if gh.revoked.Load() != 0 {
+		t.Fatal("the broker took the starting logout for an orphan and revoked it")
+	}
+	lo := <-il.started
+	if res := h.revokeAndDelete(bg, user, "github", lo); !res.confirmed || gh.revoked.Load() != 1 {
+		t.Fatalf("logout = %+v, revocations = %d; want its own confirmed revocation", res, gh.revoked.Load())
+	}
+}
+
+// Two logouts of the same credential while one runs share it: one revocation, and
+// both report its outcome.
+func TestConcurrentLogoutsShareOutcome(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
+	put(t, gh, vlt, appCred("ghu_a", "ghr_a", "v1", 4*time.Hour))
+	a, b := mustMark(t, h), mustMark(t, h)
+	if a != b {
+		t.Fatal("a second logout of a running one did not join it")
+	}
+	if ra := h.revokeAndDelete(bg, user, "github", a); !ra.confirmed {
+		t.Fatalf("first = %+v", ra)
+	}
+	if rb := h.revokeAndDelete(bg, user, "github", b); !rb.confirmed || gh.revoked.Load() != 1 {
+		t.Fatalf("second = %+v, revocations = %d; want the shared confirmed outcome", rb, gh.revoked.Load())
+	}
+}
+
+// Review P2 (sixth round): an account removed from ALLOWED_GITHUB_LOGINS has no
+// interactive access, but its logout still finds its session and revokes its grant.
+func TestRemovedAccountCanStillRevoke(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, sessions, cfg, vlt := newKindHandler(t, gh, config.GitHubApp, "octocat")
+	_, next := signIn(t, h)
+	cfg.AllowedGitHubLogins = []string{"someone-else"}
+	if sessions.CurrentUser(next) != nil {
+		t.Fatal("the removed account still has interactive access")
+	}
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	for _, ck := range next.Cookies() {
+		req.AddCookie(ck)
+	}
+	rec := httptest.NewRecorder()
+	h.Logout(rec, req)
+	if rec.Code != http.StatusNoContent || gh.revoked.Load() != 1 {
+		t.Fatalf("status = %d, revocations = %d; want the grant revoked", rec.Code, gh.revoked.Load())
+	}
+	if _, err := vlt.Get(bg, user, "github"); !errors.Is(err, vault.ErrNotFound) {
+		t.Error("credential kept after the removed account's logout")
 	}
 }
