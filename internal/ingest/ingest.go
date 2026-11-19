@@ -146,7 +146,7 @@ func (i *Ingestor) Refresh(ctx context.Context, ownerID string) error {
 // force is set it submits nothing while the owner's ingest run is in flight.
 func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, force bool) error {
 	key := ingestKey(ownerID)
-	mine, prev, ok := i.reserve(ctx, key, ingestGate, force)
+	mine, ok := i.reserve(ctx, key, ingestGate, force)
 	if !ok {
 		return nil
 	}
@@ -158,7 +158,7 @@ func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, force boo
 		Audience:   i.audience,
 		Deadline:   ingestDeadline,
 	})
-	i.settle(key, mine, prev, id, err)
+	i.settle(key, mine, id, err)
 	return err
 }
 
@@ -321,7 +321,7 @@ func (i *Ingestor) dispatchConverse(ctx context.Context, ownerID string, ref wor
 		params["independent"] = "true"
 	}
 	key := runKey{owner: ownerID, task: taskConverse, item: ref.Item, turn: ref.Turn}
-	mine, prev, ok := i.reserve(ctx, key, converseGate, false)
+	mine, ok := i.reserve(ctx, key, converseGate, false)
 	if !ok {
 		return nil // a run for this turn is already in flight
 	}
@@ -333,7 +333,7 @@ func (i *Ingestor) dispatchConverse(ctx context.Context, ownerID string, ref wor
 		Audience:   i.audience,
 		Deadline:   converseDeadline,
 	})
-	i.settle(key, mine, prev, id, err)
+	i.settle(key, mine, id, err)
 	return err
 }
 
