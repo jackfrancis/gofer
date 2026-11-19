@@ -122,9 +122,14 @@ func ResearchReflectsVisibleThread(item WorkItem) bool {
 	if r == nil || len(r.Turns) == 0 {
 		return false
 	}
+	visible := make(map[string]bool, len(item.Thread)) // one pass, not TurnIndex per key
+	for i, m := range item.Thread {
+		if !m.Hidden {
+			visible[item.TurnKey(i)] = true
+		}
+	}
 	for _, key := range r.Turns {
-		i, ok := item.TurnIndex(key)
-		if !ok || item.Thread[i].Hidden {
+		if !visible[key] {
 			return false
 		}
 	}

@@ -284,3 +284,22 @@ func TestItemContextRankingCannotEscapeBlock(t *testing.T) {
 		}
 	}
 }
+
+// Research stored before it recorded its source turns is withheld even when its
+// whole thread is visible, so the note claims only that gofer could not verify the
+// turns, never that any were hidden or cleared.
+func TestItemContextWithheldNoteClaimsOnlyWhatGoferKnows(t *testing.T) {
+	item := worklist.WorkItem{
+		Signals: worklist.Signals{Research: &worklist.ResearchAdjustment{Relevance: 1, Impact: 1, Engagement: 1, Urgency: 2, Rationale: "older research"}},
+		Thread:  []worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: "visible"}},
+	}
+	got := block(t, itemContext(item, ctxNow))
+	if !strings.Contains(got, researchWithheldNote) || strings.Contains(got, "older research") {
+		t.Fatalf("older research should be withheld with the note:\n%s", got)
+	}
+	for _, claim := range []string{"hidden", "cleared", "excluded"} {
+		if strings.Contains(got, claim) {
+			t.Errorf("the note must not claim turns were %s:\n%s", claim, got)
+		}
+	}
+}
