@@ -258,7 +258,8 @@ func (h *Handler) Index(w http.ResponseWriter, r *http.Request) {
 // Thread handles GET /items/thread?id=<item id>. It renders the per-item
 // assistive conversation for the signed-in owner. While a user turn awaits its reply,
 // the page auto-refreshes so the assistant's answer appears when the converse run
-// lands.
+// lands. A GET whose page is delivered marks the newest reply shown as read
+// (worklist.MarkThreadRead).
 func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
 	if user == nil {
@@ -281,7 +282,29 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 			} else if it.ReplyStalled(now, reviewStaleAfter) {
 				data.ReplyStalled = true // no reply within the window — show a retry hint, stop spinning
 			}
-			h.render(w, http.StatusOK, data)
+			// Delivering the thread is the read receipt (the UI has no script to send
+			// one). The key is the newest reply on this page, taken from the snapshot
+			// it was built from, so a reply that lands meanwhile stays unread.
+			seen := it.LatestReplyKey()
+			if err := h.render(w, http.StatusOK, data); err != nil || r.Method != http.MethodGet {
+				return // a HEAD, or a page that never reached the browser, shows nothing
+			}
+			// Write only when the receipt can move the cursor: the page's auto-refresh
+			// re-renders an already-read thread every few seconds. The cursor only moves
+			// forward, so one already at seen on the snapshot is at or past it in the
+			// store; MarkThreadRead re-checks inside its update. A failed write only
+			// leaves the item unread.
+			if snapshot := it; !snapshot.MarkRead(seen) {
+				return
+			}
+			// net/http may still hold a short page in its buffer, to be sent when the
+			// handler returns. Push it to the client first: a page that cannot be
+			// flushed (the connection is gone, or the writer cannot flush) is not
+			// known to be delivered, so it marks nothing.
+			if err := http.NewResponseController(w).Flush(); err != nil {
+				return
+			}
+			_ = worklist.MarkThreadRead(r.Context(), h.store, user.ID, it.ID, seen)
 			return
 		}
 	}
@@ -351,11 +374,12 @@ func (h *Handler) ResetConversations(w http.ResponseWriter, r *http.Request) {
 	_ = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		var cleared []worklist.WorkItem
 		for _, it := range current {
-			if len(it.Thread) == 0 && it.ThreadReadAt.IsZero() {
+			if len(it.Thread) == 0 && it.ThreadReadAt.IsZero() && it.ThreadReadThrough == "" {
 				continue
 			}
 			it.Thread = nil
 			it.ThreadReadAt = time.Time{}
+			it.ThreadReadThrough = ""
 			cleared = append(cleared, it)
 		}
 		return cleared, nil
@@ -753,10 +777,12 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 	}
 }
 
-func (h *Handler) render(w http.ResponseWriter, status int, data pageData) {
+// render writes the page, returning the template's error, which includes a failed
+// write to the client.
+func (h *Handler) render(w http.ResponseWriter, status int, data pageData) error {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
-	_ = h.tmpl.ExecuteTemplate(w, "page.html", data)
+	return h.tmpl.ExecuteTemplate(w, "page.html", data)
 }
 
 var funcs = template.FuncMap{

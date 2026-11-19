@@ -110,17 +110,71 @@ func ParseVerdict(reply string) (verdict, cleaned string) {
 	return "", reply
 }
 
-// HasUnreadReply reports whether the item's most recent agent reply is newer than
-// when the owner last read the thread (ThreadReadAt) — i.e. there is a response
-// the user has not seen. It drives the radar's "unread" cue. A thread whose last
-// turn is still the user's (reply pending) is not unread.
+// HasUnreadReply reports whether the thread holds an agent turn the owner has not
+// seen: one after the read cursor (ThreadReadThrough). It drives the radar's
+// "unread" cue and the unread-first sort. Turns the user posted since do not
+// count, so a thread whose newer turns are all the user's is not unread.
+//
+// An item with no cursor falls back to the legacy time-based one (ThreadReadAt).
 func (w WorkItem) HasUnreadReply() bool {
+	last := w.latestAgentTurn()
+	if last < 0 {
+		return false
+	}
+	if w.ThreadReadThrough != "" {
+		// The cursor names an agent turn (MarkRead), so it is at the latest one or
+		// before it, or names a turn no longer in the thread: unread unless it is
+		// the latest.
+		return w.TurnKey(last) != w.ThreadReadThrough
+	}
+	return w.Thread[last].At.After(w.ThreadReadAt)
+}
+
+// LatestReplyKey returns the key (TurnKey) of the newest agent turn in the thread —
+// the last one by position, which is the last to land — or "" when there is none.
+// The thread page acknowledges it as read (MarkRead) when it renders.
+func (w WorkItem) LatestReplyKey() string {
+	if i := w.latestAgentTurn(); i >= 0 {
+		return w.TurnKey(i)
+	}
+	return ""
+}
+
+// MarkRead advances the read cursor to the agent turn whose key is seen, reporting
+// whether it moved. The cursor only moves forward: a key that is not an agent turn
+// in the thread, or one at or before the cursor (another page already showed a
+// newer reply), changes nothing. A cursor whose turn is gone (the thread was
+// cleared) is replaced.
+func (w *WorkItem) MarkRead(seen string) bool {
+	p := w.turnPosition(seen)
+	if p < 0 || w.Thread[p].Role != RoleAgent {
+		return false
+	}
+	if w.ThreadReadThrough != "" && w.turnPosition(w.ThreadReadThrough) >= p {
+		return false
+	}
+	w.ThreadReadThrough = seen
+	return true
+}
+
+// latestAgentTurn is the position of the thread's last agent turn, or -1.
+func (w WorkItem) latestAgentTurn() int {
 	for i := len(w.Thread) - 1; i >= 0; i-- {
 		if w.Thread[i].Role == RoleAgent {
-			return w.Thread[i].At.After(w.ThreadReadAt)
+			return i
 		}
 	}
-	return false
+	return -1
+}
+
+// turnPosition is the position of the turn whose key (TurnKey) is key, or -1.
+func (w WorkItem) turnPosition(key string) int {
+	for i := range w.Thread {
+		if w.TurnKey(i) == key {
+			return i
+		}
+	}
+	return -1
 }
 
 // TurnRef names the thread turn a converse run answers: the item, and the key
@@ -361,4 +415,26 @@ type ToolBox interface {
 // instructions.
 type Conversationalist interface {
 	Reply(ctx context.Context, item WorkItem, viewerLogin string, sourceContext string, history []Message, userText string, tools ToolBox) (string, error)
+}
+
+// MarkThreadRead advances ownerID's item itemID's read cursor to the agent turn
+// whose key is seen (see MarkRead), in one Store.Update. It writes nothing when the
+// cursor does not move or the item is gone, so re-rendering an already-read thread
+// costs no write.
+func MarkThreadRead(ctx context.Context, store Store, ownerID, itemID, seen string) error {
+	if seen == "" {
+		return nil
+	}
+	return store.Update(ctx, ownerID, func(current []WorkItem) ([]WorkItem, error) {
+		for i := range current {
+			if current[i].ID != itemID {
+				continue
+			}
+			if !current[i].MarkRead(seen) {
+				return nil, nil
+			}
+			return current[i : i+1], nil
+		}
+		return nil, nil // item gone
+	})
 }
