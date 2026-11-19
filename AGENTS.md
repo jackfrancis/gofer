@@ -155,9 +155,16 @@ Wired on the web-tier side; they define what a runtime must respect:
   in between. A run's write-back is merged into the stored item
   (`worklist.MergeRunItems`): runs own the GitHub fields, signals and scoring; the
   thread, read cursor, hidden flag and creation time always come from the store. A
-  run adds a thread turn only through `POST /agent/worklist/reply`
-  (`worklist.AppendReply`). The web and runtime images must ship together: a runtime
-  from before this rule posts its reply inside the item, where it is now ignored.
+  write-back that carries no model proposal or research adjustment
+  (`Signals.Proposed` / `Signals.Research`) keeps the stored one
+  (`worklist.KeepModelSignals`), since a refresh or a failed scoring pass derives
+  neither. A run adds a thread turn only through `POST /agent/worklist/reply`
+  (`worklist.AppendReply`), and a converse or research run writes its research
+  adjustment only through `POST /agent/worklist/research`
+  (`worklist.ApplyResearch`), never the whole item it read before the model call, so
+  a refresh that landed meanwhile stands. The web and runtime images must ship
+  together: a runtime from before these rules posts its reply inside the item, where
+  it is now ignored, and a web tier from before them has no research route.
 - Replies can land out of order, so a turn's position does not say what it answers.
   Every new turn gets an ID; an agent turn's `ReplyTo` names the user turn it
   answers; dispatch carries the turn a run must answer (`worklist.TurnRef`, run

@@ -107,6 +107,46 @@ func (h *IngestHandler) Reply(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// researchRequest is the body of POST /agent/worklist/research.
+type researchRequest struct {
+	ItemID     string                       `json:"item_id"`
+	Adjustment *worklist.ResearchAdjustment `json:"adjustment"`
+}
+
+// maxResearchBody bounds a research request: four multipliers and a rationale.
+const maxResearchBody = 64 << 10
+
+// Research handles POST /agent/worklist/research. A converse or research run writes
+// the research adjustment it derived here (worklist.ApplyResearch), and only that:
+// the rest of the item stays as stored now, so a run that read the item before a
+// refresh cannot write back its older GitHub fields. An adjustment for an item that
+// is gone is accepted and dropped.
+func (h *IngestHandler) Research(w http.ResponseWriter, r *http.Request) {
+	p, ok := principal.FromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var body researchRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxResearchBody)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if body.ItemID == "" || body.Adjustment == nil {
+		writeError(w, http.StatusBadRequest, "item_id and adjustment are required")
+		return
+	}
+	if err := worklist.ApplyResearch(r.Context(), h.store, p.ActingUserID, body.ItemID, *body.Adjustment); err != nil {
+		writeError(w, http.StatusBadGateway, "could not persist research adjustment")
+		return
+	}
+	// The adjustment is the run's result landing (see Ingest).
+	if h.noter != nil && p.JobID != "" {
+		h.noter.NoteWriteback(p.JobID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // List handles GET /agent/worklist. A runtime reads its acting user's persisted
 // work to augment it in place rather than re-deriving it from the provider.
 func (h *IngestHandler) List(w http.ResponseWriter, r *http.Request) {

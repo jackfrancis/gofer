@@ -3,8 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-
-	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
 // runResearch re-weights a single item's ranking axes (p.ItemID) from its
@@ -39,9 +37,10 @@ func runResearch(ctx context.Context, p Params, sink Sink) error {
 	if err != nil {
 		return fmt.Errorf("research: %w", err)
 	}
-	item.Signals.Research = &adj
-	if err := sink.Ingest(ctx, []worklist.WorkItem{item}); err != nil {
-		return fmt.Errorf("ingest: %w", err)
+	// Write back only the adjustment: the item was read before the model call, and
+	// a refresh may have landed since.
+	if err := sink.Research(ctx, item.ID, adj); err != nil {
+		return fmt.Errorf("research: %w", err)
 	}
 	return nil
 }

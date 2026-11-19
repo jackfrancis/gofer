@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackfrancis/gofer/internal/agent"
 	"github.com/jackfrancis/gofer/internal/authn"
 	"github.com/jackfrancis/gofer/internal/identity"
 	"github.com/jackfrancis/gofer/internal/principal"
@@ -74,10 +75,11 @@ func TestAgentIngestWithRunToken(t *testing.T) {
 
 // planeFixture is an agent plane with a memory store and a minter for run tokens.
 type planeFixture struct {
-	store  *worklist.MemoryStore
-	ingest http.Handler
-	reply  http.Handler
-	mint   func(scopes ...string) string
+	store    *worklist.MemoryStore
+	ingest   http.Handler
+	reply    http.Handler
+	research http.Handler
+	mint     func(scopes ...string) string
 }
 
 func newPlane(t *testing.T) planeFixture {
@@ -94,9 +96,10 @@ func newPlane(t *testing.T) planeFixture {
 	store := worklist.NewMemoryStore()
 	h := NewIngestHandler(store, nil)
 	return planeFixture{
-		store:  store,
-		ingest: auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Ingest)),
-		reply:  auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Reply)),
+		store:    store,
+		ingest:   auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Ingest)),
+		reply:    auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Reply)),
+		research: auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Research)),
 		mint: func(scopes ...string) string {
 			tok, err := authority.Mint(identity.Claims{RunID: "run", Subject: "u1", Scopes: scopes})
 			if err != nil {
@@ -189,6 +192,53 @@ func TestAgentReply(t *testing.T) {
 
 	// A token without metadata:write cannot reply.
 	if code := f.post(t, f.reply, "/agent/worklist/reply", f.mint("signals:read"), reply); code != http.StatusForbidden {
+		t.Fatalf("want 403 without metadata:write, got %d", code)
+	}
+}
+
+// A research write-back sets the adjustment and nothing else: an item refreshed after
+// the run read it keeps its refreshed GitHub fields, signals and thread. The workload's
+// plane client and this handler agree on the request.
+func TestAgentResearch(t *testing.T) {
+	f := newPlane(t)
+	prop := &worklist.AxisProposal{Relevance: 0.8, Rationale: "model"}
+	f.store.Seed("u1", worklist.WorkItem{
+		ID:      "a",
+		GitHub:  worklist.GitHubRef{Repo: "o/r", Number: 1, Title: "Refreshed title", State: "closed"},
+		Signals: worklist.Signals{Comments: 9, Proposed: prop},
+		Thread:  []worklist.Message{{ID: "q1", Role: worklist.RoleUser, Content: "q"}},
+	})
+	full := f.mint("signals:read", "metadata:write")
+	adj := worklist.ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 0.5, Rationale: "discussed", AppliedAt: time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)}
+
+	srv := httptest.NewServer(f.research)
+	defer srv.Close()
+	plane := agent.NewPlaneClient(srv.URL, full, srv.Client())
+	if err := plane.Research(context.Background(), "a", adj); err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	got, _ := f.store.List(context.Background(), "u1")
+	it := got[0]
+	if it.Signals.Research == nil || !it.Signals.Research.AppliedAt.Equal(adj.AppliedAt) || it.Signals.Research.Relevance != 1.5 || it.Signals.Research.Rationale != "discussed" {
+		t.Fatalf("the adjustment must land, got %+v", it.Signals.Research)
+	}
+	if it.GitHub.Title != "Refreshed title" || it.GitHub.State != "closed" || it.Signals.Comments != 9 || it.Signals.Proposed == nil || len(it.Thread) != 1 {
+		t.Fatalf("everything but the adjustment must stay as stored, got %+v", it)
+	}
+
+	// An adjustment for an item that is gone is accepted and dropped.
+	if code := f.post(t, f.research, "/agent/worklist/research", full, map[string]any{"item_id": "gone", "adjustment": adj}); code != http.StatusOK {
+		t.Fatalf("want 200 for a dropped adjustment, got %d", code)
+	}
+	// Malformed requests are rejected.
+	if code := f.post(t, f.research, "/agent/worklist/research", full, map[string]any{"item_id": "a"}); code != http.StatusBadRequest {
+		t.Fatalf("want 400 without an adjustment, got %d", code)
+	}
+	if code := f.post(t, f.research, "/agent/worklist/research", full, map[string]any{"adjustment": adj}); code != http.StatusBadRequest {
+		t.Fatalf("want 400 without an item id, got %d", code)
+	}
+	// A token without metadata:write cannot write it.
+	if code := f.post(t, f.research, "/agent/worklist/research", f.mint("signals:read"), map[string]any{"item_id": "a", "adjustment": adj}); code != http.StatusForbidden {
 		t.Fatalf("want 403 without metadata:write, got %d", code)
 	}
 }

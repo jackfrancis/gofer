@@ -51,7 +51,8 @@ type Vendor interface {
 // A write-back is merged into the item as stored when it lands (see
 // worklist.MergeRunItems): Ingest updates what a run derives — GitHub fields,
 // signals, scoring — and never the conversation thread, so work the owner did
-// while the run was busy survives. Reply is the only way a run adds to a thread.
+// while the run was busy survives. Reply is the only way a run adds to a thread,
+// and Research writes a research adjustment without the rest of the item.
 type Sink interface {
 	List(ctx context.Context) ([]worklist.WorkItem, error)
 	Ingest(ctx context.Context, items []worklist.WorkItem) error
@@ -59,6 +60,11 @@ type Sink interface {
 	// Key is replyTo (see worklist.AppendReply). It is dropped, without error, if
 	// that turn is gone or the item is.
 	Reply(ctx context.Context, itemID, replyTo string, reply worklist.Message) error
+	// Research sets itemID's research adjustment and nothing else (see
+	// worklist.ApplyResearch), so a pass that read the item before a refresh never
+	// writes back its older GitHub fields. It is dropped, without error, if the item
+	// is gone.
+	Research(ctx context.Context, itemID string, adj worklist.ResearchAdjustment) error
 }
 
 // Params configures a single runtime invocation.
@@ -227,10 +233,11 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 
 // reconcileFetched carries gofer-owned per-item state that GitHub cannot supply — the
 // conversation thread and its read cursor, the user/agent metadata overrides (hidden,
-// completed), and the original creation time — from the persisted items onto the
+// completed), the original creation time, and the model-derived signals (the model
+// proposal and research adjustment) — from the persisted items onto the
 // freshly fetched ones, keyed by ID. Fetched items with no persisted counterpart (new
 // work) pass through unchanged. The agent plane also keeps the stored thread, read
-// cursor, hidden flag and creation time on every write-back (worklist.MergeRunItems),
+// cursor, hidden flag, creation time and model-derived signals on every write-back (worklist.MergeRunItems),
 // which is what protects a change made after this run read the items; carrying them
 // here keeps the run's own view of each item whole.
 func reconcileFetched(fetched, existing []worklist.WorkItem) []worklist.WorkItem {
@@ -246,6 +253,9 @@ func reconcileFetched(fetched, existing []worklist.WorkItem) []worklist.WorkItem
 		fetched[i].Thread = old.Thread
 		fetched[i].ThreadReadAt = old.ThreadReadAt
 		fetched[i].Meta.HiddenAt = old.Meta.HiddenAt
+		// A fetch derives no model proposal or research adjustment; keep the stored
+		// ones so the chained rank, and any pass that fails, start from them.
+		worklist.KeepModelSignals(&fetched[i].Signals, old.Signals)
 		// CompletedAt is deliberately NOT carried over: the item was just fetched from
 		// the open set, so it is open, and a reopened item resurfaces (see Metadata).
 		if !old.CreatedAt.IsZero() {

@@ -276,3 +276,30 @@ func TestConverseSkipsAnsweredOrMissingTurn(t *testing.T) {
 		})
 	}
 }
+
+// A review that finishes after a Refresh leaves the refreshed title and state in
+// place: the post-reply research write-back carries only the adjustment, not the item
+// the run read when it started.
+func TestRunConverseAfterRefreshKeepsGitHubFields(t *testing.T) {
+	t0 := time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)
+	sink := &memSink{items: []worklist.WorkItem{{
+		ID:     "github:o/r#1",
+		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, Title: "Old title", State: "open"},
+		Thread: []worklist.Message{{ID: "q1", Role: worklist.RoleUser, Content: "Can you review this PR?", Kind: worklist.KindReviewRequest, At: t0}},
+	}}}
+	fc := &sideEffectConverser{reply: "Looks good.", during: refreshDuring(sink)}
+	fr := &fakeResearcher{adj: worklist.ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 1}}
+	err := Run(context.Background(),
+		Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Converser: fc, Researcher: fr},
+		fakeVendor{token: "t"}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRefreshKept(t, sink)
+	if th := sink.items[0].Thread; len(th) != 2 || th[1].Content != "Looks good." {
+		t.Fatalf("the review reply must land, got %+v", th)
+	}
+	if sink.ingests != 0 {
+		t.Fatalf("converse must not write back the whole item, got %d ingest calls", sink.ingests)
+	}
+}

@@ -13,12 +13,19 @@ import (
 // the item as stored at write time, inside Store.Update, and these functions are
 // the merge rules.
 //
-// A run OWNS what it derives from the source: the GitHub reference, type, signals
-// (including model proposals and research adjustments), the scoring metadata, and
-// whether the item is completed. The OWNER's state always comes from the stored
-// item: the conversation thread (its messages and their hidden flags), the read
-// cursor, the hidden-item flag, and when gofer first saw the item. A run adds to
-// the thread only through AppendReply.
+// A run OWNS what it derives from the source: the GitHub reference, type, signals,
+// the scoring metadata, and whether the item is completed. The OWNER's state always
+// comes from the stored item: the conversation thread (its messages and their hidden
+// flags), the read cursor, the hidden-item flag, and when gofer first saw the item.
+// A run adds to the thread only through AppendReply.
+//
+// The two model-derived signals are the exception to "the run owns its signals": a
+// GitHub fetch cannot produce them, so a refresh sends none, and a scoring pass that
+// failed for an item sends none either. A write-back that carries no model proposal
+// (Signals.Proposed) or no research adjustment (Signals.Research) keeps the stored
+// one; a write-back that carries one replaces it. A run that only re-derives the
+// research adjustment writes it alone, through ApplyResearch, so it never carries the
+// rest of an item it read before a refresh.
 
 // MergeRunItems returns the items a run's write-back should store, given the
 // owner's current items. An item that exists keeps the owner's state from its
@@ -45,9 +52,40 @@ func MergeRunItems(current, incoming []WorkItem) []WorkItem {
 		if !old.CreatedAt.IsZero() {
 			it.CreatedAt = old.CreatedAt
 		}
+		KeepModelSignals(&it.Signals, old.Signals)
 		out = append(out, it)
 	}
 	return out
+}
+
+// KeepModelSignals fills in the model-derived signals an incoming write-back does not
+// carry — the model proposal and the research adjustment — from the stored signals.
+// A value the write-back carries wins.
+func KeepModelSignals(incoming *Signals, stored Signals) {
+	if incoming.Proposed == nil {
+		incoming.Proposed = stored.Proposed
+	}
+	if incoming.Research == nil {
+		incoming.Research = stored.Research
+	}
+}
+
+// ApplyResearch sets ownerID's item itemID's research adjustment, and nothing else,
+// in one Store.Update. A research pass reads the item, asks the model for minutes,
+// and writes back only what it derived: the GitHub fields, the other signals and
+// the thread are left as stored now, so a refresh that landed meanwhile stands. It
+// writes nothing, and returns no error, when the item is gone.
+func ApplyResearch(ctx context.Context, store Store, ownerID, itemID string, adj ResearchAdjustment) error {
+	return store.Update(ctx, ownerID, func(current []WorkItem) ([]WorkItem, error) {
+		for i := range current {
+			if current[i].ID != itemID {
+				continue
+			}
+			current[i].Signals.Research = &adj
+			return current[i : i+1], nil
+		}
+		return nil, nil // item gone
+	})
 }
 
 // ErrEmptyReply is returned by AppendReply for a reply with no content.

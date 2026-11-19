@@ -20,11 +20,13 @@ func (f fakeVendor) Vend(context.Context, string) (string, error) { return f.tok
 
 // memSink is an in-memory Sink with the agent plane's write semantics: a write-back
 // is merged into the stored item (worklist.MergeRunItems) and a reply is appended
-// through worklist.AppendReply, so tests see what a real run's writes produce.
+// through worklist.AppendReply, and a research adjustment is set alone (as
+// worklist.ApplyResearch does), so tests see what a real run's writes produce.
 type memSink struct {
-	items   []worklist.WorkItem
-	ingests int // write-back calls, so batching is observable
-	replies int // Reply calls
+	items      []worklist.WorkItem
+	ingests    int // write-back calls, so batching is observable
+	replies    int // Reply calls
+	researches int // Research calls
 }
 
 func (m *memSink) List(context.Context) ([]worklist.WorkItem, error) {
@@ -48,6 +50,16 @@ func (m *memSink) Reply(_ context.Context, itemID, replyTo string, reply worklis
 		if m.items[i].ID == itemID {
 			_, err := worklist.AppendReply(&m.items[i], replyTo, reply)
 			return err
+		}
+	}
+	return nil
+}
+
+func (m *memSink) Research(_ context.Context, itemID string, adj worklist.ResearchAdjustment) error {
+	m.researches++
+	for i := range m.items {
+		if m.items[i].ID == itemID {
+			m.items[i].Signals.Research = &adj
 		}
 	}
 	return nil
@@ -385,5 +397,82 @@ func TestRunIngestPublicOnly(t *testing.T) {
 		if !it.Meta.CompletedAt.IsZero() {
 			t.Errorf("%s was retired after a fetch with an unconfirmed repository", it.ID)
 		}
+	}
+}
+
+// failRanker fails every proposal, as a model outage or a malformed answer would.
+type failRanker struct{}
+
+func (failRanker) Propose(context.Context, worklist.WorkItem) (worklist.AxisProposal, error) {
+	return worklist.AxisProposal{}, fmt.Errorf("model unavailable")
+}
+
+// A Refresh re-fetches an item that already carries a model proposal and a research
+// adjustment. The fetch derives neither, and the chained rank fails here, so both
+// stored values must survive while the GitHub fields refresh.
+func TestRunIngestKeepsModelSignals(t *testing.T) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user" {
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+			return
+		}
+		if strings.Contains(r.URL.Query().Get("q"), "review-requested:@me") {
+			_, _ = w.Write([]byte(`{"items":[{"number":7,"title":"Fresh title","html_url":"u","state":"open","repository_url":"https://api.github.com/repos/o/r","pull_request":{"url":"x"}}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	defer srv.Close()
+
+	prop := worklist.AxisProposal{Relevance: 0.9, Impact: 0.8, Engagement: 0.7, Urgency: 0.6, Confidence: 1, Rationale: "model proposal"}
+	adj := worklist.ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 0.5, Rationale: "from the discussion"}
+	sink := &memSink{items: []worklist.WorkItem{{
+		ID: "github:o/r#7", Source: "github", Type: worklist.TypePullRequest,
+		GitHub:  worklist.GitHubRef{Repo: "o/r", Number: 7, Title: "Stale title"},
+		Signals: worklist.Signals{Proposed: &prop, Research: &adj},
+	}}}
+
+	if err := Run(context.Background(),
+		Params{JobType: JobIngest, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client(), Ranker: failRanker{}},
+		fakeVendor{token: "tok"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := sink.items[0]
+	if got.GitHub.Title != "Fresh title" {
+		t.Fatalf("refresh should take the fetched title, got %q", got.GitHub.Title)
+	}
+	if got.Signals.Proposed == nil || *got.Signals.Proposed != prop {
+		t.Errorf("refresh dropped the model proposal: got %+v", got.Signals.Proposed)
+	}
+	if got.Signals.Research == nil || *got.Signals.Research != adj {
+		t.Errorf("refresh dropped the research adjustment: got %+v", got.Signals.Research)
+	}
+}
+
+// A scoring pass that fails for an item leaves its previous proposal in place, and
+// one that succeeds replaces it.
+func TestRunRankFailureKeepsPreviousProposal(t *testing.T) {
+	prev := worklist.AxisProposal{Relevance: 0.9, Confidence: 1, Rationale: "previous"}
+	seed := func() *memSink {
+		return &memSink{items: []worklist.WorkItem{{
+			ID:      "github:o/r#1",
+			Signals: worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonReviewRequested}, Proposed: &prev},
+		}}}
+	}
+
+	sink := seed()
+	if err := Run(context.Background(), Params{JobType: JobRank, Ranker: failRanker{}}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if p := sink.items[0].Signals.Proposed; p == nil || *p != prev {
+		t.Fatalf("a failed scoring pass must keep the previous proposal, got %+v", p)
+	}
+
+	sink = seed()
+	if err := Run(context.Background(), Params{JobType: JobRank}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if p := sink.items[0].Signals.Proposed; p == nil || p.Rationale == "previous" {
+		t.Fatalf("a successful scoring pass must replace the proposal, got %+v", p)
 	}
 }
