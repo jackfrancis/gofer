@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/jackfrancis/gofer/internal/github"
+	"github.com/jackfrancis/gofer/internal/github/githubtest"
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
@@ -355,5 +356,37 @@ func TestIngestReconnect(t *testing.T) {
 	}
 	if sink.ingests != 0 {
 		t.Error("ingest wrote back")
+	}
+}
+
+// The Actions log download makes its API hop with the transport directly (not
+// http.Client.Do), so pin that the holder covers it too: a 401 on the log re-vends
+// and the log is read with the new token.
+func TestHolderCoversActionsLogHop(t *testing.T) {
+	plane := newFakePlane(t, planeAnswer{token: "tok-old", version: "v1"}, planeAnswer{token: "tok-new", version: "v2"})
+	api := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/o/r/actions/jobs/7/logs" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer tok-new" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"Bad credentials"}`))
+			return
+		}
+		_, _ = w.Write([]byte("the job log"))
+	}))
+	t.Cleanup(api.Close)
+	h, err := newTokenHolder(context.Background(), plane.vendor(), "github", api.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gh := github.NewClient(h.client(nil), api.URL)
+	var buf strings.Builder
+	if _, err := gh.ActionsJobLog(context.Background(), h.Token(), "o/r", 7, &buf, 1<<20); err != nil {
+		t.Fatalf("log: %v", err)
+	}
+	if buf.String() != "the job log" || len(plane.rejections()) != 1 {
+		t.Fatalf("log %q, rejections %v", buf.String(), plane.rejections())
 	}
 }
