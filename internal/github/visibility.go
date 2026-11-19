@@ -55,11 +55,50 @@ const (
 	verdictInaccessible
 )
 
-// gateResult is one visibility check's outcome.
+// gateResult is one visibility check's outcome. It holds no error text: a refusal is
+// worded by the caller, from the name the caller asked for (errFor) or with no name
+// at all (hiddenErr), so a private repository's name that came from GitHub (a
+// redirect's destination, a rename, another repository named in a body) never
+// reaches the model.
 type gateResult struct {
 	verdict  verdict
-	fullName string // canonical owner/name, when GitHub answered
-	err      error  // why the repository is refused; nil only for verdictPublic
+	fullName string // canonical owner/name, when GitHub answered; never put in an error
+	invalid  bool   // the name was not owner/name; nothing was asked
+	status   int    // GitHub's status, for an inaccessible or unknown answer
+	detail   string // why an answer was inaccessible or unknown, naming no repository
+}
+
+// errFor words a refusal of the repository the caller asked for by name. nil for a
+// public one.
+func (r gateResult) errFor(asked string) error {
+	switch r.verdict {
+	case verdictPublic:
+		return nil
+	case verdictPrivate:
+		return fmt.Errorf("%s is private: %w", asked, ErrNotPublic)
+	case verdictInaccessible:
+		if r.invalid {
+			return fmt.Errorf("repo must be owner/name")
+		}
+		if r.status == http.StatusForbidden {
+			return fmt.Errorf("GitHub refused access to %s (status 403)%s", asked, r.detail)
+		}
+		return fmt.Errorf("%s was not found, or is not visible with this token (status %d)", asked, r.status)
+	}
+	return fmt.Errorf("could not confirm that %s is public (%s); try again", asked, r.detail)
+}
+
+// hiddenErr words a refusal of a repository the caller did not name: the
+// destination of a redirect, or another repository a response named. It says nothing
+// about which repository that was. nil for a public one.
+func (r gateResult) hiddenErr() error {
+	switch r.verdict {
+	case verdictPublic:
+		return nil
+	case verdictUnknown:
+		return errors.New("GitHub answered with another repository, and gofer could not confirm that it is public; try again")
+	}
+	return fmt.Errorf("GitHub answered with another repository, which is not public: %w", ErrNotPublic)
 }
 
 // repoGate caches definite answers for the life of the Client (one run). Unknown
@@ -120,7 +159,7 @@ func validRepo(repo string) bool {
 func (c *Client) gate(ctx context.Context, token, repo string) (string, error) {
 	r := c.checkRepo(ctx, token, repo)
 	if r.verdict != verdictPublic {
-		return "", r.err
+		return "", r.errFor(repo)
 	}
 	return r.fullName, nil
 }
@@ -128,12 +167,12 @@ func (c *Client) gate(ctx context.Context, token, repo string) (string, error) {
 // checkRepo runs the visibility check for repo (owner/name), cached per run.
 func (c *Client) checkRepo(ctx context.Context, token, repo string) gateResult {
 	if !validRepo(repo) {
-		return gateResult{verdict: verdictInaccessible, err: fmt.Errorf("repo must be owner/name")}
+		return gateResult{verdict: verdictInaccessible, invalid: true}
 	}
 	if r, ok := c.repos.lookupName(repo); ok {
 		return r
 	}
-	r, id := c.lookupRepo(ctx, token, "/repos/"+repo, repo)
+	r, id := c.lookupRepo(ctx, token, "/repos/"+repo)
 	c.repos.store(r, id, repo, r.fullName)
 	return r
 }
@@ -144,8 +183,7 @@ func (c *Client) checkRepoID(ctx context.Context, token string, id int64) gateRe
 	if r, ok := c.repos.lookupID(id); ok {
 		return r
 	}
-	label := "repository " + strconv.FormatInt(id, 10)
-	r, gotID := c.lookupRepo(ctx, token, "/repositories/"+strconv.FormatInt(id, 10), label)
+	r, gotID := c.lookupRepo(ctx, token, "/repositories/"+strconv.FormatInt(id, 10))
 	if gotID == 0 {
 		gotID = id
 	}
@@ -157,10 +195,9 @@ func (c *Client) checkRepoID(ctx context.Context, token string, id int64) gateRe
 // answer. A rename redirect is followed within the API host, to another repository
 // metadata path only: this request reads nothing but the verdict, which is taken
 // from the response it ends on.
-func (c *Client) lookupRepo(ctx context.Context, token, path, label string) (gateResult, int64) {
+func (c *Client) lookupRepo(ctx context.Context, token, path string) (gateResult, int64) {
 	unknown := func(format string, a ...any) gateResult {
-		return gateResult{verdict: verdictUnknown,
-			err: fmt.Errorf("could not confirm that %s is public (%s); try again", label, fmt.Sprintf(format, a...))}
+		return gateResult{verdict: verdictUnknown, detail: fmt.Sprintf(format, a...)}
 	}
 	u := c.baseURL + path
 	for hop := 0; ; hop++ {
@@ -171,7 +208,7 @@ func (c *Client) lookupRepo(ctx context.Context, token, path, label string) (gat
 		if isRedirect(resp.StatusCode) {
 			loc, lerr := resp.Location()
 			drain(resp)
-			if lerr != nil || hop >= maxAPIRedirects {
+			if lerr != nil || hop >= maxAPIRedirects || unsafePath(loc.EscapedPath()) {
 				return unknown("unusable redirect"), 0
 			}
 			kind, _, _ := c.repoFromLocation(loc)
@@ -195,11 +232,9 @@ func (c *Client) lookupRepo(ctx context.Context, token, path, label string) (gat
 		switch {
 		case status == http.StatusOK:
 		case status == http.StatusNotFound || status == http.StatusGone:
-			return gateResult{verdict: verdictInaccessible,
-				err: fmt.Errorf("%s was not found, or is not visible with this token (status %d)", label, status)}, 0
+			return gateResult{verdict: verdictInaccessible, status: status}, 0
 		case status == http.StatusForbidden && !why.rateLimited:
-			return gateResult{verdict: verdictInaccessible,
-				err: fmt.Errorf("GitHub refused access to %s (status 403)%s", label, why.String())}, 0
+			return gateResult{verdict: verdictInaccessible, status: status, detail: why.String()}, 0
 		default: // 401 (a token to refresh), 429 and rate-limited 403s, 5xx
 			return unknown("status %d", status), 0
 		}
@@ -212,16 +247,40 @@ func (c *Client) lookupRepo(ctx context.Context, token, path, label string) (gat
 			return unknown("the answer did not say"), 0
 		}
 		if *meta.Private {
-			return gateResult{verdict: verdictPrivate, fullName: meta.FullName,
-				err: fmt.Errorf("%s is private: %w", meta.FullName, ErrNotPublic)}, meta.ID
+			return gateResult{verdict: verdictPrivate, fullName: meta.FullName}, meta.ID
 		}
 		return gateResult{verdict: verdictPublic, fullName: meta.FullName}, meta.ID
 	}
 }
 
+// unsafePath reports whether an escaped URL path (its query, if any, is ignored)
+// could address something other than what it spells: a "." or ".." segment, also
+// percent-encoded or inside an encoded slash, or a backslash. A server or proxy that
+// normalised such a path could serve another repository than the one gated, so the
+// client sends none.
+func unsafePath(escaped string) bool {
+	p, _, _ := strings.Cut(escaped, "?")
+	for _, seg := range strings.Split(p, "/") {
+		dec, err := url.PathUnescape(seg)
+		if err != nil || strings.Contains(dec, "\\") {
+			return true
+		}
+		for _, piece := range strings.Split(dec, "/") {
+			if piece == "." || piece == ".." {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // gatePath gates the repository a /repos/{owner}/{name}[/…] path names and returns
-// the path with the canonical name. Any other path is returned unchanged.
+// the path with the canonical name. Any other path is returned unchanged. A path
+// with a dot segment is refused outright (unsafePath).
 func (c *Client) gatePath(ctx context.Context, token, path string) (string, error) {
+	if unsafePath(path) {
+		return "", fmt.Errorf("refusing a request path with a \".\" or \"..\" segment")
+	}
 	rest, ok := strings.CutPrefix(path, "/repos/")
 	if !ok {
 		return path, nil
@@ -280,15 +339,14 @@ func (c *Client) repoFromLocation(loc *url.URL) (kind, repo string, id int64) {
 // naming a repository is followed only if that repository passes the gate. One naming
 // none is followed only when the original request was not about a repository either.
 func (c *Client) gateLocation(ctx context.Context, token string, loc *url.URL, repoScoped bool) error {
+	if unsafePath(loc.EscapedPath()) {
+		return fmt.Errorf("GitHub redirected to a path with a dot segment: %w", ErrNotPublic)
+	}
 	switch kind, repo, id := c.repoFromLocation(loc); kind {
 	case "name":
-		_, err := c.gate(ctx, token, repo)
-		return err
+		return c.checkRepo(ctx, token, repo).hiddenErr()
 	case "id":
-		if r := c.checkRepoID(ctx, token, id); r.verdict != verdictPublic {
-			return r.err
-		}
-		return nil
+		return c.checkRepoID(ctx, token, id).hiddenErr()
 	}
 	if repoScoped {
 		return fmt.Errorf("GitHub redirected a repository request to a location that names no repository: %w", ErrNotPublic)
@@ -318,10 +376,60 @@ func (c *Client) confirmSameOrPublic(ctx context.Context, token, gated, other st
 		return nil
 	}
 	if !validRepo(other) {
-		return fmt.Errorf("GitHub answered for an unrecognised repository %q: %w", clipReason(other), ErrNotPublic)
+		return fmt.Errorf("GitHub answered for an unrecognised repository: %w", ErrNotPublic)
 	}
-	_, err := c.gate(ctx, token, other)
-	return err
+	return c.checkRepo(ctx, token, other).hiddenErr()
+}
+
+// backstopError is a response refused because it names another repository than the
+// gated one, which did not pass the gate. The whole response is dropped.
+type backstopError struct{ err error }
+
+func (e *backstopError) Error() string { return e.err.Error() }
+func (e *backstopError) Unwrap() error { return e.err }
+
+// getIssue reads an issue (or a PR through the issues endpoint) of a gated
+// repository, refusing an answer whose repository_url names another repository that
+// is not public.
+func (c *Client) getIssue(ctx context.Context, token, repo string, number int) ([]byte, error) {
+	body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/issues/%d", repo, number))
+	if err != nil {
+		return nil, err
+	}
+	var is struct {
+		RepositoryURL string `json:"repository_url"`
+	}
+	if err := json.Unmarshal(body, &is); err != nil {
+		return nil, err
+	}
+	if err := c.confirmSameOrPublic(ctx, token, repo, c.repoFromAPIURL(is.RepositoryURL)); err != nil {
+		return nil, &backstopError{err}
+	}
+	return body, nil
+}
+
+// getPull reads a pull request of a gated repository, refusing an answer whose
+// base.repo names another repository that is not public. Every reader of a PR answer
+// goes through it, before using any of the answer (its head SHA included).
+func (c *Client) getPull(ctx context.Context, token, repo string, number int) ([]byte, error) {
+	body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/pulls/%d", repo, number))
+	if err != nil {
+		return nil, err
+	}
+	var pr struct {
+		Base struct {
+			Repo struct {
+				FullName string `json:"full_name"`
+			} `json:"repo"`
+		} `json:"base"`
+	}
+	if err := json.Unmarshal(body, &pr); err != nil {
+		return nil, err
+	}
+	if err := c.confirmSameOrPublic(ctx, token, repo, pr.Base.Repo.FullName); err != nil {
+		return nil, &backstopError{err}
+	}
+	return body, nil
 }
 
 // apiDo performs one authenticated GET against the API without following a redirect:
@@ -429,9 +537,23 @@ func publicQuery(q string) string {
 
 // hasTypeQualifier reports whether a search query already says whether it wants
 // issues or pull requests. A GitHub App user token answers 422 to a query that does
-// not.
+// not. Text inside double quotes is a phrase to match, not a qualifier, so it is
+// ignored ("adding is:pr support" asks for neither).
 func hasTypeQualifier(q string) bool {
-	for _, f := range strings.Fields(strings.ToLower(q)) {
+	var unquoted strings.Builder
+	inQuote := false
+	for _, r := range q {
+		switch {
+		case r == '"':
+			inQuote = !inQuote
+			unquoted.WriteRune(' ')
+		case inQuote:
+			unquoted.WriteRune(' ')
+		default:
+			unquoted.WriteRune(r)
+		}
+	}
+	for _, f := range strings.Fields(strings.ToLower(unquoted.String())) {
 		switch f {
 		case "is:issue", "is:pr", "is:pull-request", "type:issue", "type:pr", "type:pull-request":
 			return true

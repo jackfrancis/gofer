@@ -76,18 +76,14 @@ func (c *Client) Discussion(ctx context.Context, token, repo string, number int,
 	}
 
 	// Description from the issues endpoint (works for both issues and PRs).
-	issueBody, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/issues/%d", repo, number))
+	issueBody, err := c.getIssue(ctx, token, repo, number)
 	if err != nil {
 		return Discussion{}, err
 	}
 	var issue struct {
-		Body          string `json:"body"`
-		RepositoryURL string `json:"repository_url"`
+		Body string `json:"body"`
 	}
 	if err := json.Unmarshal(issueBody, &issue); err != nil {
-		return Discussion{}, err
-	}
-	if err := c.confirmSameOrPublic(ctx, token, repo, c.repoFromAPIURL(issue.RepositoryURL)); err != nil {
 		return Discussion{}, err
 	}
 	d.Body = truncateRunes(issue.Body, maxDiscussionBody)
@@ -124,21 +120,18 @@ func (c *Client) Discussion(ctx context.Context, token, repo string, number int,
 	// important for fork PRs: the head *branch* lives on the contributor's fork
 	// and does not resolve in this repo, whereas GitHub exposes the head *commit*
 	// in the base repo — so the SHA is the reliable ref.
-	if body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/pulls/%d", repo, number)); err == nil {
+	body, err := c.getPull(ctx, token, repo, number)
+	var refused *backstopError
+	if errors.As(err, &refused) {
+		return Discussion{}, err // the PR is another repository's: drop all of it
+	}
+	if err == nil {
 		var pr struct {
 			Head struct {
 				SHA string `json:"sha"`
 			} `json:"head"`
-			Base struct {
-				Repo struct {
-					FullName string `json:"full_name"`
-				} `json:"repo"`
-			} `json:"base"`
 		}
 		if err := json.Unmarshal(body, &pr); err == nil {
-			if err := c.confirmSameOrPublic(ctx, token, repo, pr.Base.Repo.FullName); err != nil {
-				return Discussion{}, err
-			}
 			d.HeadSHA = pr.Head.SHA
 		}
 	}
@@ -238,7 +231,20 @@ func truncateRunes(s string, max int) string {
 // an unreadable object returns a short explanatory note rather than an error, so
 // the assistant can react.
 func (c *Client) FileContents(ctx context.Context, token, repo, path, ref string, offset int) (string, error) {
-	p := fmt.Sprintf("/repos/%s/contents/%s", repo, path)
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return "", err
+	}
+	// The path comes from the model: each segment is escaped on its own, and a "." or
+	// ".." segment is refused, so the request names exactly the gated repository.
+	var segs []string
+	for _, seg := range strings.Split(strings.Trim(path, "/"), "/") {
+		if seg == "" || seg == "." || seg == ".." || strings.ContainsAny(seg, "\\\x00") {
+			return "", fmt.Errorf("invalid path %q: use a path within the repository, without . or .. segments", path)
+		}
+		segs = append(segs, url.PathEscape(seg))
+	}
+	p := fmt.Sprintf("/repos/%s/contents/%s", repo, strings.Join(segs, "/"))
 	if ref != "" {
 		p += "?ref=" + url.QueryEscape(ref)
 	}
@@ -319,7 +325,7 @@ func (c *Client) PullRequestStatus(ctx context.Context, token, repo string, numb
 	if err != nil {
 		return "", err
 	}
-	body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/pulls/%d", repo, number))
+	body, err := c.getPull(ctx, token, repo, number)
 	if err != nil {
 		return "", err
 	}
@@ -330,10 +336,7 @@ func (c *Client) PullRequestStatus(ctx context.Context, token, repo string, numb
 		MergedAt *time.Time `json:"merged_at"`
 		Title    string     `json:"title"`
 		Base     struct {
-			Ref  string `json:"ref"`
-			Repo struct {
-				FullName string `json:"full_name"`
-			} `json:"repo"`
+			Ref string `json:"ref"`
 		} `json:"base"`
 		Head struct {
 			Ref string `json:"ref"`
@@ -342,9 +345,6 @@ func (c *Client) PullRequestStatus(ctx context.Context, token, repo string, numb
 		HTMLURL string `json:"html_url"`
 	}
 	if err := json.Unmarshal(body, &pr); err != nil {
-		return "", err
-	}
-	if err := c.confirmSameOrPublic(ctx, token, repo, pr.Base.Repo.FullName); err != nil {
 		return "", err
 	}
 	merged := "not merged"
@@ -368,23 +368,19 @@ func (c *Client) IssueStatus(ctx context.Context, token, repo string, number int
 	if err != nil {
 		return "", err
 	}
-	body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/issues/%d", repo, number))
+	body, err := c.getIssue(ctx, token, repo, number)
 	if err != nil {
 		return "", err
 	}
 	var is struct {
-		Number        int        `json:"number"`
-		State         string     `json:"state"`
-		Title         string     `json:"title"`
-		ClosedAt      *time.Time `json:"closed_at"`
-		HTMLURL       string     `json:"html_url"`
-		RepositoryURL string     `json:"repository_url"`
-		PullRequest   *struct{}  `json:"pull_request"`
+		Number      int        `json:"number"`
+		State       string     `json:"state"`
+		Title       string     `json:"title"`
+		ClosedAt    *time.Time `json:"closed_at"`
+		HTMLURL     string     `json:"html_url"`
+		PullRequest *struct{}  `json:"pull_request"`
 	}
 	if err := json.Unmarshal(body, &is); err != nil {
-		return "", err
-	}
-	if err := c.confirmSameOrPublic(ctx, token, repo, c.repoFromAPIURL(is.RepositoryURL)); err != nil {
 		return "", err
 	}
 	kind := "issue"
@@ -420,6 +416,9 @@ func (c *Client) Search(ctx context.Context, token, query string) (string, error
 			if err := ctx.Err(); err != nil {
 				return "", err
 			}
+			// The pause would outlast the run: sending now would only be refused.
+			return "", fmt.Errorf("GitHub's search rate limit is used up for about %s, longer than this turn has left; try again later",
+				c.search.resetIn().Round(time.Second))
 		}
 		sr, _, err := c.searchPage(ctx, token, q, 1, maxSearchResults)
 		if err != nil {
@@ -475,10 +474,7 @@ func (c *Client) Tarball(ctx context.Context, token, repo, ref string) (io.ReadC
 	}
 	p := "/repos/" + repo + "/tarball"
 	if ref != "" {
-		for _, seg := range strings.Split(ref, "/") {
-			if seg == "" || seg == "." || seg == ".." || strings.ContainsAny(seg, "\x00\r\n ") {
-				return nil, fmt.Errorf("invalid ref %q", ref)
-			}
+		for _, seg := range strings.Split(ref, "/") { // validated above
 			p += "/" + url.PathEscape(seg)
 		}
 	}

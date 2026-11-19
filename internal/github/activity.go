@@ -38,6 +38,10 @@ type Activity struct {
 // and centrality signals from it in a single call, plus how long the item has
 // been blocked on login's review.
 func (c *Client) ItemActivity(ctx context.Context, token, repo string, number int, login string) (Activity, error) {
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return Activity{}, err
+	}
 	events, err := c.fetchTimeline(ctx, token, repo, number)
 	if err != nil {
 		return Activity{}, err

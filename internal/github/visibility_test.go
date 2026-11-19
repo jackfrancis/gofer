@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // gateStub is a GitHub API stub whose repositories have set visibilities. A repository
@@ -203,8 +204,14 @@ func TestGateChecksRedirectDestination(t *testing.T) {
 	ctx := context.Background()
 
 	for _, n := range []int{1, 2, 6} {
-		if _, err := c.IssueStatus(ctx, "tok", "o/r", n); !errors.Is(err, ErrNotPublic) {
+		_, err := c.IssueStatus(ctx, "tok", "o/r", n)
+		if !errors.Is(err, ErrNotPublic) {
 			t.Errorf("issue %d: err = %v, want ErrNotPublic", n, err)
+		}
+		// The destination's name came from GitHub, not the model: it stays out of the
+		// error the model reads.
+		if err != nil && (strings.Contains(err.Error(), "hidden") || strings.Contains(err.Error(), "repositories/7")) {
+			t.Errorf("issue %d: the refusal names the private destination: %v", n, err)
 		}
 	}
 	if _, err := c.IssueStatus(ctx, "tok", "o/r", 5); err == nil || !strings.Contains(err.Error(), "off the API host") {
@@ -329,19 +336,199 @@ func TestFetchWorklistPublicOnly(t *testing.T) {
 
 func TestHasTypeQualifier(t *testing.T) {
 	for q, want := range map[string]bool{
-		"repo:o/r otel":          false,
-		"is:open author:x":       false,
-		`"is:issue" in:title`:    false,
-		"is:issue foo":           true,
-		"IS:PR foo":              true,
-		"foo is:pull-request":    true,
-		"type:issue label:bug":   true,
-		"type:pr review:none":    true,
-		"-is:pr label:bug":       false,
-		"repo:o/r is:issue OR x": true,
+		"repo:o/r otel":           false,
+		"is:open author:x":        false,
+		`"is:issue" in:title`:     false,
+		"is:issue foo":            true,
+		"IS:PR foo":               true,
+		"foo is:pull-request":     true,
+		"type:issue label:bug":    true,
+		"type:pr review:none":     true,
+		"-is:pr label:bug":        false,
+		"repo:o/r is:issue OR x":  true,
+		`"adding is:pr support"`:  false,
+		`"adding is:pr" is:issue`: true,
+		`label:"is:issue" foo`:    false,
 	} {
 		if got := hasTypeQualifier(q); got != want {
 			t.Errorf("hasTypeQualifier(%q) = %v, want %v", q, got, want)
 		}
+	}
+}
+
+// A refusal names only what the caller asked for. A private repository reached by a
+// rename, or named in a response body, is never named.
+func TestGateRefusalNamesOnlyWhatWasAsked(t *testing.T) {
+	s := newGateStub(t, map[string]string{"old/name": "rename:new/secret:42", "o/r": "public"}, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/o/r/issues/1":
+			_, _ = w.Write([]byte(`{"number":1,"repository_url":"https://api.github.com/repos/new/secret"}`))
+		default:
+			t.Errorf("request past the gate: %s", r.URL.Path)
+		}
+	})
+	s.ids["42"] = "private:new/secret"
+	c := s.client()
+	ctx := context.Background()
+	_, err := c.IssueStatus(ctx, "tok", "old/name", 1)
+	if !errors.Is(err, ErrNotPublic) || !strings.Contains(err.Error(), "old/name") || strings.Contains(err.Error(), "secret") {
+		t.Errorf("renamed private repository: err = %v, want ErrNotPublic naming old/name only", err)
+	}
+	// The cached private verdict is not worded with the canonical name either.
+	if _, err := c.IssueStatus(ctx, "tok", "new/secret", 1); err == nil || !strings.Contains(err.Error(), "new/secret is private") {
+		t.Errorf("asked by its canonical name: err = %v", err)
+	}
+	_, err = c.IssueStatus(ctx, "tok", "o/r", 1)
+	if !errors.Is(err, ErrNotPublic) || strings.Contains(err.Error(), "secret") {
+		t.Errorf("body backstop: err = %v, want ErrNotPublic without the other repository's name", err)
+	}
+}
+
+// No request leaves with a path a server could normalise onto another repository: a
+// "." or ".." segment (also percent-encoded) is refused, a repository argument must
+// be exactly owner/name, and a file path is escaped segment by segment.
+func TestGateRefusesDotSegments(t *testing.T) {
+	var got []string
+	s := newGateStub(t, map[string]string{"o/r": "public"}, func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.EscapedPath())
+		_, _ = w.Write([]byte(`{"type":"file","encoding":"base64","content":"aGk="}`))
+	})
+	c := s.client()
+	ctx := context.Background()
+	for _, path := range []string{"../../../evil/secret/contents/x", "a/./b", "a/../b", "a\\..\\b"} {
+		if _, err := c.FileContents(ctx, "tok", "o/r", path, "", 0); err == nil {
+			t.Errorf("FileContents(%q) was sent", path)
+		}
+	}
+	for _, repo := range []string{"o/r/../../evil/secret", "o/r/x"} {
+		if _, err := c.CIStatusForRef(ctx, "tok", repo, "main"); err == nil || !strings.Contains(err.Error(), "owner/name") {
+			t.Errorf("CIStatusForRef(%q) err = %v", repo, err)
+		}
+		if _, err := c.ItemActivity(ctx, "tok", repo, 1, "me"); err == nil {
+			t.Errorf("ItemActivity(%q) was sent", repo)
+		}
+	}
+	for _, p := range []string{"/repos/o/r/contents/%2e%2e/x", "/repos/o/r/contents/..%2F..%2Fx", "/repos/o/r/./x"} {
+		if _, err := c.get(ctx, "tok", p); err == nil {
+			t.Errorf("get(%q) was sent", p)
+		}
+	}
+	if len(got) != 0 {
+		t.Fatalf("requests sent: %q", got)
+	}
+	// A legitimate path and a branch with a slash still work.
+	if _, err := c.FileContents(ctx, "tok", "o/r", "/dir/a b.go", "release/1.2", 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "/repos/o/r/contents/dir/a%20b.go" {
+		t.Errorf("sent %q", got)
+	}
+}
+
+// CIStatusForPR reads nothing of a PR answer, its head SHA included, that names
+// another repository that is not public.
+func TestCIStatusForPRBackstop(t *testing.T) {
+	s := newGateStub(t, map[string]string{"o/r": "public", "o/hidden": "private"}, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/o/r/pulls/5" {
+			_, _ = w.Write([]byte(`{"head":{"ref":"secret-branch","sha":"abc"},"base":{"repo":{"full_name":"o/hidden"}}}`))
+			return
+		}
+		t.Errorf("CI lookup after a refused PR answer: %s", r.URL.Path)
+	})
+	st, err := s.client().CIStatusForPR(context.Background(), "tok", "o/r", 5)
+	if !errors.Is(err, ErrNotPublic) || strings.Contains(err.Error(), "hidden") || st.Ref != "" || st.SHA != "" {
+		t.Errorf("CIStatusForPR = %+v, %v; want nothing and ErrNotPublic", st, err)
+	}
+}
+
+// An Actions log redirected within the API host is followed with the token once its
+// destination is public; only the off-host download link goes to the blob client.
+func TestLogRedirectWithinAPIKeepsToken(t *testing.T) {
+	blob := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			t.Error("the blob host received the token")
+		}
+		_, _ = w.Write([]byte("log line\n"))
+	}))
+	defer blob.Close()
+	s := newGateStub(t, map[string]string{"o/r": "public"}, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/o/r/actions/jobs/9/logs":
+			http.Redirect(w, r, "/repositories/8/actions/jobs/9/logs", http.StatusFound)
+		case "/repositories/8/actions/jobs/9/logs":
+			if r.Header.Get("Authorization") != "Bearer tok" {
+				http.Error(w, `{"message":"Must have admin rights to Repository."}`, http.StatusForbidden)
+				return
+			}
+			http.Redirect(w, r, blob.URL+"/log?sig=presigned", http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	s.ids["8"] = "public:o/moved"
+	var buf bytes.Buffer
+	if _, err := s.client().ActionsJobLog(context.Background(), "tok", "o/r", 9, &buf, 1<<20); err != nil || buf.String() != "log line\n" {
+		t.Fatalf("log = %q, err = %v", buf.String(), err)
+	}
+}
+
+// Search does not send a request it knows the rate limit will refuse: when the reset
+// is past the turn's deadline it says so.
+func TestSearchRateLimitPastDeadline(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("X-RateLimit-Reset", fmt.Sprint(time.Now().Add(10*time.Minute).Unix()))
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := NewClient(srv.Client(), srv.URL).Search(ctx, "tok", "otel")
+	if err == nil || !strings.Contains(err.Error(), "rate limit") {
+		t.Errorf("err = %v, want a rate-limit explanation", err)
+	}
+	if calls != 1 {
+		t.Errorf("requests = %d, want 1 (the PR query must not be sent)", calls)
+	}
+}
+
+// The visibility checks have their own, smaller reserve than pagination: a slow
+// search that stopped paging for time still gets its hits checked and written,
+// rather than every check being skipped and the backfill saving nothing.
+func TestFetchWorklistChecksAfterSlowSearch(t *testing.T) {
+	s := newGateStub(t, map[string]string{"o/pub": "public"}, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case "/search/issues":
+			// More pages are advertised, but the run has too little time to read them.
+			w.Header().Set("Link", `<x?page=2>; rel="next"`)
+			_, _ = w.Write([]byte(`{"items":[{"number":1,"title":"t","html_url":"u","state":"open","repository_url":"https://api.github.com/repos/o/pub"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	// Inside pagination's reserve (90s), outside the checks' (30s).
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	items, complete, err := s.client().FetchWorklist(ctx, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want the public hit kept", len(items))
+	}
+	if complete {
+		t.Error("a walk stopped for time is not complete")
+	}
+
+	// Inside the checks' reserve too: nothing can be confirmed, nothing is complete.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel2()
+	items, complete, err = s.client().FetchWorklist(ctx2, "tok")
+	if err != nil || len(items) != 0 || complete {
+		t.Errorf("items = %d, complete = %v, err = %v; want none, incomplete", len(items), complete, err)
 	}
 }

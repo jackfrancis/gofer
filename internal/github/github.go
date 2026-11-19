@@ -355,8 +355,16 @@ func (c *Client) searchPage(ctx context.Context, token, q string, page, per int)
 	return sr, more, nil
 }
 
-// gateConcurrency bounds the visibility checks ingest runs at once.
-const gateConcurrency = 8
+const (
+	// gateConcurrency bounds the visibility checks ingest runs at once.
+	gateConcurrency = 8
+	// gateTimeReserve is the slice of the run's remaining time ingest's visibility
+	// checks leave for persisting the fetch. It is smaller than searchTimeReserve on
+	// purpose: pagination stops at that reserve, and the hits it has collected by
+	// then are worth nothing unless their repositories can still be checked. What
+	// follows the write-back (enrich, rank) is best-effort and budgets itself.
+	gateTimeReserve = 30 * time.Second
+)
 
 // publicHits keeps the items whose repository passes the public-only gate. confirmed
 // is false when any repository's check had no answer (a timeout, a rate limit, the
@@ -372,6 +380,15 @@ func (c *Client) publicHits(ctx context.Context, token string, items []worklist.
 			repos = append(repos, it.GitHub.Repo)
 		}
 	}
+	// The checks stop gateTimeReserve before the run's deadline, in flight or not:
+	// a repository left unchecked stays unknown rather than spend what the write-back
+	// needs.
+	gctx := ctx
+	if deadline, ok := ctx.Deadline(); ok {
+		var cancel context.CancelFunc
+		gctx, cancel = context.WithDeadline(ctx, deadline.Add(-gateTimeReserve))
+		defer cancel()
+	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, gateConcurrency)
@@ -381,11 +398,10 @@ func (c *Client) publicHits(ctx context.Context, token string, items []worklist.
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			// Out of time: leave it unknown rather than spend what the write-back needs.
-			if !fitsBudget(ctx, searchTimeReserve) {
+			if gctx.Err() != nil {
 				return
 			}
-			v := c.checkRepo(ctx, token, repo).verdict
+			v := c.checkRepo(gctx, token, repo).verdict
 			mu.Lock()
 			verdicts[repo] = v
 			mu.Unlock()
@@ -480,6 +496,13 @@ func (b *searchBudget) wait(ctx context.Context, reserve time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// resetIn is how long until the search budget resets, as last advertised.
+func (b *searchBudget) resetIn() time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return max(time.Until(b.resetAt), 0)
 }
 
 // fitsBudget reports whether ctx has room for d before its deadline. A context

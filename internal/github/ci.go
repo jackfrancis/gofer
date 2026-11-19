@@ -46,7 +46,11 @@ type CIStatus struct {
 
 // CIStatusForPR returns the CI status of a pull request's head commit.
 func (c *Client) CIStatusForPR(ctx context.Context, token, repo string, number int) (CIStatus, error) {
-	body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/pulls/%d", repo, number))
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return CIStatus{}, err
+	}
+	body, err := c.getPull(ctx, token, repo, number)
 	if err != nil {
 		return CIStatus{}, err
 	}
@@ -72,6 +76,10 @@ func (c *Client) CIStatusForPR(ctx context.Context, token, repo string, number i
 // reports them; check runs are the latest per name, as GitHub lists them by default.
 func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (CIStatus, error) {
 	st := CIStatus{Repo: repo, Ref: ref, SHA: ref}
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return st, err
+	}
 	esc := url.PathEscape(ref)
 
 	for page := 1; page <= ciMaxPages; page++ {

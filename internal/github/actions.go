@@ -334,11 +334,37 @@ func (c *Client) downloadLog(ctx context.Context, token, path, what string, w io
 	}
 }
 
-// logLocation requests a log from the API without following its redirect. It returns
+// logLocation requests a log from the API and returns the download location it
+// redirects to, or nil when the API served the log itself (written to w) or refused.
+// A redirect within the API host (a renamed or transferred repository) is not a
+// download link: it is followed here, with the token, once its destination passes
+// the public-only gate. Only a location off the API host goes to the credential-free
+// blob client.
+func (c *Client) logLocation(ctx context.Context, token, path, what string, w io.Writer, max int64) (*url.URL, int64, error) {
+	u := c.baseURL + path
+	for hop := 0; ; hop++ {
+		loc, n, err := c.logHop(ctx, token, u, what, w, max)
+		if loc == nil {
+			return nil, n, err
+		}
+		if _, onAPI := c.apiRelPath(loc); !onAPI {
+			return loc, 0, nil
+		}
+		if hop >= maxAPIRedirects {
+			return nil, 0, fmt.Errorf("%s: too many redirects within the API", what)
+		}
+		if err := c.gateLocation(ctx, token, loc, true); err != nil {
+			return nil, 0, fmt.Errorf("%s: %w", what, err)
+		}
+		u = loc.String()
+	}
+}
+
+// logHop requests a log from the API at u without following its redirect. It returns
 // the redirect's location, or nil when the API served the log itself (written to w)
 // or refused.
-func (c *Client) logLocation(ctx context.Context, token, path, what string, w io.Writer, max int64) (*url.URL, int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+func (c *Client) logHop(ctx context.Context, token, u, what string, w io.Writer, max int64) (*url.URL, int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, 0, fmt.Errorf("build %s request", what)
 	}
@@ -386,14 +412,6 @@ func (c *Client) logLocation(ctx context.Context, token, path, what string, w io
 		return nil, 0, fmt.Errorf("%s: redirect without a usable location", what)
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-	// A redirect within the API host (a renamed or transferred repository) is followed
-	// only to a repository that passes the public-only gate. The blob host's is the
-	// gated repository's own log.
-	if _, onAPI := c.apiRelPath(loc); onAPI {
-		if err := c.gateLocation(ctx, token, loc, true); err != nil {
-			return nil, 0, fmt.Errorf("%s: %w", what, err)
-		}
-	}
 	return loc, 0, nil
 }
 

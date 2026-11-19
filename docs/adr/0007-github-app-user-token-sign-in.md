@@ -855,10 +855,13 @@ today's OAuth-app tokens, which it does not depend on:
   runs a query with no type qualifier as an issue and a PR query and merges them by
   recency. It reads the first page of each only (it shows 20 matches and reports
   GitHub's `total_count`), so the split does not double a tool call's share of the
-  search budget.
+  search budget. A qualifier inside a quoted phrase does not count. When the search
+  rate limit resets after the turn's deadline, the tool says so instead of sending a
+  request that would be refused.
 - **The gate** (`internal/github/visibility.go`): every `/repos/{owner}/{name}/…` call
   goes through it, as do the tarball and the Actions logs, which do not use the shared
-  GET. The canonical `full_name` replaces the name asked for. Definite answers are
+  GET. Every entry point checks that its repository argument is exactly `owner/name`
+  first. The canonical `full_name` replaces the name asked for. Definite answers are
   cached for the life of the `Client`, which each job creates once; an unknown answer
   is not cached, so a later call in the run asks again. The ingest job's chained
   enrich builds its own client and so checks again. Answers:
@@ -868,19 +871,32 @@ today's OAuth-app tokens, which it does not depend on:
   - 404 or 410, or a 403 that is not a rate limit: refused as not found or refused.
   - Anything else (a transport error, 401, 429, a rate-limited 403, 5xx, or an answer
     without `private`): refused as "could not confirm".
+  - A refusal names only the repository the caller asked for. One the caller did not
+    name (a redirect's destination, another repository named in a response) is
+    refused without its name, and a rename is worded with the old name: the model
+    never learns a private repository's name from gofer.
+- **Paths:** no request goes out with a `.` or `..` path segment, percent-encoded or
+  inside an encoded slash, or a backslash, so a server or proxy normalising the path
+  cannot serve a repository other than the gated one. `github_read_file` escapes the
+  model's file path segment by segment.
 - **Redirects:** the shared GET follows no redirect itself. An API-host redirect is
   followed only after its destination (`/repos/{o}/{r}/…` or `/repositories/{id}/…`)
   passes the gate, and one naming no repository only when the original request named
   none either (`/user`). A redirect off the API host is refused on the JSON path. The
   tarball still follows its off-host hop to codeload, with an API-host hop gated the
-  same way. An Actions log's API-host redirect is gated before its location is
-  fetched. The gate's own lookup follows a rename redirect only to another repository
+  same way. An Actions log's API-host redirect is followed with the token once its
+  destination passes the gate; only the off-host download link goes to the
+  credential-free blob client. The gate's own lookup follows a rename redirect only to another repository
   metadata path, and judges the answer it ends on.
 - **The body backstop:** an issue's `repository_url`, or a PR's `base.repo.full_name`,
   naming another repository than the gated one is dropped unless that repository
-  passes the gate (`IssueStatus`, `PullRequestStatus`, `Discussion`).
+  passes the gate. Every reader of an issue or PR answer goes through the same check
+  before using any of it (`IssueStatus`, `PullRequestStatus`, `Discussion`, and
+  `CIStatusForPR` before it takes the head commit).
 - **Ingest:** `FetchWorklist` gates the distinct repositories of its hits, eight at a
-  time and within its time reserve. It drops hits that are not confirmed public. An
+  time, until 30 seconds before the run's deadline. That is less than pagination's
+  90-second reserve, so a search that stopped paging for time still gets its hits
+  checked and written. It drops hits that are not confirmed public. An
   unknown answer, or a repository left unchecked for lack of time, also makes the
   result incomplete, so `runIngest` does not call `retireMissing`. A definite refusal
   drops the hit without that; a stored item from that repository can then be retired
