@@ -331,10 +331,15 @@ func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 // revoke gofer themselves (settings_urls; settings_url is the first).
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	res := logoutResult{confirmed: true}
-	if u := h.sessions.CurrentUser(r); u != nil && h.vault != nil {
+	u := h.sessions.CurrentUser(r)
+	// End the session first, with its own deadline: a browser that disconnects
+	// during the GitHub work below must not leave its session valid.
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+	h.sessions.Destroy(w, r.WithContext(sctx))
+	cancel()
+	if u != nil && h.vault != nil {
 		res = h.revokeAndDelete(r.Context(), u.ID, u.Provider)
 	}
-	h.sessions.Destroy(w, r)
 	if res.confirmed {
 		w.WriteHeader(http.StatusNoContent)
 		return

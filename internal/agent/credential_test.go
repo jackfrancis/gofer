@@ -23,6 +23,7 @@ type fakePlane struct {
 
 	mu       sync.Mutex
 	first    planeAnswer
+	later    *planeAnswer // when set, every plain vend after the first
 	onReject planeAnswer
 	rejected []string // the rejected= values received
 	vends    int
@@ -45,6 +46,9 @@ func newFakePlane(t *testing.T, first, onReject planeAnswer) *fakePlane {
 		f.mu.Lock()
 		f.vends++
 		a := f.first
+		if f.later != nil && f.vends > 1 {
+			a = *f.later
+		}
 		if rej := r.URL.Query().Get("rejected"); rej != "" {
 			f.rejected = append(f.rejected, rej)
 			a = f.onReject
@@ -108,6 +112,8 @@ func newFakeAPI(t *testing.T, good ...string) *fakeAPI {
 		switch {
 		case r.URL.Path == "/user":
 			_, _ = w.Write([]byte(`{"login":"octocat"}`))
+		case r.URL.Path == "/search/issues":
+			_, _ = w.Write([]byte(`{"total_count":1,"incomplete_results":false,"items":[{"number":1,"title":"An issue","html_url":"https://github.com/o/r/issues/1","repository_url":"https://api.github.com/repos/o/r","state":"open","created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-02T00:00:00Z","user":{"login":"octocat"}}]}`))
 		case r.URL.Path == "/repos/o/r":
 			_, _ = w.Write([]byte(`{"id":1,"full_name":"o/r","private":false}`))
 		default:
@@ -441,5 +447,25 @@ func TestConverseReVendFailureMidTurnIsDisclosed(t *testing.T) {
 	}
 	if m := lastTurn(t, sink); !strings.Contains(m.Content, "lost access to GitHub partway") {
 		t.Errorf("reply = %+v", m)
+	}
+}
+
+// Review P2 (second round): when the chained enrich finds sign-in required, backfill
+// stops with that error instead of ranking and reporting success. The items the
+// fetch already wrote stay.
+func TestBackfillStopsWhenEnrichNeedsSignIn(t *testing.T) {
+	plane := newFakePlane(t, planeAnswer{token: "tok", version: "v1"}, planeAnswer{})
+	plane.later = &planeAnswer{status: signInRequiredStatus}
+	api := newFakeAPI(t, "tok")
+	sink := &memSink{}
+	err := Run(context.Background(), Params{JobType: JobIngest, GitHubBaseURL: api.srv.URL}, plane.vendor(), sink)
+	if !isSignInRequired(err) {
+		t.Fatalf("err = %v, want sign-in required", err)
+	}
+	if len(sink.items) == 0 {
+		t.Fatal("the fetched baseline items were not written")
+	}
+	if sink.ingests != 1 {
+		t.Errorf("write-backs = %d, want only the fetch's (no rank pass)", sink.ingests)
 	}
 }

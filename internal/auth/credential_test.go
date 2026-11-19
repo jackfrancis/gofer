@@ -15,6 +15,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/jackfrancis/gofer/internal/config"
+	"github.com/jackfrancis/gofer/internal/session"
 	"github.com/jackfrancis/gofer/internal/vault"
 )
 
@@ -504,21 +505,27 @@ func decodeLogout(t *testing.T, rec *httptest.ResponseRecorder) logoutAnswer {
 	return out
 }
 
-// Review P1: a logout that cannot take the lock in time never deletes outside it.
-// It sets a tombstone instead: a refresh already in flight stores nothing (and
-// revokes the pair it got), no vend follows, and the row is deleted under the lock.
-func TestLogoutDuringRefreshLeavesNoCredential(t *testing.T) {
+// Review P1 (both rounds): a logout that cannot take the lock in time, because a
+// refresh holds it, never deletes outside the lock. The refresh still stores its
+// pair, but the request that ran it gets "sign-in required", not a token; once the
+// lock is free, the deferred logout revokes the grant with the newest token and
+// deletes the row.
+func TestLogoutDuringRefresh(t *testing.T) {
 	defer func(d time.Duration) { logoutLockWait = d }(logoutLockWait)
 	logoutLockWait = 50 * time.Millisecond
 	gh := newFakeGitHub(t)
 	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
-	old := put(t, gh, vlt, appCred("ghu_old", "ghr_old", "v1", time.Minute))
+	put(t, gh, vlt, appCred("ghu_old", "ghr_old", "v1", time.Minute))
 
-	// A refresh holds the lock and has already exchanged its refresh token.
-	unlock, err := h.locks.lock(bg, user, "github")
-	if err != nil {
-		t.Fatal(err)
-	}
+	started, proceed := make(chan struct{}), make(chan struct{})
+	gh.onRefresh = func() { close(started); <-proceed }
+	vended := make(chan error, 1)
+	go func() {
+		_, err := h.Credential(bg, user, "github", VendRequest{})
+		vended <- err
+	}()
+	<-started // the refresh holds the lock and GitHub is rotating the pair
+
 	res := h.revokeAndDelete(bg, user, "github")
 	if res.confirmed || len(res.settings) == 0 {
 		t.Fatalf("logout that could not take the lock = %+v, want unconfirmed", res)
@@ -526,28 +533,130 @@ func TestLogoutDuringRefreshLeavesNoCredential(t *testing.T) {
 	if _, err := vlt.Get(bg, user, "github"); err != nil {
 		t.Fatalf("the row was deleted outside the lock (err=%v)", err)
 	}
-	tok, err := h.refresher(bg, h.providers["github"], old.RefreshToken).Token()
+	close(proceed)
+	if err := <-vended; !errors.Is(err, vault.ErrSignInRequired) {
+		t.Fatalf("the refresh running during logout vended a token (err=%v)", err)
+	}
+
+	// The deferred logout revokes with the rotated token and deletes the row.
+	deadline := time.Now().Add(5 * time.Second)
+	for h.locks.isLoggedOut(user, "github") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := vlt.Get(bg, user, "github"); !errors.Is(err, vault.ErrNotFound) {
+		t.Fatalf("row kept after the deferred logout (err=%v)", err)
+	}
+	if gh.revoked.Load() != 1 || gh.revokedWith.Load().(string) == "ghu_old" {
+		t.Errorf("revocations = %d with %q; want one, with the rotated token", gh.revoked.Load(), gh.revokedWith.Load())
+	}
+}
+
+// Review P2: a vend that reaches the lock while a logout is pending refuses and
+// leaves the credential alone, so logout can still revoke with it.
+func TestPendingLogoutKeepsCredentialForRevocation(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
+	put(t, gh, vlt, appCred("ghu_a", "ghr_a", "v1", 4*time.Hour))
+	h.locks.markLoggedOut(user, "github")
+	if _, err := h.Credential(bg, user, "github", VendRequest{}); !errors.Is(err, vault.ErrSignInRequired) {
+		t.Fatalf("vend during logout: err = %v", err)
+	}
+	if stored(t, vlt).AccessToken != "ghu_a" {
+		t.Fatal("the vend changed the credential logout needs")
+	}
+	// A confirmed rejection that would delete a dead token leaves it to logout too.
+	h.deleteIfVersion(bg, user, stored(t, vlt))
+	stored(t, vlt)
+
+	if res := h.revokeAndDelete(bg, user, "github"); !res.confirmed || gh.revoked.Load() != 1 {
+		t.Fatalf("logout = %+v, revocations = %d; want confirmed", res, gh.revoked.Load())
+	}
+	if _, err := vlt.Get(bg, user, "github"); !errors.Is(err, vault.ErrNotFound) {
+		t.Error("row kept after logout")
+	}
+}
+
+// failingPutVault refuses every write.
+type failingPutVault struct{ vault.Vault }
+
+func (failingPutVault) Put(context.Context, string, vault.Credential) error {
+	return errors.New("disk full")
+}
+
+// Review P2: a sign-in whose write fails leaves a pending logout pending, so the old
+// credential is neither vended nor spared.
+func TestFailedSignInWriteKeepsPendingLogout(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
+	put(t, gh, vlt, appCred("ghu_old", "ghr_old", "v1", 4*time.Hour))
+	h.locks.markLoggedOut(user, "github")
+	h.vault = failingPutVault{vlt}
+	signIn(t, h)
+	if !h.locks.isLoggedOut(user, "github") {
+		t.Fatal("a failed sign-in write cleared the pending logout")
+	}
+	if _, err := h.Credential(bg, user, "github", VendRequest{}); !errors.Is(err, vault.ErrSignInRequired) {
+		t.Fatalf("the old credential was vended (err=%v)", err)
+	}
+}
+
+// Review P2: revocation gets its own deadline. A logout that waited most of its
+// lock budget, then refreshed slowly, still revokes with the rotated token.
+func TestLogoutRevocationHasItsOwnDeadline(t *testing.T) {
+	defer func(d time.Duration) { logoutLockWait = d }(logoutLockWait)
+	logoutLockWait = 300 * time.Millisecond
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
+	put(t, gh, vlt, appCred("ghu_old", "ghr_old", "v1", time.Minute))
+	unlock, err := h.locks.lock(bg, user, "github")
 	if err != nil {
 		t.Fatal(err)
 	}
-	revokedBefore := gh.revoked.Load()
-	if _, err := h.storeRefreshed(bg, user, h.providers["github"], old, tok); !errors.Is(err, vault.ErrSignInRequired) {
-		t.Fatalf("refresh during logout: err = %v, want sign-in required", err)
+	go func() { time.Sleep(200 * time.Millisecond); unlock() }()
+	gh.onRefresh = func() { time.Sleep(200 * time.Millisecond) } // past the lock budget
+	if res := h.revokeAndDelete(bg, user, "github"); !res.confirmed {
+		t.Fatalf("logout = %+v; want confirmed", res)
 	}
-	if _, err := vlt.Get(bg, user, "github"); !errors.Is(err, vault.ErrNotFound) {
-		t.Fatalf("the refreshed pair survived logout (err=%v)", err)
+	if gh.revokedWith.Load().(string) == "ghu_old" {
+		t.Error("revoked with the stale token")
 	}
-	if gh.revoked.Load() != revokedBefore+1 || gh.isValid(tok.AccessToken) {
-		t.Error("the pair refreshed during logout was not revoked")
-	}
-	unlock()
+}
 
-	// Nothing is vended afterwards, and the deferred deletion finishes.
-	if _, err := h.Credential(bg, user, "github", VendRequest{}); !errors.Is(err, vault.ErrSignInRequired) {
-		t.Fatalf("vend after logout: err = %v", err)
+// sessionSpy is a session store that records whether a delete's context was live.
+type sessionSpy struct {
+	session.Store
+	mu        sync.Mutex
+	deleteErr error
+	deleted   bool
+}
+
+func (s *sessionSpy) Delete(ctx context.Context, key string) error {
+	s.mu.Lock()
+	s.deleted, s.deleteErr = true, ctx.Err()
+	s.mu.Unlock()
+	return s.Store.Delete(ctx, key)
+}
+
+// Review P2: a browser that disconnects during logout still has its stored session
+// deleted.
+func TestLogoutDeletesSessionWhenBrowserDisconnects(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, cfg, _ := newKindHandler(t, gh, config.GitHubApp)
+	spy := &sessionSpy{Store: session.NewMemoryStore()}
+	h.sessions = session.NewManager(cfg.SessionSecret, cfg.CookieSecure, session.WithStore(spy))
+	_, next := signIn(t, h)
+	ctx, cancel := context.WithCancel(bg)
+	cancel() // the browser is already gone
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil).WithContext(ctx)
+	for _, ck := range next.Cookies() {
+		req.AddCookie(ck)
 	}
-	if h.locks.isLoggedOut(user, "github") {
-		t.Error("tombstone left after the deletion finished")
+	h.Logout(httptest.NewRecorder(), req)
+	if !spy.deleted || spy.deleteErr != nil {
+		t.Fatalf("session delete ran=%v with ctx err %v; want a live context", spy.deleted, spy.deleteErr)
+	}
+	if h.sessions.CurrentUser(next) != nil {
+		t.Error("the session survived logout")
 	}
 }
 

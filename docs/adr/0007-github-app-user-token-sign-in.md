@@ -928,20 +928,24 @@ GitHub's endpoints only:
   was revoked mid-flow it stores nothing and answers with a "Sign in again" link
   rather than an automatic redirect, so an unexpected "invalid" from GitHub cannot
   loop. A refused account's grant is revoked.
-- Logout refreshes if needed, revokes the grant, then deletes the row, always under
-  the lock. It first sets a logout tombstone that every lock holder checks, so a
-  refresh in flight stores nothing (and revokes the pair it got) and nothing is
-  vended; if logout cannot take the lock in time, the deletion finishes in the
-  background or at the next access. It answers 200 with `revocation: unconfirmed`
-  when GitHub did not confirm, including when no GitHub credential is stored, with
-  the settings page of the credential's issuer (both pages when unknown).
+- Logout ends the session first (on its own deadline), then refreshes if needed,
+  revokes the grant and deletes the row, under the lock, each step on its own
+  deadline. It first sets a logout tombstone that makes it the credential's only
+  remaining writer: every other holder refuses to vend (also after a blocking
+  refresh or check) and deletes nothing, while a refresh in flight still stores its
+  pair so logout revokes with the newest token. If logout cannot take the lock in
+  time, the same revoke-then-delete runs in the background once it is free; a new
+  sign-in clears the tombstone only once its credential is stored. Logout answers
+  200 with `revocation: unconfirmed` when GitHub did not confirm, including when no
+  GitHub credential is stored, with the settings page of the credential's issuer
+  (both pages when unknown).
 - The broker (`internal/api/credential.go`) returns `credential_version`, and answers
   "sign-in required" with 410 and code `sign_in_required`.
 - The runtime (`internal/agent/credential.go`): a token holder, as the GitHub client's
   transport, that re-vends once on 401 and turns "sign-in required" into a typed
   `ReconnectError`; a re-vend that fails otherwise puts Discuss in its
-  stored-context fallback (or marks a reply that lost access mid-turn); enrich and
-  ingest stop on a reconnect found by any request; the converser's tool loop stops on
+  stored-context fallback (or marks a reply that lost access mid-turn); enrich,
+  ingest and the backfill chain stop on a reconnect found by any request; the converser's tool loop stops on
   it; Discuss posts a
   `reconnect` system notice (at vend, in the snapshot, or from a tool call), and
   marks a reply made without GitHub "answered from stored context only". The landing

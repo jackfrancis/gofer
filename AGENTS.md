@@ -204,7 +204,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   broker's refresh and legacy tagging — goes through `internal/auth/credential.go`
   under one per-(user, provider) lock, and every write mints a new credential version
   (sealed with the token; no migration). Logout sets a tombstone (`credLocks`) that
-  every holder checks before writing or vending, and deletes only under the lock.
+  makes it the only writer left: other holders refuse to vend and delete nothing,
+  and logout revokes, then deletes, under the lock (or in the background once the
+  lock frees).
   Never write the vault from anywhere else. A
   credential from another client is never vended. The broker answers "sign-in
   required" with 410 and code `sign_in_required`; the workload (`internal/agent`,

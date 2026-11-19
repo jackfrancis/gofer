@@ -211,6 +211,11 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	// best-effort: a failure leaves the baseline-scored items in place. The
 	// separate JobEnrich / JobRank exist for an independent scheduled refresh.
 	if err := runEnrich(ctx, p, vendor, sink); err != nil {
+		// The user's access is gone: stop here, and say so, rather than rank and
+		// report success. The items already written keep their baseline scores.
+		if isSignInRequired(err) {
+			return fmt.Errorf("backfill enrich: %w", err)
+		}
 		log.Warn("backfill enrich failed", "err", err)
 	}
 	if err := runRank(ctx, p, sink); err != nil {
