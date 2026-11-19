@@ -103,7 +103,7 @@ func Resolve(ctx context.Context, store Store, ingestor Ingestor, now time.Time,
 	// the user-facing list.
 	visible := items[:0]
 	for _, it := range items {
-		if it.Meta.HiddenAt.IsZero() && it.Meta.CompletedAt.IsZero() {
+		if it.OnRadar() {
 			visible = append(visible, it)
 		}
 	}
@@ -112,6 +112,13 @@ func Resolve(ctx context.Context, store Store, ingestor Ingestor, now time.Time,
 		return Resolution{}, err
 	}
 	return Resolution{Status: StatusReady, Items: items}, nil
+}
+
+// OnRadar reports whether the item belongs on the owner's radar: it is neither
+// hidden by the owner nor completed (closed or merged). Resolve shows only these,
+// and every bulk action (Review all, the second-opinion batch) draws only from them.
+func (w WorkItem) OnRadar() bool {
+	return w.Meta.HiddenAt.IsZero() && w.Meta.CompletedAt.IsZero()
 }
 
 // HiddenAfter returns the HiddenAt to keep for a re-ingested item: it preserves a

@@ -154,7 +154,11 @@ Wired on the web-tier side; they define what a runtime must respect:
   read-modify-write), never `List` then `Upsert`, which overwrites anything written
   in between. A run's write-back is merged into the stored item
   (`worklist.MergeRunItems`): runs own the GitHub fields, signals and scoring; the
-  thread, read cursor, hidden flag and creation time always come from the store. A
+  thread, read cursor, hidden flag and creation time always come from the store,
+  except that a hidden item resurfaces when the run's GitHub update time is after
+  the hide (`worklist.HiddenAfter`). Hidden and closed items are off the radar
+  (`WorkItem.OnRadar`), and no bulk action (Review all, the second-opinion batch)
+  draws from them. A
   run adds a thread turn only through `POST /agent/worklist/reply`
   (`worklist.AppendReply`). The web and runtime images must ship together: a runtime
   from before this rule posts its reply inside the item, where it is now ignored.

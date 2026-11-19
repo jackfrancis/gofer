@@ -398,6 +398,45 @@ func (h *Handler) HideMessage(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
 }
 
+// HideItem handles POST /items/hide. It hides one whole item from the owner's radar
+// ("hidden", default true) or brings it back ("hidden=false"). A hidden item stays in
+// the store with its thread, is skipped by every bulk action, and resurfaces on its
+// own once a refresh brings a GitHub update newer than the hide
+// (worklist.HiddenAfter). It redirects to the radar, or back to the item's thread
+// when the form says so ("back=thread"). SameSite=Lax cookies give baseline CSRF
+// protection.
+func (h *Handler) HideItem(w http.ResponseWriter, r *http.Request) {
+	user := h.sessions.CurrentUser(r)
+	if user == nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	id := r.FormValue("id")
+	hidden := r.FormValue("hidden") != "false"
+	if id != "" {
+		at := h.now().UTC()
+		_ = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+			for i := range current {
+				if current[i].ID != id {
+					continue
+				}
+				if hidden {
+					current[i].Meta.HiddenAt = at
+				} else {
+					current[i].Meta.HiddenAt = time.Time{}
+				}
+				return current[i : i+1], nil
+			}
+			return nil, nil // item gone
+		})
+	}
+	if r.FormValue("back") == "thread" && id != "" {
+		http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
 // reviewPrompt is the message posted to every pull request's thread by the
 // "Review all PRs" action. Kept deliberately simple; the converse runtime gathers
 // the PR's diff and discussion as source context before answering.
@@ -437,8 +476,8 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		var changed []worklist.WorkItem
 		refs = refs[:0]
 		for _, it := range current {
-			if it.Type != worklist.TypePullRequest {
-				continue
+			if it.Type != worklist.TypePullRequest || !it.OnRadar() {
+				continue // a hidden or closed PR is off the radar: never review it in bulk
 			}
 			if it.HasReview() {
 				continue // already reviewed at least once — a first-review is no longer needed

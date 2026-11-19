@@ -117,6 +117,9 @@ body {
 
 /* Discuss affordance + assistive conversation thread. */
 .zz-item-actions { display: flex; gap: 8px; align-items: flex-start; }
+.zz-item-actions form { margin: 0; }
+.zz-thread-head .zz-meta form { margin: 0; }
+.zz-hidden-item { font-style: italic; }
 .btn-sm { padding: 2px 8px; font-size: 12px; }
 .zz-discuss { white-space: nowrap; }
 .zz-discuss--unread { border-color: var(--accent); color: var(--accent); font-weight: 600; }
