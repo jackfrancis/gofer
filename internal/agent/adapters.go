@@ -114,9 +114,15 @@ func (s *StoreSink) WithPolicy(p worklist.RunPolicy) *StoreSink {
 	return s
 }
 
-// List returns the owner's persisted work.
+// List returns the owner's persisted work, classified by the sink's policy
+// (worklist.RunPolicy.Classify), as the agent plane serves it.
 func (s *StoreSink) List(ctx context.Context) ([]worklist.WorkItem, error) {
-	return s.store.List(ctx, s.ownerID)
+	items, err := s.store.List(ctx, s.ownerID)
+	if err != nil {
+		return nil, err
+	}
+	s.policy.Classify(items)
+	return items, nil
 }
 
 // Ingest stamps a run's items with the sink's policy (on a copy; the caller's items

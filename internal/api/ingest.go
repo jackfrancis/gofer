@@ -128,5 +128,8 @@ func (h *IngestHandler) List(w http.ResponseWriter, r *http.Request) {
 	if items == nil {
 		items = []worklist.WorkItem{}
 	}
+	// Classify by the current bot list, so a run ranks by the same classification
+	// its write-back will store.
+	h.policy.Classify(items)
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }

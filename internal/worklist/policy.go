@@ -37,13 +37,22 @@ func (p RunPolicy) IsBot(login string) bool {
 //   - Meta.Origin is always OriginAgent. A workload's metadata is agent-derived,
 //     whatever the run sent, so a run cannot claim the human override (OriginUser)
 //     that Resolve leaves unrescored.
-//   - Signals.ReviewRequestedByBot is derived from Signals.ReviewRequestedBy against
-//     the bot list, replacing any value the run sent. A review a bot requested
-//     reaches the ranker as an automated assignment; a human request keeps its
-//     urgency signal.
+//   - Signals.ReviewRequestedByBot is re-derived (Classify).
 func (p RunPolicy) Apply(items []WorkItem) {
 	for i := range items {
 		items[i].Meta.Origin = OriginAgent
+	}
+	p.Classify(items)
+}
+
+// Classify sets Signals.ReviewRequestedByBot, in place, from
+// Signals.ReviewRequestedBy against the bot list, replacing any stored or sent
+// value. A review a bot requested reaches the ranker as an automated assignment; a
+// human request keeps its urgency signal. The agent plane classifies what a run
+// reads as well as what it writes, so a run ranks an item by the current bot list,
+// not by the flag stored before an upgrade or a change to BOT_REVIEWERS.
+func (p RunPolicy) Classify(items []WorkItem) {
+	for i := range items {
 		items[i].Signals.ReviewRequestedByBot = p.IsBot(items[i].Signals.ReviewRequestedBy)
 	}
 }

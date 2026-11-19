@@ -68,3 +68,26 @@ func TestRankSeesBotReviewPolicy(t *testing.T) {
 		}
 	}
 }
+
+// A standalone rank ranks stored items by the current bot list: an item stored with
+// a stale flag (before an upgrade, or before BOT_REVIEWERS changed) reaches the
+// ranker with the classification its write-back stores.
+func TestRankClassifiesStoredItemsByCurrentPolicy(t *testing.T) {
+	ctx := context.Background()
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", worklist.WorkItem{ID: "bot", OwnerID: "u1",
+		Signals: worklist.Signals{ReviewRequestedBy: "k8s-ci-robot"}}) // stored flag: false
+	sink := NewStoreSink(store, "u1").WithPolicy(worklist.NewRunPolicy([]string{"k8s-ci-robot"}))
+
+	ranker := &recordingRanker{seen: map[string]worklist.WorkItem{}}
+	if err := runRank(ctx, Params{Ranker: ranker}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if !ranker.seen["bot"].Signals.ReviewRequestedByBot {
+		t.Fatal("the ranker saw the stale stored flag, not the current classification")
+	}
+	items, _ := store.List(ctx, "u1")
+	if len(items) != 1 || !items[0].Signals.ReviewRequestedByBot {
+		t.Fatalf("stored after rank: %+v", items)
+	}
+}

@@ -25,7 +25,6 @@ import (
 
 const (
 	defaultBaseURL = "https://api.github.com"
-	perPage        = 50      // timeline page size
 	searchPerPage  = 100     // the search API's maximum, so a full walk costs the fewest calls
 	maxBody        = 8 << 20 // 8 MiB
 	// searchResultCap is GitHub's hard ceiling on a single search query: it refuses

@@ -247,3 +247,37 @@ func TestAgentIngestAppliesRunPolicy(t *testing.T) {
 		}
 	}
 }
+
+// GET /agent/worklist serves the bot flag by the current policy, not the stored
+// value, so a run ranks by the classification its write-back will store (after an
+// upgrade or a change to BOT_REVIEWERS).
+func TestAgentListClassifiesByCurrentPolicy(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	store.Seed("u1",
+		worklist.WorkItem{ID: "stale-human", OwnerID: "u1", Signals: worklist.Signals{ReviewRequestedBy: "k8s-ci-robot"}},
+		worklist.WorkItem{ID: "stale-bot", OwnerID: "u1", Signals: worklist.Signals{ReviewRequestedBy: "alice", ReviewRequestedByBot: true}},
+	)
+	h := NewIngestHandler(store, nil, worklist.NewRunPolicy([]string{"k8s-ci-robot"}))
+	req := httptest.NewRequest(http.MethodGet, "/agent/worklist", nil)
+	req = req.WithContext(principal.NewContext(req.Context(), &principal.Principal{
+		Kind: principal.KindWorkload, Subject: "run1", ActingUserID: "u1", Scopes: []principal.Scope{principal.ScopeSignalsRead},
+	}))
+	rec := httptest.NewRecorder()
+	h.List(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+	var body struct {
+		Items []worklist.WorkItem `json:"items"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, it := range body.Items {
+		got[it.ID] = it.Signals.ReviewRequestedByBot
+	}
+	if !got["stale-human"] || got["stale-bot"] {
+		t.Fatalf("served flags %v, want stale-human=true stale-bot=false", got)
+	}
+}

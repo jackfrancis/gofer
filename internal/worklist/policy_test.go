@@ -78,3 +78,63 @@ func TestRunPolicyWorkloadCannotClaimOverride(t *testing.T) {
 		t.Fatalf("Resolve kept the run's claimed metadata: origin %q rank %v, want agent rank %v", got.Origin, got.Rank, want.Rank)
 	}
 }
+
+// The deterministic scorer (used with AI disabled, by the stub ranker, and to choose
+// which items get a model call) discounts a bot's review request: no awaiting-me
+// pressure and a low floor, while a human's request keeps its urgency and other
+// signals such as a deadline or an assignment still count.
+func TestScoreDiscountsBotReviewRequest(t *testing.T) {
+	now := time.Date(2026, 3, 10, 0, 0, 0, 0, time.UTC)
+	review := func(bot bool, extra ...Reason) WorkItem {
+		return WorkItem{Signals: Signals{
+			Reasons:              append([]Reason{ReasonReviewRequested}, extra...),
+			ReviewRequestedBy:    map[bool]string{true: "k8s-ci-robot", false: "alice"}[bot],
+			ReviewRequestedByBot: bot,
+			AwaitingMeSince:      now.Add(-5 * 24 * time.Hour),
+		}}
+	}
+	stub := &StubRanker{now: func() time.Time { return now }}
+	urgency := func(it WorkItem) (score, stubbed float64) {
+		t.Helper()
+		p, err := stub.Propose(context.Background(), it)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return Score(it, now).Urgency, p.Urgency
+	}
+
+	if s, p := urgency(review(false)); s != 1 || p != 1 {
+		t.Errorf("human request, 5 days: urgency score=%v stub=%v, want 1", s, p)
+	}
+	if s, p := urgency(review(true)); s != botReviewUrgency || p != botReviewUrgency {
+		t.Errorf("bot request, 5 days: urgency score=%v stub=%v, want %v", s, p, botReviewUrgency)
+	}
+	if s, _ := urgency(review(true, ReasonAssignee)); s != 0.6 {
+		t.Errorf("bot request on an assignee: urgency %v, want the explicit floor 0.6", s)
+	}
+	withDeadline := review(true)
+	withDeadline.Signals.DeadlineAt = now.Add(-time.Hour)
+	if s, _ := urgency(withDeadline); s != 1 {
+		t.Errorf("bot request past a deadline: urgency %v, want the deadline's 1", s)
+	}
+
+	if h, b := Score(review(false), now).Relevance, Score(review(true), now).Relevance; b >= h || b != botReviewRelevance {
+		t.Errorf("relevance: human %v, bot %v; want bot = %v, below human", h, b, botReviewRelevance)
+	}
+	if r := Score(review(true, ReasonAssignee), now).Relevance; r < 0.9 {
+		t.Errorf("bot request on an assignee: relevance %v, want the assignment's weight", r)
+	}
+	if Score(review(false), now).Rank <= Score(review(true), now).Rank {
+		t.Error("a bot's review request ranks at or above a human's")
+	}
+}
+
+// Classify re-derives the flag only; it leaves the origin alone, so the read path
+// can use it without touching a stored override.
+func TestRunPolicyClassifyLeavesOrigin(t *testing.T) {
+	items := []WorkItem{{Signals: Signals{ReviewRequestedBy: "k8s-ci-robot"}, Meta: Metadata{Origin: OriginUser}}}
+	NewRunPolicy([]string{"k8s-ci-robot"}).Classify(items)
+	if !items[0].Signals.ReviewRequestedByBot || items[0].Meta.Origin != OriginUser {
+		t.Fatalf("Classify: bot=%v origin=%q", items[0].Signals.ReviewRequestedByBot, items[0].Meta.Origin)
+	}
+}

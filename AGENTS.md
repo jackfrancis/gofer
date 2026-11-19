@@ -161,7 +161,13 @@ Wired on the web-tier side; they define what a runtime must respect:
   `StoreSink`): workload metadata is stamped `OriginAgent`, so a run cannot claim the
   `OriginUser` override that `Resolve` leaves unrescored, and
   `Signals.ReviewRequestedByBot` is derived from `ReviewRequestedBy` against
-  `BOT_REVIEWERS` (case-insensitive), replacing whatever the run sent. The web and runtime images must ship together: a runtime
+  `BOT_REVIEWERS` (case-insensitive), replacing whatever the run sent. The agent
+  plane's reads (`GET /agent/worklist`, `StoreSink.List`) re-derive the flag too
+  (`RunPolicy.Classify`), so a run ranks by the current bot list. The requester is
+  the latest `review_requested` for the user on the timeline, unless a later
+  `review_request_removed` withdrew it; a timeline longer than the pages read leaves
+  it unknown. The deterministic scorer discounts a bot's request (no awaiting-me
+  pressure, low floors) unless the user is also an assignee. The web and runtime images must ship together: a runtime
   from before this rule posts its reply inside the item, where it is now ignored.
 - Replies can land out of order, so a turn's position does not say what it answers.
   Every new turn gets an ID; an agent turn's `ReplyTo` names the user turn it
