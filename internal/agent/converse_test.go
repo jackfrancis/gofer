@@ -22,12 +22,14 @@ func deadGitHub(t *testing.T) string {
 
 type fakeConverser struct {
 	reply      string
+	gotItem    worklist.WorkItem
 	gotUser    string
 	gotHistory []worklist.Message
 	gotTools   worklist.ToolBox
 }
 
-func (f *fakeConverser) Reply(_ context.Context, _ worklist.WorkItem, _ string, _ string, history []worklist.Message, userText string, tools worklist.ToolBox) (string, error) {
+func (f *fakeConverser) Reply(_ context.Context, item worklist.WorkItem, _ string, _ string, history []worklist.Message, userText string, tools worklist.ToolBox) (string, error) {
+	f.gotItem = item
 	f.gotUser = userText
 	f.gotHistory = history
 	f.gotTools = tools
