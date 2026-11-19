@@ -21,8 +21,10 @@ func TestMergeRunItemsKeepsOwnerState(t *testing.T) {
 		Thread:       []Message{{Role: RoleUser, Content: "q", At: t0}, {Role: RoleAgent, Content: "r", At: t1, Hidden: true}, {Role: RoleUser, Content: "q2", At: t2}},
 		ThreadReadAt: t1,
 		Meta:         Metadata{HiddenAt: t1, Rank: 0.1},
-		Signals:      Signals{Comments: 1},
-		CreatedAt:    t0,
+		// The read cursor names the reply at position 1 (a legacy, ID-less turn).
+		ThreadReadThrough: "pos:1",
+		Signals:           Signals{Comments: 1},
+		CreatedAt:         t0,
 	}
 	// The run read the item before q2 and the hide, then changed the signals.
 	run := WorkItem{
@@ -40,6 +42,9 @@ func TestMergeRunItemsKeepsOwnerState(t *testing.T) {
 	if len(m.Thread) != 3 || m.Thread[2].Content != "q2" || !m.Thread[1].Hidden {
 		t.Fatalf("thread must be the stored one, got %+v", m.Thread)
 	}
+	if m.ThreadReadThrough != "pos:1" {
+		t.Fatalf("the read cursor must be the stored one, got %q", m.ThreadReadThrough)
+	}
 	if !m.ThreadReadAt.Equal(t1) || !m.Meta.HiddenAt.Equal(t1) || !m.CreatedAt.Equal(t0) {
 		t.Fatalf("read cursor, hidden flag and creation time must be the stored ones, got %v %v %v", m.ThreadReadAt, m.Meta.HiddenAt, m.CreatedAt)
 	}
@@ -56,9 +61,11 @@ func TestMergeRunItemsNewItemCarriesNoOwnerState(t *testing.T) {
 		ThreadReadAt: t0,
 		Meta:         Metadata{HiddenAt: t0, Rank: 0.4},
 		CreatedAt:    t0,
+		// A forged read cursor, too.
+		ThreadReadThrough: "pos:0",
 	}
 	got := MergeRunItems(nil, []WorkItem{run})
-	if len(got) != 1 || got[0].Thread != nil || !got[0].ThreadReadAt.IsZero() || !got[0].Meta.HiddenAt.IsZero() {
+	if len(got) != 1 || got[0].Thread != nil || !got[0].ThreadReadAt.IsZero() || got[0].ThreadReadThrough != "" || !got[0].Meta.HiddenAt.IsZero() {
 		t.Fatalf("a new item must carry no owner state, got %+v", got[0])
 	}
 	if got[0].Meta.Rank != 0.4 || !got[0].CreatedAt.Equal(t0) {

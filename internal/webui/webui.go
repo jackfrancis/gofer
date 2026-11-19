@@ -258,7 +258,7 @@ func (h *Handler) Index(w http.ResponseWriter, r *http.Request) {
 // Thread handles GET /items/thread?id=<item id>. It renders the per-item
 // assistive conversation for the signed-in owner. While a user turn awaits its reply,
 // the page auto-refreshes so the assistant's answer appears when the converse run
-// lands.
+// lands. Rendering marks the newest reply shown as read (worklist.MarkThreadRead).
 func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
 	if user == nil {
@@ -281,6 +281,11 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 			} else if it.ReplyStalled(now, reviewStaleAfter) {
 				data.ReplyStalled = true // no reply within the window — show a retry hint, stop spinning
 			}
+			// Rendering the thread is the read receipt (the UI has no script to send
+			// one). Acknowledge the newest reply on this page, by its key, so a reply
+			// that lands after the page was built stays unread. A failed write only
+			// leaves the item unread.
+			_ = worklist.MarkThreadRead(r.Context(), h.store, user.ID, it.ID, it.LatestReplyKey())
 			h.render(w, http.StatusOK, data)
 			return
 		}
@@ -351,11 +356,12 @@ func (h *Handler) ResetConversations(w http.ResponseWriter, r *http.Request) {
 	_ = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		var cleared []worklist.WorkItem
 		for _, it := range current {
-			if len(it.Thread) == 0 && it.ThreadReadAt.IsZero() {
+			if len(it.Thread) == 0 && it.ThreadReadAt.IsZero() && it.ThreadReadThrough == "" {
 				continue
 			}
 			it.Thread = nil
 			it.ThreadReadAt = time.Time{}
+			it.ThreadReadThrough = ""
 			cleared = append(cleared, it)
 		}
 		return cleared, nil

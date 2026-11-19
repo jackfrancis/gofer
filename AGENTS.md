@@ -168,6 +168,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   parameter `turn`). Review and pending state (`HasReview`, `ReplyPending`, …) follow
   those links. Turns stored before IDs are keyed by position (`WorkItem.TurnKey`),
   and a legacy reply answers the user turn directly before it.
+- The read cursor (`WorkItem.ThreadReadThrough`) is the key of the newest agent
+  turn the owner has seen, never a time: reply times are stamped by the run and
+  replies land out of order. Rendering the thread page is the read receipt (the UI
+  has no script): `webui.Thread` acknowledges the newest reply it loaded
+  (`worklist.MarkThreadRead`), so a reply landing mid-request stays unread. The
+  cursor only moves forward, and an unchanged one costs no write.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

@@ -37,12 +37,14 @@ func MergeRunItems(current, incoming []WorkItem) []WorkItem {
 		if !ok {
 			it.Thread = nil
 			it.ThreadReadAt = time.Time{}
+			it.ThreadReadThrough = ""
 			it.Meta.HiddenAt = time.Time{}
 			out = append(out, it)
 			continue
 		}
 		it.Thread = old.Thread
 		it.ThreadReadAt = old.ThreadReadAt
+		it.ThreadReadThrough = old.ThreadReadThrough
 		it.Meta.HiddenAt = HiddenAfter(old.Meta.HiddenAt, it.GitHub.UpdatedAt)
 		if !old.CreatedAt.IsZero() {
 			it.CreatedAt = old.CreatedAt

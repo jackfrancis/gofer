@@ -123,9 +123,19 @@ type WorkItem struct {
 	Signals Signals   `json:"signals"`          // observed facts that feed scoring
 	Meta    Metadata  `json:"gofer"`            // gofer's judgment derived from Signals
 	Thread  []Message `json:"thread,omitempty"` // assistive conversation (ported later)
-	// ThreadReadAt is when the owner last read the thread; zero means never. An
-	// agent reply newer than this is "unread", so the radar can flag threads with
-	// a response the user hasn't seen yet.
+	// ThreadReadThrough is the read cursor: the key (TurnKey) of the newest agent
+	// turn the owner has seen, set when the thread page renders it (MarkRead). An
+	// agent turn after it in the thread is "unread", so the radar can flag threads
+	// with a response the user hasn't seen yet. Empty means never read; a key no
+	// longer in the thread (it was cleared) reads as nothing seen.
+	//
+	// The cursor names a turn rather than a time because a reply's time is stamped
+	// by the run that wrote it, and replies land out of order: a reply that arrives
+	// after the page was built can carry an older time than the one shown.
+	ThreadReadThrough string `json:"thread_read_through,omitempty"`
+	// ThreadReadAt is the legacy, time-based read cursor: an agent reply newer than
+	// it is unread. It applies only while ThreadReadThrough is empty, and gofer no
+	// longer sets it.
 	ThreadReadAt time.Time `json:"thread_read_at,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
