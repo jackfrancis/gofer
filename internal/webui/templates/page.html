@@ -49,7 +49,7 @@
         {{else}}
         <p>We couldn't load your work right now. Try again in a moment.</p>
         {{end}}
-        <div class="zz-actions"><a class="btn btn-primary" href="/">Try again</a></div>
+        <div class="zz-actions"><a class="btn btn-primary" href="{{with .RetryURL}}{{.}}{{else}}/{{end}}">Try again</a></div>
       </div>
 
     {{else if eq .View "thread"}}

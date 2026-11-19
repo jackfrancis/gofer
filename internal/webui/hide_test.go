@@ -221,7 +221,12 @@ func TestHideItemReportsFailedWrite(t *testing.T) {
 	mem := worklist.NewMemoryStore()
 	mem.Seed("u1", worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest})
 	h := New(fakeSessions{&session.User{ID: "u1"}}, failingStore{mem}, &recordPipeline{}, reconnectProviders{}, true, nil)
-	for body, verb := range map[string]string{"id=pr1": "hide", "id=pr1&hidden=false&back=thread": "unhide"} {
+	for _, tc := range []struct{ body, verb, retry string }{
+		{"id=pr1", "hide", `href="/"`},                                               // the radar row still offers Hide
+		{"id=pr1&hidden=false", "unhide", `href="/?hidden=pr1"`},                     // the radar's Undo for the still-hidden item
+		{"id=pr1&hidden=false&back=thread", "unhide", `href="/items/thread?id=pr1"`}, // the thread's Unhide
+	} {
+		body, verb := tc.body, tc.verb
 		req := httptest.NewRequest(http.MethodPost, "/items/hide", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		rec := httptest.NewRecorder()
@@ -232,6 +237,9 @@ func TestHideItemReportsFailedWrite(t *testing.T) {
 		out := rec.Body.String()
 		if !strings.Contains(out, "gofer couldn&#39;t "+verb+" that item") || strings.Contains(out, "discovering your work") {
 			t.Fatalf("%s: the page must explain the failed change, got:\n%s", verb, out)
+		}
+		if !strings.Contains(out, tc.retry+">Try again</a>") {
+			t.Fatalf("%s (%s): Try again must lead back to the same action (%s), got:\n%s", verb, body, tc.retry, out)
 		}
 	}
 }
@@ -288,5 +296,39 @@ func TestResetCountIncludesOffRadarThreads(t *testing.T) {
 	h.Index(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	if out := rec.Body.String(); !strings.Contains(out, "Reset Conversations (3)") {
 		t.Fatalf("Reset clears three threads (one visible, one hidden, one closed), so it must say 3, got:\n%s", out)
+	}
+}
+
+// countingStore counts full worklist reads.
+type countingStore struct {
+	worklist.Store
+	lists int
+}
+
+func (c *countingStore) List(ctx context.Context, owner string) ([]worklist.WorkItem, error) {
+	c.lists++
+	return c.Store.List(ctx, owner)
+}
+
+// The radar, with its Reset count and Undo banner, is built from one read of the
+// worklist, so the two can never disagree about an item hidden in between.
+func TestRadarReadsWorklistOnce(t *testing.T) {
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	thread := []worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: "q"}}
+	hidden := worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest, Thread: thread, GitHub: worklist.GitHubRef{Title: "Hidden PR"}}
+	hidden.Meta.HiddenAt = now
+	mem := worklist.NewMemoryStore()
+	mem.Seed("u1", hidden, worklist.WorkItem{ID: "pr2", Type: worklist.TypePullRequest, Thread: thread})
+	store := &countingStore{Store: mem}
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{}, true, nil)
+
+	rec := httptest.NewRecorder()
+	h.Index(rec, httptest.NewRequest(http.MethodGet, "/?hidden=pr1", nil))
+	out := rec.Body.String()
+	if store.lists != 1 {
+		t.Fatalf("the radar read the worklist %d times, want 1", store.lists)
+	}
+	if !strings.Contains(out, "Reset Conversations (2)") || !strings.Contains(out, ">Undo</button>") {
+		t.Fatalf("Reset count and Undo must still come from that one read, got:\n%s", out)
 	}
 }

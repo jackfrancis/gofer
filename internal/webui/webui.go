@@ -243,6 +243,7 @@ type pageData struct {
 	Message                  string             // failure detail rendered on the error view
 	Failure                  string             // a failed user action, rendered on the error view in place of the discovery wording
 	JustHidden               *worklist.WorkItem // the item the user just hid, offered for Undo on the radar
+	RetryURL                 string             // where the error view's "Try again" goes; empty = the radar
 	SignInRequired           bool               // gofer holds no usable credential: prompt the user to sign in again
 }
 
@@ -447,8 +448,18 @@ func (h *Handler) HideItem(w http.ResponseWriter, r *http.Request) {
 		if !hidden {
 			verb = "unhide"
 		}
-		h.render(w, http.StatusInternalServerError, pageData{View: "error", User: user,
-			Failure: "gofer couldn't " + verb + " that item. Nothing was changed; go back and try again."})
+		// "Try again" returns to a page that still offers the same action: the radar row
+		// (hide), the thread's Unhide (unhide from the thread), or the radar's Undo for
+		// the item, which is still hidden (unhide from the radar).
+		retry := "/"
+		switch {
+		case !hidden && r.FormValue("back") == "thread":
+			retry = "/items/thread?id=" + url.QueryEscape(id)
+		case !hidden:
+			retry = "/?hidden=" + url.QueryEscape(id)
+		}
+		h.render(w, http.StatusInternalServerError, pageData{View: "error", User: user, RetryURL: retry,
+			Failure: "gofer couldn't " + verb + " that item. Nothing was changed; try again."})
 		return
 	}
 	switch {
@@ -707,21 +718,22 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 				secondCount++
 				firstModels[it.FirstReviewModel()] = struct{}{}
 			}
+			if len(it.Thread) > 0 {
+				resetCount++
+			}
 		}
-		// The radar shows only items on it, but Reset clears every stored thread, hidden
-		// and closed items' included, so its count comes from the whole store; and the
-		// item just hidden is found there too, to offer Undo. If that read fails the
-		// Reset button is withheld rather than shown with a count that undersells it.
+		// The radar lists only items on it, but Reset clears every stored thread, hidden
+		// and closed items' included; and the item just hidden is off the radar, to be
+		// offered for Undo. Both come from Resolve's same read (res.OffRadar), so the
+		// page never offers Hide and Undo for one item.
 		var justHidden *worklist.WorkItem
 		hiddenID := r.URL.Query().Get("hidden")
-		if all, err := h.store.List(r.Context(), user.ID); err == nil {
-			for _, it := range all {
-				if len(it.Thread) > 0 {
-					resetCount++
-				}
-				if hiddenID != "" && it.ID == hiddenID && !it.Meta.HiddenAt.IsZero() {
-					justHidden = &it
-				}
+		for i, it := range res.OffRadar {
+			if len(it.Thread) > 0 {
+				resetCount++
+			}
+			if hiddenID != "" && it.ID == hiddenID && !it.Meta.HiddenAt.IsZero() {
+				justHidden = &res.OffRadar[i]
 			}
 		}
 		data := pageData{

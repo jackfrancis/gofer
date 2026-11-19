@@ -1,6 +1,7 @@
 package worklist
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -67,5 +68,28 @@ func TestOnRadarGatesBulkPredicates(t *testing.T) {
 		if r.NeedsSecondOpinion(now, stale) {
 			t.Errorf("%s: the second-opinion batch must not draw a %s PR", name, name)
 		}
+	}
+}
+
+// Resolve lists only on-radar items, and hands back the hidden and completed ones it
+// left out from the same read (OffRadar).
+func TestResolveSplitsOffRadarItems(t *testing.T) {
+	store := NewMemoryStore()
+	hidden := WorkItem{ID: "h", Type: TypePullRequest, Meta: Metadata{HiddenAt: t1}}
+	closed := WorkItem{ID: "c", Type: TypePullRequest, Meta: Metadata{CompletedAt: t1}}
+	store.Seed("u1", hidden, WorkItem{ID: "v", Type: TypePullRequest}, closed)
+	res, err := Resolve(context.Background(), store, nil, t3, "u1", DefaultSort, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Items) != 1 || res.Items[0].ID != "v" {
+		t.Fatalf("Items = %+v, want only the visible item", res.Items)
+	}
+	off := map[string]bool{}
+	for _, it := range res.OffRadar {
+		off[it.ID] = true
+	}
+	if len(res.OffRadar) != 2 || !off["h"] || !off["c"] {
+		t.Fatalf("OffRadar = %+v, want the hidden and the closed item", res.OffRadar)
 	}
 }
