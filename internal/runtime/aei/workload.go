@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/jackfrancis/agent-execution-interface/aeiruntime"
 
@@ -25,7 +26,47 @@ import (
 // and reports the terminal outcome — one shot on a workload substrate, or a standing
 // actor loop on a durable one, selected by the platform rather than by this code.
 func RunWorkload() {
-	aeiruntime.Main(os.Getenv, nil, work)
+	aeiruntime.Main(os.Getenv, nil, measured(work))
+}
+
+// measured wraps fn so the run reports what it spent on the model. The SDK's own
+// completion report carries only provisioning and runtime seconds, so the wrapper
+// attaches an llm.Collector to the run's context, times the run itself, and reports
+// the terminal outcome with the full Timing (model seconds, model calls, tool calls)
+// before handing fn's result back. The control plane keeps the first terminal report
+// it receives for a run, so the SDK's report after this one is a no-op; if this one
+// fails to land, the SDK's still reports the outcome, without the model numbers.
+func measured(fn func(context.Context, *aeiruntime.Runtime) error) func(context.Context, *aeiruntime.Runtime) error {
+	return func(ctx context.Context, rt *aeiruntime.Runtime) error {
+		start := time.Now()
+		ctx, collector := llm.WithCollector(ctx)
+		runErr := fn(ctx, rt)
+
+		timing := aeiruntime.Timing{
+			RuntimeSeconds: time.Since(start).Seconds(),
+			ModelSeconds:   collector.ModelDuration().Seconds(),
+			ModelCalls:     collector.ModelCalls(),
+			ToolCalls:      collector.ToolCalls(),
+		}
+		// Provisioning is dispatch-start to work-start, measured the way the SDK does.
+		if at := rt.Spec().DispatchedAt; !at.IsZero() {
+			if d := start.Sub(at); d > 0 {
+				timing.ProvisioningSeconds = d.Seconds()
+			}
+		}
+		log := slog.Default() // work routes it to the run's JSON handler
+		log.Info("gofer runtime finished", "run", rt.Spec().RunID, "ok", runErr == nil,
+			"runtime_seconds", timing.RuntimeSeconds, "model_seconds", timing.ModelSeconds,
+			"model_calls", timing.ModelCalls, "tool_calls", timing.ToolCalls)
+
+		// A fresh context, so the report still lands after the run's deadline cancelled ctx.
+		reportCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := rt.Complete(reportCtx, runErr, timing, ""); err != nil {
+			log.Warn("completion report with model timing failed; the SDK reports the outcome without it", "run", rt.Spec().RunID, "err", err)
+		}
+		return runErr
+	}
 }
 
 // work executes one gofer job for the loaded run. It is gofer's workload (agent.Run)

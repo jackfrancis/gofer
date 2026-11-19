@@ -177,6 +177,7 @@ func (c *Converser) Reply(ctx context.Context, item worklist.WorkItem, viewerLog
 			if c.log != nil {
 				c.log.Info("converse tool call", "name", tc.Function.Name)
 			}
+			recordToolCall(ctx)
 			result, err := tools.Invoke(ctx, tc.Function.Name, json.RawMessage(tc.Function.Arguments))
 			if errors.Is(err, worklist.ErrSignInRequired) {
 				// The user's GitHub access is gone: that ends the turn, it is not a

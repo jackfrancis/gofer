@@ -88,6 +88,13 @@ func modelStub(t *testing.T) *httptest.Server {
 // AEI runtime ABI): the run id, the workload, its parameters, and the run credential.
 func loadRun(t *testing.T, taskRef string, params map[string]string) *aeiruntime.Runtime {
 	t.Helper()
+	return loadRunWith(t, taskRef, params, nil)
+}
+
+// loadRunWith is loadRun with extra or overriding ABI variables (a reachable control
+// URL, a dispatch time).
+func loadRunWith(t *testing.T, taskRef string, params, extra map[string]string) *aeiruntime.Runtime {
+	t.Helper()
 	encoded, err := json.Marshal(params)
 	if err != nil {
 		t.Fatalf("encode params: %v", err)
@@ -98,6 +105,9 @@ func loadRun(t *testing.T, taskRef string, params map[string]string) *aeiruntime
 		aeiruntime.EnvParams:     string(encoded),
 		aeiruntime.EnvControlURL: "http://aei-controller.invalid",
 		aeiruntime.EnvCredential: "run-credential",
+	}
+	for k, v := range extra {
+		env[k] = v
 	}
 	rt, err := aeiruntime.Load(context.Background(), func(k string) string { return env[k] }, nil)
 	if err != nil {
