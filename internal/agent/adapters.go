@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -91,17 +92,26 @@ func (v *VaultVendor) VendCredential(ctx context.Context, provider, _ string) (V
 
 // StoreSink is the in-process Sink: it reads and writes gofer's worklist store,
 // scoping every call to the run's owner — the same scoping the agent plane enforces
-// from the run credential.
+// from the run credential. Like the agent plane, it applies the web tier's
+// write-back policy (worklist.RunPolicy) before merging.
 type StoreSink struct {
 	store   worklist.Store
 	ownerID string
+	policy  worklist.RunPolicy
 }
 
 var _ Sink = (*StoreSink)(nil)
 
-// NewStoreSink binds a sink to one run's owner.
+// NewStoreSink binds a sink to one run's owner. It applies a policy with no bot
+// reviewers; use WithPolicy to set the configured one.
 func NewStoreSink(s worklist.Store, ownerID string) *StoreSink {
-	return &StoreSink{store: s, ownerID: ownerID}
+	return &StoreSink{store: s, ownerID: ownerID, policy: worklist.NewRunPolicy(nil)}
+}
+
+// WithPolicy sets the write-back policy the sink applies, and returns the sink.
+func (s *StoreSink) WithPolicy(p worklist.RunPolicy) *StoreSink {
+	s.policy = p
+	return s
 }
 
 // List returns the owner's persisted work.
@@ -109,12 +119,15 @@ func (s *StoreSink) List(ctx context.Context) ([]worklist.WorkItem, error) {
 	return s.store.List(ctx, s.ownerID)
 }
 
-// Ingest merges a run's items into the owner's stored items (worklist.MergeRunItems),
-// atomically. An empty batch is a no-op.
+// Ingest stamps a run's items with the sink's policy (on a copy; the caller's items
+// are untouched) and merges them into the owner's stored items
+// (worklist.MergeRunItems), atomically. An empty batch is a no-op.
 func (s *StoreSink) Ingest(ctx context.Context, items []worklist.WorkItem) error {
 	if len(items) == 0 {
 		return nil
 	}
+	items = slices.Clone(items)
+	s.policy.Apply(items)
 	return s.store.Update(ctx, s.ownerID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		return worklist.MergeRunItems(current, items), nil
 	})

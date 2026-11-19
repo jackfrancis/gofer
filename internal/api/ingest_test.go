@@ -32,7 +32,7 @@ func TestAgentIngestWithRunToken(t *testing.T) {
 	)
 
 	store := worklist.NewMemoryStore()
-	h := NewIngestHandler(store, nil)
+	h := NewIngestHandler(store, nil, worklist.NewRunPolicy(nil))
 	ingest := auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Ingest))
 
 	body, _ := json.Marshal(map[string]any{"items": []worklist.WorkItem{
@@ -92,7 +92,7 @@ func newPlane(t *testing.T) planeFixture {
 		authn.NewIdentityValidator(identity.NewEd25519Verifier(pub, "gofer-agent")),
 	)
 	store := worklist.NewMemoryStore()
-	h := NewIngestHandler(store, nil)
+	h := NewIngestHandler(store, nil, worklist.NewRunPolicy(nil))
 	return planeFixture{
 		store:  store,
 		ingest: auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Ingest)),
@@ -190,5 +190,60 @@ func TestAgentReply(t *testing.T) {
 	// A token without metadata:write cannot reply.
 	if code := f.post(t, f.reply, "/agent/worklist/reply", f.mint("signals:read"), reply); code != http.StatusForbidden {
 		t.Fatalf("want 403 without metadata:write, got %d", code)
+	}
+}
+
+// The agent-plane write-back applies the web tier's policy: a review requested by a
+// configured bot is stored as an automated assignment, a human's request is stored
+// as a human ask whatever the run claims, and a run's metadata is stored as
+// agent-derived even when the run claims the human override.
+func TestAgentIngestAppliesRunPolicy(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	h := NewIngestHandler(store, nil, worklist.NewRunPolicy([]string{"k8s-ci-robot"}))
+	now := time.Now().UTC()
+
+	body, _ := json.Marshal(map[string]any{"items": []worklist.WorkItem{
+		{ID: "github:o/r#1", GitHub: worklist.GitHubRef{Number: 1, Repo: "o/r", UpdatedAt: now},
+			Signals: worklist.Signals{ReviewRequestedBy: "k8s-ci-robot", AwaitingMeSince: now.Add(-48 * time.Hour)},
+			Meta:    worklist.Metadata{Origin: worklist.OriginUser, Rank: 0.99}},
+		{ID: "github:o/r#2", GitHub: worklist.GitHubRef{Number: 2, Repo: "o/r", UpdatedAt: now},
+			Signals: worklist.Signals{ReviewRequestedBy: "alice", ReviewRequestedByBot: true, AwaitingMeSince: now.Add(-48 * time.Hour)}},
+	}})
+	req := httptest.NewRequest(http.MethodPost, "/agent/worklist", bytes.NewReader(body))
+	req = req.WithContext(principal.NewContext(req.Context(), &principal.Principal{
+		Kind: principal.KindWorkload, Subject: "run1", ActingUserID: "u1", Scopes: []principal.Scope{principal.ScopeMetadataWrite},
+	}))
+	rec := httptest.NewRecorder()
+	h.Ingest(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body)
+	}
+
+	items, _ := store.List(context.Background(), "u1")
+	byID := map[string]worklist.WorkItem{}
+	for _, it := range items {
+		byID[it.ID] = it
+	}
+	bot, human := byID["github:o/r#1"], byID["github:o/r#2"]
+	if !bot.Signals.ReviewRequestedByBot {
+		t.Error("a review requested by a configured bot was not stored as automated")
+	}
+	if human.Signals.ReviewRequestedByBot {
+		t.Error("a human's review request was stored as automated")
+	}
+	for _, it := range items {
+		if it.Meta.Origin != worklist.OriginAgent {
+			t.Errorf("%s: stored Origin = %q, want %q", it.ID, it.Meta.Origin, worklist.OriginAgent)
+		}
+	}
+	// The forged override does not survive the read model either.
+	res, err := worklist.Resolve(context.Background(), store, nil, now, "u1", worklist.SortRank, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range res.Items {
+		if it.ID == "github:o/r#1" && it.Meta.Rank == 0.99 {
+			t.Error("Resolve served the run's claimed rank instead of rescoring")
+		}
 	}
 }

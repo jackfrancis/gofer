@@ -15,8 +15,9 @@ import (
 // user's data. The routes are behind RequireScope, so only a workload token (never
 // a browser session) reaches them.
 type IngestHandler struct {
-	store worklist.Store
-	noter WritebackNoter
+	store  worklist.Store
+	noter  WritebackNoter
+	policy worklist.RunPolicy
 }
 
 // WritebackNoter is notified when a runtime writes its result back, with the run's
@@ -28,8 +29,9 @@ type WritebackNoter interface {
 
 // NewIngestHandler constructs an IngestHandler. noter (optional; may be nil) is
 // notified of each write-back so a batch action can be timed to the last review.
-func NewIngestHandler(store worklist.Store, noter WritebackNoter) *IngestHandler {
-	return &IngestHandler{store: store, noter: noter}
+// policy is applied to every write-back before it is merged (worklist.RunPolicy).
+func NewIngestHandler(store worklist.Store, noter WritebackNoter, policy worklist.RunPolicy) *IngestHandler {
+	return &IngestHandler{store: store, noter: noter, policy: policy}
 }
 
 type ingestRequest struct {
@@ -39,7 +41,9 @@ type ingestRequest struct {
 // Ingest handles POST /agent/worklist. It merges the runtime's items into the
 // acting user's stored items in one atomic update (worklist.MergeRunItems): the run's
 // derived fields land, and the owner's thread and other state are kept as stored now,
-// not as the run read them.
+// not as the run read them. Before the merge, the web tier's policy stamps the items
+// (worklist.RunPolicy.Apply): their metadata is agent-derived, and a review request
+// is classified against the bot list.
 func (h *IngestHandler) Ingest(w http.ResponseWriter, r *http.Request) {
 	p, ok := principal.FromContext(r.Context())
 	if !ok {
@@ -51,6 +55,7 @@ func (h *IngestHandler) Ingest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	h.policy.Apply(body.Items)
 	err := h.store.Update(r.Context(), p.ActingUserID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		return worklist.MergeRunItems(current, body.Items), nil
 	})

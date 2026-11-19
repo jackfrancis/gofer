@@ -79,8 +79,10 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	metric := metrics.New()
 	worklistHandler := api.NewWorklistHandler(store, ingestor)
 	// The runtime write-back sink also notifies the batch tracker (NoteWriteback), so
-	// a Review-all batch is timed to the instant its last review lands.
-	ingestHandler := api.NewIngestHandler(store, ingestor)
+	// a Review-all batch is timed to the instant its last review lands. It applies the
+	// write-back policy: workload metadata is agent-derived, and a review requested by
+	// one of BOT_REVIEWERS is flagged as an automated assignment for the ranker.
+	ingestHandler := api.NewIngestHandler(store, ingestor, worklist.NewRunPolicy(cfg.BotReviewers))
 	// The broker vends the single shared chat-model token as provider "ai", per run,
 	// so the sandbox never holds a standing model secret. Every model on this endpoint
 	// uses the same token; the model id travels as a run parameter. Per-user provider

@@ -156,7 +156,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   (`worklist.MergeRunItems`): runs own the GitHub fields, signals and scoring; the
   thread, read cursor, hidden flag and creation time always come from the store. A
   run adds a thread turn only through `POST /agent/worklist/reply`
-  (`worklist.AppendReply`). The web and runtime images must ship together: a runtime
+  (`worklist.AppendReply`). Before the merge, every write-back path applies
+  `worklist.RunPolicy` (the agent plane's ingest handler, and the in-process
+  `StoreSink`): workload metadata is stamped `OriginAgent`, so a run cannot claim the
+  `OriginUser` override that `Resolve` leaves unrescored, and
+  `Signals.ReviewRequestedByBot` is derived from `ReviewRequestedBy` against
+  `BOT_REVIEWERS` (case-insensitive), replacing whatever the run sent. The web and runtime images must ship together: a runtime
   from before this rule posts its reply inside the item, where it is now ignored.
 - Replies can land out of order, so a turn's position does not say what it answers.
   Every new turn gets an ID; an agent turn's `ReplyTo` names the user turn it
