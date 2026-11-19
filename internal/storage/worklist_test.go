@@ -195,6 +195,49 @@ func TestWorklistPersistsAcrossReopen(t *testing.T) {
 	same(t, got, scoped("alice", item("b", "edited"), item("a", "2"), item("c", "3")))
 }
 
+// A turn keeps one answer across a restart: the answered-turn rule reads the stored
+// thread, so a run that writes back after gofer restarted (a retry, or the first run
+// finishing late) is dropped.
+func TestOneAnswerPerTurnAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := worklist.WorkItem{ID: "a", Thread: []worklist.Message{
+		{ID: "q1", Role: worklist.RoleUser, Content: "review this", Kind: worklist.KindReviewRequest, At: time.Date(2026, 11, 2, 9, 0, 0, 0, time.UTC)},
+	}}
+	if err := db.Worklist().Upsert(ctx, "alice", q); err != nil {
+		t.Fatal(err)
+	}
+	first := worklist.Message{ID: "r1", Content: "first", Model: "m", At: time.Date(2026, 11, 2, 9, 1, 0, 0, time.UTC)}
+	if err := worklist.ApplyReply(ctx, db.Worklist(), "alice", "a", "q1", first); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s := open(t, dir).Worklist()
+	second := worklist.Message{ID: "r2", Content: "second", Model: "m", At: time.Date(2026, 11, 2, 9, 2, 0, 0, time.UTC)}
+	if err := worklist.ApplyReply(ctx, s, "alice", "a", "q1", second); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.List(ctx, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var answers []string
+	for _, m := range got[0].Thread {
+		if m.Role == worklist.RoleAgent {
+			answers = append(answers, m.Content)
+		}
+	}
+	if len(answers) != 1 || answers[0] != "first" {
+		t.Fatalf("want one stored answer, the first, got %q", answers)
+	}
+}
+
 // An Upsert is one transaction: if any item cannot be written, none is.
 func TestWorklistUpsertIsAtomic(t *testing.T) {
 	db := open(t, t.TempDir())

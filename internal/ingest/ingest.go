@@ -78,21 +78,6 @@ const (
 	retryAfter = ingestDeadline
 )
 
-// backfill is the most recent ingest run tracked for one owner, so a run that fails
-// can be surfaced (BackfillFailure) instead of leaving the worklist spinning, a run
-// that succeeds without producing work can be reported as genuinely empty
-// (BackfillSucceeded), and a healthy run is not re-dispatched by every poll of an
-// empty worklist. A terminal outcome is cached here, so the backend is probed once
-// per run rather than once per page render.
-type backfill struct {
-	id        string
-	at        time.Time
-	failed    bool
-	succeeded bool
-	message   string
-	logged    bool
-}
-
 // Ingestor turns web-tier actions into agent run requests and submits them through a
 // Dispatcher. It implements worklist.Ingestor and worklist.BackfillProber.
 type Ingestor struct {
@@ -104,7 +89,7 @@ type Ingestor struct {
 	log        *slog.Logger
 
 	mu   sync.Mutex
-	runs map[string]*backfill // ownerID -> most recent ingest run
+	runs map[runKey]*run // the most recent run per key: the in-flight gate (gate.go)
 }
 
 var (
@@ -121,7 +106,7 @@ func New(d Dispatcher, audience, sinkURL string, log *slog.Logger, aiEndpoint, a
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log, runs: map[string]*backfill{}}
+	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log, runs: map[runKey]*run{}}
 }
 
 // runParams builds the parameters shared by every dispatched run: the owner, the sink
@@ -147,83 +132,85 @@ func (i *Ingestor) runParams(ownerID string) map[string]string {
 // executes them. A failed or stale run (older than retryAfter) is re-dispatched, so a
 // reload retries after a failure or a lost run.
 func (i *Ingestor) EnsureBackfill(ctx context.Context, ownerID string) error {
-	i.mu.Lock()
-	cur := i.runs[ownerID]
-	inFlight := cur != nil && !cur.failed && time.Since(cur.at) < retryAfter
-	i.mu.Unlock()
-	if inFlight {
-		return nil
-	}
-	return i.dispatchIngest(ctx, ownerID)
+	return i.dispatchIngest(ctx, ownerID, false)
 }
 
 // Refresh forces a github-ingest run for ownerID so a user who just created or updated
 // work can pull it onto the radar on demand.
 func (i *Ingestor) Refresh(ctx context.Context, ownerID string) error {
-	return i.dispatchIngest(ctx, ownerID)
+	return i.dispatchIngest(ctx, ownerID, true)
 }
 
 // dispatchIngest submits a github-ingest run for ownerID and tracks it, so
-// BackfillFailure can report its outcome and EnsureBackfill can gate on it.
-func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string) error {
+// BackfillFailure can report its outcome and EnsureBackfill can gate on it. Unless
+// force is set it submits nothing while the owner's ingest run is in flight.
+func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, force bool) error {
+	key := ingestKey(ownerID)
+	mine, prev, ok := i.reserve(ctx, key, ingestGate, force)
+	if !ok {
+		return nil
+	}
 	id, err := i.d.Submit(ctx, RunSpec{
-		TaskRef:    "github-ingest",
+		TaskRef:    taskIngest,
 		Parameters: i.runParams(ownerID),
 		Subject:    ownerID,
 		Scopes:     []string{"signals:read", "metadata:write"},
 		Audience:   i.audience,
 		Deadline:   ingestDeadline,
 	})
-	if err != nil {
-		return err
-	}
-	i.mu.Lock()
-	i.runs[ownerID] = &backfill{id: id, at: time.Now()}
-	i.mu.Unlock()
-	return nil
+	i.settle(key, mine, prev, id, err)
+	return err
 }
 
-// probeRun reports the lifecycle of ownerID's tracked backfill run, reading it from
-// the backend (Dispatcher.Status) only while the run is still in flight: once a run is
+// probeRun reports the lifecycle of the run tracked for key, reading it from the
+// backend (Dispatcher.Status) only while the run is still in flight: once a run is
 // observed terminal the outcome is cached on the run, so the empty-worklist poll costs
 // one status read per RUN rather than one per page render. A transient read error is
 // returned so the caller keeps waiting rather than declaring an outcome.
-func (i *Ingestor) probeRun(ctx context.Context, ownerID string) (failed, succeeded bool, message string, err error) {
+func (i *Ingestor) probeRun(ctx context.Context, key runKey) (failed, succeeded bool, message string, err error) {
 	i.mu.Lock()
-	cur := i.runs[ownerID]
+	cur := i.runs[key]
+	var (
+		id                      string
+		curFailed, curSucceeded bool
+		curMessage              string
+	)
+	if cur != nil {
+		id, curFailed, curSucceeded, curMessage = cur.id, cur.failed, cur.succeeded, cur.message
+	}
 	i.mu.Unlock()
 	switch {
 	case cur == nil:
 		return false, false, "", nil // nothing dispatched yet
-	case cur.failed:
-		return true, false, cur.message, nil
-	case cur.succeeded:
+	case curFailed:
+		return true, false, curMessage, nil
+	case curSucceeded:
 		return false, true, "", nil
-	case cur.id == "":
-		return false, false, "", nil // the backend reported no run to probe
+	case id == "":
+		return false, false, "", nil // not submitted yet, or the backend reported no run to probe
 	}
-	res, err := i.d.Status(ctx, cur.id)
+	res, err := i.d.Status(ctx, id)
 	if err != nil {
 		return false, false, "", err // transient; keep waiting
 	}
 	switch res.Phase {
 	case "Failed":
 		i.mu.Lock()
-		// Record on the run we probed; a concurrent EnsureBackfill may have moved on.
-		if latest := i.runs[ownerID]; latest != nil && latest.id == cur.id {
-			latest.failed = true
-			latest.message = res.Message
-			if !latest.logged {
-				i.log.Warn("backfill run failed", "owner", ownerID, "run_id", cur.id, "error", res.Message)
-				latest.logged = true
+		// Record on the run we probed; a concurrent dispatch may have moved on.
+		if i.runs[key] == cur {
+			cur.failed = true
+			cur.message = res.Message
+			if !cur.logged {
+				i.log.Warn("run failed", "task", key.task, "owner", key.owner, "item", key.item, "turn", key.turn, "run_id", id, "error", res.Message)
+				cur.logged = true
 			}
 		}
 		i.mu.Unlock()
 		return true, false, res.Message, nil
 	case "Succeeded":
 		i.mu.Lock()
-		if latest := i.runs[ownerID]; latest != nil && latest.id == cur.id {
-			latest.succeeded = true
+		if i.runs[key] == cur {
+			cur.succeeded = true
 		}
 		i.mu.Unlock()
 		return false, true, "", nil
@@ -237,7 +224,7 @@ func (i *Ingestor) probeRun(ctx context.Context, ownerID string) (failed, succee
 // error reports failed=false so the caller keeps waiting. With a backend that runs
 // nothing (NoopDispatcher) no run can fail, so this always reports "not failed".
 func (i *Ingestor) BackfillFailure(ctx context.Context, ownerID string) (bool, string, error) {
-	failed, _, message, err := i.probeRun(ctx, ownerID)
+	failed, _, message, err := i.probeRun(ctx, ingestKey(ownerID))
 	if err != nil {
 		return false, "", err
 	}
@@ -250,7 +237,7 @@ func (i *Ingestor) BackfillFailure(ctx context.Context, ownerID string) (bool, s
 // permanent spinner. A backend that runs nothing (NoopDispatcher) reports no run id, so
 // this stays false and the worklist keeps its "Discovering…" state.
 func (i *Ingestor) BackfillSucceeded(ctx context.Context, ownerID string) (bool, error) {
-	_, succeeded, _, err := i.probeRun(ctx, ownerID)
+	_, succeeded, _, err := i.probeRun(ctx, ingestKey(ownerID))
 	if err != nil {
 		return false, err
 	}
@@ -315,7 +302,9 @@ func (i *Ingestor) dispatchEach(ctx context.Context, ownerID string, refs []work
 	return errors.Join(errs...)
 }
 
-// dispatchConverse submits one github-converse run answering ref. A non-empty
+// dispatchConverse submits one github-converse run answering ref, unless a run for
+// the same owner, item and turn is already in flight (see runKey): a double submit,
+// or a retry while the first run is still working, then shares that run. A non-empty
 // endpoint/model overrides the default connection for this turn; independent carries a
 // blind-review flag so a runtime answers without the prior thread.
 func (i *Ingestor) dispatchConverse(ctx context.Context, ownerID string, ref worklist.TurnRef, endpoint, model string, independent bool) error {
@@ -331,14 +320,20 @@ func (i *Ingestor) dispatchConverse(ctx context.Context, ownerID string, ref wor
 	if independent {
 		params["independent"] = "true"
 	}
-	_, err := i.d.Submit(ctx, RunSpec{
-		TaskRef:    "github-converse",
+	key := runKey{owner: ownerID, task: taskConverse, item: ref.Item, turn: ref.Turn}
+	mine, prev, ok := i.reserve(ctx, key, converseGate, false)
+	if !ok {
+		return nil // a run for this turn is already in flight
+	}
+	id, err := i.d.Submit(ctx, RunSpec{
+		TaskRef:    taskConverse,
 		Parameters: params,
 		Subject:    ownerID,
 		Scopes:     []string{"signals:read", "metadata:write"},
 		Audience:   i.audience,
 		Deadline:   converseDeadline,
 	})
+	i.settle(key, mine, prev, id, err)
 	return err
 }
 
