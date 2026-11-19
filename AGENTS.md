@@ -179,10 +179,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   flush fails and no thread is ever marked read. The
   cursor only moves forward; a re-render of an already-read thread skips the store.
 - The radar's project (repository) filter (`internal/webui/projects.go`) is a view
-  preference kept in the `gofer_projects` cookie (none = all projects). It only drops
-  items from the already-ranked list, never re-sorts. The bulk actions (Review all
-  PRs, Get 2nd Opinion, Reset Conversations) and their counts cover only the shown
-  items: each handler narrows its `store.Update` with `scopeTo`/`inScope`.
+  preference kept in the `gofer_projects` cookie, bound to the account that saved it
+  (none = all projects). It only drops items from the already-ranked list, never
+  re-sorts. The cookie never decides what a bulk action touches: each bulk form posts
+  the selection its page was rendered with (`scope`), so a filter changed in another
+  tab cannot widen it. Review all PRs and Get 2nd Opinion act only on items the radar
+  shows (`WorkItem.OnRadar`, the rule `worklist.Resolve` applies); Reset
+  Conversations also clears hidden and completed items in scope, and its count
+  includes them.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

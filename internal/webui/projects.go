@@ -11,21 +11,30 @@ import (
 // The radar's project filter narrows the worklist to the items of the chosen GitHub
 // repositories ("projects"). It never changes what is stored or how it is ranked: the
 // visible items keep the full list's order (the filter drops items, it never re-sorts
-// them). The radar's bulk actions (Review all PRs, Get 2nd Opinion, Reset
-// Conversations) act on, and count, only the items the filter shows.
+// them).
 //
-// The selection lives in a plain cookie, so it survives the Post/Redirect/Get round
-// trips back to "/" (Refresh, Review all PRs, the thread's back link). No cookie means
-// "Select all", the default. The cookie holds only repository names already on the
-// user's own radar; it grants nothing and is read only to filter that user's items.
+// The saved selection lives in a plain cookie, so it survives the Post/Redirect/Get
+// round trips back to "/" (Refresh, Review all PRs, the thread's back link). No cookie
+// means "Select all", the default. The cookie names the account that saved it and is
+// ignored for any other, so a second account in the same browser starts from "Select
+// all". It holds only repository names that were on that user's radar; it grants
+// nothing and is read only to filter that user's items.
+//
+// The cookie drives what the radar shows, never what a bulk action touches. Each bulk
+// form (Review all PRs, Get 2nd Opinion, Reset Conversations) carries the selection
+// the page was rendered with (form "scope"), and the action covers exactly the items
+// that page showed: in those projects and on the radar (worklist.WorkItem.OnRadar). So
+// a filter changed in another tab cannot widen an action submitted from this one.
 
-// projectsCookie names the cookie that holds the selected projects.
+// projectsCookie names the cookie that holds the saved selection.
 const projectsCookie = "gofer_projects"
 
-// maxProjectsCookie bounds the encoded selection. Browsers drop a cookie past ~4 KB;
-// a selection that would not fit is not saved, so the radar shows every project
-// rather than a truncated choice.
+// maxProjectsCookie bounds the encoded cookie. Browsers drop a cookie past ~4 KB, so
+// a selection that would not fit is refused and the previous filter is kept.
 const maxProjectsCookie = 3800
+
+// projectsTooMany is the query value Index reads to explain a refused selection.
+const projectsTooMany = "too-many"
 
 // ProjectOption is one entry in the project filter's checklist.
 type ProjectOption struct {
@@ -64,36 +73,6 @@ func filterProjects(items []worklist.WorkItem, selected map[string]bool) []workl
 	return kept
 }
 
-// selectedProjects reads the saved selection from the request. It returns nil (every
-// project) when there is no usable cookie.
-func selectedProjects(r *http.Request) map[string]bool {
-	c, err := r.Cookie(projectsCookie)
-	if err != nil || c.Value == "" {
-		return nil
-	}
-	v, err := url.ParseQuery(c.Value)
-	if err != nil {
-		return nil
-	}
-	sel := map[string]bool{}
-	for _, name := range v["p"] {
-		if name != "" {
-			sel[name] = true
-		}
-	}
-	return sel
-}
-
-// scopeTo returns the selection that applies to items: nil (every item) when there is
-// no selection or it covers every repository in items. The view and the bulk actions
-// both narrow through it, so an action covers exactly the items the radar shows.
-func scopeTo(selected map[string]bool, items []worklist.WorkItem) map[string]bool {
-	if selected != nil && covers(selected, projectOptions(items, nil)) {
-		return nil
-	}
-	return selected
-}
-
 // inScope reports whether it belongs to a selected project (always, with no selection).
 func inScope(selected map[string]bool, it worklist.WorkItem) bool {
 	return selected == nil || selected[it.GitHub.Repo]
@@ -110,11 +89,73 @@ func covers(selected map[string]bool, opts []ProjectOption) bool {
 	return true
 }
 
-// FilterProjects handles POST /items/projects, the project filter's Apply. A checked
-// "Select all" (form "all"), or a selection that covers every project on the radar,
-// clears the filter; otherwise the checked projects (form "project", repeated) are
-// saved. An empty selection is saved too, and shows no items. It redirects back to the
-// radar (Post/Redirect/Get).
+// encodeSelection encodes a selection as repeated "p" values, by name. An empty
+// selection encodes as "p=", distinct from no selection at all.
+func encodeSelection(selected map[string]bool) string {
+	names := make([]string, 0, len(selected))
+	for name := range selected {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return "p="
+	}
+	return url.Values{"p": names}.Encode()
+}
+
+// decodeSelection reads the "p" values of v. It returns nil (every project) when v
+// has none, and an empty, non-nil selection for "p=".
+func decodeSelection(v url.Values) map[string]bool {
+	names, ok := v["p"]
+	if !ok {
+		return nil
+	}
+	sel := map[string]bool{}
+	for _, name := range names {
+		if name != "" {
+			sel[name] = true
+		}
+	}
+	return sel
+}
+
+// savedSelection reads ownerID's saved selection from the request's cookie. It returns
+// nil (every project) with no usable cookie, or one another account saved.
+func savedSelection(r *http.Request, ownerID string) map[string]bool {
+	c, err := r.Cookie(projectsCookie)
+	if err != nil || c.Value == "" {
+		return nil
+	}
+	v, err := url.ParseQuery(c.Value)
+	if err != nil || v.Get("u") != ownerID {
+		return nil
+	}
+	return decodeSelection(v)
+}
+
+// formSelection reads the selection a bulk form was rendered with (form "scope"). No
+// scope means the page showed every project.
+func formSelection(r *http.Request) map[string]bool {
+	scope := r.PostFormValue("scope")
+	if scope == "" {
+		return nil
+	}
+	v, err := url.ParseQuery(scope)
+	if err != nil {
+		return map[string]bool{} // a garbled scope acts on nothing rather than on everything
+	}
+	if sel := decodeSelection(v); sel != nil {
+		return sel
+	}
+	return map[string]bool{}
+}
+
+// FilterProjects handles POST /items/projects, the project filter's Apply. The checked
+// projects (form "project", repeated) are saved for the signed-in account; checking
+// every project on the radar, or "Select all" (form "all"), clears the filter instead.
+// An empty selection is saved too, and shows no items. A selection too large for the
+// cookie is refused and the previous filter kept. It redirects back to the radar
+// (Post/Redirect/Get).
 func (h *Handler) FilterProjects(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
 	if user == nil || r.ParseForm() != nil {
@@ -131,25 +172,29 @@ func (h *Handler) FilterProjects(w http.ResponseWriter, r *http.Request) {
 		}
 		// Keep only repositories on the user's radar: the cookie never carries a name
 		// the page did not offer.
-		opts := projectOptions(items, nil)
+		var onRadar []worklist.WorkItem
+		for _, it := range items {
+			if it.OnRadar() {
+				onRadar = append(onRadar, it)
+			}
+		}
+		opts := projectOptions(onRadar, nil)
 		present := make(map[string]bool, len(opts))
 		for _, o := range opts {
 			present[o.Name] = true
 		}
 		chosen := map[string]bool{}
-		var names []string
 		for _, name := range r.PostForm["project"] {
-			if present[name] && !chosen[name] {
+			if present[name] {
 				chosen[name] = true
-				names = append(names, name)
 			}
 		}
-		sort.Strings(names)
-		value = url.Values{"p": names}.Encode()
-		if len(names) == 0 {
-			value = "p=" // an explicit empty selection, distinct from no cookie
+		clear = covers(chosen, opts)
+		value = url.Values{"u": {user.ID}}.Encode() + "&" + encodeSelection(chosen)
+		if !clear && len(value) > maxProjectsCookie {
+			http.Redirect(w, r, "/?projects="+projectsTooMany, http.StatusSeeOther)
+			return
 		}
-		clear = covers(chosen, opts) || len(value) > maxProjectsCookie
 	}
 	c := &http.Cookie{
 		Name:     projectsCookie,

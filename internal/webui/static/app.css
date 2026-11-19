@@ -87,6 +87,7 @@ body {
   padding: 4px 6px; border-radius: 6px; font-size: 13px; cursor: pointer;
 }
 .zz-filter-opt:hover { background: var(--bg-subtle); }
+.zz-filter-opt[hidden] { display: none; } /* "Select all" until projects.js enables it */
 .zz-filter-all { font-weight: 600; border-bottom: 1px solid var(--border); border-radius: 6px 6px 0 0; padding-bottom: 6px; margin-bottom: 2px; }
 .zz-filter-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .zz-filter-count { color: var(--muted); font-size: 12px; }

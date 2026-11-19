@@ -2,9 +2,12 @@ package webui
 
 import (
 	"context"
+	"html/template"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -35,23 +38,34 @@ func projectsFixture(t *testing.T) *Handler {
 	return New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{false}, false, nil)
 }
 
-// postFilter submits the filter form and returns the cookie it set (nil when it set
-// none).
-func postFilter(t *testing.T, h *Handler, form url.Values) *http.Cookie {
-	t.Helper()
+// postFilterRaw submits the filter form and returns the response.
+func postFilterRaw(h *Handler, form url.Values) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/items/projects", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	rec := httptest.NewRecorder()
 	h.FilterProjects(rec, req)
-	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/" {
-		t.Fatalf("status = %d, location = %q; want 303 to / (Post/Redirect/Get)", rec.Code, rec.Header().Get("Location"))
-	}
+	return rec
+}
+
+// selectionCookie returns the selection cookie rec set, or nil.
+func selectionCookie(rec *httptest.ResponseRecorder) *http.Cookie {
 	for _, c := range rec.Result().Cookies() {
 		if c.Name == projectsCookie {
 			return c
 		}
 	}
 	return nil
+}
+
+// postFilter submits the filter form and returns the cookie it set (nil when it set
+// none).
+func postFilter(t *testing.T, h *Handler, form url.Values) *http.Cookie {
+	t.Helper()
+	rec := postFilterRaw(h, form)
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/" {
+		t.Fatalf("status = %d, location = %q; want 303 to / (Post/Redirect/Get)", rec.Code, rec.Header().Get("Location"))
+	}
+	return selectionCookie(rec)
 }
 
 func getIndex(t *testing.T, h *Handler, c *http.Cookie) string {
@@ -91,8 +105,10 @@ func order(page string, titles ...string) []string {
 
 var fixtureTitles = []string{"title-a/one-1", "title-b/two-2", "title-a/one-3", "title-c/three-4", "title-b/two-5"}
 
-// With no saved selection every project is shown, "Select all" is checked, and the
-// checklist lists each repository once with its item count.
+// With no saved selection every project is shown and the checklist lists each
+// repository once with its item count. "Select all" is checked but rendered hidden and
+// disabled: projects.js enables it, and without the script the per-project boxes alone
+// decide what Apply saves.
 func TestProjectFilterDefaultsToAll(t *testing.T) {
 	page := getIndex(t, projectsFixture(t), nil)
 	if got := order(page, fixtureTitles...); strings.Join(got, ",") != strings.Join(fixtureTitles, ",") {
@@ -100,7 +116,7 @@ func TestProjectFilterDefaultsToAll(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Projects: All",
-		`name="all" value="1" data-filter-all checked`,
+		`<label class="zz-filter-opt zz-filter-all" hidden><input type="checkbox" name="all" value="1" data-filter-all disabled checked>`,
 		`value="a/one" data-filter-project checked`,
 		`<span class="zz-filter-name">c/three</span> <span class="zz-filter-count">1</span>`,
 		"5 items on your radar",
@@ -134,12 +150,13 @@ func TestProjectFilterKeepsFullListOrder(t *testing.T) {
 			t.Errorf("filtered page lacks %q", s)
 		}
 	}
-	if strings.Contains(page, "data-filter-all checked") {
+	if strings.Contains(page, "data-filter-all disabled checked") {
 		t.Error(`"Select all" must be unchecked while filtered`)
 	}
 }
 
-// "Select all", or checking every project on the radar, clears the saved selection.
+// "Select all", or checking every project on the radar (all a script-less browser can
+// send), clears the saved selection.
 func TestProjectFilterSelectAllClears(t *testing.T) {
 	h := projectsFixture(t)
 	for name, form := range map[string]url.Values{
@@ -154,16 +171,17 @@ func TestProjectFilterSelectAllClears(t *testing.T) {
 	}
 }
 
-// Only repositories on the user's radar are saved; an empty selection is kept (and
-// shows no items) rather than falling back to every project.
+// Only repositories on the user's radar are saved, under the user's ID; an empty
+// selection is kept (and shows no items) rather than falling back to every project.
 func TestProjectFilterSanitizesSelection(t *testing.T) {
 	h := projectsFixture(t)
 	c := postFilter(t, h, url.Values{"project": {"c/three", "z/not-mine", "c/three"}})
 	if c == nil {
 		t.Fatal("expected a selection cookie")
 	}
-	if v, _ := url.ParseQuery(c.Value); strings.Join(v["p"], ",") != "c/three" {
-		t.Fatalf("saved selection = %v, want [c/three]", v["p"])
+	v, _ := url.ParseQuery(c.Value)
+	if strings.Join(v["p"], ",") != "c/three" || v.Get("u") != "u1" {
+		t.Fatalf("saved selection = %v for %q, want [c/three] for u1", v["p"], v.Get("u"))
 	}
 
 	empty := postFilter(t, h, url.Values{})
@@ -189,15 +207,70 @@ func TestProjectFilterRequiresSession(t *testing.T) {
 	}
 }
 
-// A radar with a single project has nothing to filter, so the dropdown is hidden —
-// unless a saved selection is narrowing it, so it can always be undone.
-func TestProjectFilterHiddenForOneProject(t *testing.T) {
+// A selection saved by one account is ignored for another signed in to the same
+// browser, which starts from "Select all".
+func TestProjectFilterIsPerAccount(t *testing.T) {
+	saved := postFilter(t, projectsFixture(t), url.Values{"project": {"c/three"}})
+	if saved == nil {
+		t.Fatal("expected a selection cookie")
+	}
+	other := projectsFixture(t)
+	other.sessions = fakeSessions{&session.User{ID: "u2"}}
+	items, _ := other.store.List(context.Background(), "u1")
+	other.store.(*worklist.MemoryStore).Seed("u2", items...)
+	page := getIndex(t, other, saved)
+	if !strings.Contains(page, "Projects: All") || len(order(page, fixtureTitles...)) != len(fixtureTitles) {
+		t.Fatal("another account must not inherit the saved selection")
+	}
+}
+
+// A selection too large for the cookie is refused: the previous filter is kept and the
+// radar says why, instead of silently widening to every project.
+func TestProjectFilterTooLargeKeepsPrevious(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	var repos []string
+	var items []worklist.WorkItem
+	for i := 0; i < 150; i++ {
+		repo := "some-organization/" + strings.Repeat("r", 20) + strconv.Itoa(i)
+		repos = append(repos, repo)
+		items = append(items, worklist.WorkItem{ID: repo, GitHub: worklist.GitHubRef{Repo: repo, Number: 1, Title: repo}})
+	}
+	store.Seed("u1", items...)
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{false}, false, nil)
+
+	rec := postFilterRaw(h, url.Values{"project": repos[1:]})
+	if loc := rec.Header().Get("Location"); rec.Code != http.StatusSeeOther || loc != "/?projects="+projectsTooMany {
+		t.Fatalf("status = %d, location = %q; want 303 to the too-many notice", rec.Code, loc)
+	}
+	if c := selectionCookie(rec); c != nil {
+		t.Fatalf("a refused selection must leave the cookie alone, got %+v", c)
+	}
+
+	prev := filterCookie(repos[0])
+	req := httptest.NewRequest(http.MethodGet, "/?projects="+projectsTooMany, nil)
+	req.AddCookie(prev)
+	page := httptest.NewRecorder()
+	h.Index(page, req)
+	if body := page.Body.String(); !strings.Contains(body, "Too many projects selected to save") || !strings.Contains(body, "Projects: 1 of 150") {
+		t.Fatal("expected the notice and the previous filter")
+	}
+}
+
+// A single-project radar has nothing to filter, so the dropdown is hidden — unless a
+// selection is saved, even one that now covers the whole radar (another project's last
+// item closed), so it can always be cleared to include future projects.
+func TestProjectFilterReachableWhileSaved(t *testing.T) {
 	one := []worklist.WorkItem{{ID: "i1", GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, Title: "t"}}}
 	if out := renderPage(t, pageData{View: "worklist", Items: one, Projects: projectOptions(one, nil)}); strings.Contains(out, "zz-filter") {
 		t.Fatal("a single-project radar should not show the filter")
 	}
-	if out := renderPage(t, pageData{View: "worklist", Projects: projectOptions(one, map[string]bool{}), ProjectsFiltered: true}); !strings.Contains(out, "zz-filter") {
-		t.Fatal("a filtered radar must always show the filter")
+
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", one...)
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{false}, false, nil)
+	page := getIndex(t, h, filterCookie("o/r"))
+	if !strings.Contains(page, "zz-filter") || !strings.Contains(page, "Projects: 1 of 1") {
+		t.Fatal("a saved selection must keep the filter on the radar")
 	}
 }
 
@@ -207,122 +280,187 @@ func inRepo(it worklist.WorkItem, repo string) worklist.WorkItem {
 	return it
 }
 
-// filterCookie is the cookie FilterProjects saves for the given projects.
+// filterCookie is the cookie FilterProjects saves for user u1 and the given projects.
 func filterCookie(repos ...string) *http.Cookie {
-	return &http.Cookie{Name: projectsCookie, Value: url.Values{"p": repos}.Encode()}
+	sel := map[string]bool{}
+	for _, r := range repos {
+		sel[r] = true
+	}
+	return &http.Cookie{Name: projectsCookie, Value: url.Values{"u": {"u1"}}.Encode() + "&" + encodeSelection(sel)}
 }
 
-// The bulk actions act only on the items the project filter shows, and on every item
-// without a filter.
-func TestBulkActionsFollowProjectFilter(t *testing.T) {
+// scopeOf is the "scope" a bulk form rendered for the given projects carries.
+func scopeOf(repos ...string) string {
+	sel := map[string]bool{}
+	for _, r := range repos {
+		sel[r] = true
+	}
+	return encodeSelection(sel)
+}
+
+// The bulk actions act on exactly what the submitting page showed: the projects named
+// by the form's scope (never the cookie, which another tab may have changed since)
+// and only items on the radar. Reset Conversations also clears hidden and completed
+// items in those projects.
+func TestBulkActionsFollowSubmittedScope(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	opts := []ModelOption{
 		{Value: "c0|default", Endpoint: "https://default", Model: "default"},
 		{Value: "c1|alt", Endpoint: "https://alt", Model: "alt"},
 	}
 	seed := func() *worklist.MemoryStore {
+		merged := inRepo(worklist.WorkItem{ID: "merged-a", Type: worklist.TypePullRequest}, "a/one")
+		merged.Meta.CompletedAt = now.Add(-time.Hour)
+		hidden := inRepo(reviewedByModel("hidden-a", "default", now), "a/one")
+		hidden.Meta.HiddenAt = now.Add(-time.Hour)
 		store := worklist.NewMemoryStore()
 		store.Seed("u1",
 			inRepo(worklist.WorkItem{ID: "new-a", Type: worklist.TypePullRequest}, "a/one"),
 			inRepo(worklist.WorkItem{ID: "new-b", Type: worklist.TypePullRequest}, "b/two"),
 			inRepo(reviewedByModel("rev-a", "default", now), "a/one"),
 			inRepo(reviewedByModel("rev-b", "default", now), "b/two"),
+			merged, hidden,
 		)
 		return store
 	}
-	post := func(store *worklist.MemoryStore, pipe *recordPipeline, path string, c *http.Cookie, handle func(*Handler, http.ResponseWriter, *http.Request)) {
+	post := func(store *worklist.MemoryStore, pipe *recordPipeline, path, scope string, c *http.Cookie, handle func(*Handler, http.ResponseWriter, *http.Request)) {
 		h := &Handler{sessions: fakeSessions{&session.User{ID: "u1"}}, store: store, pipeline: pipe, convEnabled: true, options: opts, now: func() time.Time { return now }}
-		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("choice=c1|alt"))
+		form := url.Values{"choice": {"c1|alt"}}
+		if scope != "" {
+			form.Set("scope", scope)
+		}
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		if c != nil {
 			req.AddCookie(c)
 		}
 		handle(h, httptest.NewRecorder(), req)
 	}
-	threads := func(store *worklist.MemoryStore) map[string]int {
+	cleared := func(store *worklist.MemoryStore) string {
 		items, _ := store.List(context.Background(), "u1")
-		n := map[string]int{}
+		var ids []string
 		for _, it := range items {
-			n[it.ID] = len(it.Thread)
+			if len(it.Thread) == 0 && strings.HasPrefix(it.ID, "rev") || len(it.Thread) == 0 && it.ID == "hidden-a" {
+				ids = append(ids, it.ID)
+			}
 		}
-		return n
+		sort.Strings(ids)
+		return strings.Join(ids, ",")
 	}
 
 	for _, tc := range []struct {
 		name                    string
+		scope                   string
 		cookie                  *http.Cookie
 		review, second, cleared string
 	}{
-		{"filtered", filterCookie("a/one"), "new-a", "rev-a", "rev-a"},
-		{"every project selected", filterCookie("a/one", "b/two"), "new-a,new-b", "rev-a,rev-b", "rev-a,rev-b"},
-		{"no filter", nil, "new-a,new-b", "rev-a,rev-b", "rev-a,rev-b"},
+		{"filtered page", scopeOf("a/one"), filterCookie("a/one"), "new-a", "rev-a", "hidden-a,rev-a"},
+		// The filter was widened to All in another tab after this page rendered.
+		{"filtered page, cookie since cleared", scopeOf("a/one"), nil, "new-a", "rev-a", "hidden-a,rev-a"},
+		// The filter was narrowed in another tab after this unfiltered page rendered.
+		{"unfiltered page, cookie since narrowed", "", filterCookie("b/two"), "new-a,new-b", "rev-a,rev-b", "hidden-a,rev-a,rev-b"},
+		{"every project", scopeOf("a/one", "b/two"), nil, "new-a,new-b", "rev-a,rev-b", "hidden-a,rev-a,rev-b"},
+		{"empty selection", "p=", nil, "", "", ""},
+		{"garbled scope", "%zz", nil, "", "", ""},
 	} {
 		pipe := &recordPipeline{}
-		post(seed(), pipe, "/items/review-all", tc.cookie, (*Handler).ReviewAllPRs)
+		post(seed(), pipe, "/items/review-all", tc.scope, tc.cookie, (*Handler).ReviewAllPRs)
 		if got := strings.Join(pipe.reviewed, ","); got != tc.review {
 			t.Errorf("%s: Review all PRs dispatched %q, want %q", tc.name, got, tc.review)
 		}
 
 		pipe = &recordPipeline{}
-		post(seed(), pipe, "/items/second-opinion-all", tc.cookie, (*Handler).SecondOpinionAllPRs)
+		post(seed(), pipe, "/items/second-opinion-all", tc.scope, tc.cookie, (*Handler).SecondOpinionAllPRs)
 		if got := strings.Join(pipe.secondOpinions, ","); got != tc.second {
 			t.Errorf("%s: Get 2nd Opinion dispatched %q, want %q", tc.name, got, tc.second)
 		}
 
 		store := seed()
-		post(store, &recordPipeline{}, "/items/reset-conversations", tc.cookie, (*Handler).ResetConversations)
-		var cleared []string
-		for _, id := range []string{"rev-a", "rev-b"} {
-			if threads(store)[id] == 0 {
-				cleared = append(cleared, id)
-			}
-		}
-		if got := strings.Join(cleared, ","); got != tc.cleared {
+		post(store, &recordPipeline{}, "/items/reset-conversations", tc.scope, tc.cookie, (*Handler).ResetConversations)
+		if got := cleared(store); got != tc.cleared {
 			t.Errorf("%s: Reset Conversations cleared %q, want %q", tc.name, got, tc.cleared)
 		}
 	}
 }
 
-// The bulk actions' counts on the radar cover only the shown items.
+// The bulk actions' counts on the radar match what each would act on, and each bulk
+// form carries the page's selection.
 func TestBulkCountsFollowProjectFilter(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	store := worklist.NewMemoryStore()
-	user := worklist.Metadata{Origin: worklist.OriginUser}
 	mk := func(it worklist.WorkItem, repo string) worklist.WorkItem {
 		it = inRepo(it, repo)
-		it.Meta = user
+		it.Meta.Origin = worklist.OriginUser
 		return it
 	}
+	hidden := mk(reviewedByModel("hidden-a", "default", now), "a/one")
+	hidden.Meta.HiddenAt = now.Add(-time.Hour)
+	merged := mk(worklist.WorkItem{ID: "merged-b", Type: worklist.TypePullRequest}, "b/two")
+	merged.Meta.CompletedAt = now.Add(-time.Hour)
 	store.Seed("u1",
 		mk(worklist.WorkItem{ID: "new-a", Type: worklist.TypePullRequest}, "a/one"),
 		mk(worklist.WorkItem{ID: "new-b1", Type: worklist.TypePullRequest}, "b/two"),
 		mk(worklist.WorkItem{ID: "new-b2", Type: worklist.TypePullRequest}, "b/two"),
 		mk(reviewedByModel("rev-b", "default", now), "b/two"),
+		hidden, merged,
 	)
 	opts := []ModelOption{{Value: "c0|default", Model: "default"}, {Value: "c1|alt", Model: "alt"}}
 	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{false}, true, opts)
 	h.now = func() time.Time { return now }
-	get := func(c *http.Cookie) string {
-		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		if c != nil {
-			req.AddCookie(c)
-		}
-		rec := httptest.NewRecorder()
-		h.Index(rec, req)
-		return rec.Body.String()
-	}
 
-	all := get(nil)
-	for _, s := range []string{"Review all PRs (3)", "Get 2nd Opinion (1)", "Reset Conversations (1)"} {
+	// Hidden and completed PRs are not reviewed, so not counted; Reset also clears the
+	// hidden item's thread, so it counts it.
+	all := getIndex(t, h, nil)
+	for _, s := range []string{"Review all PRs (3)", "Get 2nd Opinion (1)", "Reset Conversations (2)"} {
 		if !strings.Contains(all, s) {
 			t.Errorf("unfiltered radar lacks %q", s)
 		}
 	}
-	a := get(filterCookie("a/one"))
-	if !strings.Contains(a, "Review all PRs (1)") {
-		t.Error("filtered radar should count only a/one's unreviewed PR")
+	if strings.Contains(all, `name="scope"`) {
+		t.Error("an unfiltered page's bulk forms carry no scope")
 	}
-	if strings.Contains(a, "Get 2nd Opinion") || strings.Contains(a, "Reset Conversations") {
-		t.Error("a/one has no reviewed PR or conversation: those actions should be hidden")
+
+	a := getIndex(t, h, filterCookie("a/one"))
+	for _, s := range []string{"Review all PRs (1)", "Reset Conversations (1)"} {
+		if !strings.Contains(a, s) {
+			t.Errorf("a/one radar lacks %q", s)
+		}
+	}
+	if strings.Contains(a, "Get 2nd Opinion") {
+		t.Error("a/one's only reviewed PR is hidden: Get 2nd Opinion should be hidden")
+	}
+	want := `<input type="hidden" name="scope" value="` + template.HTMLEscapeString(scopeOf("a/one")) + `">`
+	if n := strings.Count(a, want); n != 3 { // Review all PRs (one form per model) and Reset
+		t.Errorf("expected the scope on every bulk form (3), found %d of %q", n, want)
+	}
+}
+
+// Every bulk form variant — Review all PRs (plain and per model), Get 2nd Opinion
+// (menu and auto), Reset Conversations — posts the page's selection back.
+func TestEveryBulkFormCarriesScope(t *testing.T) {
+	pr := worklist.WorkItem{ID: "p", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "a/one", Number: 1}}
+	base := pageData{View: "worklist", Items: []worklist.WorkItem{pr}, ConvEnabled: true, ReviewCount: 1, SecondOpinionEnabled: true,
+		SecondOpinionCount: 1, ResetCount: 1, ProjectsFiltered: true, ProjectScope: scopeOf("a/one")}
+	field := `name="scope" value="p=a%2fone"`
+	for name, tc := range map[string]struct {
+		mod  func(*pageData)
+		want int
+	}{
+		"plain review, auto 2nd opinion": {func(d *pageData) { d.SecondOpinionMode = "auto" }, 3},
+		"per-model review, menu 2nd opinion": {func(d *pageData) {
+			d.ReviewModelOptions = []ModelOption{{Value: "a"}, {Value: "b"}}
+			d.SecondOpinionMode, d.SecondOpinionMenuOptions = "menu", []ModelOption{{Value: "b"}}
+		}, 4},
+	} {
+		d := base
+		tc.mod(&d)
+		out := strings.ToLower(renderPage(t, d))
+		forms := 0
+		for _, action := range []string{"review-all", "second-opinion-all", "reset-conversations"} {
+			forms += strings.Count(out, `<form method="post" action="/items/`+action+`">`)
+		}
+		if got := strings.Count(out, field); got != tc.want || forms != tc.want {
+			t.Errorf("%s: %d of %d bulk forms carry the scope, want all %d", name, got, forms, tc.want)
+		}
 	}
 }
