@@ -41,7 +41,9 @@
     {{else if eq .View "error"}}
       <div class="zz-empty">
         <h1>Something went wrong</h1>
-        {{if .Message}}
+        {{if .Failure}}
+        <p>{{.Failure}}</p>
+        {{else if .Message}}
         <p>We couldn't finish discovering your work:</p>
         <p class="zz-error-detail">{{.Message}}</p>
         {{else}}
@@ -141,6 +143,16 @@
       {{end}}
 
     {{else}}
+      {{with .JustHidden}}
+      <div class="zz-undo" role="status">
+        <span>Hidden <b>{{.GitHub.Title}}</b> until GitHub shows new activity on it.</span>
+        <form method="post" action="/items/hide">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <input type="hidden" name="hidden" value="false">
+          <button class="zz-linkbtn" type="submit">Undo</button>
+        </form>
+      </div>
+      {{end}}
       <div class="zz-toolbar">
         <p class="zz-count">{{len .Items}} item{{if ne (len .Items) 1}}s{{end}} on your radar</p>
         <div class="zz-toolbar-actions">

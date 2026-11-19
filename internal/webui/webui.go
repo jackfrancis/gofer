@@ -227,21 +227,23 @@ type pageData struct {
 	User                     *session.User
 	Providers                []string
 	Items                    []worklist.WorkItem
-	Item                     worklist.WorkItem // the single item, for the thread view
-	ConvEnabled              bool              // whether the assistive conversation is available
-	ModelOptions             []ModelOption     // conversation picker options (default first)
-	SecondOpinionEnabled     bool              // whether a second-opinion model is configured
-	SecondOpinionOptions     []ModelOption     // alternative options offered in the 2nd-opinion picker
-	ReviewCount              int               // PRs needing a first review; gates/labels "Review all PRs"
-	ReviewModelOptions       []ModelOption     // models for the "Review all PRs" dropdown; nil = plain button (<=1 model)
-	SecondOpinionCount       int               // PRs reviewed once without a 2nd opinion; gates/labels "Get 2nd Opinion"
-	SecondOpinionMode        string            // "" hidden | "menu" (pick a model) | "auto" (heterogeneous first reviews, immediate)
-	SecondOpinionMenuOptions []ModelOption     // menu-mode models (every model except the single first-review model)
-	ResetCount               int               // visible items carrying a conversation; gates/labels "Reset Conversations"
-	RefreshSecs              int               // when > 0, the page auto-refreshes after this many seconds
-	ReplyStalled             bool              // a pending reply has not arrived within reviewStaleAfter (thread view)
-	Message                  string            // failure detail rendered on the error view
-	SignInRequired           bool              // gofer holds no usable credential: prompt the user to sign in again
+	Item                     worklist.WorkItem  // the single item, for the thread view
+	ConvEnabled              bool               // whether the assistive conversation is available
+	ModelOptions             []ModelOption      // conversation picker options (default first)
+	SecondOpinionEnabled     bool               // whether a second-opinion model is configured
+	SecondOpinionOptions     []ModelOption      // alternative options offered in the 2nd-opinion picker
+	ReviewCount              int                // PRs needing a first review; gates/labels "Review all PRs"
+	ReviewModelOptions       []ModelOption      // models for the "Review all PRs" dropdown; nil = plain button (<=1 model)
+	SecondOpinionCount       int                // PRs reviewed once without a 2nd opinion; gates/labels "Get 2nd Opinion"
+	SecondOpinionMode        string             // "" hidden | "menu" (pick a model) | "auto" (heterogeneous first reviews, immediate)
+	SecondOpinionMenuOptions []ModelOption      // menu-mode models (every model except the single first-review model)
+	ResetCount               int                // stored items carrying a conversation (hidden and closed too: Reset clears them all); gates/labels "Reset Conversations"
+	RefreshSecs              int                // when > 0, the page auto-refreshes after this many seconds
+	ReplyStalled             bool               // a pending reply has not arrived within reviewStaleAfter (thread view)
+	Message                  string             // failure detail rendered on the error view
+	Failure                  string             // a failed user action, rendered on the error view in place of the discovery wording
+	JustHidden               *worklist.WorkItem // the item the user just hid, offered for Undo on the radar
+	SignInRequired           bool               // gofer holds no usable credential: prompt the user to sign in again
 }
 
 // Index handles GET /. It renders the sign-in view for anonymous visitors, the
@@ -402,9 +404,11 @@ func (h *Handler) HideMessage(w http.ResponseWriter, r *http.Request) {
 // ("hidden", default true) or brings it back ("hidden=false"). A hidden item stays in
 // the store with its thread, is skipped by every bulk action, and resurfaces on its
 // own once a refresh brings a GitHub update newer than the hide
-// (worklist.HiddenAfter). It redirects to the radar, or back to the item's thread
-// when the form says so ("back=thread"). SameSite=Lax cookies give baseline CSRF
-// protection.
+// (worklist.HiddenAfter). Hiding a hidden item, or unhiding a visible one, changes
+// nothing. After a hide it redirects to the radar with an Undo for that item; after
+// an unhide, to the radar, or back to the item's thread when the form says so
+// ("back=thread"). A failed write renders an error rather than redirecting as if it
+// had worked. SameSite=Lax cookies give baseline CSRF protection.
 func (h *Handler) HideItem(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
 	if user == nil {
@@ -413,28 +417,50 @@ func (h *Handler) HideItem(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.FormValue("id")
 	hidden := r.FormValue("hidden") != "false"
-	if id != "" {
-		at := h.now().UTC()
-		_ = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
-			for i := range current {
-				if current[i].ID != id {
-					continue
-				}
-				if hidden {
-					current[i].Meta.HiddenAt = at
-				} else {
-					current[i].Meta.HiddenAt = time.Time{}
-				}
-				return current[i : i+1], nil
-			}
-			return nil, nil // item gone
-		})
-	}
-	if r.FormValue("back") == "thread" && id != "" {
-		http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
+	if id == "" {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	at := h.now().UTC()
+	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		for i := range current {
+			if current[i].ID != id {
+				continue
+			}
+			switch {
+			case hidden && current[i].Meta.HiddenAt.IsZero():
+				current[i].Meta.HiddenAt = at
+			case !hidden && !current[i].Meta.HiddenAt.IsZero():
+				current[i].Meta.HiddenAt = time.Time{}
+			default:
+				// Already in the asked-for state. A repeated Hide (a stale tab, a double
+				// submit) must keep the original hide time: moving it later would swallow
+				// GitHub activity that landed in between.
+				return nil, nil
+			}
+			return current[i : i+1], nil
+		}
+		return nil, nil // item gone
+	})
+	if err != nil {
+		verb := "hide"
+		if !hidden {
+			verb = "unhide"
+		}
+		h.render(w, http.StatusInternalServerError, pageData{View: "error", User: user,
+			Failure: "gofer couldn't " + verb + " that item. Nothing was changed; go back and try again."})
+		return
+	}
+	switch {
+	case !hidden && r.FormValue("back") == "thread":
+		http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
+	case hidden:
+		// The radar offers Undo for the item just hidden (signedInView), since its row,
+		// and with it the way to its thread's Unhide, is gone.
+		http.Redirect(w, r, "/?hidden="+url.QueryEscape(id), http.StatusSeeOther)
+	default:
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	}
 }
 
 // reviewPrompt is the message posted to every pull request's thread by the
@@ -681,14 +707,27 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 				secondCount++
 				firstModels[it.FirstReviewModel()] = struct{}{}
 			}
-			if len(it.Thread) > 0 {
-				resetCount++
+		}
+		// The radar shows only items on it, but Reset clears every stored thread, hidden
+		// and closed items' included, so its count comes from the whole store; and the
+		// item just hidden is found there too, to offer Undo. If that read fails the
+		// Reset button is withheld rather than shown with a count that undersells it.
+		var justHidden *worklist.WorkItem
+		hiddenID := r.URL.Query().Get("hidden")
+		if all, err := h.store.List(r.Context(), user.ID); err == nil {
+			for _, it := range all {
+				if len(it.Thread) > 0 {
+					resetCount++
+				}
+				if hiddenID != "" && it.ID == hiddenID && !it.Meta.HiddenAt.IsZero() {
+					justHidden = &it
+				}
 			}
 		}
 		data := pageData{
 			View: "worklist", User: user, Items: res.Items, ConvEnabled: h.convEnabled,
 			ReviewCount: reviewCount, SecondOpinionEnabled: h.secondOpinionEnabled(), SecondOpinionCount: secondCount,
-			ResetCount: resetCount,
+			ResetCount: resetCount, JustHidden: justHidden,
 		}
 		// "Review all PRs" offers every model when more than one is configured; a
 		// single-model setup keeps the plain button.

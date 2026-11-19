@@ -2,8 +2,11 @@ package webui
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -42,8 +45,8 @@ func TestHideItemTogglesWholeItem(t *testing.T) {
 	}
 
 	rec := post(h, "id=pr1")
-	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/" {
-		t.Fatalf("hide: status %d to %q, want 303 to the radar", rec.Code, rec.Header().Get("Location"))
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/?hidden=pr1" {
+		t.Fatalf("hide: status %d to %q, want 303 to the radar with Undo for pr1", rec.Code, rec.Header().Get("Location"))
 	}
 	if got := get("pr1"); !got.Meta.HiddenAt.Equal(now) || len(got.Thread) != 1 {
 		t.Fatalf("hide must stamp HiddenAt and keep the thread, got %v %+v", got.Meta.HiddenAt, got.Thread)
@@ -54,6 +57,19 @@ func TestHideItemTogglesWholeItem(t *testing.T) {
 	res, err := worklist.Resolve(context.Background(), store, &recordPipeline{}, now, "u1", worklist.DefaultSort, true)
 	if err != nil || len(res.Items) != 1 || res.Items[0].ID != "pr2" {
 		t.Fatalf("a hidden item leaves the radar, got %+v (%v)", res.Items, err)
+	}
+
+	// A repeated Hide (a stale tab, a double submit) keeps the original hide time, so
+	// GitHub activity after the first Hide still resurfaces the item.
+	later := &Handler{sessions: h.sessions, store: store, now: func() time.Time { return now.Add(time.Hour) }}
+	post(later, "id=pr1")
+	if got := get("pr1"); !got.Meta.HiddenAt.Equal(now) {
+		t.Fatalf("a repeated Hide moved HiddenAt to %v, want the original %v", got.Meta.HiddenAt, now)
+	}
+	merged := worklist.MergeRunItems([]worklist.WorkItem{get("pr1")},
+		[]worklist.WorkItem{{ID: "pr1", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{UpdatedAt: now.Add(time.Minute)}}})
+	if !merged[0].OnRadar() {
+		t.Fatal("a comment between the first and a repeated Hide must still resurface the item")
 	}
 
 	rec = post(h, "id=pr1&hidden=false&back=thread")
@@ -190,5 +206,87 @@ func TestHideItemControls(t *testing.T) {
 	out = renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true, User: &session.User{ID: "u1"}})
 	if strings.Contains(out, ">Hide item</button>") || !strings.Contains(out, `name="back" value="thread"`) || !strings.Contains(out, "Hidden from your radar") {
 		t.Fatalf("a hidden item's thread offers Unhide instead, got:\n%s", out)
+	}
+}
+
+// failingStore fails every write, as a full disk or a locked database would.
+type failingStore struct{ worklist.Store }
+
+func (failingStore) Update(context.Context, string, func([]worklist.WorkItem) ([]worklist.WorkItem, error)) error {
+	return errors.New("disk full")
+}
+
+// A hide or unhide whose write fails says so instead of redirecting as if it worked.
+func TestHideItemReportsFailedWrite(t *testing.T) {
+	mem := worklist.NewMemoryStore()
+	mem.Seed("u1", worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest})
+	h := New(fakeSessions{&session.User{ID: "u1"}}, failingStore{mem}, &recordPipeline{}, reconnectProviders{}, true, nil)
+	for body, verb := range map[string]string{"id=pr1": "hide", "id=pr1&hidden=false&back=thread": "unhide"} {
+		req := httptest.NewRequest(http.MethodPost, "/items/hide", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		h.HideItem(rec, req)
+		if rec.Code != http.StatusInternalServerError || rec.Header().Get("Location") != "" {
+			t.Fatalf("%s: status %d to %q, want a 500 page, not a redirect", verb, rec.Code, rec.Header().Get("Location"))
+		}
+		out := rec.Body.String()
+		if !strings.Contains(out, "gofer couldn&#39;t "+verb+" that item") || strings.Contains(out, "discovering your work") {
+			t.Fatalf("%s: the page must explain the failed change, got:\n%s", verb, out)
+		}
+	}
+}
+
+// After a hide the radar offers Undo for that item, which is no longer listed; it
+// offers nothing for an item that is visible again or unknown.
+func TestRadarOffersUndoAfterHide(t *testing.T) {
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	store := worklist.NewMemoryStore()
+	hidden := worklist.WorkItem{ID: "github:o/r#1", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, Title: "Hidden PR"}}
+	hidden.Meta.HiddenAt = now
+	visible := worklist.WorkItem{ID: "github:o/r#2", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "o/r", Number: 2, Title: "Visible PR"}}
+	store.Seed("u1", hidden, visible)
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{}, true, nil)
+	page := func(target string) string {
+		rec := httptest.NewRecorder()
+		h.Index(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		return rec.Body.String()
+	}
+
+	out := page("/?hidden=" + url.QueryEscape(hidden.ID))
+	if !strings.Contains(out, "Hidden <b>Hidden PR</b>") || !strings.Contains(out, ">Undo</button>") ||
+		!strings.Contains(out, `name="id" value="github:o/r#1"`) || !strings.Contains(out, `name="hidden" value="false"`) {
+		t.Fatalf("expected an Undo for the hidden item, got:\n%s", out)
+	}
+	for _, target := range []string{"/", "/?hidden=" + url.QueryEscape(visible.ID), "/?hidden=nope"} {
+		if strings.Contains(page(target), ">Undo</button>") {
+			t.Errorf("%s: no Undo expected", target)
+		}
+	}
+}
+
+// Reset Conversations counts every thread it will clear: hidden and closed items'
+// threads too, not just the ones on the radar.
+func TestResetCountIncludesOffRadarThreads(t *testing.T) {
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	thread := []worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: "q"}}
+	mk := func(n int) worklist.WorkItem {
+		return worklist.WorkItem{ID: fmt.Sprintf("pr%d", n), Type: worklist.TypePullRequest, Thread: thread,
+			GitHub: worklist.GitHubRef{Repo: "o/r", Number: n, Title: fmt.Sprintf("PR %d", n)}}
+	}
+	closed := mk(3)
+	closed.Meta.CompletedAt = now
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", mk(1), mk(2), closed, worklist.WorkItem{ID: "pr4", Type: worklist.TypePullRequest})
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{}, true, nil)
+	h.now = func() time.Time { return now }
+
+	req := httptest.NewRequest(http.MethodPost, "/items/hide", strings.NewReader("id=pr2"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.HideItem(httptest.NewRecorder(), req)
+
+	rec := httptest.NewRecorder()
+	h.Index(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if out := rec.Body.String(); !strings.Contains(out, "Reset Conversations (3)") {
+		t.Fatalf("Reset clears three threads (one visible, one hidden, one closed), so it must say 3, got:\n%s", out)
 	}
 }
