@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackfrancis/gofer/internal/session"
 	"github.com/jackfrancis/gofer/internal/vault"
 )
 
@@ -169,22 +170,26 @@ func (v *VaultStore) markWith(ctx context.Context, ex execer, userID, provider s
 	return nil
 }
 
-// MarkLogoutEndingSession records a pending logout and deletes the session whose
-// hashed id is sessionKey (the sessions table of this database), in one transaction:
-// either the logout is recorded and the session gone, or neither. An empty
-// sessionKey records the logout alone.
+// MarkLogoutEndingSession consumes the session whose hashed id is sessionKey (the
+// sessions table of this database) and records a pending logout, in one
+// transaction: either this call removed the session and the logout is recorded, or
+// neither happened. A session already gone (another logout of it got there first)
+// is session.ErrNotFound, and nothing is recorded, so each browser session starts
+// at most one logout. An empty sessionKey records the logout alone.
 func (v *VaultStore) MarkLogoutEndingSession(ctx context.Context, sessionKey, userID, provider string) error {
 	return v.inTx(ctx, func(tx *sql.Tx) error {
-		if err := v.markWith(ctx, tx, userID, provider); err != nil {
-			return err
+		if sessionKey != "" {
+			res, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE id_hash = ?`, sessionKey)
+			if err != nil {
+				return fmt.Errorf("storage: delete session: %w", err)
+			}
+			if n, err := res.RowsAffected(); err != nil {
+				return fmt.Errorf("storage: delete session: %w", err)
+			} else if n == 0 {
+				return session.ErrNotFound
+			}
 		}
-		if sessionKey == "" {
-			return nil
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE id_hash = ?`, sessionKey); err != nil {
-			return fmt.Errorf("storage: delete session: %w", err)
-		}
-		return nil
+		return v.markWith(ctx, tx, userID, provider)
 	})
 }
 

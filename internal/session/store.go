@@ -63,6 +63,17 @@ func (s *MemoryStore) Load(_ context.Context, key string) (User, time.Time, erro
 	return e.user, e.expiresAt, nil
 }
 
+// Consume deletes the entry under key and reports whether it was there.
+func (s *MemoryStore) Consume(_ context.Context, key string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.entries[key]
+	delete(s.entries, key)
+	return ok, nil
+}
+
+var _ Consumer = (*MemoryStore)(nil)
+
 func (s *MemoryStore) Delete(_ context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -7,6 +7,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -343,8 +344,15 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	// Find the owner on a deadline of its own: a browser that disconnects must not
 	// hide whose credential to revoke.
 	lctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
-	u := h.sessions.CurrentUser(r.WithContext(lctx))
+	u, lerr := h.sessions.Lookup(r.WithContext(lctx))
 	cancel()
+	if lerr != nil {
+		// The store could not say whose session this is. Ending it now could leave
+		// that user's credential vendable: change nothing, and say so.
+		slog.ErrorContext(r.Context(), "logout: looking up the session failed; the session stands", "err", lerr)
+		writeLogoutError(w)
+		return
+	}
 	// Record the pending logout and end the session together (one commit with the
 	// SQLite vault), again detached from the browser. If that fails nothing changed:
 	// the session stands, nothing is revoked, and the user is told to try again.
@@ -359,7 +367,15 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 		return err
 	})
 	cancel()
-	if err != nil {
+	switch {
+	case errors.Is(err, session.ErrNotFound):
+		// Another logout of this same session consumed it first; that one owns the
+		// revocation. Clear this browser's cookie and record nothing.
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+		h.sessions.Destroy(w, r.WithContext(dctx))
+		dcancel()
+		res = h.unconfirmed(u.Provider, h.providers[u.Provider], nil)
+	case err != nil:
 		slog.ErrorContext(r.Context(), "logout could not be recorded; the session stands", "user", u.ID, "err", err)
 		writeLogoutError(w)
 		return

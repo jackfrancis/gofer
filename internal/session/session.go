@@ -229,29 +229,61 @@ func (m *Manager) Authenticate(w http.ResponseWriter, r *http.Request, u *User) 
 
 // CurrentUser returns the authenticated user for the request, or nil.
 func (m *Manager) CurrentUser(r *http.Request) *User {
+	u, err := m.Lookup(r)
+	if err != nil {
+		slog.Default().Warn("session: loading stored session failed", "err", err)
+		return nil
+	}
+	return u
+}
+
+// Lookup is CurrentUser that tells "no session" (nil, nil) apart from a store that
+// could not answer (nil, err). A caller about to end the session needs the
+// difference: a store failure must not look like a missing session.
+func (m *Manager) Lookup(r *http.Request) (*User, error) {
 	id := m.id(r)
 	if id == "" {
-		return nil
+		return nil, nil
 	}
 	key := storeKey(id)
 	u, expiresAt, err := m.store.Load(r.Context(), key)
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
 	if err != nil {
-		if !errors.Is(err, ErrNotFound) {
-			slog.Default().Warn("session: loading stored session failed", "err", err)
-		}
-		return nil
+		return nil, err
 	}
 	if m.now().After(expiresAt) {
 		_ = m.store.Delete(r.Context(), key)
-		return nil
+		return nil, nil
 	}
 	if m.allow != nil && !m.allow(&u) {
-		return nil
+		return nil, nil
 	}
-	return &u
+	return &u, nil
 }
 
-// Destroy removes the session and clears the cookie.
+// Consumer is a Store that deletes an entry and reports whether it was there, in
+// one step. MemoryStore implements it.
+type Consumer interface {
+	Consume(ctx context.Context, key string) (bool, error)
+}
+
+// ConsumeStored deletes the stored session under storeKey and reports whether this
+// call removed it, so of two overlapping callers exactly one sees true. A store
+// that is not a Consumer gets a Load then a Delete, which is not atomic.
+func (m *Manager) ConsumeStored(ctx context.Context, storeKey string) (bool, error) {
+	if c, ok := m.store.(Consumer); ok {
+		return c.Consume(ctx, storeKey)
+	}
+	if _, _, err := m.store.Load(ctx, storeKey); errors.Is(err, ErrNotFound) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	return true, m.store.Delete(ctx, storeKey)
+}
+
 // EndWith ends the request's session through commit, which must delete the stored
 // session (storeKey, the hashed id a Store sees) together with whatever the caller
 // records about the session's end, in one commit where the store allows it. Only if
@@ -274,6 +306,7 @@ func (m *Manager) EndWith(w http.ResponseWriter, r *http.Request, commit func(ct
 	return nil
 }
 
+// Destroy removes the session and clears the cookie.
 func (m *Manager) Destroy(w http.ResponseWriter, r *http.Request) {
 	m.drop(r)
 	m.clearCookie(w)

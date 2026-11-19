@@ -210,8 +210,10 @@ Wired on the web-tier side; they define what a runtime must respect:
   marker row under a reserved provider name in `credentials`, no migration), so the
   refusal survives a restart; the next lock holder, or startup, finishes it. Pairs
   that must agree after a crash commit in one SQLite transaction: the logout marker
-  with the session delete (`MarkLogoutEndingSession`), and a sign-in's credential
-  with clearing the marker (`PutClearingLogout`).
+  with the session delete (`MarkLogoutEndingSession`, which records nothing unless
+  it removed the session), and a sign-in's credential with clearing the marker
+  (`PutClearingLogout`). Marker transitions and in-memory ownership change together
+  under `credLocks.markerLock`.
   Never write the vault from anywhere else. A
   credential from another client is never vended. The broker answers "sign-in
   required" with 410 and code `sign_in_required`; the workload (`internal/agent`,

@@ -492,3 +492,25 @@ func TestPutClearingLogoutIsAtomic(t *testing.T) {
 		t.Error("sign-in did not replace the credential and clear the marker")
 	}
 }
+
+// Review (fifth round): a logout is recorded only by the call that consumes the
+// session. A second call for the same, already deleted session records nothing.
+func TestMarkLogoutEndingSessionConsumesOnce(t *testing.T) {
+	db := open(t, t.TempDir())
+	v := db.Vault(keyring(t, testKey(1)))
+	if err := db.Sessions().Save(ctx, "sess-hash", session.User{ID: "alice"}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.MarkLogoutEndingSession(ctx, "sess-hash", "alice", "github"); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.ClearLogout(ctx, "alice", "github"); err != nil { // the first logout finished
+		t.Fatal(err)
+	}
+	if err := v.MarkLogoutEndingSession(ctx, "sess-hash", "alice", "github"); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("second logout of the same session: err = %v, want session.ErrNotFound", err)
+	}
+	if p, _ := v.LogoutPending(ctx, "alice", "github"); p {
+		t.Error("the second logout recorded a marker")
+	}
+}

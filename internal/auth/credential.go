@@ -17,6 +17,7 @@ import (
 
 	"golang.org/x/oauth2"
 
+	"github.com/jackfrancis/gofer/internal/session"
 	"github.com/jackfrancis/gofer/internal/vault"
 )
 
@@ -77,6 +78,28 @@ type credLocks struct {
 	mu      sync.Mutex
 	m       map[string]*credLock
 	logouts map[string]*localLogout
+	markers map[string]*sync.Mutex
+}
+
+// markerLock serialises the transitions of one (user, provider)'s pending logout —
+// the durable marker together with this process's ownership of it: logout recording
+// it, a sign-in clearing it, logout's cleanup clearing it. Each holds it only for a
+// bounded ledger write, never while calling GitHub. It is taken after the credential
+// lock where both are held, never before.
+func (l *credLocks) markerLock(userID, provider string) func() {
+	key := credKey(userID, provider)
+	l.mu.Lock()
+	if l.markers == nil {
+		l.markers = make(map[string]*sync.Mutex)
+	}
+	m := l.markers[key]
+	if m == nil {
+		m = &sync.Mutex{}
+		l.markers[key] = m
+	}
+	l.mu.Unlock()
+	m.Lock()
+	return m.Unlock
 }
 
 type credLock struct {
@@ -167,16 +190,31 @@ type logoutCommitter interface {
 // operation's ID, or an error if nothing was committed, in which case nothing has
 // changed: the session stands and the caller reports that sign-out failed.
 func (h *Handler) beginLogout(ctx context.Context, sessionKey, userID, providerName string) (string, error) {
+	defer h.locks.markerLock(userID, providerName)()
 	op := h.locks.beginLogout(userID, providerName)
 	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
 	defer cancel()
 	var err error
 	if c, ok := h.vault.(logoutCommitter); ok {
+		// Records the logout only if this call consumed the session
+		// (session.ErrNotFound otherwise).
 		err = c.MarkLogoutEndingSession(lctx, sessionKey, userID, providerName)
 	} else {
-		// An in-memory vault: there is no restart to survive, and the session
-		// manager deletes its own session after this.
-		err = h.ledger.MarkLogout(lctx, userID, providerName)
+		// An in-memory vault: there is no restart to survive. Consume the session
+		// from the manager's own store first, so each session still starts at most
+		// one logout.
+		if sessionKey != "" {
+			consumed, cerr := h.sessions.ConsumeStored(lctx, sessionKey)
+			switch {
+			case cerr != nil:
+				err = cerr
+			case !consumed:
+				err = session.ErrNotFound
+			}
+		}
+		if err == nil {
+			err = h.ledger.MarkLogout(lctx, userID, providerName)
+		}
 	}
 	if err != nil {
 		h.locks.abandonLogout(userID, providerName, op)
@@ -196,6 +234,7 @@ func (h *Handler) markLogout(ctx context.Context, userID, providerName string) (
 // once; if it persists the marker stays, which fails closed (the user signs in
 // again).
 func (h *Handler) clearLogout(ctx context.Context, userID, providerName string) {
+	defer h.locks.markerLock(userID, providerName)()
 	h.locks.dropLogout(userID, providerName)
 	for attempt := 0; attempt < 2; attempt++ {
 		lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
@@ -754,7 +793,10 @@ func (h *Handler) storeSignIn(ctx context.Context, p *provider, userID string, t
 	// The new credential and the clearing of any pending logout commit together, so
 	// a restart sees either the pending logout or the sign-in that replaced it, never
 	// the new credential paired with the old logout (whose recovery would revoke the
-	// grant the user just gave).
+	// grant the user just gave). The marker lock keeps a logout that commits right
+	// after this write from losing its ownership to this sign-in's clear.
+	unlockMarker := h.locks.markerLock(userID, p.name)
+	defer unlockMarker()
 	if l, ok := h.vault.(vault.LogoutLedger); ok {
 		err = l.PutClearingLogout(ctx, userID, cred)
 	} else if err = h.vault.Put(ctx, userID, cred); err == nil {

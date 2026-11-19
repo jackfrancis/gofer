@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -1065,5 +1067,169 @@ func TestLedgerErrorIsTemporary(t *testing.T) {
 		if err == nil || errors.Is(err, vault.ErrSignInRequired) {
 			t.Errorf("ledger read %d failing: err = %v, want a temporary error", n, err)
 		}
+	}
+}
+
+// flakyLoadStore is a session store whose first Load fails, as a SQLite store
+// timing out would, and then recovers.
+type flakyLoadStore struct {
+	session.Store
+	mu     sync.Mutex
+	failed bool
+}
+
+func (s *flakyLoadStore) Load(ctx context.Context, key string) (session.User, time.Time, error) {
+	s.mu.Lock()
+	first := !s.failed
+	s.failed = true
+	s.mu.Unlock()
+	if first {
+		return session.User{}, time.Time{}, context.DeadlineExceeded
+	}
+	return s.Store.Load(ctx, key)
+}
+
+// Review P1 (fifth round): a session lookup that fails is not "no session". Logout
+// answers 503 and leaves both the session and the credential as they were.
+func TestLogoutLookupFailureChangesNothing(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, cfg, _ := newKindHandler(t, gh, config.GitHubApp)
+	store := &flakyLoadStore{Store: session.NewMemoryStore(), failed: true}
+	h.sessions = session.NewManager(cfg.SessionSecret, cfg.CookieSecure, session.WithStore(store))
+	_, next := signIn(t, h)
+	store.mu.Lock()
+	store.failed = false // the next Load, logout's, fails
+	store.mu.Unlock()
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	for _, ck := range next.Cookies() {
+		req.AddCookie(ck)
+	}
+	rec := httptest.NewRecorder()
+	h.Logout(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.MaxAge < 0 {
+			t.Error("cookie cleared after a failed lookup")
+		}
+	}
+	if h.sessions.CurrentUser(next) == nil {
+		t.Error("the session was ended after a failed lookup")
+	}
+	if logoutIsPending(h) || gh.revoked.Load() != 0 {
+		t.Error("a logout was recorded or revoked after a failed lookup")
+	}
+}
+
+// staleStore answers Load with a user even after the row is gone: what a second,
+// overlapping logout request saw before the first one consumed the session.
+type staleStore struct {
+	session.Store
+	user session.User
+}
+
+func (s staleStore) Load(context.Context, string) (session.User, time.Time, error) {
+	return s.user, time.Now().Add(time.Hour), nil
+}
+
+// Review P2 (fifth round): each browser session starts at most one logout. A
+// delayed, overlapping logout of a session the first one already consumed records
+// nothing, so it cannot revoke the grant of a sign-in that happened in between.
+func TestOverlappingLogoutOfConsumedSessionRecordsNothing(t *testing.T) {
+	gh := newFakeGitHub(t)
+	db, err := storage.Open(bg, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	keys, _ := storage.NewKeyring(make([]byte, storage.KeySize))
+	h, _, cfg, _ := newKindHandler(t, gh, config.GitHubApp)
+	vlt := db.Vault(keys)
+	h.vault, h.ledger = vlt, vlt
+	h.sessions = session.NewManager(cfg.SessionSecret, cfg.CookieSecure, session.WithStore(db.Sessions()))
+	_, next := signIn(t, h)
+
+	// The first logout consumed the session (and finished); the user signed in again.
+	u := h.sessions.CurrentUser(next)
+	if u == nil {
+		t.Fatal("no session")
+	}
+	h.sessions = session.NewManager(cfg.SessionSecret, cfg.CookieSecure,
+		session.WithStore(staleStore{Store: db.Sessions(), user: *u}))
+	var ck *http.Cookie
+	for _, c := range next.Cookies() {
+		ck = c
+	}
+	if err := db.Sessions().Delete(bg, sessionKeyFor(t, cfg, ck)); err != nil {
+		t.Fatal(err)
+	}
+	put(t, gh, vlt, appCred("ghu_new", "ghr_new", "v9", 8*time.Hour))
+
+	// The delayed second request, carrying the old cookie.
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	req.AddCookie(ck)
+	rec := httptest.NewRecorder()
+	h.Logout(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (nothing recorded, revocation not this request's)", rec.Code)
+	}
+	if logoutIsPending(h) || gh.revoked.Load() != 0 {
+		t.Fatalf("pending = %v, revocations = %d: the stale logout acted", logoutIsPending(h), gh.revoked.Load())
+	}
+	if c, err := h.Credential(bg, user, "github", VendRequest{}); err != nil || c.AccessToken != "ghu_new" {
+		t.Fatalf("the new sign-in's credential: %q, %v", c.AccessToken, err)
+	}
+}
+
+// sessionKeyFor is the store key (hashed id) of a session cookie, computed the way
+// session.Manager does: the cookie is "id.signature".
+func sessionKeyFor(t *testing.T, _ *config.Config, c *http.Cookie) string {
+	t.Helper()
+	i := strings.LastIndexByte(c.Value, '.')
+	if i < 0 {
+		t.Fatalf("unexpected cookie %q", c.Value)
+	}
+	sum := sha256.Sum256([]byte(c.Value[:i]))
+	return hex.EncodeToString(sum[:])
+}
+
+// racingSignInVault starts a logout while a sign-in's write is committing, the
+// moment between that write and the sign-in dropping its in-memory ownership.
+type racingSignInVault struct {
+	*vault.MemoryVault
+	h      *Handler
+	logout chan string
+}
+
+func (v *racingSignInVault) PutClearingLogout(ctx context.Context, userID string, c vault.Credential) error {
+	if err := v.MemoryVault.PutClearingLogout(ctx, userID, c); err != nil {
+		return err
+	}
+	go func() {
+		op, _ := v.h.markLogout(bg, userID, c.Provider)
+		v.logout <- op
+	}()
+	time.Sleep(50 * time.Millisecond) // give the logout every chance to run first
+	return nil
+}
+
+// Review P2 (fifth round): a logout that commits right after a sign-in's write keeps
+// its ownership; the sign-in's clear cannot erase it, so its worker still revokes.
+func TestLogoutAfterSignInWriteKeepsOwnership(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, _ := newKindHandler(t, gh, config.GitHubApp)
+	rv := &racingSignInVault{MemoryVault: vault.NewMemoryVault(), h: h, logout: make(chan string, 1)}
+	h.vault, h.ledger = rv, rv
+	signIn(t, h)
+	op := <-rv.logout
+	if op == "" || !h.locks.owns(user, "github", op) {
+		t.Fatal("the sign-in erased the newer logout's ownership")
+	}
+	if !logoutIsPending(h) {
+		t.Fatal("the newer logout is not pending")
+	}
+	if res := h.revokeAndDelete(bg, user, "github", op); !res.confirmed || gh.revoked.Load() != 1 {
+		t.Fatalf("logout = %+v, revocations = %d; want its worker to revoke", res, gh.revoked.Load())
 	}
 }
