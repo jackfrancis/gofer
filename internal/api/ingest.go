@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/jackfrancis/gofer/internal/principal"
 	"github.com/jackfrancis/gofer/internal/worklist"
@@ -109,8 +110,32 @@ func (h *IngestHandler) Reply(w http.ResponseWriter, r *http.Request) {
 
 // researchRequest is the body of POST /agent/worklist/research.
 type researchRequest struct {
-	ItemID     string                       `json:"item_id"`
-	Adjustment *worklist.ResearchAdjustment `json:"adjustment"`
+	ItemID     string              `json:"item_id"`
+	Adjustment *researchAdjustment `json:"adjustment"`
+}
+
+// researchAdjustment is worklist.ResearchAdjustment as posted, with each multiplier
+// a pointer so a missing one is told apart from an explicit zero: a missing
+// multiplier decoding as 0 would silently zero that ranking axis.
+type researchAdjustment struct {
+	Relevance  *float64  `json:"relevance"`
+	Impact     *float64  `json:"impact"`
+	Engagement *float64  `json:"engagement"`
+	Urgency    *float64  `json:"urgency"`
+	Rationale  string    `json:"rationale"`
+	AppliedAt  time.Time `json:"applied_at"`
+}
+
+// complete reports whether every multiplier and the stamp are present.
+func (a *researchAdjustment) complete() bool {
+	return a != nil && a.Relevance != nil && a.Impact != nil && a.Engagement != nil && a.Urgency != nil && !a.AppliedAt.IsZero()
+}
+
+func (a *researchAdjustment) value() worklist.ResearchAdjustment {
+	return worklist.ResearchAdjustment{
+		Relevance: *a.Relevance, Impact: *a.Impact, Engagement: *a.Engagement, Urgency: *a.Urgency,
+		Rationale: a.Rationale, AppliedAt: a.AppliedAt,
+	}
 }
 
 // maxResearchBody bounds a research request: four multipliers and a rationale.
@@ -120,7 +145,7 @@ const maxResearchBody = 64 << 10
 // the research adjustment it derived here (worklist.ApplyResearch), and only that:
 // the rest of the item stays as stored now, so a run that read the item before a
 // refresh cannot write back its older GitHub fields. An adjustment for an item that
-// is gone is accepted and dropped.
+// is gone, or older than the stored one (a resend), is accepted and dropped.
 func (h *IngestHandler) Research(w http.ResponseWriter, r *http.Request) {
 	p, ok := principal.FromContext(r.Context())
 	if !ok {
@@ -132,11 +157,11 @@ func (h *IngestHandler) Research(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if body.ItemID == "" || body.Adjustment == nil {
-		writeError(w, http.StatusBadRequest, "item_id and adjustment are required")
+	if body.ItemID == "" || !body.Adjustment.complete() {
+		writeError(w, http.StatusBadRequest, "item_id and an adjustment with relevance, impact, engagement, urgency and applied_at are required")
 		return
 	}
-	if err := worklist.ApplyResearch(r.Context(), h.store, p.ActingUserID, body.ItemID, *body.Adjustment); err != nil {
+	if err := worklist.ApplyResearch(r.Context(), h.store, p.ActingUserID, body.ItemID, body.Adjustment.value()); err != nil {
 		writeError(w, http.StatusBadGateway, "could not persist research adjustment")
 		return
 	}

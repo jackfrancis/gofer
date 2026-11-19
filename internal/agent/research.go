@@ -3,6 +3,9 @@ package agent
 import (
 	"context"
 	"fmt"
+	"time"
+
+	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
 // runResearch re-weights a single item's ranking axes (p.ItemID) from its
@@ -39,8 +42,18 @@ func runResearch(ctx context.Context, p Params, sink Sink) error {
 	}
 	// Write back only the adjustment: the item was read before the model call, and
 	// a refresh may have landed since.
-	if err := sink.Research(ctx, item.ID, adj); err != nil {
+	if err := sink.Research(ctx, item.ID, stampResearch(adj)); err != nil {
 		return fmt.Errorf("research: %w", err)
 	}
 	return nil
+}
+
+// stampResearch gives an adjustment its AppliedAt if the researcher left it unset.
+// The stamp is fixed before the write is sent, so a resend carries the same one and
+// cannot be taken for a newer result (worklist.ApplyResearch).
+func stampResearch(adj worklist.ResearchAdjustment) worklist.ResearchAdjustment {
+	if adj.AppliedAt.IsZero() {
+		adj.AppliedAt = time.Now().UTC()
+	}
+	return adj
 }

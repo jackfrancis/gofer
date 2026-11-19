@@ -28,6 +28,15 @@ const (
 //
 // Time-dependent axes (Engagement, Urgency) are evaluated against now, so a later
 // read-time rescore keeps them fresh.
+// BaselineScore is Score without the model-derived signals: the deterministic
+// metadata scorer alone, as computed from GitHub's signals. Choosing which items
+// to send to the model uses it, so a stored proposal cannot decide its own refresh.
+func BaselineScore(item WorkItem, now time.Time) Metadata {
+	item.Signals.Proposed = nil
+	item.Signals.Research = nil
+	return Score(item, now)
+}
+
 func Score(item WorkItem, now time.Time) Metadata {
 	var contribs []Contribution
 

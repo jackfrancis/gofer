@@ -108,6 +108,8 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 			s.ReviewRequestedBy = act.RequestedByLogin
 			s.AwaitingMeSince = act.AwaitingMeSince
 			s.AwaitingOthersSince = act.AwaitingOthersSince
+			// Enrich derives no model signals; leave them to the store.
+			clearModelSignals(s)
 			mu.Lock()
 			changed = append(changed, items[i])
 			mu.Unlock()

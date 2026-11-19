@@ -207,7 +207,7 @@ func TestApplyResearch(t *testing.T) {
 		Signals: Signals{Comments: 4, Proposed: prop},
 		Thread:  []Message{{ID: "q1", Role: RoleUser, Content: "q", At: t0}},
 	})
-	adj := ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "r"}
+	adj := ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "r", AppliedAt: t1}
 	if err := ApplyResearch(ctx, s, "u1", "a", adj); err != nil {
 		t.Fatal(err)
 	}
@@ -227,5 +227,41 @@ func TestApplyResearch(t *testing.T) {
 	}
 	if other, _ := s.List(ctx, "u2"); len(other) != 0 {
 		t.Fatalf("u2 must have nothing, got %+v", other)
+	}
+}
+
+// A resent adjustment cannot undo a later one: A lands, B lands for a later turn,
+// and A arrives again. An unstamped adjustment is refused.
+func TestApplyResearchDropsOlderAdjustment(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore()
+	s.Seed("u1", WorkItem{ID: "a"})
+	a := ResearchAdjustment{Relevance: 0.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "A", AppliedAt: t1}
+	b := ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "B", AppliedAt: t2}
+	for _, adj := range []ResearchAdjustment{a, b, a} {
+		if err := ApplyResearch(ctx, s, "u1", "a", adj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ := s.List(ctx, "u1")
+	if r := got[0].Signals.Research; r == nil || r.Rationale != "B" {
+		t.Fatalf("a replayed older adjustment must not replace a newer one, got %+v", r)
+	}
+	if err := ApplyResearch(ctx, s, "u1", "a", ResearchAdjustment{Relevance: 1, Impact: 1, Engagement: 1, Urgency: 1}); err != ErrUnstampedResearch {
+		t.Fatalf("want ErrUnstampedResearch, got %v", err)
+	}
+}
+
+// BaselineScore ignores the model-derived signals.
+func TestBaselineScoreIgnoresModelSignals(t *testing.T) {
+	plain := WorkItem{ID: "a", Signals: Signals{Reasons: []Reason{ReasonReviewRequested}}}
+	scored := plain
+	scored.Signals.Proposed = &AxisProposal{Relevance: 0.01, Impact: 0.01, Engagement: 0.01, Urgency: 0.01}
+	scored.Signals.Research = &ResearchAdjustment{Relevance: 0, Impact: 0, Engagement: 0, Urgency: 0}
+	if got, want := BaselineScore(scored, t0).Rank, Score(plain, t0).Rank; got != want {
+		t.Fatalf("BaselineScore = %v, want the plain score %v", got, want)
+	}
+	if scored.Signals.Proposed == nil || scored.Signals.Research == nil {
+		t.Fatal("BaselineScore must not change its argument")
 	}
 }

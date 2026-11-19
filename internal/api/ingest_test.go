@@ -230,6 +230,39 @@ func TestAgentResearch(t *testing.T) {
 	if code := f.post(t, f.research, "/agent/worklist/research", full, map[string]any{"item_id": "gone", "adjustment": adj}); code != http.StatusOK {
 		t.Fatalf("want 200 for a dropped adjustment, got %d", code)
 	}
+	// A resend of an older adjustment (A, then B, then A again) is accepted and dropped.
+	later := adj
+	later.AppliedAt = adj.AppliedAt.Add(time.Hour)
+	later.Rationale = "later"
+	for _, a := range []worklist.ResearchAdjustment{later, adj} {
+		if code := f.post(t, f.research, "/agent/worklist/research", full, map[string]any{"item_id": "a", "adjustment": a}); code != http.StatusOK {
+			t.Fatalf("want 200, got %d", code)
+		}
+	}
+	if got, _ := f.store.List(context.Background(), "u1"); got[0].Signals.Research.Rationale != "later" {
+		t.Fatalf("a resent older adjustment must not replace a newer one, got %+v", got[0].Signals.Research)
+	}
+
+	// An explicit zero multiplier is a valid adjustment.
+	zero := map[string]any{"relevance": 0, "impact": 1, "engagement": 1, "urgency": 1, "applied_at": later.AppliedAt.Add(time.Hour)}
+	if code := f.post(t, f.research, "/agent/worklist/research", full, map[string]any{"item_id": "a", "adjustment": zero}); code != http.StatusOK {
+		t.Fatalf("want 200 for an explicit zero multiplier, got %d", code)
+	}
+	if got, _ := f.store.List(context.Background(), "u1"); got[0].Signals.Research.Relevance != 0 || got[0].Signals.Research.Impact != 1 {
+		t.Fatalf("the explicit zero must land, got %+v", got[0].Signals.Research)
+	}
+
+	// Incomplete adjustments are rejected: a missing multiplier would decode as zero.
+	for name, partial := range map[string]map[string]any{
+		"empty":           {},
+		"missing urgency": {"relevance": 1, "impact": 1, "engagement": 1, "applied_at": later.AppliedAt},
+		"unstamped":       {"relevance": 1, "impact": 1, "engagement": 1, "urgency": 1},
+	} {
+		if code := f.post(t, f.research, "/agent/worklist/research", full, map[string]any{"item_id": "a", "adjustment": partial}); code != http.StatusBadRequest {
+			t.Fatalf("%s: want 400, got %d", name, code)
+		}
+	}
+
 	// Malformed requests are rejected.
 	if code := f.post(t, f.research, "/agent/worklist/research", full, map[string]any{"item_id": "a"}); code != http.StatusBadRequest {
 		t.Fatalf("want 400 without an adjustment, got %d", code)

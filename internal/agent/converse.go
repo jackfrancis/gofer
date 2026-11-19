@@ -158,7 +158,7 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	if p.Researcher != nil {
 		item.Thread = append(item.Thread, msg)
 		if adj, rerr := p.Researcher.Research(ctx, item); rerr == nil {
-			if err := sink.Research(ctx, item.ID, adj); err != nil {
+			if err := sink.Research(ctx, item.ID, stampResearch(adj)); err != nil {
 				return fmt.Errorf("research: %w", err)
 			}
 		}

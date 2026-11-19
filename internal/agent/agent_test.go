@@ -27,6 +27,9 @@ type memSink struct {
 	ingests    int // write-back calls, so batching is observable
 	replies    int // Reply calls
 	researches int // Research calls
+
+	// beforeIngest, if set, runs once just before the first write-back is merged.
+	beforeIngest func()
 }
 
 func (m *memSink) List(context.Context) ([]worklist.WorkItem, error) {
@@ -40,6 +43,10 @@ func (m *memSink) List(context.Context) ([]worklist.WorkItem, error) {
 
 func (m *memSink) Ingest(_ context.Context, items []worklist.WorkItem) error {
 	m.ingests++
+	if f := m.beforeIngest; f != nil {
+		m.beforeIngest = nil
+		f() // what lands in the store between the run's read and its first write
+	}
 	m.put(worklist.MergeRunItems(m.items, items))
 	return nil
 }
@@ -59,7 +66,8 @@ func (m *memSink) Research(_ context.Context, itemID string, adj worklist.Resear
 	m.researches++
 	for i := range m.items {
 		if m.items[i].ID == itemID {
-			m.items[i].Signals.Research = &adj
+			_, err := worklist.SetResearch(&m.items[i], adj)
+			return err
 		}
 	}
 	return nil
@@ -407,10 +415,9 @@ func (failRanker) Propose(context.Context, worklist.WorkItem) (worklist.AxisProp
 	return worklist.AxisProposal{}, fmt.Errorf("model unavailable")
 }
 
-// A Refresh re-fetches an item that already carries a model proposal and a research
-// adjustment. The fetch derives neither, and the chained rank fails here, so both
-// stored values must survive while the GitHub fields refresh.
-func TestRunIngestKeepsModelSignals(t *testing.T) {
+// freshPR7GitHub is a GitHub whose only open work is o/r#7, titled "Fresh title".
+func freshPR7GitHub(t *testing.T) *httptest.Server {
+	t.Helper()
 	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/user" {
 			_, _ = w.Write([]byte(`{"login":"me"}`))
@@ -422,7 +429,15 @@ func TestRunIngestKeepsModelSignals(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"items":[]}`))
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A Refresh re-fetches an item that already carries a model proposal and a research
+// adjustment. The fetch derives neither, and the chained rank fails here, so both
+// stored values must survive while the GitHub fields refresh.
+func TestRunIngestKeepsModelSignals(t *testing.T) {
+	srv := freshPR7GitHub(t)
 
 	prop := worklist.AxisProposal{Relevance: 0.9, Impact: 0.8, Engagement: 0.7, Urgency: 0.6, Confidence: 1, Rationale: "model proposal"}
 	adj := worklist.ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 0.5, Rationale: "from the discussion"}
@@ -474,5 +489,105 @@ func TestRunRankFailureKeepsPreviousProposal(t *testing.T) {
 	}
 	if p := sink.items[0].Signals.Proposed; p == nil || p.Rationale == "previous" {
 		t.Fatalf("a successful scoring pass must replace the proposal, got %+v", p)
+	}
+}
+
+// A discussion saves a new research adjustment after the Refresh read the items but
+// before it wrote them back. The Refresh must not restore the adjustment it read.
+func TestRunIngestKeepsResearchWrittenMeanwhile(t *testing.T) {
+	srv := freshPR7GitHub(t)
+	t0 := time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)
+	older := worklist.ResearchAdjustment{Relevance: 0.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "older", AppliedAt: t0}
+	newer := worklist.ResearchAdjustment{Relevance: 1.8, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "newer", AppliedAt: t0.Add(time.Hour)}
+	sink := &memSink{items: []worklist.WorkItem{{
+		ID: "github:o/r#7", Source: "github", Type: worklist.TypePullRequest,
+		GitHub:  worklist.GitHubRef{Repo: "o/r", Number: 7, Title: "Stale title"},
+		Signals: worklist.Signals{Research: &older},
+	}}}
+	sink.beforeIngest = func() {
+		if err := sink.Research(context.Background(), "github:o/r#7", newer); err != nil {
+			t.Error(err)
+		}
+	}
+	if err := Run(context.Background(),
+		Params{JobType: JobIngest, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client(), Ranker: failRanker{}},
+		fakeVendor{token: "tok"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := sink.items[0]
+	if got.GitHub.Title != "Fresh title" {
+		t.Fatalf("refresh should take the fetched title, got %q", got.GitHub.Title)
+	}
+	if r := got.Signals.Research; r == nil || r.Rationale != "newer" {
+		t.Fatalf("the refresh restored the adjustment it read over a newer one: got %+v", r)
+	}
+}
+
+// recordingRanker records which items reach the model and runs during() inside the
+// first call, to stand in for what lands in the web tier meanwhile.
+type recordingRanker struct {
+	mu     sync.Mutex
+	got    []string
+	during func()
+}
+
+func (r *recordingRanker) Propose(_ context.Context, it worklist.WorkItem) (worklist.AxisProposal, error) {
+	r.mu.Lock()
+	r.got = append(r.got, it.ID)
+	f := r.during
+	r.during = nil
+	r.mu.Unlock()
+	if f != nil {
+		f()
+	}
+	return worklist.AxisProposal{Relevance: 0.5, Impact: 0.5, Engagement: 0.5, Urgency: 0.5, Confidence: 1, Rationale: "new"}, nil
+}
+
+// With room for one item, the rank pass picks by the deterministic baseline: a newly
+// requested review with an old, low proposal goes to the model ahead of an item the
+// user merely commented on. A stored proposal must not decide its own refresh.
+func TestRunRankSelectsOnBaseline(t *testing.T) {
+	now := time.Now().UTC()
+	low := worklist.AxisProposal{Relevance: 0.01, Impact: 0.01, Engagement: 0.01, Urgency: 0.01, Confidence: 1, Rationale: "old"}
+	requested := worklist.WorkItem{ID: "requested", Signals: worklist.Signals{
+		Reasons: []worklist.Reason{worklist.ReasonReviewRequested}, AwaitingMeSince: now.Add(-time.Hour), Proposed: &low,
+	}}
+	commented := worklist.WorkItem{ID: "commented", Signals: worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonCommented}}}
+	// The premise: the stored proposal ranks the review below the comment, and the
+	// baseline ranks it above.
+	if worklist.Score(requested, now).Rank >= worklist.Score(commented, now).Rank {
+		t.Fatal("test premise: the old proposal should rank the review lower")
+	}
+	if worklist.BaselineScore(requested, now).Rank <= worklist.BaselineScore(commented, now).Rank {
+		t.Fatal("test premise: the baseline should rank the review higher")
+	}
+
+	sink := &memSink{items: []worklist.WorkItem{commented, requested}}
+	rr := &recordingRanker{}
+	if err := Run(context.Background(), Params{JobType: JobRank, Ranker: rr, RankLimit: 1}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if len(rr.got) != 1 || rr.got[0] != "requested" {
+		t.Fatalf("want the requested review re-ranked, got %v", rr.got)
+	}
+}
+
+// A research adjustment that lands while a rank pass is asking the model survives
+// the pass's write-back: rank sends only the proposal it derived.
+func TestRunRankKeepsResearchWrittenMeanwhile(t *testing.T) {
+	t0 := time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)
+	older := worklist.ResearchAdjustment{Relevance: 0.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "older", AppliedAt: t0}
+	newer := worklist.ResearchAdjustment{Relevance: 1.8, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "newer", AppliedAt: t0.Add(time.Hour)}
+	sink := &memSink{items: []worklist.WorkItem{{ID: "github:o/r#1", Signals: worklist.Signals{Research: &older}}}}
+	rr := &recordingRanker{during: func() { sink.items[0].Signals.Research = &newer }}
+	if err := Run(context.Background(), Params{JobType: JobRank, Ranker: rr}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := sink.items[0].Signals
+	if got.Proposed == nil || got.Proposed.Rationale != "new" {
+		t.Fatalf("the new proposal must land, got %+v", got.Proposed)
+	}
+	if got.Research == nil || got.Research.Rationale != "newer" {
+		t.Fatalf("rank restored the adjustment it read over a newer one: got %+v", got.Research)
 	}
 }

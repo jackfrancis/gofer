@@ -250,8 +250,9 @@ type ReplyRequest struct {
 }
 
 // Research writes an item's research adjustment, and nothing else, through the
-// agent plane (POST /agent/worklist/research). Setting the same value twice is
-// harmless, so resending after a lost response is safe.
+// agent plane (POST /agent/worklist/research). The plane drops an adjustment older
+// than the stored one (by AppliedAt), so resending after a lost response cannot
+// undo a later result.
 func (c *PlaneClient) Research(ctx context.Context, itemID string, adj worklist.ResearchAdjustment) error {
 	return c.post(ctx, "/agent/worklist/research", "research", ResearchRequest{ItemID: itemID, Adjustment: adj})
 }

@@ -233,11 +233,11 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 
 // reconcileFetched carries gofer-owned per-item state that GitHub cannot supply — the
 // conversation thread and its read cursor, the user/agent metadata overrides (hidden,
-// completed), the original creation time, and the model-derived signals (the model
-// proposal and research adjustment) — from the persisted items onto the
+// completed), and the original creation time — from the persisted items onto the
 // freshly fetched ones, keyed by ID. Fetched items with no persisted counterpart (new
 // work) pass through unchanged. The agent plane also keeps the stored thread, read
-// cursor, hidden flag, creation time and model-derived signals on every write-back (worklist.MergeRunItems),
+// cursor, hidden flag, creation time and, when a write-back carries none, the model
+// proposal and research adjustment on every write-back (worklist.MergeRunItems),
 // which is what protects a change made after this run read the items; carrying them
 // here keeps the run's own view of each item whole.
 func reconcileFetched(fetched, existing []worklist.WorkItem) []worklist.WorkItem {
@@ -253,9 +253,11 @@ func reconcileFetched(fetched, existing []worklist.WorkItem) []worklist.WorkItem
 		fetched[i].Thread = old.Thread
 		fetched[i].ThreadReadAt = old.ThreadReadAt
 		fetched[i].Meta.HiddenAt = old.Meta.HiddenAt
-		// A fetch derives no model proposal or research adjustment; keep the stored
-		// ones so the chained rank, and any pass that fails, start from them.
-		worklist.KeepModelSignals(&fetched[i].Signals, old.Signals)
+		// A fetch derives no model proposal or research adjustment, so it sends none:
+		// the plane's merge then keeps whatever is stored when this write lands, not
+		// the copy read above, which a discussion may have replaced since. The
+		// chained enrich and rank read the store again.
+		clearModelSignals(&fetched[i].Signals)
 		// CompletedAt is deliberately NOT carried over: the item was just fetched from
 		// the open set, so it is open, and a reopened item resurfaces (see Metadata).
 		if !old.CreatedAt.IsZero() {
@@ -282,9 +284,21 @@ func retireMissing(fetched, existing []worklist.WorkItem, now time.Time) []workl
 			continue
 		}
 		it.Meta.CompletedAt = now
+		// Retiring derives no model signals; leave them to the store (see
+		// reconcileFetched).
+		clearModelSignals(&it.Signals)
 		retired = append(retired, it)
 	}
 	return retired
+}
+
+// clearModelSignals drops the model proposal and research adjustment from a
+// write-back that did not derive them. A write-back that carries neither leaves the
+// stored values in place (worklist.MergeRunItems), so a pass never restores the
+// copy it read over a newer one written meanwhile.
+func clearModelSignals(s *worklist.Signals) {
+	s.Proposed = nil
+	s.Research = nil
 }
 
 // runRank reads the user's persisted work, asks the AxisRanker to propose the
@@ -317,11 +331,13 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 	if len(items) > limit {
 		// Spend the model budget on the items the cheap, deterministic scorer already
 		// rates highest rather than on an arbitrary slice. enrich has just run, so those
-		// baselines are computed from complete signals.
+		// baselines are computed from complete signals. The baseline ignores stored
+		// model signals: an old low proposal must not keep a newly requested review
+		// from being re-scored.
 		now := time.Now().UTC()
 		baseline := make(map[string]float64, len(items))
 		for _, it := range items {
-			baseline[it.ID] = worklist.Score(it, now).Rank
+			baseline[it.ID] = worklist.BaselineScore(it, now).Rank
 		}
 		slices.SortStableFunc(items, func(a, b worklist.WorkItem) int {
 			return cmp.Compare(baseline[b.ID], baseline[a.ID])
@@ -352,6 +368,8 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 				return // best-effort: leave the item unchanged
 			}
 			items[i].Signals.Proposed = &prop
+			// Rank derives only the proposal; the stored research adjustment stays.
+			items[i].Signals.Research = nil
 			mu.Lock()
 			changed = append(changed, items[i])
 			mu.Unlock()

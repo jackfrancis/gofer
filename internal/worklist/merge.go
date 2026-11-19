@@ -25,7 +25,8 @@ import (
 // (Signals.Proposed) or no research adjustment (Signals.Research) keeps the stored
 // one; a write-back that carries one replaces it. A run that only re-derives the
 // research adjustment writes it alone, through ApplyResearch, so it never carries the
-// rest of an item it read before a refresh.
+// rest of an item it read before a refresh. Every workload pass sends only the
+// model signal it derived (or none), so it never restores a stale copy it read.
 
 // MergeRunItems returns the items a run's write-back should store, given the
 // owner's current items. An item that exists keeps the owner's state from its
@@ -70,22 +71,49 @@ func KeepModelSignals(incoming *Signals, stored Signals) {
 	}
 }
 
+// ErrUnstampedResearch is returned by ApplyResearch for an adjustment with no
+// AppliedAt: without it a replayed write could not be told from a newer one.
+var ErrUnstampedResearch = errors.New("worklist: research adjustment has no applied_at")
+
 // ApplyResearch sets ownerID's item itemID's research adjustment, and nothing else,
 // in one Store.Update. A research pass reads the item, asks the model for minutes,
 // and writes back only what it derived: the GitHub fields, the other signals and
-// the thread are left as stored now, so a refresh that landed meanwhile stands. It
-// writes nothing, and returns no error, when the item is gone.
+// the thread are left as stored now, so a refresh that landed meanwhile stands.
+//
+// AppliedAt orders adjustments: one older than the stored adjustment is dropped,
+// so a resent write cannot undo a later result. It writes nothing, and returns no
+// error, when the item is gone or the adjustment is older.
 func ApplyResearch(ctx context.Context, store Store, ownerID, itemID string, adj ResearchAdjustment) error {
+	if adj.AppliedAt.IsZero() {
+		return ErrUnstampedResearch
+	}
 	return store.Update(ctx, ownerID, func(current []WorkItem) ([]WorkItem, error) {
 		for i := range current {
 			if current[i].ID != itemID {
 				continue
 			}
-			current[i].Signals.Research = &adj
+			changed, err := SetResearch(&current[i], adj)
+			if err != nil || !changed {
+				return nil, err
+			}
 			return current[i : i+1], nil
 		}
 		return nil, nil // item gone
 	})
+}
+
+// SetResearch sets item's research adjustment unless the stored one is newer (by
+// AppliedAt), and reports whether it did. An adjustment with no AppliedAt is
+// ErrUnstampedResearch.
+func SetResearch(item *WorkItem, adj ResearchAdjustment) (bool, error) {
+	if adj.AppliedAt.IsZero() {
+		return false, ErrUnstampedResearch
+	}
+	if old := item.Signals.Research; old != nil && adj.AppliedAt.Before(old.AppliedAt) {
+		return false, nil // a newer adjustment is already stored
+	}
+	item.Signals.Research = &adj
+	return true, nil
 }
 
 // ErrEmptyReply is returned by AppendReply for a reply with no content.

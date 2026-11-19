@@ -80,7 +80,7 @@ func assertRefreshKept(t *testing.T, sink *memSink) {
 	if got.GitHub.Title != "Refreshed title" || got.GitHub.State != "closed" || got.Signals.Comments != 9 {
 		t.Fatalf("a late write-back undid the refresh: title %q state %q comments %d", got.GitHub.Title, got.GitHub.State, got.Signals.Comments)
 	}
-	if r := got.Signals.Research; r == nil || r.Relevance != 1.5 {
-		t.Fatalf("the research adjustment must still land, got %+v", r)
+	if r := got.Signals.Research; r == nil || r.Relevance != 1.5 || r.AppliedAt.IsZero() {
+		t.Fatalf("the research adjustment must still land, stamped, got %+v", r)
 	}
 }
