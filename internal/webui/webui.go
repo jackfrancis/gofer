@@ -9,6 +9,8 @@ package webui
 import (
 	"context"
 	"embed"
+	"errors"
+	"fmt"
 	"html/template"
 	"math"
 	"net/http"
@@ -285,17 +287,44 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+// maxMessageBytes bounds one user message in a thread, as ZZ did. Every turn is
+// stored in the item and read back by each Discuss run, so an unbounded message
+// would grow what a run must read without limit.
+const maxMessageBytes = 16 << 10
+
+// messageTooLong is the answer to an oversized message.
+var messageTooLong = fmt.Sprintf("message too long: the limit is %d KiB", maxMessageBytes>>10)
+
+// maxThreadForm bounds the whole POST /items/thread body: the message (URL-encoded,
+// so up to three bytes per byte) plus the item ID and model choice.
+const maxThreadForm = 3*maxMessageBytes + 4<<10
+
 // ThreadPost handles POST /items/thread. It appends the user's message to the
 // item's thread and schedules an assistant turn, then redirects back to the thread
-// (Post/Redirect/Get). SameSite=Lax cookies give baseline CSRF protection.
+// (Post/Redirect/Get). SameSite=Lax cookies give baseline CSRF protection. A message
+// over maxMessageBytes is refused with 413 and nothing is stored.
 func (h *Handler) ThreadPost(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
 	if user == nil || !h.convEnabled {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxThreadForm)
+	if err := r.ParseForm(); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, messageTooLong, http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
 	id := r.FormValue("id")
 	content := strings.TrimSpace(r.FormValue("content"))
+	if len(content) > maxMessageBytes {
+		http.Error(w, messageTooLong, http.StatusRequestEntityTooLarge)
+		return
+	}
 	if id == "" || content == "" {
 		http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
 		return

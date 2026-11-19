@@ -29,15 +29,17 @@
 //     agent.Run executes the job named by RunSpec.TaskRef (github-ingest, enrich,
 //     llm-rank, github-converse, github-research) against two small seams:
 //     - agent.Vendor: vend the acting user's delegated provider token for the run.
-//     - agent.Sink:   read the user's worklist and write results back. Write-backs
-//     are merged into the items as stored (worklist.MergeRunItems), so a run
-//     cannot rewrite a thread; it adds a reply only through Sink.Reply.
+//     - agent.Sink:   read the user's worklist and write results back. Every read
+//     is bounded (one item with its thread, the top N, or a page without threads;
+//     worklist.Selection), so a run completes however large the worklist grows.
+//     Write-backs are merged into the items as stored (worklist.MergeRunItems), so
+//     a run cannot rewrite a thread; it adds a reply only through Sink.Reply.
 //     gofer SUPPLIES both shapes, so a backend writes no plumbing of its own
 //     (internal/agent/adapters.go):
 //     - in-process:     agent.NewVaultVendor + agent.NewStoreSink (vault + store).
 //     - out-of-process: agent.NewPlaneClient (one client that is both Vendor and
-//     Sink over /agent/credential, /agent/worklist and
-//     /agent/worklist/reply, authenticating
+//     Sink over /agent/credential, /agent/worklist, /agent/worklist/item
+//     and /agent/worklist/reply, authenticating
 //     with the run credential).
 //     A backend supplies whatever launches agent.Run under its substrate (a binary, a
 //     pod, an in-process goroutine); the workload code is gofer's and is reused as-is.

@@ -24,13 +24,15 @@ import (
 //     inside the web tier reads gofer's vault and worklist store directly.
 //   - OUT-OF-PROCESS (PlaneClient): a backend that executes the workload in another
 //     process or sandbox reaches gofer over its agent plane (GET /agent/credential,
-//     GET/POST /agent/worklist), authenticating every call with the run credential.
+//     GET/POST /agent/worklist, GET /agent/worklist/item), authenticating every call
+//     with the run credential.
 //
 // A backend picks the shape its substrate needs and writes no plumbing of its own.
 
-// maxSinkResponse bounds a worklist read from the agent plane. It matches the
-// server's own request limit: every item carries its whole conversation thread, so a
-// full worklist is large but bounded.
+// maxSinkResponse bounds one read from the agent plane. It matches the server's own
+// request limit. No read a run makes approaches it however large the worklist grows:
+// a run reads one item (with its thread), the top N, or a page of items without their
+// threads (worklist.Selection).
 const maxSinkResponse = 8 << 20
 
 // defaultPlaneTimeout bounds a single call to gofer's agent plane. These are gofer's
@@ -104,9 +106,24 @@ func NewStoreSink(s worklist.Store, ownerID string) *StoreSink {
 	return &StoreSink{store: s, ownerID: ownerID}
 }
 
-// List returns the owner's persisted work.
-func (s *StoreSink) List(ctx context.Context) ([]worklist.WorkItem, error) {
-	return s.store.List(ctx, s.ownerID)
+// Item returns the owner's item with id, thread included; ok is false if it is gone.
+func (s *StoreSink) Item(ctx context.Context, id string) (worklist.WorkItem, bool, error) {
+	items, err := s.store.List(ctx, s.ownerID)
+	if err != nil {
+		return worklist.WorkItem{}, false, err
+	}
+	it, ok := worklist.Find(items, id)
+	return it, ok, nil
+}
+
+// Select returns the owner's items that sel names (worklist.Select).
+func (s *StoreSink) Select(ctx context.Context, sel worklist.Selection) ([]worklist.WorkItem, string, error) {
+	items, err := s.store.List(ctx, s.ownerID)
+	if err != nil {
+		return nil, "", err
+	}
+	page, next := worklist.Select(items, sel, time.Now().UTC())
+	return page, next, nil
 }
 
 // Ingest merges a run's items into the owner's stored items (worklist.MergeRunItems),
@@ -197,27 +214,63 @@ func (c *PlaneClient) VendCredential(ctx context.Context, provider, rejected str
 	return VendedCredential{AccessToken: out.AccessToken, Version: out.Version}, nil
 }
 
-// List reads the acting user's persisted work from the agent plane.
-func (c *PlaneClient) List(ctx context.Context) ([]worklist.WorkItem, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/agent/worklist", nil)
+// Item reads one of the acting user's items, thread included, from the agent plane
+// (GET /agent/worklist/item). The owner is the run credential's, so another user's
+// item is simply not found. ok is false if the item is gone. The server answers a
+// missing item with found=false, so a 404 (a web tier without the route) is an
+// error rather than a silent "gone".
+func (c *PlaneClient) Item(ctx context.Context, id string) (worklist.WorkItem, bool, error) {
+	var out ItemResponse
+	if err := c.getJSON(ctx, "/agent/worklist/item?"+url.Values{"id": {id}}.Encode(), "read item", &out); err != nil {
+		return worklist.WorkItem{}, false, err
+	}
+	if !out.Found {
+		return worklist.WorkItem{}, false, nil
+	}
+	return out.Item, true, nil
+}
+
+// ItemResponse is the body of GET /agent/worklist/item.
+type ItemResponse struct {
+	Found bool              `json:"found"`
+	Item  worklist.WorkItem `json:"item"`
+}
+
+// SelectResponse is the body of GET /agent/worklist with a selection.
+type SelectResponse struct {
+	Items []worklist.WorkItem `json:"items"`
+	Next  string              `json:"next,omitempty"`
+}
+
+// Select reads a bounded slice of the acting user's items from the agent plane
+// (GET /agent/worklist with a selection). The server may return fewer items than
+// sel.Limit asks for; a non-empty next means there is more to read.
+func (c *PlaneClient) Select(ctx context.Context, sel worklist.Selection) ([]worklist.WorkItem, string, error) {
+	var out SelectResponse
+	if err := c.getJSON(ctx, "/agent/worklist?"+sel.Query().Encode(), "list worklist", &out); err != nil {
+		return nil, "", err
+	}
+	return out.Items, out.Next, nil
+}
+
+// getJSON reads one agent-plane resource into v, at most maxSinkResponse bytes.
+func (c *PlaneClient) getJSON(ctx context.Context, path, what string, v any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+path, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("list worklist: status %d", resp.StatusCode)
+		return fmt.Errorf("%s: status %d", what, resp.StatusCode)
 	}
-	var out struct {
-		Items []worklist.WorkItem `json:"items"`
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxSinkResponse)).Decode(v); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxSinkResponse)).Decode(&out); err != nil {
-		return nil, err
-	}
-	return out.Items, nil
+	return nil
 }
 
 // Ingest writes items back through the agent plane, which merges them into the

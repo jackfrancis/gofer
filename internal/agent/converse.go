@@ -22,21 +22,14 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	if p.ItemID == "" {
 		return fmt.Errorf("agent: github-converse requires an item id")
 	}
-	items, err := sink.List(ctx)
+	// Read just the dispatched item, thread included, not the worklist.
+	item, ok, err := sink.Item(ctx, p.ItemID)
 	if err != nil {
-		return fmt.Errorf("list worklist: %w", err)
+		return fmt.Errorf("read item: %w", err)
 	}
-	idx := -1
-	for i := range items {
-		if items[i].ID == p.ItemID {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
+	if !ok {
 		return nil // item gone; nothing to answer
 	}
-	item := items[idx]
 
 	trigger, triggerKey, history, ok := turnToAnswer(item, p.Turn)
 	if !ok {
@@ -158,6 +151,7 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		item.Thread = append(item.Thread, msg)
 		if adj, rerr := p.Researcher.Research(ctx, item); rerr == nil {
 			item.Signals.Research = &adj
+			item.Thread = nil // the plane keeps the stored thread; don't resend it
 			if err := sink.Ingest(ctx, []worklist.WorkItem{item}); err != nil {
 				return fmt.Errorf("ingest: %w", err)
 			}

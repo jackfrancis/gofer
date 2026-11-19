@@ -11,12 +11,10 @@
 package agent
 
 import (
-	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"slices"
 	"sync"
 	"time"
 
@@ -48,12 +46,21 @@ type Vendor interface {
 // persisted work, and write results back. In-process it is the store directly;
 // out-of-process it is an HTTP client to gofer's agent sink.
 //
+// Every read is bounded, so a run completes however large the worklist grows: Item
+// reads one item with its thread, and Select reads the top N or a page of items
+// without their threads (worklist.Selection; selectAll pages through them).
+//
 // A write-back is merged into the item as stored when it lands (see
 // worklist.MergeRunItems): Ingest updates what a run derives — GitHub fields,
 // signals, scoring — and never the conversation thread, so work the owner did
 // while the run was busy survives. Reply is the only way a run adds to a thread.
 type Sink interface {
-	List(ctx context.Context) ([]worklist.WorkItem, error)
+	// Item reads the acting user's item with id, thread included; ok is false if it
+	// is gone (or is not the acting user's).
+	Item(ctx context.Context, id string) (item worklist.WorkItem, ok bool, err error)
+	// Select reads the items sel names, without threads, and the cursor of the next
+	// page (sel.After), empty on the last. It may return fewer than sel.Limit items.
+	Select(ctx context.Context, sel worklist.Selection) (items []worklist.WorkItem, next string, err error)
 	Ingest(ctx context.Context, items []worklist.WorkItem) error
 	// Reply appends an agent turn to itemID's thread, answering the user turn whose
 	// Key is replyTo (see worklist.AppendReply). It is dropped, without error, if
@@ -76,6 +83,7 @@ type Params struct {
 	Independent   bool                       // converse: answer blind — omit prior thread turns (independent review)
 	Researcher    worklist.ResearchRanker    // github-research re-ranker; required for that job
 	EnrichLimit   int                        // optional cap on items to enrich; 0 enriches every item
+	ReadPageSize  int                        // items per worklist page read (selectAll); 0 uses the default
 	Logger        *slog.Logger               // phase logger; nil uses slog.Default()
 }
 
@@ -102,6 +110,10 @@ const (
 	// a large worklist is written in batches: no single request approaches the limit,
 	// and a failure part-way still lands the earlier batches.
 	writeBackChunk = 25
+	// defaultReadPageSize is how many items one worklist page read carries. Items
+	// are read without their threads, so a page is far under the agent plane's
+	// response limit.
+	defaultReadPageSize = 500
 )
 
 // hasBudget reports whether the run has more than reserve left before its deadline; a
@@ -114,6 +126,30 @@ func hasBudget(ctx context.Context, reserve time.Duration) bool {
 		return true
 	}
 	return time.Until(deadline) > reserve
+}
+
+// selectAll reads every item sel names (sel.After and sel.Limit are its own), a
+// bounded page at a time, so no single read grows with the worklist.
+func selectAll(ctx context.Context, p Params, sink Sink, sel worklist.Selection) ([]worklist.WorkItem, error) {
+	sel.Top, sel.After, sel.Limit = 0, "", p.ReadPageSize
+	if sel.Limit <= 0 {
+		sel.Limit = defaultReadPageSize
+	}
+	var all []worklist.WorkItem
+	for {
+		page, next, err := sink.Select(ctx, sel)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if next == "" {
+			return all, nil
+		}
+		if next <= sel.After {
+			return nil, fmt.Errorf("list worklist: page cursor %q does not advance past %q", next, sel.After)
+		}
+		sel.After = next
+	}
 }
 
 // writeBack persists items through the sink in bounded batches (writeBackChunk).
@@ -182,7 +218,9 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	// overrides. The fresh GitHub fields and base signals come from the fetch; the
 	// chained enrich+rank re-derive the score. If the existing items cannot be read we
 	// proceed unreconciled rather than skip the refresh — a rare case, logged loudly.
-	existing, lerr := sink.List(ctx)
+	// Only IDs, completion and the per-item state above are needed, so the read omits
+	// thread bodies (the agent plane keeps the stored thread on every write-back).
+	existing, lerr := selectAll(ctx, p, sink, worklist.Selection{})
 	if lerr != nil {
 		log.Warn("ingest: could not read existing items to reconcile; threads may reset", "err", lerr)
 		existing = nil
@@ -289,34 +327,18 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 	if ranker == nil {
 		ranker = worklist.NewStubRanker()
 	}
-	all, err := sink.List(ctx)
-	if err != nil {
-		return fmt.Errorf("list worklist: %w", err)
-	}
-	// Retired items are off the radar; a model proposal for one is wasted spend.
-	items := all[:0:0]
-	for _, it := range all {
-		if it.Meta.CompletedAt.IsZero() {
-			items = append(items, it)
-		}
-	}
 	limit := p.RankLimit
 	if limit <= 0 {
 		limit = defaultRankLimit
 	}
-	if len(items) > limit {
-		// Spend the model budget on the items the cheap, deterministic scorer already
-		// rates highest rather than on an arbitrary slice. enrich has just run, so those
-		// baselines are computed from complete signals.
-		now := time.Now().UTC()
-		baseline := make(map[string]float64, len(items))
-		for _, it := range items {
-			baseline[it.ID] = worklist.Score(it, now).Rank
-		}
-		slices.SortStableFunc(items, func(a, b worklist.WorkItem) int {
-			return cmp.Compare(baseline[b.ID], baseline[a.ID])
-		})
-		items = items[:limit]
+	// Spend the model budget on the open items the cheap, deterministic scorer already
+	// rates highest rather than on an arbitrary slice: the agent plane selects them
+	// (worklist.Select), so the read is the top N, not the worklist. Retired items are
+	// off the radar; a model proposal for one is wasted spend. enrich has just run, so
+	// those baselines are computed from complete signals.
+	items, _, err := sink.Select(ctx, worklist.Selection{Open: true, Top: limit})
+	if err != nil {
+		return fmt.Errorf("list worklist: %w", err)
 	}
 	log.Info("rank: proposing axes", "items", len(items), "stub", stub)
 

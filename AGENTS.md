@@ -158,6 +158,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   run adds a thread turn only through `POST /agent/worklist/reply`
   (`worklist.AppendReply`). The web and runtime images must ship together: a runtime
   from before this rule posts its reply inside the item, where it is now ignored.
+- A run never reads the whole worklist: its threads grow without bound and the agent
+  plane caps a response at 8 MiB. `agent.Sink` has only bounded reads: `Item` (one
+  item, thread included, owner-scoped; Discuss and research) and `Select`
+  (`worklist.Selection`, never with threads, at most `worklist.MaxSelectLimit` items):
+  ranking reads the top N by baseline score, and ingest and enrichment page through
+  every item with `selectAll`. Enrichment must keep reaching every open item; never
+  cap it. A write-back need not carry a thread (`MergeRunItems` keeps the stored one).
+  A user message is capped at 16 KiB (`webui.maxMessageBytes`).
 - Replies can land out of order, so a turn's position does not say what it answers.
   Every new turn gets an ID; an agent turn's `ReplyTo` names the user turn it
   answers; dispatch carries the turn a run must answer (`worklist.TurnRef`, run

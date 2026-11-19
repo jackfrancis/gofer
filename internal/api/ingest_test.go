@@ -192,3 +192,53 @@ func TestAgentReply(t *testing.T) {
 		t.Fatalf("want 403 without metadata:write, got %d", code)
 	}
 }
+
+// The agent plane's reads are bounded and owner-scoped: a selection returns a page
+// without threads and the next cursor, a selection that asks for threads is refused,
+// and the single-item read finds only the acting user's item.
+func TestAgentReadsAreBoundedAndOwnerScoped(t *testing.T) {
+	f := newPlane(t)
+	h := NewIngestHandler(f.store, nil)
+	ctx := context.Background()
+	_ = f.store.Upsert(ctx, "u1",
+		worklist.WorkItem{ID: "a", Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "secret-a"}}},
+		worklist.WorkItem{ID: "b"},
+		worklist.WorkItem{ID: "c"},
+	)
+	_ = f.store.Upsert(ctx, "u2", worklist.WorkItem{ID: "z", Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "secret-z"}}})
+	get := func(hf http.HandlerFunc, target string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req = req.WithContext(principal.NewContext(req.Context(), &principal.Principal{ActingUserID: "u1"}))
+		rec := httptest.NewRecorder()
+		hf(rec, req)
+		return rec
+	}
+
+	rec := get(h.List, "/agent/worklist?threads=0&limit=2")
+	var page struct {
+		Items []worklist.WorkItem `json:"items"`
+		Next  string              `json:"next"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil || rec.Code != http.StatusOK {
+		t.Fatalf("selection: %d %v", rec.Code, err)
+	}
+	if len(page.Items) != 2 || page.Items[0].ID != "a" || page.Next != "b" || bytes.Contains(rec.Body.Bytes(), []byte("secret")) {
+		t.Fatalf("selection page = %s", rec.Body.String())
+	}
+	if rec := get(h.List, "/agent/worklist?threads=1"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("a selection with threads got %d, want 400", rec.Code)
+	}
+
+	rec = get(h.Item, "/agent/worklist/item?id=a")
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"found":true`)) || !bytes.Contains(rec.Body.Bytes(), []byte("secret-a")) {
+		t.Fatalf("own item = %d %s, want it with its thread", rec.Code, rec.Body.String())
+	}
+	rec = get(h.Item, "/agent/worklist/item?id=z")
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"found":false`)) || bytes.Contains(rec.Body.Bytes(), []byte("secret-z")) {
+		t.Fatalf("another owner's item = %d %s, want not found", rec.Code, rec.Body.String())
+	}
+	if rec := get(h.Item, "/agent/worklist/item"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("no id got %d, want 400", rec.Code)
+	}
+}

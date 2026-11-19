@@ -4,6 +4,9 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -544,5 +547,65 @@ func TestSecondOpinionAllPlansAgainstStoredState(t *testing.T) {
 	}
 	if got["pr1"] != "alt" || got["pr2"] != "default" {
 		t.Fatalf("each PR must get a model other than its first reviewer's, got %v", got)
+	}
+}
+
+// A user message over maxMessageBytes is refused with 413: nothing is stored and no
+// run is dispatched. One at the limit is accepted. Every Discuss run reads the
+// thread, so an unbounded message would grow what a run must read without limit.
+func TestThreadPostRejectsOversizedMessage(t *testing.T) {
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest})
+	pipe := &recordPipeline{}
+	opts := []ModelOption{{Value: "c0|default", Endpoint: "https://default", Model: "default"}}
+	h := &Handler{sessions: fakeSessions{&session.User{ID: "u1"}}, store: store, pipeline: pipe, convEnabled: true, options: opts, now: func() time.Time { return now }}
+	post := func(content string) *httptest.ResponseRecorder {
+		t.Helper()
+		form := url.Values{"id": {"pr1"}, "content": {content}}
+		req := httptest.NewRequest(http.MethodPost, "/items/thread", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		h.ThreadPost(rec, req)
+		return rec
+	}
+	thread := func() []worklist.Message {
+		items, _ := store.List(context.Background(), "u1")
+		return items[0].Thread
+	}
+
+	// Just over the limit, in plain text and in text that URL-encodes to three bytes a
+	// byte, and far past the form bound.
+	for name, content := range map[string]string{
+		"one byte over": strings.Repeat("a", maxMessageBytes+1),
+		"encoded":       strings.Repeat("é", maxMessageBytes/2+1),
+		"far past":      strings.Repeat("a", 4*maxThreadForm),
+	} {
+		rec := post(content)
+		if rec.Code != http.StatusRequestEntityTooLarge || !strings.Contains(rec.Body.String(), "message too long") {
+			t.Fatalf("%s: got %d %q, want 413", name, rec.Code, rec.Body.String())
+		}
+		if len(thread()) != 0 || len(pipe.turns) != 0 {
+			t.Fatalf("%s: an oversized message was stored or dispatched", name)
+		}
+	}
+
+	// At the limit (with whitespace that is trimmed away) it is stored and dispatched.
+	if rec := post("  " + strings.Repeat("é", maxMessageBytes/2) + "\n"); rec.Code != http.StatusSeeOther {
+		t.Fatalf("a message at the limit got %d, want the redirect", rec.Code)
+	}
+	if th := thread(); len(th) != 1 || len(th[0].Content) != maxMessageBytes || len(pipe.turns) != 1 {
+		t.Fatalf("a message at the limit was not stored and dispatched: %d turns, %d dispatches", len(th), len(pipe.turns))
+	}
+}
+
+// The textarea's maxlength hint matches the server's limit.
+func TestThreadFormHintsMessageLimit(t *testing.T) {
+	page, err := os.ReadFile("templates/page.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `maxlength="` + strconv.Itoa(maxMessageBytes) + `"`; !strings.Contains(string(page), want) {
+		t.Fatalf("thread form lacks %s", want)
 	}
 }

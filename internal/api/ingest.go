@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/jackfrancis/gofer/internal/principal"
 	"github.com/jackfrancis/gofer/internal/worklist"
@@ -108,11 +109,20 @@ func (h *IngestHandler) Reply(w http.ResponseWriter, r *http.Request) {
 }
 
 // List handles GET /agent/worklist. A runtime reads its acting user's persisted
-// work to augment it in place rather than re-deriving it from the provider.
+// work to augment it in place rather than re-deriving it from the provider. A
+// request with a selection (worklist.ParseSelection: threads=0, plus open, after and
+// limit, or top) gets a bounded slice without threads and the cursor of the next page
+// ({"items": [...], "next": "<id>"}); without one it gets the whole worklist, threads
+// included, which no current run asks for.
 func (h *IngestHandler) List(w http.ResponseWriter, r *http.Request) {
 	p, ok := principal.FromContext(r.Context())
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	sel, selected, err := worklist.ParseSelection(r.URL.Query())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	items, err := h.store.List(r.Context(), p.ActingUserID)
@@ -120,8 +130,45 @@ func (h *IngestHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "could not load work items")
 		return
 	}
-	if items == nil {
-		items = []worklist.WorkItem{}
+	if !selected {
+		if items == nil {
+			items = []worklist.WorkItem{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	page, next := worklist.Select(items, sel, time.Now().UTC())
+	resp := map[string]any{"items": page}
+	if next != "" {
+		resp["next"] = next
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// Item handles GET /agent/worklist/item?id=. A Discuss or research run reads the
+// one item it was dispatched for, thread included, rather than the whole worklist.
+// The lookup is scoped to the token's ActingUserID, so another user's item is not
+// found: the answer is {"found": false}, the same as for an item that is gone.
+func (h *IngestHandler) Item(w http.ResponseWriter, r *http.Request) {
+	p, ok := principal.FromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	items, err := h.store.List(r.Context(), p.ActingUserID)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "could not load work items")
+		return
+	}
+	it, found := worklist.Find(items, id)
+	if !found {
+		writeJSON(w, http.StatusOK, map[string]any{"found": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"found": true, "item": it})
 }
