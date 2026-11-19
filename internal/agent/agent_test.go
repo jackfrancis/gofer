@@ -29,9 +29,12 @@ type memSink struct {
 	selects []worklist.Selection // Select calls, so paging is observable
 }
 
-func (m *memSink) Item(_ context.Context, id string) (worklist.WorkItem, bool, error) {
+func (m *memSink) Item(_ context.Context, id, turn string) (worklist.WorkItem, bool, error) {
 	it, ok := worklist.Find(m.items, id)
-	return it, ok, nil
+	if !ok {
+		return worklist.WorkItem{}, false, nil
+	}
+	return worklist.ThreadWindow(it, turn, worklist.MaxThreadBytes), true, nil
 }
 
 func (m *memSink) Select(_ context.Context, sel worklist.Selection) ([]worklist.WorkItem, string, error) {

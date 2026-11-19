@@ -194,8 +194,8 @@ func TestAgentReply(t *testing.T) {
 }
 
 // The agent plane's reads are bounded and owner-scoped: a selection returns a page
-// without threads and the next cursor, a selection that asks for threads is refused,
-// and the single-item read finds only the acting user's item.
+// without threads and the next cursor, a malformed one is refused, and the
+// single-item read finds only the acting user's item.
 func TestAgentReadsAreBoundedAndOwnerScoped(t *testing.T) {
 	f := newPlane(t)
 	h := NewIngestHandler(f.store, nil)
@@ -215,7 +215,7 @@ func TestAgentReadsAreBoundedAndOwnerScoped(t *testing.T) {
 		return rec
 	}
 
-	rec := get(h.List, "/agent/worklist?threads=0&limit=2")
+	rec := get(h.Select, "/agent/worklist/select?limit=2")
 	var page struct {
 		Items []worklist.WorkItem `json:"items"`
 		Next  string              `json:"next"`
@@ -226,8 +226,8 @@ func TestAgentReadsAreBoundedAndOwnerScoped(t *testing.T) {
 	if len(page.Items) != 2 || page.Items[0].ID != "a" || page.Next != "b" || bytes.Contains(rec.Body.Bytes(), []byte("secret")) {
 		t.Fatalf("selection page = %s", rec.Body.String())
 	}
-	if rec := get(h.List, "/agent/worklist?threads=1"); rec.Code != http.StatusBadRequest {
-		t.Fatalf("a selection with threads got %d, want 400", rec.Code)
+	if rec := get(h.Select, "/agent/worklist/select?limit=x"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("a malformed selection got %d, want 400", rec.Code)
 	}
 
 	rec = get(h.Item, "/agent/worklist/item?id=a")

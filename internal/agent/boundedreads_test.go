@@ -60,6 +60,7 @@ func newBoundedPlane(t *testing.T) *boundedPlane {
 	mux := http.NewServeMux()
 	mux.Handle("POST /agent/worklist", auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Ingest)))
 	mux.Handle("GET /agent/worklist", auth.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(h.List)))
+	mux.Handle("GET /agent/worklist/select", auth.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(h.Select)))
 	mux.Handle("GET /agent/worklist/item", auth.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(h.Item)))
 	mux.Handle("POST /agent/worklist/reply", auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Reply)))
 	mux.Handle("GET /agent/credential", auth.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -226,7 +227,7 @@ func TestEveryJobCompletesPastTheResponseLimit(t *testing.T) {
 		t.Fatalf("largest worklist read was %d bytes (%s); want every read small (≤ 1 MiB)", n, key)
 	}
 	for key := range plane.reads {
-		if strings.HasPrefix(key, "/agent/worklist?") && !strings.Contains(key, "threads=0") {
+		if strings.HasPrefix(key, "/agent/worklist?") {
 			t.Fatalf("a run read the whole worklist: %s", key)
 		}
 	}
@@ -285,10 +286,10 @@ func TestItemLookupIsOwnerScoped(t *testing.T) {
 	if err := plane.store.Upsert(ctx, "u1", worklist.WorkItem{ID: "github:o/r#1", OwnerID: "u1"}); err != nil {
 		t.Fatal(err)
 	}
-	if it, ok, err := plane.client("u1").Item(ctx, "github:o/secret#1"); err != nil || ok {
+	if it, ok, err := plane.client("u1").Item(ctx, "github:o/secret#1", ""); err != nil || ok {
 		t.Fatalf("u1 read u2's item: (%+v, %v, %v)", it, ok, err)
 	}
-	if it, ok, err := plane.client("u2").Item(ctx, "github:o/secret#1"); err != nil || !ok || it.Thread[0].Content != "private" {
+	if it, ok, err := plane.client("u2").Item(ctx, "github:o/secret#1", ""); err != nil || !ok || it.Thread[0].Content != "private" {
 		t.Fatalf("u2 Item = (%+v, %v, %v), want its own item", it, ok, err)
 	}
 	// Nor does a selection reach across owners.
@@ -315,5 +316,196 @@ func TestItemLookupIsOwnerScoped(t *testing.T) {
 	plane.srv.Config.Handler.ServeHTTP(rec, req)
 	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil || raw.Found || strings.Contains(rec.Body.String(), "private") {
 		t.Fatalf("raw item response for another owner = %q", rec.Body.String())
+	}
+}
+
+// countingRanker counts model proposals.
+type countingRanker struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (r *countingRanker) Propose(context.Context, worklist.WorkItem) (worklist.AxisProposal, error) {
+	r.mu.Lock()
+	r.calls++
+	r.mu.Unlock()
+	return worklist.AxisProposal{}, nil
+}
+
+// A runtime that reaches a web tier from before the bounded reads (the AgentApp's
+// image can roll out first) must fail its reads, not take the whole worklist as one
+// final page: the old tier serves only GET /agent/worklist, which ignores a
+// selection, so ranking would spend a model call on every item, retired ones
+// included, past its ceiling.
+func TestPreviousWebTierFailsTheBoundedReads(t *testing.T) {
+	var items []worklist.WorkItem
+	for i := 1; i <= 300; i++ {
+		it := worklist.WorkItem{ID: fmt.Sprintf("github:o/r#%d", i), Source: "github", GitHub: worklist.GitHubRef{Repo: "o/r", Number: i}}
+		if i%3 == 0 {
+			it.Meta.CompletedAt = time.Now().Add(-time.Hour)
+		}
+		items = append(items, it)
+	}
+	whole, _ := json.Marshal(map[string]any{"items": items})
+	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/agent/credential":
+			_, _ = w.Write([]byte(`{"access_token":"gh-tok"}`))
+		case r.URL.Path == "/agent/worklist" && r.Method == http.MethodGet:
+			_, _ = w.Write(whole) // the previous tier: every query ignored
+		case r.URL.Path == "/agent/worklist" && r.Method == http.MethodPost:
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer old.Close()
+	gh, enriched := boundedGitHub(t, 0)
+	sink := NewPlaneClient(old.URL, "cred", old.Client())
+	ctx := context.Background()
+
+	ranker := &countingRanker{}
+	if err := Run(ctx, Params{JobType: JobRank, Ranker: ranker}, sink, sink); err == nil {
+		t.Fatal("rank against the previous web tier succeeded")
+	}
+	if ranker.calls != 0 {
+		t.Fatalf("rank made %d model calls against the previous web tier, want none", ranker.calls)
+	}
+	if err := Run(ctx, Params{JobType: JobEnrich, Provider: "github", GitHubBaseURL: gh.URL, Client: gh.Client()}, sink, sink); err == nil {
+		t.Fatal("enrich against the previous web tier succeeded")
+	}
+	if n := len(enriched()); n != 0 {
+		t.Fatalf("enrich reached %d items against the previous web tier", n)
+	}
+	fc := &fakeConverser{reply: "x"}
+	if err := Run(ctx, Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Converser: fc}, sink, sink); err == nil || fc.gotUser != "" {
+		t.Fatalf("converse against the previous web tier = %v (converser saw %q), want an error", err, fc.gotUser)
+	}
+}
+
+// One long conversation cannot break Discuss or research: the item read carries a
+// bounded window of the thread that keeps the dispatched turn and what answers it,
+// for turns with IDs and for legacy turns keyed by position, while the stored thread
+// stays whole.
+func TestOneLongConversationStaysReadable(t *testing.T) {
+	plane := newBoundedPlane(t)
+	ctx := context.Background()
+	big := strings.Repeat("q", 16<<10)
+	reply := strings.Repeat("r", 2<<10)
+	var modern, legacy []worklist.Message
+	for i := range 600 { // ≈ 10.5 MiB per thread
+		modern = append(modern,
+			worklist.Message{ID: fmt.Sprintf("u%d", i), Role: worklist.RoleUser, Content: big},
+			worklist.Message{ID: fmt.Sprintf("a%d", i), Role: worklist.RoleAgent, Content: reply, ReplyTo: fmt.Sprintf("u%d", i)})
+		legacy = append(legacy,
+			worklist.Message{Role: worklist.RoleUser, Content: big},
+			worklist.Message{Role: worklist.RoleAgent, Content: reply})
+	}
+	modern = append(modern, worklist.Message{ID: "ask", Role: worklist.RoleUser, Content: "and now?"})
+	legacy = append(legacy, worklist.Message{Role: worklist.RoleUser, Content: "legacy ask"})
+	if err := plane.store.Upsert(ctx, "u1",
+		worklist.WorkItem{ID: "github:o/r#1", Source: "github", GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1}, Thread: modern},
+		worklist.WorkItem{ID: "github:o/r#2", Source: "github", GitHub: worklist.GitHubRef{Repo: "o/r", Number: 2}, Thread: legacy},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := json.Marshal(modern); len(b) <= maxSinkResponse {
+		t.Fatalf("fixture thread is %d bytes, want past %d", len(b), maxSinkResponse)
+	}
+	sink := plane.client("u1")
+	run := func(p Params) {
+		t.Helper()
+		if err := Run(ctx, p, sink, sink); err != nil {
+			t.Fatalf("%s %s: %v", p.JobType, p.ItemID, err)
+		}
+	}
+	fc := &fakeConverser{reply: "modern answer"}
+	run(Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Turn: "ask", Converser: fc})
+	if fc.gotUser != "and now?" || len(fc.gotHistory) == 0 {
+		t.Fatalf("converser saw %q with %d history turns", fc.gotUser, len(fc.gotHistory))
+	}
+	lc := &fakeConverser{reply: "legacy answer"}
+	run(Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#2", Converser: lc})
+	if lc.gotUser != "legacy ask" {
+		t.Fatalf("legacy converser saw %q", lc.gotUser)
+	}
+	run(Params{JobType: JobResearch, ItemID: "github:o/r#1", Researcher: &fakeResearcher{adj: worklist.ResearchAdjustment{Rationale: "long"}}})
+
+	if key, n := plane.largestRead(); n > maxSinkResponse/2+(1<<20) {
+		t.Fatalf("largest read %d bytes (%s)", n, key)
+	}
+	got, _ := plane.store.List(ctx, "u1")
+	byID := map[string]worklist.WorkItem{}
+	for _, it := range got {
+		byID[it.ID] = it
+	}
+	m := byID["github:o/r#1"]
+	if len(m.Thread) != len(modern)+1 || !m.Answered("ask") || m.Signals.Research == nil {
+		t.Fatalf("modern item: %d turns (want %d), answered %v, research %v", len(m.Thread), len(modern)+1, m.Answered("ask"), m.Signals.Research)
+	}
+	l := byID["github:o/r#2"]
+	askKey := l.TurnKey(len(legacy) - 1)
+	if len(l.Thread) != len(legacy)+1 || !l.Answered(askKey) || l.Thread[len(l.Thread)-1].Content != "legacy answer" {
+		t.Fatalf("legacy item: %d turns, answered %s = %v", len(l.Thread), askKey, l.Answered(askKey))
+	}
+}
+
+// Items without threads can still be large (labels, model rationales). A page ends
+// by encoded size, so enrichment at the default page size still reaches every item
+// and ranking still reads its top N, with every read under the response limit.
+func TestPagedReadsStayUnderTheLimitWithLargeItems(t *testing.T) {
+	const n = 600 // × ~17 KiB ≈ 10 MiB without threads
+	plane := newBoundedPlane(t)
+	ctx := context.Background()
+	label := strings.Repeat("l", 17<<10)
+	var seed []worklist.WorkItem
+	for i := 1; i <= n; i++ {
+		seed = append(seed, worklist.WorkItem{
+			ID: fmt.Sprintf("github:o/r#%d", i), Source: "github",
+			GitHub:  worklist.GitHubRef{Repo: "o/r", Number: i},
+			Signals: worklist.Signals{Labels: []string{label}},
+		})
+	}
+	if err := plane.store.Upsert(ctx, "u1", seed...); err != nil {
+		t.Fatal(err)
+	}
+	gh, enriched := boundedGitHub(t, 0)
+	sink := plane.client("u1")
+	if err := Run(ctx, Params{JobType: JobEnrich, Provider: "github", GitHubBaseURL: gh.URL, Client: gh.Client()}, sink, sink); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(enriched()); got != n {
+		t.Fatalf("enriched %d items, want all %d", got, n)
+	}
+	ranker := &countingRanker{}
+	if err := Run(ctx, Params{JobType: JobRank, Ranker: ranker}, sink, sink); err != nil {
+		t.Fatal(err)
+	}
+	if ranker.calls != defaultRankLimit {
+		t.Fatalf("rank made %d proposals, want its ceiling of %d", ranker.calls, defaultRankLimit)
+	}
+	if key, size := plane.largestRead(); size > worklist.MaxSelectBytes+(64<<10) {
+		t.Fatalf("largest read %d bytes (%s), want ≤ about %d", size, key, worklist.MaxSelectBytes)
+	}
+}
+
+// The in-process sink holds a selection to the same bounds as the agent plane.
+func TestSinksApplyTheSameSelectionBounds(t *testing.T) {
+	plane := newBoundedPlane(t)
+	ctx := context.Background()
+	var seed []worklist.WorkItem
+	for i := range worklist.MaxSelectLimit + 500 {
+		seed = append(seed, worklist.WorkItem{ID: fmt.Sprintf("i%05d", i)})
+	}
+	if err := plane.store.Upsert(ctx, "u1", seed...); err != nil {
+		t.Fatal(err)
+	}
+	for name, sink := range map[string]Sink{"in-process": NewStoreSink(plane.store, "u1"), "plane": plane.client("u1")} {
+		for _, sel := range []worklist.Selection{{}, {Limit: 5000}} {
+			page, next, err := sink.Select(ctx, sel)
+			if err != nil || len(page) != worklist.MaxSelectLimit || next != page[len(page)-1].ID {
+				t.Fatalf("%s %+v: %d items, next %q, err %v; want %d and a cursor", name, sel, len(page), next, err, worklist.MaxSelectLimit)
+			}
+		}
 	}
 }

@@ -108,21 +108,14 @@ func (h *IngestHandler) Reply(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// List handles GET /agent/worklist. A runtime reads its acting user's persisted
-// work to augment it in place rather than re-deriving it from the provider. A
-// request with a selection (worklist.ParseSelection: threads=0, plus open, after and
-// limit, or top) gets a bounded slice without threads and the cursor of the next page
-// ({"items": [...], "next": "<id>"}); without one it gets the whole worklist, threads
-// included, which no current run asks for.
+// List handles GET /agent/worklist: the acting user's whole worklist, threads
+// included. No current run reads it (it outgrows the agent plane's response limit);
+// a run reads one item (Item) or a bounded selection (Select). It stays for a
+// runtime from before those reads.
 func (h *IngestHandler) List(w http.ResponseWriter, r *http.Request) {
 	p, ok := principal.FromContext(r.Context())
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "authentication required")
-		return
-	}
-	sel, selected, err := worklist.ParseSelection(r.URL.Query())
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	items, err := h.store.List(r.Context(), p.ActingUserID)
@@ -130,14 +123,32 @@ func (h *IngestHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "could not load work items")
 		return
 	}
-	if !selected {
-		if items == nil {
-			items = []worklist.WorkItem{}
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	if items == nil {
+		items = []worklist.WorkItem{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+// Select handles GET /agent/worklist/select: a bounded selection of the acting
+// user's items, without threads (worklist.ParseSelection, worklist.SelectFrom), as
+// {"items": [...], "next": "<cursor>"}. It is its own route so that a runtime talking
+// to a web tier without it fails (404) instead of receiving the whole worklist.
+func (h *IngestHandler) Select(w http.ResponseWriter, r *http.Request) {
+	p, ok := principal.FromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	page, next := worklist.Select(items, sel, time.Now().UTC())
+	sel, err := worklist.ParseSelection(r.URL.Query())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	page, next, err := worklist.SelectFrom(r.Context(), h.store, p.ActingUserID, sel, time.Now().UTC())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "could not load work items")
+		return
+	}
 	resp := map[string]any{"items": page}
 	if next != "" {
 		resp["next"] = next
@@ -145,27 +156,28 @@ func (h *IngestHandler) List(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// Item handles GET /agent/worklist/item?id=. A Discuss or research run reads the
-// one item it was dispatched for, thread included, rather than the whole worklist.
-// The lookup is scoped to the token's ActingUserID, so another user's item is not
-// found: the answer is {"found": false}, the same as for an item that is gone.
+// Item handles GET /agent/worklist/item?id=&turn=. A Discuss or research run reads
+// the one item it was dispatched for, with a bounded window of its thread that keeps
+// the turn it answers (worklist.ReadItem). The lookup is scoped to the token's
+// ActingUserID, so another user's item is not found: the answer is {"found": false},
+// the same as for an item that is gone.
 func (h *IngestHandler) Item(w http.ResponseWriter, r *http.Request) {
 	p, ok := principal.FromContext(r.Context())
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	id := r.URL.Query().Get("id")
+	q := r.URL.Query()
+	id := q.Get("id")
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "id is required")
 		return
 	}
-	items, err := h.store.List(r.Context(), p.ActingUserID)
+	it, found, err := worklist.ReadItem(r.Context(), h.store, p.ActingUserID, id, q.Get("turn"))
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "could not load work items")
+		writeError(w, http.StatusBadGateway, "could not load work item")
 		return
 	}
-	it, found := worklist.Find(items, id)
 	if !found {
 		writeJSON(w, http.StatusOK, map[string]any{"found": false})
 		return

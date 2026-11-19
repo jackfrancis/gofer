@@ -24,15 +24,15 @@ import (
 //     inside the web tier reads gofer's vault and worklist store directly.
 //   - OUT-OF-PROCESS (PlaneClient): a backend that executes the workload in another
 //     process or sandbox reaches gofer over its agent plane (GET /agent/credential,
-//     GET/POST /agent/worklist, GET /agent/worklist/item), authenticating every call
-//     with the run credential.
+//     POST /agent/worklist, GET /agent/worklist/select, GET /agent/worklist/item),
+//     authenticating every call with the run credential.
 //
 // A backend picks the shape its substrate needs and writes no plumbing of its own.
 
 // maxSinkResponse bounds one read from the agent plane. It matches the server's own
 // request limit. No read a run makes approaches it however large the worklist grows:
-// a run reads one item (with its thread), the top N, or a page of items without their
-// threads (worklist.Selection).
+// a run reads one item with a bounded window of its thread (worklist.MaxThreadBytes),
+// or a page of items without threads (worklist.MaxSelectBytes).
 const maxSinkResponse = 8 << 20
 
 // defaultPlaneTimeout bounds a single call to gofer's agent plane. These are gofer's
@@ -106,24 +106,16 @@ func NewStoreSink(s worklist.Store, ownerID string) *StoreSink {
 	return &StoreSink{store: s, ownerID: ownerID}
 }
 
-// Item returns the owner's item with id, thread included; ok is false if it is gone.
-func (s *StoreSink) Item(ctx context.Context, id string) (worklist.WorkItem, bool, error) {
-	items, err := s.store.List(ctx, s.ownerID)
-	if err != nil {
-		return worklist.WorkItem{}, false, err
-	}
-	it, ok := worklist.Find(items, id)
-	return it, ok, nil
+// Item returns the owner's item with id and a window of its thread that keeps turn
+// (worklist.ReadItem); ok is false if it is gone.
+func (s *StoreSink) Item(ctx context.Context, id, turn string) (worklist.WorkItem, bool, error) {
+	return worklist.ReadItem(ctx, s.store, s.ownerID, id, turn)
 }
 
-// Select returns the owner's items that sel names (worklist.Select).
+// Select returns the owner's items that sel names (worklist.SelectFrom), under the
+// same bounds the agent plane applies.
 func (s *StoreSink) Select(ctx context.Context, sel worklist.Selection) ([]worklist.WorkItem, string, error) {
-	items, err := s.store.List(ctx, s.ownerID)
-	if err != nil {
-		return nil, "", err
-	}
-	page, next := worklist.Select(items, sel, time.Now().UTC())
-	return page, next, nil
+	return worklist.SelectFrom(ctx, s.store, s.ownerID, sel, time.Now().UTC())
 }
 
 // Ingest merges a run's items into the owner's stored items (worklist.MergeRunItems),
@@ -214,14 +206,18 @@ func (c *PlaneClient) VendCredential(ctx context.Context, provider, rejected str
 	return VendedCredential{AccessToken: out.AccessToken, Version: out.Version}, nil
 }
 
-// Item reads one of the acting user's items, thread included, from the agent plane
-// (GET /agent/worklist/item). The owner is the run credential's, so another user's
-// item is simply not found. ok is false if the item is gone. The server answers a
-// missing item with found=false, so a 404 (a web tier without the route) is an
-// error rather than a silent "gone".
-func (c *PlaneClient) Item(ctx context.Context, id string) (worklist.WorkItem, bool, error) {
+// Item reads one of the acting user's items from the agent plane (GET
+// /agent/worklist/item), with a window of its thread that keeps turn. The owner is
+// the run credential's, so another user's item is simply not found. ok is false if
+// the item is gone. The server answers a missing item with found=false, so a 404 (a
+// web tier without the route) is an error rather than a silent "gone".
+func (c *PlaneClient) Item(ctx context.Context, id, turn string) (worklist.WorkItem, bool, error) {
+	q := url.Values{"id": {id}}
+	if turn != "" {
+		q.Set("turn", turn)
+	}
 	var out ItemResponse
-	if err := c.getJSON(ctx, "/agent/worklist/item?"+url.Values{"id": {id}}.Encode(), "read item", &out); err != nil {
+	if err := c.getJSON(ctx, "/agent/worklist/item?"+q.Encode(), "read item", &out); err != nil {
 		return worklist.WorkItem{}, false, err
 	}
 	if !out.Found {
@@ -236,18 +232,20 @@ type ItemResponse struct {
 	Item  worklist.WorkItem `json:"item"`
 }
 
-// SelectResponse is the body of GET /agent/worklist with a selection.
+// SelectResponse is the body of GET /agent/worklist/select.
 type SelectResponse struct {
 	Items []worklist.WorkItem `json:"items"`
 	Next  string              `json:"next,omitempty"`
 }
 
-// Select reads a bounded slice of the acting user's items from the agent plane
-// (GET /agent/worklist with a selection). The server may return fewer items than
-// sel.Limit asks for; a non-empty next means there is more to read.
+// Select reads a bounded selection of the acting user's items from the agent plane
+// (GET /agent/worklist/select). The server may return fewer items than sel.Limit
+// asks for; a non-empty next means there is more to read. A web tier without the
+// route answers 404, which is an error: the client never falls back to the
+// whole-worklist read, which would ignore the selection's bounds.
 func (c *PlaneClient) Select(ctx context.Context, sel worklist.Selection) ([]worklist.WorkItem, string, error) {
 	var out SelectResponse
-	if err := c.getJSON(ctx, "/agent/worklist?"+sel.Query().Encode(), "list worklist", &out); err != nil {
+	if err := c.getJSON(ctx, "/agent/worklist/select?"+sel.Query().Encode(), "select worklist", &out); err != nil {
 		return nil, "", err
 	}
 	return out.Items, out.Next, nil

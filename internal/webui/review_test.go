@@ -1,7 +1,9 @@
 package webui
 
 import (
+	"bytes"
 	"context"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -607,5 +609,47 @@ func TestThreadFormHintsMessageLimit(t *testing.T) {
 	}
 	if want := `maxlength="` + strconv.Itoa(maxMessageBytes) + `"`; !strings.Contains(string(page), want) {
 		t.Fatalf("thread form lacks %s", want)
+	}
+}
+
+// A multipart (FormData) thread post is parsed like a URL-encoded one, under the
+// same limit: a valid message is stored and dispatched, an oversized one gets 413.
+func TestThreadPostAcceptsMultipart(t *testing.T) {
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest})
+	pipe := &recordPipeline{}
+	opts := []ModelOption{{Value: "c0|default", Endpoint: "https://default", Model: "default"}}
+	h := &Handler{sessions: fakeSessions{&session.User{ID: "u1"}}, store: store, pipeline: pipe, convEnabled: true, options: opts, now: func() time.Time { return now }}
+	post := func(content string) *httptest.ResponseRecorder {
+		t.Helper()
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		_ = mw.WriteField("id", "pr1")
+		_ = mw.WriteField("content", content)
+		_ = mw.Close()
+		req := httptest.NewRequest(http.MethodPost, "/items/thread", &body)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		rec := httptest.NewRecorder()
+		h.ThreadPost(rec, req)
+		return rec
+	}
+	if rec := post("hello from FormData"); rec.Code != http.StatusSeeOther {
+		t.Fatalf("multipart post got %d", rec.Code)
+	}
+	items, _ := store.List(context.Background(), "u1")
+	if th := items[0].Thread; len(th) != 1 || th[0].Content != "hello from FormData" || len(pipe.turns) != 1 {
+		t.Fatalf("multipart message not stored and dispatched: %+v, %d dispatches", th, len(pipe.turns))
+	}
+	for name, content := range map[string]string{
+		"over the message limit": strings.Repeat("a", maxMessageBytes+1),
+		"over the form limit":    strings.Repeat("a", 2*maxThreadForm),
+	} {
+		if rec := post(content); rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("%s: got %d, want 413", name, rec.Code)
+		}
+	}
+	if items, _ := store.List(context.Background(), "u1"); len(items[0].Thread) != 1 {
+		t.Fatal("an oversized multipart message was stored")
 	}
 }

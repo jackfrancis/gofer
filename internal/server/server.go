@@ -165,6 +165,7 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// /api/*).
 	mux.Handle("POST /agent/worklist", authenticator.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(ingestHandler.Ingest)))
 	mux.Handle("GET /agent/worklist", authenticator.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(ingestHandler.List)))
+	mux.Handle("GET /agent/worklist/select", authenticator.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(ingestHandler.Select)))
 	mux.Handle("GET /agent/worklist/item", authenticator.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(ingestHandler.Item)))
 	// A converse run appends its answer to a thread here; it cannot rewrite the thread.
 	mux.Handle("POST /agent/worklist/reply", authenticator.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(ingestHandler.Reply)))

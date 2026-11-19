@@ -22,8 +22,9 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	if p.ItemID == "" {
 		return fmt.Errorf("agent: github-converse requires an item id")
 	}
-	// Read just the dispatched item, thread included, not the worklist.
-	item, ok, err := sink.Item(ctx, p.ItemID)
+	// Read just the dispatched item, with a bounded window of its thread, not the
+	// worklist.
+	item, ok, err := sink.Item(ctx, p.ItemID, p.Turn)
 	if err != nil {
 		return fmt.Errorf("read item: %w", err)
 	}

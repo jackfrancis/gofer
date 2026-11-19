@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"html/template"
 	"math"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -299,6 +300,16 @@ var messageTooLong = fmt.Sprintf("message too long: the limit is %d KiB", maxMes
 // so up to three bytes per byte) plus the item ID and model choice.
 const maxThreadForm = 3*maxMessageBytes + 4<<10
 
+// parseThreadForm parses a URL-encoded or multipart (FormData) thread post, under
+// the body limit the caller set. ParseForm alone would leave a multipart body
+// unread, and FormValue would then not parse it either.
+func parseThreadForm(r *http.Request) error {
+	if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt == "multipart/form-data" {
+		return r.ParseMultipartForm(maxThreadForm)
+	}
+	return r.ParseForm()
+}
+
 // ThreadPost handles POST /items/thread. It appends the user's message to the
 // item's thread and schedules an assistant turn, then redirects back to the thread
 // (Post/Redirect/Get). SameSite=Lax cookies give baseline CSRF protection. A message
@@ -310,7 +321,7 @@ func (h *Handler) ThreadPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxThreadForm)
-	if err := r.ParseForm(); err != nil {
+	if err := parseThreadForm(r); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			http.Error(w, messageTooLong, http.StatusRequestEntityTooLarge)

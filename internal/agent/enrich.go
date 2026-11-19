@@ -30,7 +30,7 @@ const (
 // cheap (one timeline read per item, a few percent of the hourly core budget even for
 // a large worklist); it is bounded by concurrency and by the run clock instead of by
 // an arbitrary count. Params.EnrichLimit still caps it when a caller wants that.
-// The read pages through the open items without their threads (selectAll), so it
+// The read pages through the open items without their threads (readAll), so it
 // stays bounded however large the worklist grows without dropping any item.
 func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	provider := p.Provider
@@ -50,7 +50,7 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 		}
 		return fmt.Errorf("github login: %w", err)
 	}
-	items, err := selectAll(ctx, p, sink, worklist.Selection{Open: true})
+	items, err := readAll(ctx, p, sink, worklist.Selection{Open: true})
 	if err != nil {
 		return fmt.Errorf("list worklist: %w", err)
 	}

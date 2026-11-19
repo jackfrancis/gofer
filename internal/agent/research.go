@@ -19,8 +19,9 @@ func runResearch(ctx context.Context, p Params, sink Sink) error {
 	if p.ItemID == "" {
 		return fmt.Errorf("agent: github-research requires an item id")
 	}
-	// Read just the dispatched item, thread included, not the worklist.
-	item, ok, err := sink.Item(ctx, p.ItemID)
+	// Read just the dispatched item, with a bounded window of its thread, not the
+	// worklist.
+	item, ok, err := sink.Item(ctx, p.ItemID, "")
 	if err != nil {
 		return fmt.Errorf("read item: %w", err)
 	}

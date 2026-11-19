@@ -47,19 +47,21 @@ type Vendor interface {
 // out-of-process it is an HTTP client to gofer's agent sink.
 //
 // Every read is bounded, so a run completes however large the worklist grows: Item
-// reads one item with its thread, and Select reads the top N or a page of items
-// without their threads (worklist.Selection; selectAll pages through them).
+// reads one item with a window of its thread, and Select reads a page of a
+// selection without threads (worklist.Selection; readAll pages through it).
 //
 // A write-back is merged into the item as stored when it lands (see
 // worklist.MergeRunItems): Ingest updates what a run derives — GitHub fields,
 // signals, scoring — and never the conversation thread, so work the owner did
 // while the run was busy survives. Reply is the only way a run adds to a thread.
 type Sink interface {
-	// Item reads the acting user's item with id, thread included; ok is false if it
-	// is gone (or is not the acting user's).
-	Item(ctx context.Context, id string) (item worklist.WorkItem, ok bool, err error)
-	// Select reads the items sel names, without threads, and the cursor of the next
-	// page (sel.After), empty on the last. It may return fewer than sel.Limit items.
+	// Item reads the acting user's item with id and a window of its thread that
+	// keeps the turn named by turn (worklist.ThreadWindow); ok is false if it is gone
+	// (or is not the acting user's).
+	Item(ctx context.Context, id, turn string) (item worklist.WorkItem, ok bool, err error)
+	// Select reads one page of the items sel names, without threads, and the cursor
+	// of the next page (sel.After), empty on the last. A page may hold fewer items
+	// than sel.Limit asks for (worklist.Select).
 	Select(ctx context.Context, sel worklist.Selection) (items []worklist.WorkItem, next string, err error)
 	Ingest(ctx context.Context, items []worklist.WorkItem) error
 	// Reply appends an agent turn to itemID's thread, answering the user turn whose
@@ -83,7 +85,7 @@ type Params struct {
 	Independent   bool                       // converse: answer blind — omit prior thread turns (independent review)
 	Researcher    worklist.ResearchRanker    // github-research re-ranker; required for that job
 	EnrichLimit   int                        // optional cap on items to enrich; 0 enriches every item
-	ReadPageSize  int                        // items per worklist page read (selectAll); 0 uses the default
+	ReadPageSize  int                        // items per worklist page read (readAll); 0 uses the default
 	Logger        *slog.Logger               // phase logger; nil uses slog.Default()
 }
 
@@ -110,9 +112,9 @@ const (
 	// a large worklist is written in batches: no single request approaches the limit,
 	// and a failure part-way still lands the earlier batches.
 	writeBackChunk = 25
-	// defaultReadPageSize is how many items one worklist page read carries. Items
-	// are read without their threads, so a page is far under the agent plane's
-	// response limit.
+	// defaultReadPageSize is how many items one worklist page read asks for. Items
+	// are read without their threads, and the server also ends a page by size
+	// (worklist.MaxSelectBytes), so a page is far under the response limit.
 	defaultReadPageSize = 500
 )
 
@@ -128,25 +130,35 @@ func hasBudget(ctx context.Context, reserve time.Duration) bool {
 	return time.Until(deadline) > reserve
 }
 
-// selectAll reads every item sel names (sel.After and sel.Limit are its own), a
-// bounded page at a time, so no single read grows with the worklist.
-func selectAll(ctx context.Context, p Params, sink Sink, sel worklist.Selection) ([]worklist.WorkItem, error) {
-	sel.Top, sel.After, sel.Limit = 0, "", p.ReadPageSize
-	if sel.Limit <= 0 {
-		sel.Limit = defaultReadPageSize
+// readAll reads every item sel names, a bounded page at a time, so no single read
+// grows with the worklist: a paged read (p.ReadPageSize items a page) or the top N.
+// An item a later page repeats (a top-N ranking can shift between pages) is dropped.
+func readAll(ctx context.Context, p Params, sink Sink, sel worklist.Selection) ([]worklist.WorkItem, error) {
+	sel.After = ""
+	if sel.Top == 0 {
+		sel.Limit = p.ReadPageSize
+		if sel.Limit <= 0 {
+			sel.Limit = defaultReadPageSize
+		}
 	}
 	var all []worklist.WorkItem
+	seen := map[string]bool{}
 	for {
 		page, next, err := sink.Select(ctx, sel)
 		if err != nil {
 			return nil, err
 		}
-		all = append(all, page...)
-		if next == "" {
+		for _, it := range page {
+			if !seen[it.ID] {
+				seen[it.ID] = true
+				all = append(all, it)
+			}
+		}
+		if next == "" || (sel.Top > 0 && len(all) >= sel.Top) {
 			return all, nil
 		}
-		if next <= sel.After {
-			return nil, fmt.Errorf("list worklist: page cursor %q does not advance past %q", next, sel.After)
+		if len(page) == 0 || next == sel.After {
+			return nil, fmt.Errorf("list worklist: page cursor %q does not advance", next)
 		}
 		sel.After = next
 	}
@@ -220,7 +232,7 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	// proceed unreconciled rather than skip the refresh — a rare case, logged loudly.
 	// Only IDs, completion and the per-item state above are needed, so the read omits
 	// thread bodies (the agent plane keeps the stored thread on every write-back).
-	existing, lerr := selectAll(ctx, p, sink, worklist.Selection{})
+	existing, lerr := readAll(ctx, p, sink, worklist.Selection{})
 	if lerr != nil {
 		log.Warn("ingest: could not read existing items to reconcile; threads may reset", "err", lerr)
 		existing = nil
@@ -336,7 +348,7 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 	// (worklist.Select), so the read is the top N, not the worklist. Retired items are
 	// off the radar; a model proposal for one is wasted spend. enrich has just run, so
 	// those baselines are computed from complete signals.
-	items, _, err := sink.Select(ctx, worklist.Selection{Open: true, Top: limit})
+	items, err := readAll(ctx, p, sink, worklist.Selection{Open: true, Top: limit})
 	if err != nil {
 		return fmt.Errorf("list worklist: %w", err)
 	}

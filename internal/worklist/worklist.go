@@ -203,6 +203,13 @@ type Store interface {
 	// the read and the write. fn must be quick and do no I/O. If fn returns an
 	// error, nothing is written and Update returns it.
 	Update(ctx context.Context, ownerID string, fn func(current []WorkItem) ([]WorkItem, error)) error
+	// Get returns the owner's item with id, thread included; ok is false if the
+	// owner has none. It reads that one item, never another owner's.
+	Get(ctx context.Context, ownerID, id string) (item WorkItem, ok bool, err error)
+	// Briefs returns the owner's items that q names, without their threads
+	// (ApplyBriefQuery is the reference), reading no more than it returns. It backs
+	// the bounded reads a run makes (SelectFrom).
+	Briefs(ctx context.Context, ownerID string, q BriefQuery) ([]WorkItem, error)
 }
 
 // Lister enumerates stored items across all owners. It is a cross-owner
