@@ -216,6 +216,14 @@ func (f *failingWriter) Header() http.Header       { return f.header }
 func (f *failingWriter) WriteHeader(int)           {}
 func (f *failingWriter) Write([]byte) (int, error) { return 0, errors.New("connection reset") }
 
+// bufferedWriter renders fine into net/http's buffer, but the flush to the client
+// fails: the connection dropped before the short page was sent.
+type bufferedWriter struct {
+	httptest.ResponseRecorder
+}
+
+func (b *bufferedWriter) FlushError() error { return errors.New("broken pipe") }
+
 // The receipt is for a delivered page: a HEAD (empty body) or a GET whose page
 // fails to reach the client marks nothing read.
 func TestThreadUndeliveredPageMarksNothing(t *testing.T) {
@@ -233,6 +241,11 @@ func TestThreadUndeliveredPageMarksNothing(t *testing.T) {
 	h.Thread(&failingWriter{header: http.Header{}}, httptest.NewRequest(http.MethodGet, "/items/thread?id="+low.ID, nil))
 	if got := stored(t, store, low.ID); got.ThreadReadThrough != "" || !got.HasUnreadReply() {
 		t.Fatal("a page that failed to reach the client must not mark the thread read")
+	}
+
+	h.Thread(&bufferedWriter{ResponseRecorder: *httptest.NewRecorder()}, httptest.NewRequest(http.MethodGet, "/items/thread?id="+low.ID, nil))
+	if got := stored(t, store, low.ID); got.ThreadReadThrough != "" || !got.HasUnreadReply() {
+		t.Fatal("a rendered page whose flush to the client failed must not mark the thread read")
 	}
 
 	openThread(t, h, low.ID)

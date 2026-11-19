@@ -294,9 +294,17 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 			// forward, so one already at seen on the snapshot is at or past it in the
 			// store; MarkThreadRead re-checks inside its update. A failed write only
 			// leaves the item unread.
-			if snapshot := it; snapshot.MarkRead(seen) {
-				_ = worklist.MarkThreadRead(r.Context(), h.store, user.ID, it.ID, seen)
+			if snapshot := it; !snapshot.MarkRead(seen) {
+				return
 			}
+			// net/http may still hold a short page in its buffer, to be sent when the
+			// handler returns. Push it to the client first: a page that cannot be
+			// flushed (the connection is gone, or the writer cannot flush) is not
+			// known to be delivered, so it marks nothing.
+			if err := http.NewResponseController(w).Flush(); err != nil {
+				return
+			}
+			_ = worklist.MarkThreadRead(r.Context(), h.store, user.ID, it.ID, seen)
 			return
 		}
 	}

@@ -171,9 +171,12 @@ Wired on the web-tier side; they define what a runtime must respect:
 - The read cursor (`WorkItem.ThreadReadThrough`) is the key of the newest agent
   turn the owner has seen, never a time: reply times are stamped by the run and
   replies land out of order. Delivering the thread page is the read receipt (the UI
-  has no script): after a GET renders without error, `webui.Thread` acknowledges the
-  newest reply in the snapshot it rendered (`worklist.MarkThreadRead`), so a reply
-  landing mid-request stays unread, and a HEAD or failed write marks nothing. The
+  has no script): after a GET renders and flushes to the client without error,
+  `webui.Thread` acknowledges the newest reply in the snapshot it rendered
+  (`worklist.MarkThreadRead`), so a reply landing mid-request stays unread, and a
+  HEAD or failed write marks nothing. A middleware that wraps the
+  `http.ResponseWriter` must implement `Unwrap` (as `statusRecorder` does), or the
+  flush fails and no thread is ever marked read. The
   cursor only moves forward; a re-render of an already-read thread skips the store.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
