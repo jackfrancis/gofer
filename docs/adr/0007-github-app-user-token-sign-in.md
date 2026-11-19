@@ -855,7 +855,14 @@ today's OAuth-app tokens, which it does not depend on:
   runs a query with no type qualifier as an issue and a PR query and merges them by
   recency. It reads the first page of each only (it shows 20 matches and reports
   GitHub's `total_count`), so the split does not double a tool call's share of the
-  search budget. A qualifier inside a quoted phrase does not count. When the search
+  search budget. A qualifier inside a quoted phrase does not count. Ingest counts a
+  query as walked to the end only if no page's `total_count` exceeds GitHub's
+  1,000-result ceiling, the count is the same on every page, no item comes back
+  twice, and the distinct items collected reach the count. GitHub stops serving pages
+  at the ceiling, and the match set can shift between pages while the walk runs (an
+  item updated mid-walk moves to the front, one that closes shifts the rest up a
+  row). Otherwise the walk is partial: what it found is still written, and nothing is
+  retired that run. When the search
   rate limit resets after the turn's deadline, the tool says so instead of sending a
   request that would be refused.
 - **The gate** (`internal/github/visibility.go`): every `/repos/{owner}/{name}/…` call
@@ -884,14 +891,19 @@ today's OAuth-app tokens, which it does not depend on:
   cannot serve a repository other than the gated one. `github_read_file` escapes the
   model's file path segment by segment, and the tarball's ref goes through the same
   check.
-- **Redirects:** the shared GET follows no redirect itself. An API-host redirect is
+- **Redirects:** the shared GET follows no redirect itself. Every API request, the
+  archive's hops and the logs' included, is one round trip through the transport,
+  never `Client.Do`: `Client.Do` parses a redirect's `Location` before `CheckRedirect`
+  can stop it and quotes a malformed one in its error, which could name a private
+  repository or carry a pre-signed URL. gofer parses `Location` itself and reports
+  only that it was unusable. An API-host redirect is
   followed only after its destination (`/repos/{o}/{r}/…` or `/repositories/{id}/…`)
   passes the gate, and one naming no repository only when the original request named
   none either (`/user`). A redirect off the API host is refused on the JSON path. The
   tarball still follows its off-host hop to codeload, with an API-host hop gated the
-  same way. The client removes every credential header from the codeload hop itself:
-  net/http drops `Authorization` only when the hostname changes, not for another port
-  or a subdomain. An Actions log's API-host redirect is followed with the token once its
+  same way. A hop off the API origin (codeload) is a fresh request with no credential
+  header at all: net/http would drop `Authorization` only when the hostname changes,
+  not for another port or a subdomain. An Actions log's API-host redirect is followed with the token once its
   destination passes the gate; only the off-host download link goes to the
   credential-free blob client. The gate's own lookup follows a rename redirect only to another repository
   metadata path, and judges the answer it ends on.

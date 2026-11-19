@@ -54,11 +54,6 @@ type Client struct {
 	blobOnce sync.Once
 	blob     *http.Client
 
-	// api is http with redirects left to the caller, which gates them
-	// (visibility.go); built on first use.
-	apiOnce sync.Once
-	api     *http.Client
-
 	// repos caches the public-only gate's answers. A Client serves one run, so this is
 	// the per-run cache ADR 0007 calls for.
 	repos repoGate
@@ -297,11 +292,22 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 	}, true
 }
 
-// searchIssues walks a search query page by page. whole reports that the walk reached
-// the last page with no early stop (time budget, rate-limit wait, or the 1,000-result
-// ceiling) and that GitHub never flagged a page as incomplete.
+// searchIssues walks a search query page by page. whole reports that the walk saw
+// the query's entire match set, so an item missing from it is no longer a match.
+//
+// That takes more than reaching the last page. GitHub stops serving pages at the
+// 1,000-result ceiling, and the match set can change while the walk runs: an item
+// updated mid-walk moves to the front (sort=updated) and is served twice while
+// another slips behind a page boundary; one that closes shifts the rest up a row. So
+// a walk is whole only if it reached the last page with no early stop (time budget,
+// rate-limit wait), GitHub never flagged a page incomplete, no page counted more
+// matches than the ceiling, total_count was the same on every page, no item came
+// back twice, and the distinct items collected reach that count. Anything else is
+// partial: everything found is still returned, and the caller skips retirement.
 func (c *Client) searchIssues(ctx context.Context, token, q string) (out []searchItem, whole bool, err error) {
-	incomplete := false
+	unsure := false // something says the walk may have missed a match
+	total := -1
+	seen := make(map[string]bool)
 	for page := 1; page*searchPerPage <= searchResultCap; page++ {
 		// Never spend the time the rest of the run still needs. The first page is always
 		// attempted (an empty fetch is worse than a late one); every page after it is a
@@ -317,10 +323,20 @@ func (c *Client) searchIssues(ctx context.Context, token, q string) (out []searc
 			return nil, false, err
 		}
 		out = append(out, sr.Items...)
-		incomplete = incomplete || sr.IncompleteResults
+		if sr.IncompleteResults || sr.TotalCount > searchResultCap || (total >= 0 && sr.TotalCount != total) {
+			unsure = true
+		}
+		total = sr.TotalCount
+		for _, it := range sr.Items {
+			key := it.RepositoryURL + "#" + strconv.Itoa(it.Number)
+			if seen[key] {
+				unsure = true // the set shifted between pages
+			}
+			seen[key] = true
+		}
 		if !more || len(sr.Items) == 0 {
-			// The last page: the walk saw everything GitHub had for this query.
-			return out, !incomplete, nil
+			// The last page GitHub will serve.
+			return out, !unsure && len(seen) >= total, nil
 		}
 	}
 	// Left the loop early: the budget broke it, or the result ceiling ended it with

@@ -605,3 +605,131 @@ func TestGateRedirected403KeepsNoFreeText(t *testing.T) {
 		t.Errorf("err = %v, want a 403 refusal without the destination's name", err)
 	}
 }
+
+// A malformed redirect Location never reaches an error: net/http's Client.Do would
+// quote it ("failed to parse Location header"), and it could name a private
+// repository or carry a pre-signed URL. The gate's lookup, the shared GET and the
+// archive download all parse it themselves and say only that it was unusable.
+func TestMalformedLocationStaysOutOfErrors(t *testing.T) {
+	bad := func(w http.ResponseWriter, loc string) {
+		w.Header().Set("Location", loc)
+		w.WriteHeader(http.StatusMovedPermanently)
+	}
+	s := newGateStub(t, map[string]string{"o/r": "public"}, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/o/r/issues/1": // the shared GET
+			bad(w, "/repos/new/secret%zz/issues/1")
+		case "/repos/o/r/tarball": // the archive download
+			bad(w, "https://codeload.example/secret%zz?sig=presigned")
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/old/name" { // the gate's lookup of a renamed repository
+			bad(w, "/repositories/new%zzsecret")
+			return
+		}
+		s.serve(w, r)
+	}))
+	defer srv.Close()
+	c := NewClient(srv.Client(), srv.URL)
+	ctx := context.Background()
+
+	_, err1 := c.IssueStatus(ctx, "tok", "old/name", 1)
+	_, err2 := c.IssueStatus(ctx, "tok", "o/r", 1)
+	_, err3 := c.Tarball(ctx, "tok", "o/r", "")
+	for i, err := range []error{err1, err2, err3} {
+		if err == nil {
+			t.Errorf("case %d: no error", i+1)
+			continue
+		}
+		if msg := err.Error(); strings.Contains(msg, "secret") || strings.Contains(msg, "presigned") || strings.Contains(msg, "%zz") {
+			t.Errorf("case %d: the error quotes the Location: %v", i+1, err)
+		}
+	}
+}
+
+// A search walk is whole only if it saw the whole match set: the match count is
+// within GitHub's 1,000-result ceiling on every page and the same on every page, no
+// item comes back twice, and the distinct items reach the count. GitHub stops serving
+// pages at the ceiling, and the set can shift between pages while the walk runs, so
+// reaching the last page GitHub serves proves none of that by itself.
+func TestSearchWalkRespectsTotalCount(t *testing.T) {
+	type pg struct {
+		total int
+		items []int // issue numbers served on the page
+	}
+	span := func(from, to int) []int { // from..to-1
+		var out []int
+		for n := from; n < to; n++ {
+			out = append(out, n)
+		}
+		return out
+	}
+	steady := func(total int, pages ...[]int) []pg {
+		var out []pg
+		for _, items := range pages {
+			out = append(out, pg{total, items})
+		}
+		return out
+	}
+	var overCeiling [][]int
+	for p := 0; p < 10; p++ {
+		overCeiling = append(overCeiling, span(p*100, p*100+100))
+	}
+	// 1,001 matches (#0-#1000) when the walk starts. After page one, #1 closes, so
+	// every later page starts a row further on and #100 is never served: the walk
+	// collects 1,000 distinct rows under a final count of 1,000.
+	shrunk := []pg{{1001, span(0, 100)}}
+	for p := 1; p < 10; p++ {
+		shrunk = append(shrunk, pg{1000, span(p*100+1, p*100+101)})
+	}
+
+	for _, tc := range []struct {
+		name      string
+		pages     []pg // the last has no rel="next"
+		wantWhole bool
+	}{
+		{"within the ceiling", steady(130, span(0, 100), span(100, 130)), true},
+		{"over the ceiling", steady(1500, overCeiling...), false},
+		{"fewer collected than counted", steady(150, span(0, 100), span(100, 130)), false},
+		{"a page over the ceiling, then within it", shrunk, false},
+		// The count stays 150, but #5 was updated and moved to page one's position
+		// again, pushing #100 behind the boundary: 150 rows, 149 distinct issues.
+		{"an item moved forward between pages", steady(150, span(0, 100), append([]int{5}, span(101, 150)...)), false},
+		// 150 distinct issues, but one was served twice: the set moved during the walk.
+		{"an item served twice", steady(150, span(0, 100), append([]int{5}, span(100, 150)...)), false},
+		// One closed after page one: the count drops and the rest shift up a row, so the
+		// rows collected match the final count while #100 was never seen.
+		{"the count changed between pages", []pg{{150, span(0, 100)}, {149, span(101, 150)}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				page := 0
+				fmt.Sscan(r.URL.Query().Get("page"), &page)
+				if page < 1 || page > len(tc.pages) {
+					w.WriteHeader(http.StatusUnprocessableEntity) // past the ceiling
+					return
+				}
+				if page < len(tc.pages) {
+					w.Header().Set("Link", `<x>; rel="next"`)
+				}
+				p := tc.pages[page-1]
+				items := make([]string, len(p.items))
+				for i, n := range p.items {
+					items[i] = fmt.Sprintf(`{"number":%d,"repository_url":"https://api.github.com/repos/o/r"}`, n)
+				}
+				fmt.Fprintf(w, `{"total_count":%d,"items":[%s]}`, p.total, strings.Join(items, ","))
+			}))
+			defer srv.Close()
+			out, whole, err := NewClient(srv.Client(), srv.URL).searchIssues(context.Background(), "tok", "is:pr")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if whole != tc.wantWhole {
+				t.Errorf("whole = %v after %d rows, want %v", whole, len(out), tc.wantWhole)
+			}
+		})
+	}
+}
