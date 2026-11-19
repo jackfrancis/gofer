@@ -1347,3 +1347,73 @@ func TestRemovedAccountCanStillRevoke(t *testing.T) {
 		t.Error("credential kept after the removed account's logout")
 	}
 }
+
+// Review P2 (seventh round): a logout whose background wait gave up is reused, not
+// replaced, by the next logout; so when the user then signs in again, the sign-in
+// supersedes the record every waiter holds, and none of them revokes the new grant.
+func TestStaleLogoutNeverRevokesNewSignIn(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
+	put(t, gh, vlt, appCred("ghu_old", "ghr_old", "v1", 4*time.Hour))
+	first := mustMark(t, h)
+	h.releaseLogout(user, "github", first) // its background wait timed out
+	second := mustMark(t, h)
+	if second != first {
+		t.Fatal("a new logout replaced an unfinished one")
+	}
+	signIn(t, h) // the user signs in again
+	fresh := stored(t, vlt)
+	if res := h.revokeAndDelete(bg, user, "github", first); res.confirmed || gh.revoked.Load() != 0 {
+		t.Fatalf("old waiter = %+v, revocations = %d; want nothing revoked", res, gh.revoked.Load())
+	}
+	if c, err := h.Credential(bg, user, "github", VendRequest{}); err != nil || c.Version != fresh.Version {
+		t.Fatalf("the new sign-in's credential: %+v, %v", c, err)
+	}
+}
+
+// A logout record that is no longer the credential's current one never runs.
+func TestRunLogoutRefusesStaleRecord(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
+	put(t, gh, vlt, appCred("ghu_a", "ghr_a", "v1", 4*time.Hour))
+	stale := newLocalLogout() // never published, or replaced
+	unlock, err := h.locks.lock(bg, user, "github")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := h.runLogout(bg, user, "github", stale)
+	unlock()
+	if res.confirmed || gh.revoked.Load() != 0 || !stale.finished() {
+		t.Fatalf("stale run = %+v, revocations = %d, finished = %v", res, gh.revoked.Load(), stale.finished())
+	}
+	stored(t, vlt)
+}
+
+// Review P3 (seventh round): a request waiting for the lock on a logout another
+// request performs returns that outcome as soon as it is recorded, rather than
+// timing out and reporting it unconfirmed.
+func TestJoinedLogoutReportsRecordedOutcome(t *testing.T) {
+	defer func(d time.Duration) { logoutLockWait = d }(logoutLockWait)
+	logoutLockWait = 2 * time.Second
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newKindHandler(t, gh, config.GitHubApp)
+	put(t, gh, vlt, appCred("ghu_a", "ghr_a", "v1", 4*time.Hour))
+	unlock, err := h.locks.lock(bg, user, "github") // the performing request holds it
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	lo := mustMark(t, h)
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		h.completeLogout(bg, user, "github", lo, logoutResult{confirmed: true}, false)
+	}()
+	start := time.Now()
+	res := h.revokeAndDelete(bg, user, "github", lo)
+	if !res.confirmed {
+		t.Fatalf("joined request = %+v, want the recorded confirmation", res)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("joined request waited %v for the lock instead of the outcome", elapsed)
+	}
+}

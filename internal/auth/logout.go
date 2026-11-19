@@ -141,7 +141,11 @@ func (h *Handler) beginLogout(ctx context.Context, sessionKey, userID, providerN
 	if err != nil {
 		return nil, err
 	}
-	if lo := h.locks.currentLogout(userID, providerName); lo != nil && lo.running && !lo.finished() {
+	// An unfinished logout of this credential is reused, never replaced: joined if
+	// it is running, resumed if its background wait gave up. Replacing it would leave
+	// its waiters holding a record nobody supersedes when the user signs in again.
+	if lo := h.locks.currentLogout(userID, providerName); lo != nil && !lo.finished() {
+		lo.running = true
 		return lo, nil
 	}
 	lo := newLocalLogout()
@@ -294,10 +298,22 @@ type logoutResult struct {
 // a row whose refresh token is dead, which after a restore from backup does not mean
 // the grant is gone.
 func (h *Handler) revokeAndDelete(ctx context.Context, userID, providerName string, lo *localLogout) logoutResult {
+	// Wait for the lock, or for lo's outcome if another request performs it first
+	// (this one joined it): then there is nothing left to do but report it.
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), logoutLockWait)
 	defer cancel()
+	go func() {
+		select {
+		case <-lo.done:
+			cancel()
+		case <-wctx.Done():
+		}
+	}()
 	unlock, err := h.locks.lock(wctx, userID, providerName)
 	if err != nil {
+		if lo.finished() {
+			return lo.result
+		}
 		slog.WarnContext(ctx, "logout: credential lock busy; revocation deferred", "user", userID, "provider", providerName)
 		go h.pendingLogout(context.WithoutCancel(ctx), userID, providerName, lo)
 		return h.unconfirmed(providerName, h.providers[providerName], nil)
@@ -311,8 +327,18 @@ func (h *Handler) revokeAndDelete(ctx context.Context, userID, providerName stri
 func (h *Handler) pendingLogout(ctx context.Context, userID, providerName string, lo *localLogout) {
 	wctx, cancel := context.WithTimeout(ctx, pendingLogoutWait)
 	defer cancel()
+	go func() {
+		select {
+		case <-lo.done:
+			cancel()
+		case <-wctx.Done():
+		}
+	}()
 	unlock, err := h.locks.lock(wctx, userID, providerName)
 	if err != nil {
+		if lo.finished() {
+			return // another request performed it
+		}
 		h.releaseLogout(userID, providerName, lo)
 		slog.WarnContext(ctx, "logout: deferred revocation timed out; left to the next credential access", "user", userID, "provider", providerName)
 		return
@@ -323,14 +349,35 @@ func (h *Handler) pendingLogout(ctx context.Context, userID, providerName string
 }
 
 // runLogout performs lo, holding the credential lock, unless it already has an
-// outcome (another request performed it, or a sign-in superseded it).
+// outcome (another request performed it, or a sign-in superseded it) or is no longer
+// the credential's current logout. The ownership check is made under the marker
+// lock, right before the revocation: a logout that is not current must never revoke,
+// since the credential may be one the user has just signed in to get.
 func (h *Handler) runLogout(ctx context.Context, userID, providerName string, lo *localLogout) logoutResult {
-	if lo.finished() {
-		return lo.result
+	if res, owned := h.ownLogout(userID, providerName, lo); !owned {
+		return res
 	}
 	res, deleted := h.logoutLocked(ctx, userID, providerName)
 	h.completeLogout(ctx, userID, providerName, lo, res, deleted)
 	return res
+}
+
+// ownLogout reports whether lo may run: unfinished and still the current logout.
+// If it is neither, it returns the outcome to report, finishing a stale lo as
+// unconfirmed (nothing was revoked for it). The caller holds the credential lock,
+// under which only a sign-in (which supersedes, finishing lo) changes the current
+// logout to something else.
+func (h *Handler) ownLogout(userID, providerName string, lo *localLogout) (logoutResult, bool) {
+	defer h.locks.markerLock(userID, providerName)()
+	if lo.finished() {
+		return lo.result, false
+	}
+	if !h.locks.isCurrent(userID, providerName, lo) {
+		lo.finish(h.unconfirmed(providerName, h.providers[providerName], nil))
+		return lo.result, false
+	}
+	lo.running = true
+	return logoutResult{}, true
 }
 
 // logoutLocked revokes and deletes the credential, holding the credential lock, and
