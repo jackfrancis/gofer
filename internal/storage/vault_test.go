@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackfrancis/gofer/internal/session"
 	"github.com/jackfrancis/gofer/internal/vault"
 )
 
@@ -23,6 +24,10 @@ func cred(access string) vault.Credential {
 		RefreshToken: "refresh-" + access,
 		TokenType:    "bearer",
 		Expiry:       time.Date(2027, 1, 2, 3, 4, 5, 0, time.UTC),
+		// ADR 0007's fields, sealed with the rest.
+		RefreshExpiry: time.Date(2027, 6, 2, 3, 4, 5, 0, time.UTC),
+		ClientID:      "client-1",
+		Version:       "v-" + access,
 	}
 }
 
@@ -54,7 +59,10 @@ func TestVaultParity(t *testing.T) {
 			if !got.Expiry.Equal(want.Expiry) {
 				t.Fatalf("expiry = %v, want %v", got.Expiry, want.Expiry)
 			}
-			got.Expiry = want.Expiry
+			if !got.RefreshExpiry.Equal(want.RefreshExpiry) {
+				t.Fatalf("refresh expiry = %v, want %v", got.RefreshExpiry, want.RefreshExpiry)
+			}
+			got.Expiry, got.RefreshExpiry = want.Expiry, want.RefreshExpiry
 			if got != want {
 				t.Fatalf("got %+v, want %+v", got, want)
 			}
@@ -339,4 +347,170 @@ func flip(b []byte, i int) []byte {
 	out := bytes.Clone(b)
 	out[i] ^= 0x01
 	return out
+}
+
+// A row sealed before ADR 0007 has no client_id, version or refresh expiry. It still
+// opens, with those fields empty, so no migration is needed and the broker can tell
+// it is a legacy row.
+func TestVaultOpensALegacyRow(t *testing.T) {
+	db := open(t, t.TempDir())
+	keys := keyring(t, testKey(1))
+	v := db.Vault(keys)
+	legacy := []byte(`{"access_token":"gho_legacy","token_type":"bearer","expiry":"0001-01-01T00:00:00Z"}`)
+	keyID, sealed := keys.Seal(legacy, credentialAAD("alice", "github"))
+	if _, err := db.sql.ExecContext(ctx,
+		`INSERT INTO credentials (user_id, provider, key_id, sealed, updated_at) VALUES (?, ?, ?, ?, ?)`,
+		"alice", "github", keyID, sealed, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	got := mustGet(t, v, "alice", "github")
+	if got.AccessToken != "gho_legacy" || got.ClientID != "" || got.Version != "" || !got.RefreshExpiry.IsZero() || !got.Expiry.IsZero() {
+		t.Fatalf("legacy row = %+v", got)
+	}
+}
+
+// The pending-logout ledger: marked, listed and cleared independently of the
+// credential row, in both vaults, and durable across a reopen in SQLite. It lives
+// under a reserved provider name that no credential can take.
+func TestLogoutLedger(t *testing.T) {
+	dir := t.TempDir()
+	impls := map[string]vault.Vault{
+		"memory": vault.NewMemoryVault(),
+		"sqlite": open(t, dir).Vault(keyring(t, testKey(1))),
+	}
+	for name, v := range impls {
+		t.Run(name, func(t *testing.T) {
+			l := v.(vault.LogoutLedger)
+			if err := v.Put(ctx, "alice", cred("tok")); err != nil {
+				t.Fatal(err)
+			}
+			if p, err := l.LogoutPending(ctx, "alice", "github"); err != nil || p {
+				t.Fatalf("pending before marking = %v, %v", p, err)
+			}
+			if err := l.MarkLogout(ctx, "alice", "github"); err != nil {
+				t.Fatal(err)
+			}
+			if p, err := l.LogoutPending(ctx, "alice", "github"); err != nil || !p {
+				t.Fatalf("pending after marking = %v, %v", p, err)
+			}
+			keys, err := l.PendingLogouts(ctx)
+			if err != nil || len(keys) != 1 || keys[0] != (vault.LogoutKey{UserID: "alice", Provider: "github"}) {
+				t.Fatalf("pending logouts = %v, %v", keys, err)
+			}
+			if mustGet(t, v, "alice", "github").AccessToken != "tok" {
+				t.Fatal("marking touched the credential")
+			}
+			// Deleting the credential leaves the marker; clearing the marker leaves
+			// the credential.
+			if err := l.ClearLogout(ctx, "alice", "github"); err != nil {
+				t.Fatal(err)
+			}
+			if p, _ := l.LogoutPending(ctx, "alice", "github"); p {
+				t.Fatal("still pending after clearing")
+			}
+			mustGet(t, v, "alice", "github")
+		})
+	}
+
+	// SQLite: a marker survives reopening the database, and the reserved name is not
+	// a credential anyone can write.
+	dir2 := t.TempDir()
+	first := open(t, dir2)
+	if err := first.Vault(keyring(t, testKey(1))).MarkLogout(ctx, "bob", "github"); err != nil {
+		t.Fatal(err)
+	}
+	_ = first.Close()
+	reopened := open(t, dir2).Vault(keyring(t, testKey(1)))
+	if p, err := reopened.LogoutPending(ctx, "bob", "github"); err != nil || !p {
+		t.Fatalf("marker lost on reopen: %v, %v", p, err)
+	}
+	if err := reopened.Put(ctx, "bob", vault.Credential{Provider: logoutMarkerPrefix + "github", AccessToken: "x"}); err == nil {
+		t.Error("a credential was written under the reserved marker name")
+	}
+}
+
+// Review (fourth round): recording a pending logout and deleting the browser session
+// commit together. If the session delete fails, the marker is rolled back too.
+func TestMarkLogoutEndingSessionIsAtomic(t *testing.T) {
+	db := open(t, t.TempDir())
+	v := db.Vault(keyring(t, testKey(1)))
+	sessions := db.Sessions()
+	if err := sessions.Save(ctx, "sess-hash", session.User{ID: "alice"}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.sql.ExecContext(ctx, `CREATE TRIGGER no_session_delete BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.MarkLogoutEndingSession(ctx, "sess-hash", "alice", "github"); err == nil {
+		t.Fatal("commit succeeded although the session delete failed")
+	}
+	if p, _ := v.LogoutPending(ctx, "alice", "github"); p {
+		t.Error("the marker survived a failed commit")
+	}
+	if _, err := db.sql.ExecContext(ctx, `DROP TRIGGER no_session_delete`); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.MarkLogoutEndingSession(ctx, "sess-hash", "alice", "github"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := v.LogoutPending(ctx, "alice", "github"); !p {
+		t.Error("no marker after the commit")
+	}
+	if _, _, err := sessions.Load(ctx, "sess-hash"); !errors.Is(err, session.ErrNotFound) {
+		t.Errorf("session kept after the commit (err=%v)", err)
+	}
+}
+
+// Review (fourth round): a sign-in's credential and the clearing of the old
+// logout commit together. If clearing fails, the credential write is rolled back.
+func TestPutClearingLogoutIsAtomic(t *testing.T) {
+	db := open(t, t.TempDir())
+	v := db.Vault(keyring(t, testKey(1)))
+	if err := v.Put(ctx, "alice", cred("old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.MarkLogout(ctx, "alice", "github"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.sql.ExecContext(ctx, `CREATE TRIGGER keep_marker BEFORE DELETE ON credentials
+		WHEN OLD.provider = 'logout-pending:github' BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.PutClearingLogout(ctx, "alice", cred("new")); err == nil {
+		t.Fatal("commit succeeded although clearing the marker failed")
+	}
+	if got := mustGet(t, v, "alice", "github").AccessToken; got != "old" {
+		t.Errorf("credential = %q after a failed commit, want the old one", got)
+	}
+	if _, err := db.sql.ExecContext(ctx, `DROP TRIGGER keep_marker`); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.PutClearingLogout(ctx, "alice", cred("new")); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := v.LogoutPending(ctx, "alice", "github"); p || mustGet(t, v, "alice", "github").AccessToken != "new" {
+		t.Error("sign-in did not replace the credential and clear the marker")
+	}
+}
+
+// Review (fifth round): a logout is recorded only by the call that consumes the
+// session. A second call for the same, already deleted session records nothing.
+func TestMarkLogoutEndingSessionConsumesOnce(t *testing.T) {
+	db := open(t, t.TempDir())
+	v := db.Vault(keyring(t, testKey(1)))
+	if err := db.Sessions().Save(ctx, "sess-hash", session.User{ID: "alice"}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.MarkLogoutEndingSession(ctx, "sess-hash", "alice", "github"); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.ClearLogout(ctx, "alice", "github"); err != nil { // the first logout finished
+		t.Fatal(err)
+	}
+	if err := v.MarkLogoutEndingSession(ctx, "sess-hash", "alice", "github"); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("second logout of the same session: err = %v, want session.ErrNotFound", err)
+	}
+	if p, _ := v.LogoutPending(ctx, "alice", "github"); p {
+		t.Error("the second logout recorded a marker")
+	}
 }

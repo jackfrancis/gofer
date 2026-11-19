@@ -47,7 +47,10 @@ type VaultVendor struct {
 	aiToken string
 }
 
-var _ Vendor = (*VaultVendor)(nil)
+var (
+	_ Vendor           = (*VaultVendor)(nil)
+	_ CredentialVendor = (*VaultVendor)(nil)
+)
 
 // NewVaultVendor binds a vendor to one run's acting user. aiToken is the shared
 // chat-model token vended as provider "ai"; empty disables the model.
@@ -64,14 +67,26 @@ func (v *VaultVendor) Vend(ctx context.Context, provider string) (string, error)
 		}
 		return v.aiToken, nil
 	}
+	vc, err := v.VendCredential(ctx, provider, "")
+	return vc.AccessToken, err
+}
+
+// VendCredential returns the stored credential's token and version. In-process
+// there is no broker to refresh or confirm a rejection, so rejected is ignored and
+// the stored token comes back (a 401 then stands). A missing credential is a
+// ReconnectError, as the broker's "sign-in required" is out of process.
+func (v *VaultVendor) VendCredential(ctx context.Context, provider, _ string) (VendedCredential, error) {
 	cred, err := v.vault.Get(ctx, v.ownerID, provider)
+	if errors.Is(err, vault.ErrNotFound) || errors.Is(err, vault.ErrSignInRequired) {
+		return VendedCredential{}, &ReconnectError{Provider: provider}
+	}
 	if err != nil {
-		return "", fmt.Errorf("vend %s credential: %w", provider, err)
+		return VendedCredential{}, fmt.Errorf("vend %s credential: %w", provider, err)
 	}
 	if cred.AccessToken == "" {
-		return "", fmt.Errorf("agent: empty %s credential for %s", provider, v.ownerID)
+		return VendedCredential{}, fmt.Errorf("agent: empty %s credential for %s", provider, v.ownerID)
 	}
-	return cred.AccessToken, nil
+	return VendedCredential{AccessToken: cred.AccessToken, Version: cred.Version}, nil
 }
 
 // StoreSink is the in-process Sink: it reads and writes gofer's worklist store,
@@ -122,8 +137,9 @@ type PlaneClient struct {
 }
 
 var (
-	_ Vendor = (*PlaneClient)(nil)
-	_ Sink   = (*PlaneClient)(nil)
+	_ Vendor           = (*PlaneClient)(nil)
+	_ CredentialVendor = (*PlaneClient)(nil)
+	_ Sink             = (*PlaneClient)(nil)
 )
 
 // NewPlaneClient builds a client for gofer's agent plane at baseURL, authenticating
@@ -138,28 +154,47 @@ func NewPlaneClient(baseURL, runCredential string, client *http.Client) *PlaneCl
 // Vend fetches the acting user's delegated provider token from gofer. The runtime
 // holds it for the run only — never a standing secret.
 func (c *PlaneClient) Vend(ctx context.Context, provider string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/agent/credential?provider="+url.QueryEscape(provider), nil)
+	vc, err := c.VendCredential(ctx, provider, "")
+	return vc.AccessToken, err
+}
+
+// VendCredential fetches the token and its credential version
+// (GET /agent/credential). A non-empty rejected names the version GitHub answered
+// with 401, so the broker confirms it and refreshes if it must. The broker's
+// "sign-in required" is a ReconnectError.
+func (c *PlaneClient) VendCredential(ctx context.Context, provider, rejected string) (VendedCredential, error) {
+	q := url.Values{"provider": {provider}}
+	if rejected != "" {
+		q.Set("rejected", rejected)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/agent/credential?"+q.Encode(), nil)
 	if err != nil {
-		return "", err
+		return VendedCredential{}, err
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return "", err
+		return VendedCredential{}, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("vend %s credential: status %d", provider, resp.StatusCode)
-	}
 	var out struct {
 		AccessToken string `json:"access_token"`
+		Version     string `json:"credential_version"`
+		Code        string `json:"code"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&out); err != nil {
-		return "", err
+	decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&out)
+	if resp.StatusCode == signInRequiredStatus && out.Code == signInRequiredCode {
+		return VendedCredential{}, &ReconnectError{Provider: provider}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return VendedCredential{}, fmt.Errorf("vend %s credential: status %d", provider, resp.StatusCode)
+	}
+	if decodeErr != nil {
+		return VendedCredential{}, decodeErr
 	}
 	if out.AccessToken == "" {
-		return "", fmt.Errorf("vend %s credential: empty token", provider)
+		return VendedCredential{}, fmt.Errorf("vend %s credential: empty token", provider)
 	}
-	return out.AccessToken, nil
+	return VendedCredential{AccessToken: out.AccessToken, Version: out.Version}, nil
 }
 
 // List reads the acting user's persisted work from the agent plane.

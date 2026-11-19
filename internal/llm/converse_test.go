@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -272,6 +273,27 @@ func TestConverserReplyToolError(t *testing.T) {
 	}
 	if !strings.HasPrefix(relayed, "tool error: ") || !strings.Contains(relayed, "path is required") {
 		t.Fatalf("tool error not relayed to model: %q", relayed)
+	}
+}
+
+// A tool call that finds the user's GitHub access gone ends the turn: the error is
+// returned, not fed to the model, and no further model round runs.
+func TestConverserReplyStopsOnSignInRequired(t *testing.T) {
+	var rounds int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rounds++
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"github_read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`))
+	}))
+	defer srv.Close()
+
+	box := &fakeToolBox{err: fmt.Errorf("read file: %w", worklist.ErrSignInRequired)}
+	c := NewConverser(Config{Endpoint: srv.URL, Token: "t", Client: srv.Client()})
+	reply, err := c.Reply(context.Background(), worklist.WorkItem{}, "", "", nil, "read it", box)
+	if !errors.Is(err, worklist.ErrSignInRequired) || reply != "" {
+		t.Fatalf("reply %q, err %v; want the sign-in error and no reply", reply, err)
+	}
+	if rounds != 1 || len(box.invoked) != 1 {
+		t.Fatalf("rounds = %d, invocations = %d; want the turn to end at the first tool call", rounds, len(box.invoked))
 	}
 }
 

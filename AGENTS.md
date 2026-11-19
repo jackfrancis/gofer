@@ -113,6 +113,8 @@ Wired on the web-tier side; they define what a runtime must respect:
   `GET /agent/credential` (behind RequireScope) and are held by the workload for the
   run only — never a standing secret, never logged, never persisted. gofer core
   packages import no provider client; only the workload (`internal/agent`) does.
+  The broker vends through `auth.Handler.Credential`, which refreshes expiring
+  (GitHub App) tokens; the refresh token never leaves the web tier.
 - **The chat-model token is the same class.** The web tier holds only the non-secret
   coordinates (`AI_CONNECTIONS`) and brokers the token; the workload runs the model.
 - **Least privilege.** Source scopes are READ; only gofer metadata is WRITE.
@@ -199,6 +201,29 @@ Wired on the web-tier side; they define what a runtime must respect:
   in its error: use `apiDo`/`roundTrip`. Test stubs
   must answer that lookup: wrap the handler in `githubtest.PublicRepos`. Ingest drops
   hits not confirmed public, and an unknown answer makes the fetch incomplete.
+- GitHub sign-in is an OAuth app or a read-only GitHub App (`GITHUB_CLIENT_KIND`,
+  ADR 0007). Every write of a stored credential — the callback's `Put`, logout, the
+  broker's refresh and legacy tagging — goes through `internal/auth/credential.go`
+  under one per-(user, provider) lock, and every write mints a new credential version
+  (sealed with the token; no migration). Logout sets a tombstone (`credLocks`) that
+  makes it the only writer left: other holders refuse to vend and delete nothing,
+  and logout revokes, then deletes, under the lock (or in the background once the
+  lock frees). The pending logout is also recorded durably (`vault.LogoutLedger`: a
+  marker row under a reserved provider name in `credentials`, no migration), so the
+  refusal survives a restart; the next lock holder, or startup, finishes it. Pairs
+  that must agree after a crash commit in one SQLite transaction: the logout marker
+  with the session delete (`MarkLogoutEndingSession`, which records nothing unless
+  it removed the session), and a sign-in's credential with clearing the marker
+  (`PutClearingLogout`). Marker transitions and in-memory ownership (a
+  `localLogout` record per logout, in `internal/auth/logout.go`) change together
+  under `credLocks.markerLock`.
+  Never write the vault from anywhere else. A
+  credential from another client is never vended. The broker answers "sign-in
+  required" with 410 and code `sign_in_required`; the workload (`internal/agent`,
+  which does not import the web tier) repeats both, and a test in `internal/api`
+  holds them together. The workload's GitHub calls go through a `tokenHolder`, which
+  re-vends once on 401 with `rejected=<version>`; a Discuss turn that finds sign-in
+  required saves a reconnect notice (`worklist.NoticeReconnect`), never an answer.
 - `go test` binds httptest sockets; run it outside a restrictive sandbox.
 
 ## Build / test / run

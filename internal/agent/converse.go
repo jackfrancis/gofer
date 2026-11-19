@@ -11,8 +11,7 @@ import (
 )
 
 // runConverse answers one turn of the assistive conversation for a single item
-// (p.ItemID): it reads the item, gathers best-effort read-only GitHub context and
-// tools, replies to the user's latest thread message via the Conversationalist,
+// (p.ItemID): it reads the item, gathers read-only GitHub context and tools, replies to the user's latest thread message via the Conversationalist,
 // appends the reply, and writes the item back. It reads and writes gofer only —
 // no provider write — and the reply is advisory (gofer never acts on GitHub from
 // it).
@@ -54,22 +53,36 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	// leading verdict token we record as structured metadata.
 	triggerKind := trigger.Kind
 
-	// Best-effort live context plus read-only GitHub tools: a vend failure (e.g.
-	// no credential) or an empty token leaves the assistant reasoning over the
-	// item's gofer metadata and thread alone. With a credential it gets both a
-	// pre-fetched snapshot of the item and tools to look up anything else — all
-	// read-only, bounded by the token's own scopes.
+	// Live context plus read-only GitHub tools. With a credential the assistant gets
+	// both a pre-fetched snapshot of the item and tools to look up anything else —
+	// all read-only, bounded by the token's own permissions. Without one:
+	//
+	//   - "sign-in required" (at the vend, in the snapshot fetch, or from a tool call):
+	//     the model is not called, or its output is discarded, and the turn gets a
+	//     reconnect notice instead (ADR 0007, "Discuss without GitHub access");
+	//   - any other vend failure: the model answers from gofer's stored context, told
+	//     GitHub is unavailable, and the reply says so visibly.
 	var (
 		sourceContext string
 		viewerLogin   string
 		tools         worklist.ToolBox
+		holder        *tokenHolder
+		noGitHub      bool
 	)
 	provider := p.Provider
 	if provider == "" {
 		provider = "github"
 	}
-	if token, verr := vendor.Vend(ctx, provider); verr == nil && token != "" {
-		gh := github.NewClient(p.Client, p.GitHubBaseURL)
+	holder, verr := newTokenHolder(ctx, vendor, provider, p.GitHubBaseURL)
+	switch {
+	case isSignInRequired(verr):
+		return postReconnect(ctx, sink, item.ID, triggerKey)
+	case verr != nil:
+		p.logger().Warn("converse: GitHub unavailable for this turn; answering from stored context", "err", verr)
+		holder, noGitHub = nil, true
+	default:
+		token := holder.Token()
+		gh := github.NewClient(holder.client(p.Client), p.GitHubBaseURL)
 		// Resolve who the assistant is talking to, so it recognizes the user when
 		// they appear on the item and never refers them to their own account.
 		if login, lerr := gh.Login(ctx, token); lerr == nil {
@@ -79,13 +92,33 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		if disc, derr := gh.Discussion(ctx, token, item.GitHub.Repo, item.GitHub.Number, isPR); derr == nil {
 			sourceContext = formatDiscussion(disc)
 		}
-		box := newGitHubToolBox(gh, token, item.GitHub.Repo)
-		// Repository checkouts live on the sandbox's scratch disk for this turn only.
-		defer box.Close()
-		tools = box
+		// The token was vended unexpired but GitHub refused it, and the broker
+		// confirmed the user's access is gone.
+		if holder.Reconnect() != nil {
+			return postReconnect(ctx, sink, item.ID, triggerKey)
+		}
+		if ferr := holder.Failed(); ferr != nil {
+			// GitHub refused the token and the broker could not be asked for a new
+			// one: the same as a failed vend.
+			p.logger().Warn("converse: GitHub unavailable for this turn; answering from stored context", "err", ferr)
+			viewerLogin, sourceContext, noGitHub = "", "", true
+		} else {
+			box := newGitHubToolBox(gh, token, item.GitHub.Repo)
+			// Repository checkouts live on the sandbox's scratch disk for this turn only.
+			defer box.Close()
+			tools = reconnectBox{ToolBox: box, h: holder}
+		}
+	}
+	if noGitHub {
+		userText += githubUnavailableNote
 	}
 
 	reply, err := p.Converser.Reply(ctx, item, viewerLogin, sourceContext, history, userText, tools)
+	if isSignInRequired(err) || (holder != nil && holder.Reconnect() != nil) {
+		// A tool call found the access gone: whatever the model produced is
+		// discarded, never saved as a reply or review.
+		return postReconnect(ctx, sink, item.ID, triggerKey)
+	}
 	if err != nil {
 		return fmt.Errorf("converse: %w", err)
 	}
@@ -95,6 +128,13 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	content, verdict := reply, ""
 	if triggerKind == worklist.KindSynthesisRequest {
 		verdict, content = worklist.ParseVerdict(reply)
+	}
+	switch {
+	case noGitHub:
+		content += storedContextOnlyNote
+	case holder != nil && holder.Failed() != nil:
+		// Access was lost partway through the tool loop.
+		content += lostGitHubNote
 	}
 	msg := worklist.Message{
 		ID:      worklist.NewMessageID(),
@@ -122,6 +162,36 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 				return fmt.Errorf("ingest: %w", err)
 			}
 		}
+	}
+	return nil
+}
+
+// githubUnavailableNote tells the model, after the user's question, that this turn
+// has no GitHub access. It goes to the model only; the saved turn is unchanged.
+const githubUnavailableNote = "\n\n[gofer: GitHub is unavailable for this turn, so you have no live GitHub context and no tools. Answer only from the item and the conversation above, and say plainly what you could not check.]"
+
+// storedContextOnlyNote is appended to a reply the model gave without GitHub access,
+// so the user knows to ask again for an answer with live evidence.
+const storedContextOnlyNote = "\n\n---\n_Answered from stored context only: gofer couldn't reach GitHub for this turn. Ask again later for an answer backed by live GitHub data._"
+
+// lostGitHubNote is appended to a reply whose tool calls lost GitHub access partway
+// through the turn (a token GitHub refused, and no broker to replace it).
+const lostGitHubNote = "\n\n---\n_gofer lost access to GitHub partway through this turn, so parts of this answer may rest on stored context only. Ask again later to check it against live GitHub data._"
+
+// postReconnect saves a reconnect notice in reply to the turn: the run could not
+// reach GitHub for the user, who must sign in again. It is a system notice, not an
+// answer (worklist.NoticeReconnect), so review state does not count it.
+func postReconnect(ctx context.Context, sink Sink, itemID, triggerKey string) error {
+	msg := worklist.Message{
+		ID:      worklist.NewMessageID(),
+		ReplyTo: triggerKey,
+		Role:    worklist.RoleAgent,
+		Notice:  worklist.NoticeReconnect,
+		Content: worklist.ReconnectNotice,
+		At:      time.Now().UTC(),
+	}
+	if err := sink.Reply(ctx, itemID, triggerKey, msg); err != nil {
+		return fmt.Errorf("reply: %w", err)
 	}
 	return nil
 }

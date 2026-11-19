@@ -5,6 +5,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -34,6 +35,9 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	sessions := session.NewManager(cfg.SessionSecret, cfg.CookieSecure, session.WithStore(sessionStore),
 		session.WithAllow(func(u *session.User) bool { return cfg.SignInAllowed(u.Provider, u.Login) }))
 	authH := auth.NewHandler(cfg, sessions, vlt)
+	// Finish any logout a previous process began and did not complete (ADR 0007):
+	// its credential stays unvendable until then.
+	authH.ResumePendingLogouts(context.Background())
 	// The web tier holds only the run-credential verification key: it authenticates a
 	// runtime's bearer but cannot mint one. Minting is a runtime/control-plane concern;
 	// gofer keeps only the verifier.
@@ -79,8 +83,10 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	ingestHandler := api.NewIngestHandler(store, ingestor)
 	// The broker vends the single shared chat-model token as provider "ai", per run,
 	// so the sandbox never holds a standing model secret. Every model on this endpoint
-	// uses the same token; the model id travels as a run parameter.
-	credentialHandler := api.NewCredentialHandler(vlt, conn.Token)
+	// uses the same token; the model id travels as a run parameter. Per-user provider
+	// tokens come through the auth handler, which refreshes expiring ones and
+	// serialises every credential write (ADR 0007).
+	credentialHandler := api.NewCredentialHandler(authH, conn.Token)
 	// The assistive conversation is offered when the model is fully configured; the
 	// runtime (not the web tier) runs the model, vending the token from the broker.
 	convEnabled := cfg.ConversationEnabled

@@ -13,6 +13,11 @@
       <span class="zz-brand">gofer</span>
       {{if .User}}<span class="zz-user">{{with .User.Name}}{{.}}{{else}}{{.User.Email}}{{end}}</span>{{end}}
     </header>
+    {{if and .User .SignInRequired}}
+    <div class="zz-reconnect" role="alert">
+      gofer can't reach GitHub for you. <a href="/auth/{{.User.Provider}}/login">Sign in again</a> to reconnect; your worklist and conversations are kept.
+    </div>
+    {{end}}
 
     {{if eq .View "signin"}}
       <div class="zz-signin">
@@ -55,6 +60,8 @@
         {{range $i, $m := .Item.Thread}}
           {{if isSynthesisRequest $m}}{{else if isSecondOpinionRequest $m}}
           <div class="zz-notice">{{userHandle $.User}} has requested a 2nd review</div>
+          {{else if eq $m.Notice "reconnect"}}
+          <div class="zz-notice zz-notice--reconnect">{{$m.Content}} <a href="/auth/{{$.User.Provider}}/login">Sign in again</a></div>
           {{else if $m.Hidden}}
           <div class="zz-hidden">
             <span>Hidden {{if eq $m.Role "agent"}}reply{{else}}message{{end}}</span>

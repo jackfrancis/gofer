@@ -176,6 +176,7 @@ func TestRunUnknownJobType(t *testing.T) {
 // calls (enrich) are counted per item number.
 func ingestServer(t *testing.T, open []int, incomplete bool, timelines map[string]int) *httptest.Server {
 	t.Helper()
+	var mu sync.Mutex // enrich fetches timelines concurrently
 	return httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/user":
@@ -191,7 +192,9 @@ func ingestServer(t *testing.T, open []int, incomplete bool, timelines map[strin
 			}
 			fmt.Fprintf(w, `{"incomplete_results":%v,"items":[%s]}`, incomplete, strings.Join(items, ","))
 		case strings.HasSuffix(r.URL.Path, "/timeline"):
+			mu.Lock()
 			timelines[r.URL.Path]++
+			mu.Unlock()
 			_, _ = w.Write([]byte(`[]`))
 		default:
 			_, _ = w.Write([]byte(`[]`))

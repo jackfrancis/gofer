@@ -91,7 +91,7 @@ app whose callback is `http://localhost:8080/auth/github/callback`.
 2. Deploy gofer, from this checkout:
 
    ```sh
-   export GITHUB_CLIENT_ID=... GITHUB_CLIENT_SECRET=...
+   export GITHUB_CLIENT_ID=... GITHUB_CLIENT_SECRET=...   # an OAuth app's; for a GitHub App see ADR 0007 (GITHUB_CLIENT_KIND)
    export AI_TOKEN=...          # optional: the chat-model token; unset = stub ranker, no Discuss
    make dev-up                  # AGENT_PROVIDER_CLASS defaults to "isolated"
    make dev-forward             # http://localhost:8080

@@ -1,11 +1,12 @@
 # ADR 0007 — Sign in through a read-only GitHub App instead of an OAuth app
 
-Status: proposed — phase 1 in progress; revised through review, then phased (see
-"Phasing"). Phase 1's workload part (search under user tokens and the public-only
-guard, in `internal/github`) is implemented; sign-in, expiry and refresh are not yet
-(see "Verification"). The question it rests on is verified: a GitHub App user access
-token with only read permissions gets the job log's 302 in an organisation where the
-app is not installed (see "The question").
+Status: proposed — phase 1 implemented, phase 2 not; revised through review, then
+phased (see "Phasing"). Both parts of phase 1 are in: the workload part (search under
+user tokens and the public-only guard, in `internal/github`) and the credential part
+(sign-in, expiry and refresh, Discuss without GitHub access; see "Verification").
+Neither has been run against real GitHub with an app token yet. The question it rests
+on is verified: a GitHub App user access token with only read permissions gets the
+job log's 302 in an organisation where the app is not installed (see "The question").
 Date: 2026-11-18
 
 ## Context
@@ -920,6 +921,69 @@ today's OAuth-app tokens, which it does not depend on:
   result incomplete, so `runIngest` does not call `retireMissing`. A definite refusal
   drops the hit without that; a stored item from that repository can then be retired
   by a complete fetch, as "Gaps phase 1 accepts" allows.
+
+Implemented (phase 1, credential part), and unit-tested against stand-ins for
+GitHub's endpoints only:
+
+- `GITHUB_CLIENT_KIND` (`internal/config`) and each kind's scopes (`internal/auth`).
+- The credential source, `auth.Handler.Credential` (`internal/auth/credential.go`):
+  one per-(user, provider) lock shared by the callback, logout and refresh; refresh
+  with 30 minutes left (`oauth2.ReuseTokenSourceWithExpiry`); persist before vend,
+  retried once; `client_id` and a credential version in the sealed JSON
+  (`internal/storage/vault.go`); legacy rows tagged under the lock, or "sign-in
+  required" under the app; `rejected=<version>` confirmed with check-token, with one
+  forced refresh per run ID; version-checked writes and deletes. Check-token's 404
+  alone means invalid; a 422 or any other answer is inconclusive and changes
+  nothing. A refresh exchange and the write that stores its pair run on their own
+  deadline, so a run that disconnects cannot strand a spent pair.
+- The callback re-checks its token with check-token under the lock. If the grant
+  was revoked mid-flow it stores nothing and answers with a "Sign in again" link
+  rather than an automatic redirect, so an unexpected "invalid" from GitHub cannot
+  loop. A refused account's grant is revoked.
+- Logout ends the session first (on its own deadline), then refreshes if needed,
+  revokes the grant and deletes the row, under the lock, each step on its own
+  deadline. It first sets a logout tombstone that makes it the credential's only
+  remaining writer: every other holder refuses to vend (also after a blocking
+  refresh or check) and deletes nothing, while a refresh in flight still stores its
+  pair so logout revokes with the newest token. If logout cannot take the lock in
+  time, the same revoke-then-delete runs in the background once it is free; a new
+  sign-in clears the tombstone only once its credential is stored. The pending
+  logout is recorded durably (the vault's `LogoutLedger`, a marker row in the
+  `credentials` table under a reserved provider name, so still no migration) in the
+  same SQLite transaction that deletes the browser session, and only if that
+  transaction is what removed the session, so each session starts at most one
+  logout; if the commit or the session lookup fails, logout answers 503 and changes
+  nothing. The marker's transitions and this process's ownership of it change
+  together under a short per-(user, provider) lock. A logout's in-process record is
+  published only after its commit; a later logout of the same credential reuses an
+  unfinished one (joining it, or resuming it if its background wait gave up) and
+  never replaces it; a logout re-checks that it is still current right before it
+  revokes; a request waiting on a logout another performs returns that outcome as
+  soon as it is recorded; whoever performs the revoke-then-delete records the outcome, which
+  every waiting request reports; and the broker classifies and claims an orphaned
+  logout in one locked section. Logout finds the session's owner without applying
+  the allow-list, so an account removed from `ALLOWED_GITHUB_LOGINS` can still
+  revoke its grant. Each logout is one operation, recorded
+  once: a sign-in that replaces the credential clears the marker in the same
+  transaction as its write, and the rest of that logout then leaves the replacement
+  alone. A pair logout rotates is stored, still unvendable, before the revocation
+  request. After a restart, or once the background wait gives up,
+  the credential stays unvendable and the next lock holder finishes the logout; the
+  web tier also resumes pending logouts at startup. Logout answers
+  200 with `revocation: unconfirmed` when GitHub did not confirm, including when no
+  GitHub credential is stored, with the settings page of the credential's issuer
+  (both pages when unknown).
+- The broker (`internal/api/credential.go`) returns `credential_version`, and answers
+  "sign-in required" with 410 and code `sign_in_required`.
+- The runtime (`internal/agent/credential.go`): a token holder, as the GitHub client's
+  transport, that re-vends once on 401 and turns "sign-in required" into a typed
+  `ReconnectError`; a re-vend that fails otherwise puts Discuss in its
+  stored-context fallback (or marks a reply that lost access mid-turn); enrich,
+  ingest and the backfill chain stop on a reconnect found by any request; the converser's tool loop stops on
+  it; Discuss posts a
+  `reconnect` system notice (at vend, in the snapshot, or from a tool call), and
+  marks a reply made without GitHub "answered from stored context only". The landing
+  page and the thread prompt the user to sign in again.
 
 Left unverified:
 

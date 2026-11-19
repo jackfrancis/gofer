@@ -228,3 +228,21 @@ func TestSignInAllowed(t *testing.T) {
 		t.Errorf("parsed allow-list = %q, want [octocat hubot]", listed.AllowedGitHubLogins)
 	}
 }
+
+func TestParseGitHubKind(t *testing.T) {
+	for in, want := range map[string]string{"": GitHubOAuthApp, " oauth-app ": GitHubOAuthApp, "github-app": GitHubApp} {
+		got, err := parseGitHubKind(in)
+		if err != nil || got != want {
+			t.Errorf("parseGitHubKind(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	// gofer never guesses the kind, so anything else is refused at startup.
+	for _, in := range []string{"app", "GitHub-App", "Iv1.abc"} {
+		if _, err := parseGitHubKind(in); err == nil {
+			t.Errorf("parseGitHubKind(%q) accepted", in)
+		}
+	}
+	if (Providers{GitHubKind: GitHubApp}).IsGitHubApp() != true || (Providers{}).IsGitHubApp() {
+		t.Error("IsGitHubApp")
+	}
+}

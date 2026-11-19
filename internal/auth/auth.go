@@ -5,9 +5,9 @@
 package auth
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -36,6 +37,10 @@ type provider struct {
 	userURL   string
 	userAgent string // some providers (GitHub) require a User-Agent header
 	mapUser   func(raw map[string]any) (*session.User, error)
+	// legacyRows: a stored credential with no client recorded may be from this
+	// client, so it is tagged and vended. False for GitHub under a GitHub App, which
+	// never wrote such a row.
+	legacyRows bool
 }
 
 // Handler exposes HTTP handlers for the OAuth login lifecycle.
@@ -46,6 +51,16 @@ type Handler struct {
 	client        *http.Client
 	vault         vault.Vault
 	githubAPIBase string // GitHub REST base URL; overridable in tests
+	now           func() time.Time
+
+	// locks serialises every write of one (user, provider) credential: the
+	// callback's Put, logout, and the broker's refresh (credential.go).
+	locks credLocks
+	// ledger records pending logouts durably: the vault's own, when it keeps one.
+	ledger vault.LogoutLedger
+	// forced records the runs that have used their one forced refresh.
+	forcedMu sync.Mutex
+	forced   map[string]time.Time
 }
 
 // NewHandler builds the auth handler from configuration. Only providers with
@@ -58,6 +73,12 @@ func NewHandler(cfg *config.Config, sessions *session.Manager, vlt vault.Vault) 
 		client:        loginHTTPClient(),
 		vault:         vlt,
 		githubAPIBase: "https://api.github.com",
+		now:           time.Now,
+	}
+	if l, ok := vlt.(vault.LogoutLedger); ok {
+		h.ledger = l
+	} else {
+		h.ledger = vault.NewMemoryVault() // in memory, like the vault itself
 	}
 
 	redirect := func(name string) string {
@@ -66,7 +87,8 @@ func NewHandler(cfg *config.Config, sessions *session.Manager, vlt vault.Vault) 
 
 	if app := cfg.Providers.Google; app.Enabled() {
 		h.providers["google"] = &provider{
-			name: "google",
+			name:       "google",
+			legacyRows: true,
 			oauth: &oauth2.Config{
 				ClientID:     app.ClientID,
 				ClientSecret: app.ClientSecret,
@@ -88,14 +110,23 @@ func NewHandler(cfg *config.Config, sessions *session.Manager, vlt vault.Vault) 
 	}
 
 	if app := cfg.Providers.GitHub; app.Enabled() {
+		// GITHUB_CLIENT_KIND decides the scopes. An OAuth app keeps read:user
+		// user:email, so a sign-in through it (during rollout, or after a rollback)
+		// still reads hidden primary emails. A GitHub App takes none: its permissions
+		// decide, and Email addresses takes user:email's place (ADR 0007).
+		scopes := []string{"read:user", "user:email"}
+		if cfg.Providers.IsGitHubApp() {
+			scopes = nil
+		}
 		h.providers["github"] = &provider{
-			name: "github",
+			name:       "github",
+			legacyRows: !cfg.Providers.IsGitHubApp(),
 			oauth: &oauth2.Config{
 				ClientID:     app.ClientID,
 				ClientSecret: app.ClientSecret,
 				Endpoint:     github.Endpoint,
 				RedirectURL:  redirect("github"),
-				Scopes:       []string{"read:user", "user:email"},
+				Scopes:       scopes,
 			},
 			userURL:   "https://api.github.com/user",
 			userAgent: "gofer",
@@ -123,7 +154,8 @@ func NewHandler(cfg *config.Config, sessions *session.Manager, vlt vault.Vault) 
 
 	if app := cfg.Providers.Microsoft; app.Enabled() {
 		h.providers["microsoft"] = &provider{
-			name: "microsoft",
+			name:       "microsoft",
+			legacyRows: true,
 			oauth: &oauth2.Config{
 				ClientID:     app.ClientID,
 				ClientSecret: app.ClientSecret,
@@ -244,14 +276,15 @@ func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// The sign-in allow-list (ALLOWED_GITHUB_LOGINS). A refused account gets no
-	// session and nothing in the vault, and the token GitHub just issued to this app
-	// for it is revoked, so gofer is left holding no credential of someone it refused.
+	// session and nothing in the vault, and the grant GitHub just gave this client
+	// is revoked (the whole grant, so a refresh token dies too), so gofer is left
+	// holding no credential of someone it refused.
 	if h.cfg != nil && !h.cfg.SignInAllowed(user.Provider, user.Login) {
 		slog.Default().Warn("sign-in refused: account not in ALLOWED_GITHUB_LOGINS",
 			"provider", p.name, "login", user.Login, "user", user.ID)
 		if p.name == "github" && token.AccessToken != "" {
-			if rerr := h.revokeGitHubToken(ctx, token.AccessToken); rerr != nil {
-				slog.Default().Warn("revoking a refused account's github token failed", "user", user.ID, "err", rerr)
+			if rerr := h.revokeGrant(ctx, p, token.AccessToken); rerr != nil {
+				slog.Default().Warn("revoking a refused account's github grant failed", "user", user.ID, "err", rerr)
 			}
 		}
 		h.sessions.Destroy(w, r) // drop the pre-auth flow
@@ -260,16 +293,29 @@ func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Retain the delegated provider token in the vault so agent runtimes can be
-	// vended a credential to act on the user's behalf. Best-effort: a vault failure
-	// must not block interactive login.
+	// vended a credential to act on the user's behalf, under the credential lock and
+	// after re-checking it with GitHub (storeSignIn). A grant revoked mid-flow (a
+	// logout in another tab) stores nothing and asks the user to sign in again, so
+	// they consent again.
 	if h.vault != nil {
-		_ = h.vault.Put(ctx, user.ID, vault.Credential{
-			Provider:     p.name,
-			AccessToken:  token.AccessToken,
-			RefreshToken: token.RefreshToken,
-			TokenType:    token.TokenType,
-			Expiry:       token.Expiry,
-		})
+		restart, err := h.storeSignIn(ctx, p, user.ID, token)
+		if err != nil {
+			slog.Default().Warn("could not verify the new token", "provider", p.name, "user", user.ID, "err", err)
+			http.Error(w, "could not verify the sign-in with "+p.name, http.StatusBadGateway)
+			return
+		}
+		if restart {
+			// Not an automatic redirect: if GitHub ever answered check-token "invalid"
+			// for a good token, that would loop. The user restarts sign-in themselves.
+			slog.Default().Info("sign-in token was revoked mid-flow; asking the user to sign in again", "provider", p.name, "user", user.ID)
+			h.sessions.Destroy(w, r) // drop the pre-auth flow
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `<!doctype html><meta charset="utf-8"><title>gofer</title>`+
+				`<p>gofer's access was revoked while you were signing in, so the sign-in did not complete.</p>`+
+				`<p><a href="/auth/`+p.name+`/login">Sign in again</a></p>`)
+			return
+		}
 	}
 
 	if err := h.sessions.Authenticate(w, r, user); err != nil {
@@ -280,104 +326,86 @@ func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-// Logout ends the interactive session and best-effort revokes the delegated
-// provider credential the login left in the vault: it deletes the vault entry
-// and, for GitHub, asks the provider to invalidate the access token itself.
-// Revocation never blocks logout — the session is always destroyed.
+// Logout ends the interactive session and discards the delegated provider
+// credential the login left in the vault. For GitHub it first revokes the grant at
+// GitHub, refreshing the token first if it has expired or is about to (see
+// revokeAndDelete). The pending logout and the end of the session are committed
+// together first; if that commit fails, logout answers 503 and changes nothing.
+// After it, logout is never blocked: the credential is revoked and deleted, now or
+// in the background.
+//
+// It answers 204 when revocation is confirmed (or there was nothing to revoke).
+// When it is not — no stored GitHub credential, a dead refresh token, a failed
+// revoke call, or a credential from another client — it answers 200 with a JSON body
+// that says so and links the user to the GitHub settings page(s) where they can
+// revoke gofer themselves (settings_urls; settings_url is the first).
 func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
-	if u := h.sessions.CurrentUser(r); u != nil && h.vault != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-		cred, err := h.vault.Get(ctx, u.ID, u.Provider)
-		_ = h.vault.Delete(ctx, u.ID, u.Provider)
-		if err == nil && u.Provider == "github" && cred.AccessToken != "" {
-			if rerr := h.revokeGitHubToken(ctx, cred.AccessToken); rerr != nil {
-				slog.WarnContext(ctx, "github token revocation on logout failed",
-					"user", u.ID, "error", rerr)
-			}
+	res := logoutResult{confirmed: true}
+	// Find the owner on a deadline of its own: a browser that disconnects must not
+	// hide whose credential to revoke.
+	lctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+	// LookupOwner, not CurrentUser: an account dropped from ALLOWED_GITHUB_LOGINS
+	// gets no interactive access, but must still be able to revoke its grant.
+	u, lerr := h.sessions.LookupOwner(r.WithContext(lctx))
+	cancel()
+	if lerr != nil {
+		// The store could not say whose session this is. Ending it now could leave
+		// that user's credential vendable: change nothing, and say so.
+		slog.ErrorContext(r.Context(), "logout: looking up the session failed; the session stands", "err", lerr)
+		writeLogoutError(w)
+		return
+	}
+	// Record the pending logout and end the session together (one commit with the
+	// SQLite vault), again detached from the browser. If that fails nothing changed:
+	// the session stands, nothing is revoked, and the user is told to try again.
+	var lo *localLogout
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+	err := h.sessions.EndWith(w, r.WithContext(cctx), func(ctx context.Context, sessionKey string) error {
+		if u == nil || h.vault == nil {
+			return nil
 		}
-	}
-	h.sessions.Destroy(w, r)
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// revokeGitHubToken asks GitHub to invalidate an OAuth access token via DELETE
-// /applications/{client_id}/token, authenticated with the app's own client
-// credentials. A 2xx or 404 (already gone) is success.
-func (h *Handler) revokeGitHubToken(ctx context.Context, accessToken string) error {
-	p, ok := h.providers["github"]
-	if !ok {
-		return fmt.Errorf("github provider not configured")
-	}
-	body, err := json.Marshal(map[string]string{"access_token": accessToken})
-	if err != nil {
+		var err error
+		lo, err = h.beginLogout(ctx, sessionKey, u.ID, u.Provider)
 		return err
-	}
-	url := h.githubAPIBase + "/applications/" + p.oauth.ClientID + "/token"
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.SetBasicAuth(p.oauth.ClientID, p.oauth.ClientSecret)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "gofer")
-
-	resp, err := h.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
-	if resp.StatusCode/100 != 2 && resp.StatusCode != http.StatusNotFound {
-		return fmt.Errorf("github token revocation: status %d", resp.StatusCode)
-	}
-	return nil
-}
-
-// Credential returns a usable credential for the user and provider, refreshing
-// and persisting it if it has expired and a refresh token is available. It is the
-// credential source the vend path can use, so token rotation happens at the single
-// point a credential leaves gofer. Providers whose stored credential has no
-// refresh token pass through unchanged.
-func (h *Handler) Credential(ctx context.Context, userID, providerName string) (vault.Credential, error) {
-	cred, err := h.vault.Get(ctx, userID, providerName)
-	if err != nil {
-		return vault.Credential{}, err
-	}
-	p, ok := h.providers[providerName]
-	if !ok || cred.RefreshToken == "" {
-		return cred, nil // nothing to refresh against
-	}
-
-	if h.client != nil {
-		ctx = context.WithValue(ctx, oauth2.HTTPClient, h.client)
-	}
-	src := p.oauth.TokenSource(ctx, &oauth2.Token{
-		AccessToken:  cred.AccessToken,
-		RefreshToken: cred.RefreshToken,
-		TokenType:    cred.TokenType,
-		Expiry:       cred.Expiry,
 	})
-	fresh, err := src.Token()
-	if err != nil {
-		return vault.Credential{}, fmt.Errorf("refresh %s credential: %w", providerName, err)
+	cancel()
+	switch {
+	case errors.Is(err, session.ErrNotFound):
+		// Another logout of this same session consumed it first; that one owns the
+		// revocation. Clear this browser's cookie and record nothing.
+		dctx, dcancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+		h.sessions.Destroy(w, r.WithContext(dctx))
+		dcancel()
+		res = h.unconfirmed(u.Provider, h.providers[u.Provider], nil)
+	case err != nil:
+		slog.ErrorContext(r.Context(), "logout could not be recorded; the session stands", "user", u.ID, "err", err)
+		writeLogoutError(w)
+		return
 	}
-	if fresh.AccessToken == cred.AccessToken {
-		return cred, nil // still valid; nothing rotated
+	if lo != nil {
+		res = h.revokeAndDelete(r.Context(), u.ID, u.Provider, lo)
 	}
+	if res.confirmed {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"revocation":    "unconfirmed",
+		"message":       "You are signed out of gofer, but GitHub did not confirm that gofer's access was revoked. Revoke gofer in GitHub's settings to be sure.",
+		"settings_url":  res.settings[0],
+		"settings_urls": res.settings,
+	})
+}
 
-	rotated := vault.Credential{
-		Provider:     providerName,
-		AccessToken:  fresh.AccessToken,
-		RefreshToken: fresh.RefreshToken,
-		TokenType:    fresh.TokenType,
-		Expiry:       fresh.Expiry,
-	}
-	if rotated.RefreshToken == "" {
-		rotated.RefreshToken = cred.RefreshToken
-	}
-	_ = h.vault.Put(ctx, userID, rotated)
-	return rotated, nil
+// writeLogoutError answers a logout that changed nothing.
+func writeLogoutError(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"error": "gofer could not sign you out right now; you are still signed in. Try again.",
+	})
 }
 
 // fetchUser calls the provider's user-info endpoint with the access token.

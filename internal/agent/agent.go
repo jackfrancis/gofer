@@ -38,6 +38,8 @@ const (
 // Vendor exchanges a run's authorization for the acting user's delegated provider
 // credential. In-process it reads the vault; out-of-process it calls gofer's
 // credential broker (GET /agent/credential). The runtime never holds a standing secret.
+// A Vendor that is also a CredentialVendor lets a run re-vend once when GitHub
+// rejects the token (tokenHolder).
 type Vendor interface {
 	Vend(ctx context.Context, provider string) (accessToken string, err error)
 }
@@ -159,12 +161,17 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	if provider == "" {
 		provider = "github"
 	}
-	token, err := vendor.Vend(ctx, provider)
+	// The holder re-vends once if GitHub rejects the token (ADR 0007), and turns the
+	// broker's "sign-in required" into a ReconnectError.
+	holder, err := newTokenHolder(ctx, vendor, provider, p.GitHubBaseURL)
 	if err != nil {
 		return fmt.Errorf("vend credential: %w", err)
 	}
-	gh := github.NewClient(p.Client, p.GitHubBaseURL)
-	items, complete, err := gh.FetchWorklist(ctx, token)
+	gh := github.NewClient(holder.client(p.Client), p.GitHubBaseURL)
+	items, complete, err := gh.FetchWorklist(ctx, holder.Token())
+	if rerr := holder.Reconnect(); rerr != nil {
+		return fmt.Errorf("fetch github: %w", rerr)
+	}
 	if err != nil {
 		return fmt.Errorf("fetch github: %w", err)
 	}
@@ -204,6 +211,11 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	// best-effort: a failure leaves the baseline-scored items in place. The
 	// separate JobEnrich / JobRank exist for an independent scheduled refresh.
 	if err := runEnrich(ctx, p, vendor, sink); err != nil {
+		// The user's access is gone: stop here, and say so, rather than rank and
+		// report success. The items already written keep their baseline scores.
+		if isSignInRequired(err) {
+			return fmt.Errorf("backfill enrich: %w", err)
+		}
 		log.Warn("backfill enrich failed", "err", err)
 	}
 	if err := runRank(ctx, p, sink); err != nil {
