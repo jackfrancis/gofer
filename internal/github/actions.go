@@ -369,23 +369,11 @@ func (c *Client) logHop(ctx context.Context, token, u, what string, w io.Writer,
 		return nil, 0, fmt.Errorf("build %s request", what)
 	}
 	setHeaders(req, token)
-	// One round trip through the client's transport (its retries included), not
-	// Client.Do: the client parses a redirect's Location before CheckRedirect can stop
-	// it, and quotes a malformed one, pre-signed URL and all, in its error. Here only
-	// resp.Location() below parses it, and its error is not passed on.
-	if t := c.http.Timeout; t > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, t)
-		defer cancel()
-		req = req.WithContext(ctx)
-	}
-	rt := c.http.Transport
-	if rt == nil {
-		rt = http.DefaultTransport
-	}
-	resp, err := rt.RoundTrip(req)
+	// One round trip, not Client.Do (see roundTrip): only resp.Location() below parses
+	// a redirect's location, and its error is not passed on.
+	resp, err := c.roundTrip(req, c.http.Timeout)
 	if err != nil {
-		return nil, 0, fmt.Errorf("%s: %w", what, stripURL(err))
+		return nil, 0, fmt.Errorf("%s: %w", what, err)
 	}
 	defer resp.Body.Close()
 	switch {

@@ -481,32 +481,72 @@ func (c *Client) Tarball(ctx context.Context, token, repo, ref string) (io.ReadC
 	if unsafePath(p) { // the rule every other request passes through Client.get
 		return nil, fmt.Errorf("invalid ref %q", ref)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+p, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build archive request")
-	}
-	setHeaders(req, token)
-	// The shared client's overall timeout is sized for small JSON calls; an archive
-	// download is bounded by the caller's context instead.
-	hc := *c.http
-	hc.Timeout = 0
-	// The codeload hop is followed as before; an API-host hop only to a public
-	// repository.
-	hc.CheckRedirect = c.followGated(token)
-	resp, err := hc.Do(req)
-	if err != nil {
-		var ue *url.Error
-		if errors.As(err, &ue) {
-			err = ue.Err
+	return c.followArchive(ctx, token, c.baseURL+p)
+}
+
+// maxArchiveRedirects bounds the hops from the API to the archive.
+const maxArchiveRedirects = 10
+
+// followArchive fetches an archive, following its redirects one hop at a time (never
+// Client.Do, which quotes a malformed Location in its error; see roundTrip). An
+// API-host hop carries the token and is followed only to a repository that passes the
+// public-only gate. A hop off the API origin (codeload) is a fresh request with no
+// credential at all, so neither the hostname rule net/http applies nor a caller's
+// headers decide where the token goes. No error carries a hop's URL: off the API host
+// it is pre-signed, a credential in itself.
+func (c *Client) followArchive(ctx context.Context, token, u string) (io.ReadCloser, error) {
+	allowHTTP := strings.HasPrefix(c.baseURL, "http://")
+	for hop := 0; ; hop++ {
+		loc, err := url.Parse(u)
+		if err != nil {
+			return nil, fmt.Errorf("download archive: bad location")
 		}
-		return nil, fmt.Errorf("download archive: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusNotFound {
-			return nil, fmt.Errorf("repository or ref not found (status 404)")
+		_, onAPI := c.apiRelPath(loc)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build archive request")
 		}
-		return nil, fmt.Errorf("download archive: status %d", resp.StatusCode)
+		if onAPI {
+			setHeaders(req, token)
+		} else {
+			if loc.Scheme != "https" && !(allowHTTP && loc.Scheme == "http") || loc.User != nil {
+				return nil, fmt.Errorf("download archive: refusing the download location")
+			}
+			req.Header.Set("User-Agent", "gofer-agent")
+		}
+		// The shared client's timeout is sized for small JSON calls; an archive
+		// download is bounded by the caller's context instead.
+		resp, err := c.roundTrip(req, 0)
+		if err != nil {
+			if onAPI {
+				return nil, fmt.Errorf("download archive: %w", err)
+			}
+			return nil, blobError(ctx, "archive", err)
+		}
+		if isRedirect(resp.StatusCode) {
+			next, lerr := resp.Location()
+			drain(resp)
+			if lerr != nil {
+				return nil, fmt.Errorf("download archive: redirect without a usable location")
+			}
+			if hop >= maxArchiveRedirects {
+				return nil, fmt.Errorf("download archive: too many redirects")
+			}
+			if _, nextOnAPI := c.apiRelPath(next); nextOnAPI {
+				if err := c.gateLocation(ctx, token, next, true); err != nil {
+					return nil, err
+				}
+			}
+			u = next.String()
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			drain(resp)
+			if resp.StatusCode == http.StatusNotFound {
+				return nil, fmt.Errorf("repository or ref not found (status 404)")
+			}
+			return nil, fmt.Errorf("download archive: status %d", resp.StatusCode)
+		}
+		return resp.Body, nil
 	}
-	return resp.Body, nil
 }

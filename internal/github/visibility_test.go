@@ -605,3 +605,90 @@ func TestGateRedirected403KeepsNoFreeText(t *testing.T) {
 		t.Errorf("err = %v, want a 403 refusal without the destination's name", err)
 	}
 }
+
+// A malformed redirect Location never reaches an error: net/http's Client.Do would
+// quote it ("failed to parse Location header"), and it could name a private
+// repository or carry a pre-signed URL. The gate's lookup, the shared GET and the
+// archive download all parse it themselves and say only that it was unusable.
+func TestMalformedLocationStaysOutOfErrors(t *testing.T) {
+	bad := func(w http.ResponseWriter, loc string) {
+		w.Header().Set("Location", loc)
+		w.WriteHeader(http.StatusMovedPermanently)
+	}
+	s := newGateStub(t, map[string]string{"o/r": "public"}, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/o/r/issues/1": // the shared GET
+			bad(w, "/repos/new/secret%zz/issues/1")
+		case "/repos/o/r/tarball": // the archive download
+			bad(w, "https://codeload.example/secret%zz?sig=presigned")
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+		}
+	})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/old/name" { // the gate's lookup of a renamed repository
+			bad(w, "/repositories/new%zzsecret")
+			return
+		}
+		s.serve(w, r)
+	}))
+	defer srv.Close()
+	c := NewClient(srv.Client(), srv.URL)
+	ctx := context.Background()
+
+	_, err1 := c.IssueStatus(ctx, "tok", "old/name", 1)
+	_, err2 := c.IssueStatus(ctx, "tok", "o/r", 1)
+	_, err3 := c.Tarball(ctx, "tok", "o/r", "")
+	for i, err := range []error{err1, err2, err3} {
+		if err == nil {
+			t.Errorf("case %d: no error", i+1)
+			continue
+		}
+		if msg := err.Error(); strings.Contains(msg, "secret") || strings.Contains(msg, "presigned") || strings.Contains(msg, "%zz") {
+			t.Errorf("case %d: the error quotes the Location: %v", i+1, err)
+		}
+	}
+}
+
+// A search walk is whole only if the match count is within GitHub's 1,000-result
+// ceiling and the walk collected that many. GitHub stops serving pages at the
+// ceiling, so the last page it serves is not proof of the whole set.
+func TestSearchWalkRespectsTotalCount(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		total     int
+		perPage   []int // items served on each page; the last has no rel="next"
+		wantWhole bool
+	}{
+		{"within the ceiling", 130, []int{100, 30}, true},
+		{"over the ceiling", 1500, []int{100, 100, 100, 100, 100, 100, 100, 100, 100, 100}, false},
+		{"fewer collected than counted", 150, []int{100, 30}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				page := 0
+				fmt.Sscan(r.URL.Query().Get("page"), &page)
+				if page < 1 || page > len(tc.perPage) {
+					w.WriteHeader(http.StatusUnprocessableEntity) // past the ceiling
+					return
+				}
+				if page < len(tc.perPage) {
+					w.Header().Set("Link", `<x>; rel="next"`)
+				}
+				items := make([]string, tc.perPage[page-1])
+				for i := range items {
+					items[i] = fmt.Sprintf(`{"number":%d}`, page*1000+i)
+				}
+				fmt.Fprintf(w, `{"total_count":%d,"items":[%s]}`, tc.total, strings.Join(items, ","))
+			}))
+			defer srv.Close()
+			out, whole, err := NewClient(srv.Client(), srv.URL).searchIssues(context.Background(), "tok", "is:pr")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if whole != tc.wantWhole {
+				t.Errorf("whole = %v after %d items, want %v", whole, len(out), tc.wantWhole)
+			}
+		})
+	}
+}

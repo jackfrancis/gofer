@@ -194,7 +194,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   per-repository call first checks `GET /repos/{owner}/{name}` for `"private": false`
   (cached per `Client`, i.e. per run) and uses the canonical name it returns, and an
   API-host redirect is followed only to a repository that passes the same check. A new
-  per-repository call must go through `Client.get` or call `c.gate` itself. Test stubs
+  per-repository call must go through `Client.get` or call `c.gate` itself, and no
+  GitHub API request uses `http.Client.Do`, which quotes a malformed redirect `Location`
+  in its error: use `apiDo`/`roundTrip`. Test stubs
   must answer that lookup: wrap the handler in `githubtest.PublicRepos`. Ingest drops
   hits not confirmed public, and an unknown answer makes the fetch incomplete.
 - `go test` binds httptest sockets; run it outside a restrictive sandbox.

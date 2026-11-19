@@ -54,11 +54,6 @@ type Client struct {
 	blobOnce sync.Once
 	blob     *http.Client
 
-	// api is http with redirects left to the caller, which gates them
-	// (visibility.go); built on first use.
-	apiOnce sync.Once
-	api     *http.Client
-
 	// repos caches the public-only gate's answers. A Client serves one run, so this is
 	// the per-run cache ADR 0007 calls for.
 	repos repoGate
@@ -299,7 +294,8 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 
 // searchIssues walks a search query page by page. whole reports that the walk reached
 // the last page with no early stop (time budget, rate-limit wait, or the 1,000-result
-// ceiling) and that GitHub never flagged a page as incomplete.
+// ceiling), that GitHub never flagged a page as incomplete, and that it collected as
+// many items as the query's total_count, which is at most the ceiling.
 func (c *Client) searchIssues(ctx context.Context, token, q string) (out []searchItem, whole bool, err error) {
 	incomplete := false
 	for page := 1; page*searchPerPage <= searchResultCap; page++ {
@@ -319,8 +315,12 @@ func (c *Client) searchIssues(ctx context.Context, token, q string) (out []searc
 		out = append(out, sr.Items...)
 		incomplete = incomplete || sr.IncompleteResults
 		if !more || len(sr.Items) == 0 {
-			// The last page: the walk saw everything GitHub had for this query.
-			return out, !incomplete, nil
+			// The last page GitHub will serve. That is the whole match set only if the
+			// match count is within the 1,000-result ceiling and the walk collected that
+			// many: GitHub stops serving pages at the ceiling, so a capped walk ends here
+			// too, with matches it never returned.
+			whole := !incomplete && sr.TotalCount <= searchResultCap && len(out) >= sr.TotalCount
+			return out, whole, nil
 		}
 	}
 	// Left the loop early: the budget broke it, or the result ceiling ended it with

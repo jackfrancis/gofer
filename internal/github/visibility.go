@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ErrNotPublic reports a repository the public-only guard refused: GitHub said it is
@@ -448,17 +449,50 @@ func (c *Client) apiDo(ctx context.Context, token, u string) (*http.Response, er
 		return nil, err
 	}
 	setHeaders(req, token)
-	return c.apiClient().Do(req)
+	return c.roundTrip(req, c.http.Timeout)
 }
 
-// apiClient is the shared client with redirects left to the caller.
-func (c *Client) apiClient() *http.Client {
-	c.apiOnce.Do(func() {
-		hc := *c.http
-		hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-		c.api = &hc
-	})
-	return c.api
+// roundTrip sends req as ONE round trip through the client's transport (its retries
+// included), bounded by timeout when it is above zero, and never follows a redirect.
+//
+// It is not Client.Do on purpose. Client.Do parses a redirect's Location before
+// CheckRedirect can stop it, and a malformed one comes back quoted in its error
+// ("failed to parse Location header %q"). That text could name a private repository
+// or carry a pre-signed URL, and errors reach the model. Here only the caller parses
+// Location, with resp.Location(), and no caller passes that error's text on.
+//
+// The timeout's context is released when the response body is closed, so a caller
+// reading the body after roundTrip returns is still bounded by it.
+func (c *Client) roundTrip(req *http.Request, timeout time.Duration) (*http.Response, error) {
+	cancel := context.CancelFunc(func() {})
+	if timeout > 0 {
+		var ctx context.Context
+		ctx, cancel = context.WithTimeout(req.Context(), timeout)
+		req = req.WithContext(ctx)
+	}
+	rt := c.http.Transport
+	if rt == nil {
+		rt = http.DefaultTransport
+	}
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		cancel()
+		return nil, stripURL(err)
+	}
+	resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+// cancelOnClose releases a request's timeout when its response body is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnClose) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
 
 // get performs an authenticated GET of an API path and returns the response body. A
@@ -505,27 +539,6 @@ func (c *Client) get(ctx context.Context, token, path string) ([]byte, error) {
 			return nil, fmt.Errorf("status %d", resp.StatusCode)
 		}
 		return body, nil
-	}
-}
-
-// followGated is a CheckRedirect for a client that must follow off-host redirects (a
-// tarball to codeload): an API-host hop is followed only to a repository that passes
-// the gate; an off-host hop is followed as net/http does, which drops the token.
-func (c *Client) followGated(token string) func(*http.Request, []*http.Request) error {
-	return func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 10 {
-			return errors.New("stopped after 10 redirects")
-		}
-		if _, on := c.apiRelPath(req.URL); !on {
-			// Off the API origin (codeload): no credential goes along. net/http drops
-			// Authorization only when the hostname changes, so it would keep it for
-			// another port on the same host, or for a subdomain.
-			for _, h := range []string{"Authorization", "Cookie", "Proxy-Authorization"} {
-				req.Header.Del(h)
-			}
-			return nil
-		}
-		return c.gateLocation(req.Context(), token, req.URL, true)
 	}
 }
 
