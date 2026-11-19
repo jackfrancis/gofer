@@ -113,12 +113,15 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		userText += githubUnavailableNote
 	}
 
-	// The assistant explains the ranking the user sees, which the landing page
-	// re-derives at read time; the stored Meta may predate it. Only the model's copy
-	// is re-scored: what this run writes back is unchanged.
-	ranked := item
-	ranked.Meta = worklist.Rescore(item, time.Now().UTC())
-	reply, err := p.Converser.Reply(ctx, ranked, viewerLogin, sourceContext, history, userText, tools)
+	// An independent review must not see the prior thread through the item either:
+	// the converser explains the item's ranking, and a research adjustment summarizes
+	// the thread, so the model's copy carries none (the converser then withholds it).
+	// What this run writes back is unchanged.
+	model := item
+	if p.Independent {
+		model.Thread = nil
+	}
+	reply, err := p.Converser.Reply(ctx, model, viewerLogin, sourceContext, history, userText, tools)
 	if isSignInRequired(err) || (holder != nil && holder.Reconnect() != nil) {
 		// A tool call found the access gone: whatever the model produced is
 		// discarded, never saved as a reply or review.

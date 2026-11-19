@@ -108,6 +108,32 @@ func Rescore(item WorkItem, now time.Time) Metadata {
 	return scored
 }
 
+// ResearchReflectsVisibleThread reports whether item's research adjustment still
+// stands for the conversation the user can see. Research is derived from the thread,
+// so it may be shown to a model only while every turn it could have read is visible.
+// It cannot when a turn posted before the research ran is now hidden (the research
+// prompt reads hidden turns too), or when no visible turn predates it (the
+// conversation was reset, or the turns it read are gone). An adjustment without an
+// AppliedAt time could have read any turn. It reports false when there is no
+// research.
+func ResearchReflectsVisibleThread(item WorkItem) bool {
+	r := item.Signals.Research
+	if r == nil {
+		return false
+	}
+	read := false
+	for _, m := range item.Thread {
+		if !r.AppliedAt.IsZero() && m.At.After(r.AppliedAt) {
+			continue // posted after the research ran: it could not have read it
+		}
+		if m.Hidden {
+			return false
+		}
+		read = true
+	}
+	return read
+}
+
 // baselineAxes returns the four deterministic, signal-based axis values without
 // recording contributions. It is the fallback when no proposal is ratified and
 // the reference the StubRanker echoes.
@@ -208,8 +234,14 @@ func engagementScore(s Signals, c *[]Contribution) float64 {
 	velocity := saturate(s.CommentVelocity, 5)
 	eng := math.Min(1, 0.4*comments+0.3*participants+0.15*reactions+0.15*velocity)
 	if eng > 0 {
+		people := fmt.Sprintf(" from %d people", s.Participants)
+		if s.Participants == 0 && s.Comments > 0 {
+			// Search supplies the comment count; participants come from the timeline
+			// enrichment, which has not run or failed. Zero would be false.
+			people = " (participants not yet counted)"
+		}
 		add(c, "engagement", "discussion", eng,
-			fmt.Sprintf("%d comments from %d people, %d reactions", s.Comments, s.Participants, s.Reactions))
+			fmt.Sprintf("%d comments%s, %d reactions", s.Comments, people, s.Reactions))
 	}
 	return eng
 }
