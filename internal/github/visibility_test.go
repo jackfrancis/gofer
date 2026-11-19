@@ -650,36 +650,77 @@ func TestMalformedLocationStaysOutOfErrors(t *testing.T) {
 	}
 }
 
-// A search walk is whole only if the match count is within GitHub's 1,000-result
-// ceiling and the walk collected that many. GitHub stops serving pages at the
-// ceiling, so the last page it serves is not proof of the whole set.
+// A search walk is whole only if it saw the whole match set: the match count is
+// within GitHub's 1,000-result ceiling on every page and the same on every page, no
+// item comes back twice, and the distinct items reach the count. GitHub stops serving
+// pages at the ceiling, and the set can shift between pages while the walk runs, so
+// reaching the last page GitHub serves proves none of that by itself.
 func TestSearchWalkRespectsTotalCount(t *testing.T) {
+	type pg struct {
+		total int
+		items []int // issue numbers served on the page
+	}
+	span := func(from, to int) []int { // from..to-1
+		var out []int
+		for n := from; n < to; n++ {
+			out = append(out, n)
+		}
+		return out
+	}
+	steady := func(total int, pages ...[]int) []pg {
+		var out []pg
+		for _, items := range pages {
+			out = append(out, pg{total, items})
+		}
+		return out
+	}
+	var overCeiling [][]int
+	for p := 0; p < 10; p++ {
+		overCeiling = append(overCeiling, span(p*100, p*100+100))
+	}
+	// 1,001 matches (#0-#1000) when the walk starts. After page one, #1 closes, so
+	// every later page starts a row further on and #100 is never served: the walk
+	// collects 1,000 distinct rows under a final count of 1,000.
+	shrunk := []pg{{1001, span(0, 100)}}
+	for p := 1; p < 10; p++ {
+		shrunk = append(shrunk, pg{1000, span(p*100+1, p*100+101)})
+	}
+
 	for _, tc := range []struct {
 		name      string
-		total     int
-		perPage   []int // items served on each page; the last has no rel="next"
+		pages     []pg // the last has no rel="next"
 		wantWhole bool
 	}{
-		{"within the ceiling", 130, []int{100, 30}, true},
-		{"over the ceiling", 1500, []int{100, 100, 100, 100, 100, 100, 100, 100, 100, 100}, false},
-		{"fewer collected than counted", 150, []int{100, 30}, false},
+		{"within the ceiling", steady(130, span(0, 100), span(100, 130)), true},
+		{"over the ceiling", steady(1500, overCeiling...), false},
+		{"fewer collected than counted", steady(150, span(0, 100), span(100, 130)), false},
+		{"a page over the ceiling, then within it", shrunk, false},
+		// The count stays 150, but #5 was updated and moved to page one's position
+		// again, pushing #100 behind the boundary: 150 rows, 149 distinct issues.
+		{"an item moved forward between pages", steady(150, span(0, 100), append([]int{5}, span(101, 150)...)), false},
+		// 150 distinct issues, but one was served twice: the set moved during the walk.
+		{"an item served twice", steady(150, span(0, 100), append([]int{5}, span(100, 150)...)), false},
+		// One closed after page one: the count drops and the rest shift up a row, so the
+		// rows collected match the final count while #100 was never seen.
+		{"the count changed between pages", []pg{{150, span(0, 100)}, {149, span(101, 150)}}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				page := 0
 				fmt.Sscan(r.URL.Query().Get("page"), &page)
-				if page < 1 || page > len(tc.perPage) {
+				if page < 1 || page > len(tc.pages) {
 					w.WriteHeader(http.StatusUnprocessableEntity) // past the ceiling
 					return
 				}
-				if page < len(tc.perPage) {
+				if page < len(tc.pages) {
 					w.Header().Set("Link", `<x>; rel="next"`)
 				}
-				items := make([]string, tc.perPage[page-1])
-				for i := range items {
-					items[i] = fmt.Sprintf(`{"number":%d}`, page*1000+i)
+				p := tc.pages[page-1]
+				items := make([]string, len(p.items))
+				for i, n := range p.items {
+					items[i] = fmt.Sprintf(`{"number":%d,"repository_url":"https://api.github.com/repos/o/r"}`, n)
 				}
-				fmt.Fprintf(w, `{"total_count":%d,"items":[%s]}`, tc.total, strings.Join(items, ","))
+				fmt.Fprintf(w, `{"total_count":%d,"items":[%s]}`, p.total, strings.Join(items, ","))
 			}))
 			defer srv.Close()
 			out, whole, err := NewClient(srv.Client(), srv.URL).searchIssues(context.Background(), "tok", "is:pr")
@@ -687,7 +728,7 @@ func TestSearchWalkRespectsTotalCount(t *testing.T) {
 				t.Fatal(err)
 			}
 			if whole != tc.wantWhole {
-				t.Errorf("whole = %v after %d items, want %v", whole, len(out), tc.wantWhole)
+				t.Errorf("whole = %v after %d rows, want %v", whole, len(out), tc.wantWhole)
 			}
 		})
 	}

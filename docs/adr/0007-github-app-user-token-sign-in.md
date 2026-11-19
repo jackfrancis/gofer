@@ -856,10 +856,13 @@ today's OAuth-app tokens, which it does not depend on:
   recency. It reads the first page of each only (it shows 20 matches and reports
   GitHub's `total_count`), so the split does not double a tool call's share of the
   search budget. A qualifier inside a quoted phrase does not count. Ingest counts a
-  query as walked to the end only if its `total_count` is within GitHub's
-  1,000-result ceiling and the walk collected that many items: GitHub stops serving
-  pages at the ceiling, so its last page proves nothing about a larger match set, and
-  retiring after a capped walk would retire open work. When the search
+  query as walked to the end only if no page's `total_count` exceeds GitHub's
+  1,000-result ceiling, the count is the same on every page, no item comes back
+  twice, and the distinct items collected reach the count. GitHub stops serving pages
+  at the ceiling, and the match set can shift between pages while the walk runs (an
+  item updated mid-walk moves to the front, one that closes shifts the rest up a
+  row). Otherwise the walk is partial: what it found is still written, and nothing is
+  retired that run. When the search
   rate limit resets after the turn's deadline, the tool says so instead of sending a
   request that would be refused.
 - **The gate** (`internal/github/visibility.go`): every `/repos/{owner}/{name}/…` call
