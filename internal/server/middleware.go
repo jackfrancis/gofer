@@ -52,7 +52,8 @@ func logRequests(log *slog.Logger, next http.Handler) http.Handler {
 }
 
 // securityHeaders sets conservative security-related response headers. The CSP
-// allows same-origin styles (the UI ships app.css from /static) but nothing else:
+// allows same-origin styles and scripts (the UI ships app.css and a small
+// progressive-enhancement script from /static) but nothing else:
 // no inline styles or scripts, no third-party origins.
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

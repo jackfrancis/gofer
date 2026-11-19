@@ -245,6 +245,10 @@ type pageData struct {
 	JustHidden               *worklist.WorkItem // the item the user just hid, offered for Undo on the radar
 	RetryURL                 string             // where the error view's "Try again" goes; empty = the radar
 	SignInRequired           bool               // gofer holds no usable credential: prompt the user to sign in again
+	Projects                 []ProjectOption    // the project filter's checklist, by name (worklist view)
+	ProjectsFiltered         bool               // some project is deselected: Items is a subset of the radar
+	SelectedProjects         int                // projects shown, for the filter's label
+	TotalItems               int                // items on the whole radar, before the project filter
 }
 
 // Index handles GET /. It renders the sign-in view for anonymous visitors, the
@@ -360,8 +364,9 @@ func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 //
 // This is a demo and development affordance: with the threads gone every PR is
 // unreviewed again, so "Review all PRs" and the review panel can be exercised end to
-// end without rebuilding the environment. It clears EVERY item the owner has, including
-// ones hidden or completed on the radar, and the conversations are not recoverable.
+// end without rebuilding the environment. It clears every item in the radar's selected
+// projects (all of them with no project filter), including ones hidden or completed on
+// the radar, and the conversations are not recoverable.
 // SameSite=Lax cookies give baseline CSRF protection.
 func (h *Handler) ResetConversations(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
@@ -371,9 +376,14 @@ func (h *Handler) ResetConversations(w http.ResponseWriter, r *http.Request) {
 	}
 	// One atomic update, so a run's write-back cannot restore a thread mid-clear. Only
 	// items that actually carry conversation state are written back.
+	selected := selectedProjects(r)
 	_ = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		var cleared []worklist.WorkItem
+		scope := scopeTo(selected, current)
 		for _, it := range current {
+			if !inScope(scope, it) {
+				continue // outside the radar's project filter
+			}
 			if len(it.Thread) == 0 && it.ThreadReadAt.IsZero() && it.ThreadReadThrough == "" {
 				continue
 			}
@@ -520,7 +530,7 @@ const independentReviewPrompt = "Give an independent review of this PR. There ma
 const reviewStaleAfter = 5 * time.Minute
 
 // ReviewAllPRs handles POST /items/review-all. For every pull request on the
-// user's radar it appends the review prompt to the item's thread and, in one
+// user's radar, within the selected projects, it appends the review prompt to the item's thread and, in one
 // concurrent batch, schedules an assistant review turn for each — then redirects
 // back to the radar (Post/Redirect/Get). A PR already awaiting a reply is skipped,
 // so a double submit does not stack duplicate reviews.
@@ -532,13 +542,15 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 	}
 	at := h.now().UTC()
 	var refs []worklist.TurnRef
+	selected := selectedProjects(r)
 	// Choose and stamp the PRs in one atomic update, against the threads as stored.
 	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		var changed []worklist.WorkItem
 		refs = refs[:0]
+		scope := scopeTo(selected, current)
 		for _, it := range current {
-			if it.Type != worklist.TypePullRequest || !it.OnRadar() {
-				continue // a hidden or closed PR is off the radar: never review it in bulk
+			if it.Type != worklist.TypePullRequest || !it.OnRadar() || !inScope(scope, it) {
+				continue // off the radar (hidden or closed) or outside the project filter: never review it in bulk
 			}
 			if it.HasReview() {
 				continue // already reviewed at least once — a first-review is no longer needed
@@ -603,7 +615,7 @@ func (h *Handler) SecondOpinion(w http.ResponseWriter, r *http.Request) {
 }
 
 // SecondOpinionAllPRs handles POST /items/second-opinion-all. For every pull request
-// reviewed once but without a consensus synthesis yet, it appends an independent-review
+// in the selected projects reviewed once but without a consensus synthesis yet, it appends an independent-review
 // prompt and runs the review panel (blind review + chained synthesis) by a model that
 // differs from that PR's first review, then redirects back to the radar (Post/Redirect/
 // Get). When the eligible PRs' first reviews are homogeneous the user picks the model
@@ -617,6 +629,7 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 	}
 	now := h.now().UTC()
 	choice := strings.TrimSpace(r.FormValue("choice"))
+	selected := selectedProjects(r)
 	type dispatch struct {
 		ref worklist.TurnRef
 		opt ModelOption
@@ -632,8 +645,9 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 		plan = plan[:0]
 		var eligible []worklist.WorkItem
 		firstModels := map[string]struct{}{}
+		scope := scopeTo(selected, current)
 		for _, it := range current {
-			if it.NeedsSecondOpinion(now, reviewStaleAfter) {
+			if inScope(scope, it) && it.NeedsSecondOpinion(now, reviewStaleAfter) {
 				eligible = append(eligible, it)
 				firstModels[it.FirstReviewModel()] = struct{}{}
 			}
@@ -732,9 +746,20 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		return pageData{View: "error", User: user, Message: res.Message}, http.StatusOK
 	default:
 		now := h.now()
+		// The project filter narrows what is shown, and the bulk actions' counts below
+		// cover only the shown items, as their handlers do.
+		selected := scopeTo(selectedProjects(r), res.Items)
+		projects := projectOptions(res.Items, selected)
+		shown := filterProjects(res.Items, selected)
+		selectedCount := 0
+		for _, p := range projects {
+			if p.Selected {
+				selectedCount++
+			}
+		}
 		var reviewCount, secondCount, resetCount int
 		firstModels := map[string]struct{}{}
-		for _, it := range res.Items {
+		for _, it := range shown {
 			if it.NeedsReview(now, reviewStaleAfter) {
 				reviewCount++
 			}
@@ -753,7 +778,7 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		var justHidden *worklist.WorkItem
 		hiddenID := r.URL.Query().Get("hidden")
 		for i, it := range res.OffRadar {
-			if len(it.Thread) > 0 {
+			if len(it.Thread) > 0 && inScope(selected, it) {
 				resetCount++
 			}
 			if hiddenID != "" && it.ID == hiddenID && !it.Meta.HiddenAt.IsZero() {
@@ -761,9 +786,10 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 			}
 		}
 		data := pageData{
-			View: "worklist", User: user, Items: res.Items, ConvEnabled: h.convEnabled,
+			View: "worklist", User: user, Items: shown, ConvEnabled: h.convEnabled,
 			ReviewCount: reviewCount, SecondOpinionEnabled: h.secondOpinionEnabled(), SecondOpinionCount: secondCount,
 			ResetCount: resetCount, JustHidden: justHidden,
+			Projects: projects, ProjectsFiltered: selected != nil, SelectedProjects: selectedCount, TotalItems: len(res.Items),
 		}
 		// "Review all PRs" offers every model when more than one is configured; a
 		// single-model setup keeps the plain button.
