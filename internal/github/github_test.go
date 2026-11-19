@@ -9,11 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackfrancis/gofer/internal/github/githubtest"
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
 func TestFetchWorklistMapsAndDedups(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/user" {
 			_, _ = w.Write([]byte(`{"login":"me"}`))
 			return
@@ -67,7 +68,7 @@ func TestFetchWorklistMapsAndDedups(t *testing.T) {
 // honest generic reason until enrich can prove participation from the timeline.
 // review-requested comes from its own query and needs no derivation.
 func TestFetchWorklistDerivesReasons(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/user" {
 			_, _ = w.Write([]byte(`{"login":"me"}`))
 			return
@@ -117,7 +118,7 @@ func TestFetchWorklistDerivesReasons(t *testing.T) {
 // order is Go's randomized map iteration and every downstream "first N" picks a
 // different arbitrary subset on each run. Most recently updated first.
 func TestFetchWorklistOrdersByRecency(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/user" {
 			_, _ = w.Write([]byte(`{"login":"me"}`))
 			return
@@ -154,7 +155,7 @@ func TestFetchWorklistOrdersByRecency(t *testing.T) {
 // single-page sample would silently drop work off the radar.
 func TestSearchIssuesPaginates(t *testing.T) {
 	var pages []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		page := r.URL.Query().Get("page")
 		pages = append(pages, page)
 		if got := r.URL.Query().Get("per_page"); got != "100" {
@@ -244,7 +245,7 @@ func TestSearchBudgetWait(t *testing.T) {
 // the pages already fetched instead of spending budget the rest of the backfill needs.
 func TestSearchIssuesStopsOnBudget(t *testing.T) {
 	var calls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		// Always advertise another page, so only the budget can stop the walk.
 		w.Header().Set("Link", `<`+r.URL.String()+`>; rel="next"`)
@@ -274,7 +275,7 @@ func TestSearchIssuesStopsOnBudget(t *testing.T) {
 // GitHub's own incomplete_results flag (a server-side search timeout) means the page
 // is not the full match set, even when it is the last page.
 func TestSearchIssuesHonoursIncompleteResults(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"incomplete_results":true,"items":[{"number":1,"repository_url":"https://api.github.com/repos/o/r","state":"open"}]}`))
 	}))
 	defer srv.Close()
@@ -291,7 +292,7 @@ func TestSearchIssuesHonoursIncompleteResults(t *testing.T) {
 // The 1,000-result ceiling ends the walk with pages still advertised: partial.
 func TestSearchIssuesResultCeilingIsPartial(t *testing.T) {
 	var calls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("Link", `<`+r.URL.String()+`>; rel="next"`)
 		_, _ = w.Write([]byte(`{"items":[{"number":1,"repository_url":"https://api.github.com/repos/o/r","state":"open"}]}`))

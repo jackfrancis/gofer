@@ -4,32 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"time"
 )
-
-// get performs an authenticated GET and returns the response body.
-func (c *Client) get(ctx context.Context, token, path string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
-	if err != nil {
-		return nil, err
-	}
-	setHeaders(req, token)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
-	}
-	return body, nil
-}
 
 type timelineEvent struct {
 	Event             string    `json:"event"`
@@ -62,6 +38,10 @@ type Activity struct {
 // and centrality signals from it in a single call, plus how long the item has
 // been blocked on login's review.
 func (c *Client) ItemActivity(ctx context.Context, token, repo string, number int, login string) (Activity, error) {
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return Activity{}, err
+	}
 	events, err := c.fetchTimeline(ctx, token, repo, number)
 	if err != nil {
 		return Activity{}, err

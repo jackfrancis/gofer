@@ -123,7 +123,7 @@ func ParseActionsURL(raw string) (ActionsRef, error) {
 		return ref, fmt.Errorf("not a GitHub Actions run or job URL")
 	}
 	ref.Repo = segs[0] + "/" + segs[1]
-	if !repoName.MatchString(ref.Repo) || strings.Contains(ref.Repo, "..") {
+	if !validRepo(ref.Repo) {
 		return ref, fmt.Errorf("not a GitHub Actions URL: bad repository %q", ref.Repo)
 	}
 	id := func(s string) (int64, bool) {
@@ -216,7 +216,7 @@ func (j ActionsJob) Failing() bool {
 }
 
 func checkActionsRepo(repo string) error {
-	if !repoName.MatchString(repo) || strings.Contains(repo, "..") {
+	if !validRepo(repo) {
 		return fmt.Errorf("repo must be owner/name")
 	}
 	return nil
@@ -291,6 +291,10 @@ func (c *Client) ActionsJobLog(ctx context.Context, token, repo string, jobID in
 	if err := checkActionsRepo(repo); err != nil {
 		return 0, err
 	}
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return 0, err
+	}
 	return c.downloadLog(ctx, token, fmt.Sprintf("/repos/%s/actions/jobs/%d/logs", repo, jobID), "job log", w, max)
 }
 
@@ -302,6 +306,10 @@ func (c *Client) ActionsStepLog(ctx context.Context, token, repo string, jobID i
 	}
 	if step <= 0 {
 		return 0, fmt.Errorf("step must be a positive step number")
+	}
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return 0, err
 	}
 	return c.downloadLog(ctx, token, fmt.Sprintf("/repos/%s/actions/jobs/%d/steps/%d/logs", repo, jobID, step), "step log", w, max)
 }
@@ -326,11 +334,37 @@ func (c *Client) downloadLog(ctx context.Context, token, path, what string, w io
 	}
 }
 
-// logLocation requests a log from the API without following its redirect. It returns
+// logLocation requests a log from the API and returns the download location it
+// redirects to, or nil when the API served the log itself (written to w) or refused.
+// A redirect within the API host (a renamed or transferred repository) is not a
+// download link: it is followed here, with the token, once its destination passes
+// the public-only gate. Only a location off the API host goes to the credential-free
+// blob client.
+func (c *Client) logLocation(ctx context.Context, token, path, what string, w io.Writer, max int64) (*url.URL, int64, error) {
+	u := c.baseURL + path
+	for hop := 0; ; hop++ {
+		loc, n, err := c.logHop(ctx, token, u, what, w, max)
+		if loc == nil {
+			return nil, n, err
+		}
+		if _, onAPI := c.apiRelPath(loc); !onAPI {
+			return loc, 0, nil
+		}
+		if hop >= maxAPIRedirects {
+			return nil, 0, fmt.Errorf("%s: too many redirects within the API", what)
+		}
+		if err := c.gateLocation(ctx, token, loc, true); err != nil {
+			return nil, 0, fmt.Errorf("%s: %w", what, err)
+		}
+		u = loc.String()
+	}
+}
+
+// logHop requests a log from the API at u without following its redirect. It returns
 // the redirect's location, or nil when the API served the log itself (written to w)
 // or refused.
-func (c *Client) logLocation(ctx context.Context, token, path, what string, w io.Writer, max int64) (*url.URL, int64, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+func (c *Client) logHop(ctx context.Context, token, u, what string, w io.Writer, max int64) (*url.URL, int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, 0, fmt.Errorf("build %s request", what)
 	}
@@ -397,22 +431,30 @@ const maxReasonBody = 8 << 10
 
 // apiReason reads an API error response's reason (a bounded read of its body).
 func apiReason(resp *http.Response) reason {
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxReasonBody))
+	return reasonFrom(resp.Header, raw)
+}
+
+// reasonFrom reads an API error response's reason from its headers and body.
+func reasonFrom(h http.Header, raw []byte) reason {
 	var r reason
 	var body struct {
 		Message string `json:"message"`
 	}
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxReasonBody))
+	if len(raw) > maxReasonBody {
+		raw = raw[:maxReasonBody]
+	}
 	if json.Unmarshal(raw, &body) == nil {
 		r.message = clipReason(body.Message)
 	}
-	if v, ok := resp.Header["X-Oauth-Scopes"]; ok && len(v) > 0 {
+	if v, ok := h["X-Oauth-Scopes"]; ok && len(v) > 0 {
 		r.tokenScopes = &v[0]
 	}
-	if v, ok := resp.Header["X-Accepted-Oauth-Scopes"]; ok && len(v) > 0 {
+	if v, ok := h["X-Accepted-Oauth-Scopes"]; ok && len(v) > 0 {
 		r.accepted = &v[0]
 	}
-	r.sso = resp.Header.Get("X-GitHub-SSO") != ""
-	r.rateLimited = resp.Header.Get("X-RateLimit-Remaining") == "0" ||
+	r.sso = h.Get("X-GitHub-SSO") != ""
+	r.rateLimited = h.Get("X-RateLimit-Remaining") == "0" ||
 		strings.Contains(strings.ToLower(r.message), "rate limit")
 	return r
 }

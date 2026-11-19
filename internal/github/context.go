@@ -1,9 +1,9 @@
 // Read-only context fetches for the assistive conversation: a discussion
 // snapshot for the item under discussion, plus the lookups the conversation
 // tools call (a file at a ref, a PR/issue's state, a search). Every call only
-// ever GETs, with the user's vended credential; reach is bounded by that token's
-// own scopes, and any repository the token can see is fair game. gofer core
-// never imports this client — only the agent runtime does.
+// ever GETs, with the user's vended credential, and only from public repositories:
+// the public-only guard (visibility.go) refuses any other, whatever the token can
+// see. gofer core never imports this client — only the agent runtime does.
 package github
 
 import (
@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -69,9 +70,13 @@ type Review struct {
 // missing piece is not fatal, so a degraded snapshot is better than none.
 func (c *Client) Discussion(ctx context.Context, token, repo string, number int, isPR bool) (Discussion, error) {
 	var d Discussion
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return Discussion{}, err
+	}
 
 	// Description from the issues endpoint (works for both issues and PRs).
-	issueBody, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/issues/%d", repo, number))
+	issueBody, err := c.getIssue(ctx, token, repo, number)
 	if err != nil {
 		return Discussion{}, err
 	}
@@ -115,7 +120,12 @@ func (c *Client) Discussion(ctx context.Context, token, repo string, number int,
 	// important for fork PRs: the head *branch* lives on the contributor's fork
 	// and does not resolve in this repo, whereas GitHub exposes the head *commit*
 	// in the base repo — so the SHA is the reliable ref.
-	if body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/pulls/%d", repo, number)); err == nil {
+	body, err := c.getPull(ctx, token, repo, number)
+	var refused *backstopError
+	if errors.As(err, &refused) {
+		return Discussion{}, err // the PR is another repository's: drop all of it
+	}
+	if err == nil {
 		var pr struct {
 			Head struct {
 				SHA string `json:"sha"`
@@ -221,7 +231,20 @@ func truncateRunes(s string, max int) string {
 // an unreadable object returns a short explanatory note rather than an error, so
 // the assistant can react.
 func (c *Client) FileContents(ctx context.Context, token, repo, path, ref string, offset int) (string, error) {
-	p := fmt.Sprintf("/repos/%s/contents/%s", repo, path)
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return "", err
+	}
+	// The path comes from the model: each segment is escaped on its own, and a "." or
+	// ".." segment is refused, so the request names exactly the gated repository.
+	var segs []string
+	for _, seg := range strings.Split(strings.Trim(path, "/"), "/") {
+		if seg == "" || seg == "." || seg == ".." || strings.ContainsAny(seg, "\\\x00") {
+			return "", fmt.Errorf("invalid path %q: use a path within the repository, without . or .. segments", path)
+		}
+		segs = append(segs, url.PathEscape(seg))
+	}
+	p := fmt.Sprintf("/repos/%s/contents/%s", repo, strings.Join(segs, "/"))
 	if ref != "" {
 		p += "?ref=" + url.QueryEscape(ref)
 	}
@@ -298,7 +321,11 @@ func fileWindow(text string, offset int) string {
 // PullRequestStatus returns a pull request's current state (open/closed, merged
 // or not, base/head, title) as a compact text summary.
 func (c *Client) PullRequestStatus(ctx context.Context, token, repo string, number int) (string, error) {
-	body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/pulls/%d", repo, number))
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return "", err
+	}
+	body, err := c.getPull(ctx, token, repo, number)
 	if err != nil {
 		return "", err
 	}
@@ -337,7 +364,11 @@ func (c *Client) PullRequestStatus(ctx context.Context, token, repo string, numb
 
 // IssueStatus returns an issue's (or PR's) current state as a compact summary.
 func (c *Client) IssueStatus(ctx context.Context, token, repo string, number int) (string, error) {
-	body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/issues/%d", repo, number))
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return "", err
+	}
+	body, err := c.getIssue(ctx, token, repo, number)
 	if err != nil {
 		return "", err
 	}
@@ -364,21 +395,45 @@ func (c *Client) IssueStatus(ctx context.Context, token, repo string, number int
 }
 
 // Search runs a GitHub issues/PRs search and returns the top matches as compact
-// text. It accepts the full GitHub search syntax (e.g. "repo:owner/name otel").
+// text. It accepts the full GitHub search syntax (e.g. "repo:owner/name otel"), and
+// searches public repositories only (searchPage adds is:public).
+//
+// A GitHub App user token answers 422 to a query that does not say whether it wants
+// issues or pull requests, so a query without is:issue, is:pr, is:pull-request,
+// type:issue or type:pr runs twice, once for each, and the matches are merged by
+// recency. Only the first page of each is read: the tool shows maxSearchResults, and
+// GitHub's total_count gives the rest, so paging further would only spend the small
+// search budget.
 func (c *Client) Search(ctx context.Context, token, query string) (string, error) {
-	items, _, err := c.searchIssues(ctx, token, query)
-	if err != nil {
-		return "", err
+	variants := []string{query}
+	if !hasTypeQualifier(query) {
+		variants = []string{query + " is:issue", query + " is:pr"}
+	}
+	var items []searchItem
+	total := 0
+	for _, q := range variants {
+		if !c.search.wait(ctx, 0) {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			// The pause would outlast the run: sending now would only be refused.
+			return "", fmt.Errorf("GitHub's search rate limit is used up for about %s, longer than this turn has left; try again later",
+				c.search.resetIn().Round(time.Second))
+		}
+		sr, _, err := c.searchPage(ctx, token, q, 1, maxSearchResults)
+		if err != nil {
+			return "", err
+		}
+		items = append(items, sr.Items...)
+		total += max(sr.TotalCount, len(sr.Items))
 	}
 	if len(items) == 0 {
 		return "no matching issues or pull requests", nil
 	}
+	slices.SortStableFunc(items, func(a, b searchItem) int { return b.UpdatedAt.Compare(a.UpdatedAt) })
 	var b strings.Builder
-	shown := len(items)
-	if shown > maxSearchResults {
-		shown = maxSearchResults
-	}
-	fmt.Fprintf(&b, "%d result(s) (showing %d):\n", len(items), shown)
+	shown := min(len(items), maxSearchResults)
+	fmt.Fprintf(&b, "%d result(s) (showing %d):\n", total, shown)
 	for _, it := range items[:shown] {
 		repo := strings.TrimPrefix(it.RepositoryURL, defaultBaseURL+"/repos/")
 		kind := "issue"
@@ -403,17 +458,28 @@ var repoName = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 // token goes to the API host only. The pre-signed URL is itself a credential, so a
 // transport error is returned WITHOUT the URL net/http would embed in it.
 func (c *Client) Tarball(ctx context.Context, token, repo, ref string) (io.ReadCloser, error) {
-	if !repoName.MatchString(repo) || strings.Contains(repo, "..") {
+	if !validRepo(repo) {
 		return nil, fmt.Errorf("repo must be owner/name")
+	}
+	if ref != "" {
+		for _, seg := range strings.Split(ref, "/") {
+			if seg == "" || seg == "." || seg == ".." || strings.ContainsAny(seg, "\x00\r\n \\") {
+				return nil, fmt.Errorf("invalid ref %q", ref)
+			}
+		}
+	}
+	repo, err := c.gate(ctx, token, repo)
+	if err != nil {
+		return nil, err
 	}
 	p := "/repos/" + repo + "/tarball"
 	if ref != "" {
-		for _, seg := range strings.Split(ref, "/") {
-			if seg == "" || seg == "." || seg == ".." || strings.ContainsAny(seg, "\x00\r\n ") {
-				return nil, fmt.Errorf("invalid ref %q", ref)
-			}
+		for _, seg := range strings.Split(ref, "/") { // validated above
 			p += "/" + url.PathEscape(seg)
 		}
+	}
+	if unsafePath(p) { // the rule every other request passes through Client.get
+		return nil, fmt.Errorf("invalid ref %q", ref)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+p, nil)
 	if err != nil {
@@ -424,6 +490,9 @@ func (c *Client) Tarball(ctx context.Context, token, repo, ref string) (io.ReadC
 	// download is bounded by the caller's context instead.
 	hc := *c.http
 	hc.Timeout = 0
+	// The codeload hop is followed as before; an API-host hop only to a public
+	// repository.
+	hc.CheckRedirect = c.followGated(token)
 	resp, err := hc.Do(req)
 	if err != nil {
 		var ue *url.Error

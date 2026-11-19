@@ -189,6 +189,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   Never put the blob URL in an error, not even net/http's inner one. A generic
   `/runs/<id>` check link is an Actions job only when the check's app is
   `github-actions`. See `docs/adr/0006-github-actions-log-tools.md`.
+- The workload's GitHub client is public-only, always (ADR 0007 phase 1,
+  `internal/github/visibility.go`): every search carries `is:public`, every
+  per-repository call first checks `GET /repos/{owner}/{name}` for `"private": false`
+  (cached per `Client`, i.e. per run) and uses the canonical name it returns, and an
+  API-host redirect is followed only to a repository that passes the same check. A new
+  per-repository call must go through `Client.get` or call `c.gate` itself. Test stubs
+  must answer that lookup: wrap the handler in `githubtest.PublicRepos`. Ingest drops
+  hits not confirmed public, and an unknown answer makes the fetch incomplete.
 - `go test` binds httptest sockets; run it outside a restrictive sandbox.
 
 ## Build / test / run

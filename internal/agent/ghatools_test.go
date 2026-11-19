@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/jackfrancis/gofer/internal/github/githubtest"
 	"github.com/jackfrancis/gofer/internal/prow"
 )
 
@@ -122,7 +123,7 @@ type ghaFake struct {
 func newGHAFake(t *testing.T) *ghaFake {
 	t.Helper()
 	f := &ghaFake{}
-	f.blob = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	f.blob = httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "" {
 			f.blobCreds.Store(true)
 		}
@@ -153,7 +154,7 @@ func newGHAFake(t *testing.T) *ghaFake {
 			http.NotFound(w, r)
 		}
 	}))
-	f.api = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	f.api = httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer s3cret-token" {
 			t.Errorf("API call without the token: %s", r.URL.Path)
 		}
