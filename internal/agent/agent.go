@@ -295,7 +295,10 @@ func reconcileFetched(fetched, existing []worklist.WorkItem) []worklist.WorkItem
 		}
 		fetched[i].Thread = old.Thread
 		fetched[i].ThreadReadAt = old.ThreadReadAt
-		fetched[i].Meta.HiddenAt = old.Meta.HiddenAt
+		fetched[i].ThreadReadThrough = old.ThreadReadThrough
+		// A hidden item stays hidden until GitHub shows it changed after the hide; the
+		// plane's merge applies the same rule, so the run's view and the store agree.
+		fetched[i].Meta.HiddenAt = worklist.HiddenAfter(old.Meta.HiddenAt, fetched[i].GitHub.UpdatedAt)
 		// CompletedAt is deliberately NOT carried over: the item was just fetched from
 		// the open set, so it is open, and a reopened item resurfaces (see Metadata).
 		if !old.CreatedAt.IsZero() {

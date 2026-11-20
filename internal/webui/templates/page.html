@@ -41,20 +41,39 @@
     {{else if eq .View "error"}}
       <div class="zz-empty">
         <h1>Something went wrong</h1>
-        {{if .Message}}
+        {{if .Failure}}
+        <p>{{.Failure}}</p>
+        {{else if .Message}}
         <p>We couldn't finish discovering your work:</p>
         <p class="zz-error-detail">{{.Message}}</p>
         {{else}}
         <p>We couldn't load your work right now. Try again in a moment.</p>
         {{end}}
-        <div class="zz-actions"><a class="btn btn-primary" href="/">Try again</a></div>
+        <div class="zz-actions"><a class="btn btn-primary" href="{{with .RetryURL}}{{.}}{{else}}/{{end}}">Try again</a></div>
       </div>
 
     {{else if eq .View "thread"}}
       <p><a href="/">&larr; Back to radar</a></p>
       <div class="zz-thread-head">
         <div class="zz-title"><a href="{{.Item.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.Item.GitHub.Title}}</a></div>
-        <div class="zz-meta">{{.Item.GitHub.Repo}}{{if .Item.GitHub.Number}} #{{.Item.GitHub.Number}}{{end}}</div>
+        <div class="zz-meta">
+          <span>{{.Item.GitHub.Repo}}{{if .Item.GitHub.Number}} #{{.Item.GitHub.Number}}{{end}}</span>
+          {{if .Item.Meta.HiddenAt.IsZero}}
+          <form method="post" action="/items/hide">
+            <input type="hidden" name="id" value="{{.Item.ID}}">
+            <input type="hidden" name="hidden" value="true">
+            <button class="zz-linkbtn" type="submit" title="Hide this item from your radar until GitHub shows new activity on it">Hide item</button>
+          </form>
+          {{else}}
+          <span class="zz-hidden-item">Hidden from your radar until GitHub shows new activity</span>
+          <form method="post" action="/items/hide">
+            <input type="hidden" name="id" value="{{.Item.ID}}">
+            <input type="hidden" name="hidden" value="false">
+            <input type="hidden" name="back" value="thread">
+            <button class="zz-linkbtn" type="submit">Unhide</button>
+          </form>
+          {{end}}
+        </div>
       </div>
       <div class="zz-chat">
         {{range $i, $m := .Item.Thread}}
@@ -124,6 +143,16 @@
       {{end}}
 
     {{else}}
+      {{with .JustHidden}}
+      <div class="zz-undo" role="status">
+        <span>Hidden <b>{{.GitHub.Title}}</b> until GitHub shows new activity on it.</span>
+        <form method="post" action="/items/hide">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <input type="hidden" name="hidden" value="false">
+          <button class="zz-linkbtn" type="submit">Undo</button>
+        </form>
+      </div>
+      {{end}}
       <div class="zz-toolbar">
         <p class="zz-count">{{len .Items}} item{{if ne (len .Items) 1}}s{{end}} on your radar</p>
         <div class="zz-toolbar-actions">
@@ -179,11 +208,15 @@
         <div class="zz-item">
           <div class="zz-item-head">
             <div class="zz-title"><a href="{{.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.GitHub.Title}}</a></div>
-            {{if $.ConvEnabled}}
             <div class="zz-item-actions">
+              {{if $.ConvEnabled}}
               <a class="btn btn-sm zz-discuss{{if .HasUnreadReply}} zz-discuss--unread{{end}}" href="/items/thread?id={{.ID | urlquery}}"{{with discussTitle .}} title="{{.}}"{{end}}>{{with discussBadge .}}{{.}} {{end}}Discuss</a>
+              {{end}}
+              <form method="post" action="/items/hide">
+                <input type="hidden" name="id" value="{{.ID}}">
+                <button class="btn btn-sm" type="submit" title="Hide this item until GitHub shows new activity on it">Hide</button>
+              </form>
             </div>
-            {{end}}
           </div>
           <div class="zz-meta">
             <span>{{.GitHub.Repo}} #{{.GitHub.Number}}</span>
