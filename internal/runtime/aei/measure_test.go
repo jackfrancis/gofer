@@ -22,11 +22,12 @@ import (
 // the run's completion report carries the model time and the model and tool calls the
 // workload observed, which the control plane exports to Prometheus.
 
-// completion is the POST /complete body the runtime sends.
+// completion is the POST /complete body the runtime sends, with its raw timing object.
 type completion struct {
-	RunID  string            `json:"run_id"`
-	Error  string            `json:"error"`
-	Timing aeiruntime.Timing `json:"timing"`
+	RunID     string            `json:"run_id"`
+	Error     string            `json:"error"`
+	Timing    aeiruntime.Timing `json:"timing"`
+	RawTiming map[string]any    `json:"-"`
 }
 
 // fakeControl is the aei-controller's /complete endpoint: it records each report and
@@ -46,11 +47,24 @@ func newFakeControl(t *testing.T) *fakeControl {
 			http.NotFound(w, r)
 			return
 		}
-		var body completion
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		var body completion
+		var wire struct {
+			Timing map[string]any `json:"timing"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := json.Unmarshal(raw, &wire); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		body.RawTiming = wire.Timing
 		c.mu.Lock()
 		c.reports = append(c.reports, body)
 		c.bearers = append(c.bearers, r.Header.Get("Authorization"))
@@ -190,6 +204,28 @@ func TestRunOnceReportsARankRun(t *testing.T) {
 	}
 	if got.Timing.ModelSeconds <= 0 {
 		t.Errorf("model_seconds = %v, want > 0", got.Timing.ModelSeconds)
+	}
+}
+
+// A run that makes no model calls measured zero model time and sends it as an explicit
+// zero, so the controller counts the sample instead of reading "not measured". Runtime
+// is sent too, and provisioning is omitted when the dispatch time is unknown.
+func TestRunOnceSendsAnExplicitZeroModelTime(t *testing.T) {
+	control := newFakeControl(t)
+	env := runEnv(t, "github-ingest", nil, map[string]string{aeiruntime.EnvControlURL: control.srv.URL})
+
+	if code := run(env, func(context.Context, *aeiruntime.Runtime) error { return nil }); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	got := control.only(t).RawTiming
+	if v, ok := got["model_seconds"]; !ok || v != 0.0 {
+		t.Errorf("model_seconds on the wire = %v (present %v), want an explicit 0; timing %v", v, ok, got)
+	}
+	if _, ok := got["runtime_seconds"]; !ok {
+		t.Errorf("runtime_seconds missing from %v", got)
+	}
+	if _, ok := got["provisioning_seconds"]; ok {
+		t.Errorf("provisioning_seconds sent without a dispatch time: %v", got)
 	}
 }
 

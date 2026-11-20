@@ -93,13 +93,18 @@ func measure(ctx context.Context, rt *aeiruntime.Runtime, fn func(context.Contex
 	ctx, collector := llm.WithCollector(ctx)
 	runErr := fn(ctx, rt)
 
+	// Runtime and model time are always measured, so they are sent even when zero (a
+	// run that made no model calls spent zero seconds in the model, and the controller
+	// counts that sample); an unmarked zero would be omitted as "not measured".
 	timing := aeiruntime.Timing{
 		RuntimeSeconds: time.Since(start).Seconds(),
 		ModelSeconds:   collector.ModelDuration().Seconds(),
 		ModelCalls:     collector.ModelCalls(),
 		ToolCalls:      collector.ToolCalls(),
+		Measured:       aeiruntime.StageRuntime | aeiruntime.StageModel,
 	}
 	if at := rt.Spec().DispatchedAt; !at.IsZero() {
+		timing.Measured |= aeiruntime.StageProvisioning
 		if d := start.Sub(at); d > 0 {
 			timing.ProvisioningSeconds = d.Seconds()
 		}
