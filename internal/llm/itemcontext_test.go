@@ -49,8 +49,8 @@ func TestItemContextRanking(t *testing.T) {
 		"discussion: 9 comments, 5 participants\n",
 		"rank: " + fmtRank(want) + "\n",
 		"source: gofer's scoring of the item's signals\n",
-		// strongest first
-		"signals behind the axes: relevance 1.00 (on your radar as a review request); impact 0.75 (priority/p1); urgency 0.60 (review requested); engagement",
+		// strongest first; a bot's review request is discounted (worklist.Score)
+		"signals behind the axes: impact 0.75 (priority/p1); relevance 0.60 (on your radar as a review request); engagement 0.30 (9 comments from 5 people, 0 reactions); urgency 0.30 (review auto-requested by a bot)",
 	} {
 		if !strings.Contains(got, s) {
 			t.Errorf("ranking block missing %q:\n%s", s, got)
