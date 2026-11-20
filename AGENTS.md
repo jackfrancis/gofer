@@ -216,7 +216,8 @@ Wired on the web-tier side; they define what a runtime must respect:
   visible history before it, or the turn and its reply if the store shows it
   answered; a Discuss run without a turn asks for `worklist.LatestUserTurn`, which
   the read resolves against the stored thread; research, naming none, gets the newest
-  turns; position keys are written into legacy turns) and `Select` (`GET /agent/worklist/select`, `worklist.SelectFrom`: no
+  turns, and so does Discuss's research pass, which reads again after its reply
+  lands and skips research if the reply was dropped; position keys are written into legacy turns) and `Select` (`GET /agent/worklist/select`, `worklist.SelectFrom`: no
   threads, at most `MaxSelectLimit` items and `MaxSelectBytes`, with a cursor).
   Stored data past the bounds still reads: an oversized message is cut with a note,
   and an item over `MaxBriefBytes` is projected (`worklist.Project`), which marks
