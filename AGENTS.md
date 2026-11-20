@@ -167,8 +167,13 @@ Wired on the web-tier side; they define what a runtime must respect:
   read, which a newer write may have replaced. A converse or research run writes its
   research adjustment only through `POST /agent/worklist/research`
   (`worklist.ApplyResearch`), never the whole item it read before the model call, so
-  a refresh that landed meanwhile stands; adjustments are ordered by `AppliedAt`
-  (required), and an older one is dropped, so a resend cannot undo a later result.
+  a refresh that landed meanwhile stands. An adjustment is dropped if a turn it read
+  (`ResearchAdjustment.Turns`) is no longer in the stored thread (the conversation
+  was cleared); otherwise adjustments are ordered by `AppliedAt` (required), and an
+  older one is dropped, so a resend cannot undo a later result. A refresh keeps the
+  last known `ReviewRequestedBy` of a review still requested (search does not name
+  the requester; enrich's timeline read replaces it), so a proposal the bot policy
+  set aside stays set aside.
   Before the merge, every write-back path applies
   `worklist.RunPolicy` (the agent plane's ingest handler, and the in-process
   `StoreSink`): workload metadata is stamped `OriginAgent`, so a run cannot claim the

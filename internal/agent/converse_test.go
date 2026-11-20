@@ -305,3 +305,42 @@ func TestRunConverseAfterRefreshKeepsGitHubFields(t *testing.T) {
 		t.Fatalf("converse must not write back the whole item, got %d ingest calls", sink.ingests)
 	}
 }
+
+// turnsResearcher records the turns it read, as the model-backed researcher does.
+type turnsResearcher struct{ rationale string }
+
+func (r turnsResearcher) Research(_ context.Context, item worklist.WorkItem) (worklist.ResearchAdjustment, error) {
+	adj := worklist.ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: r.rationale}
+	for i := range item.Thread {
+		adj.Turns = append(adj.Turns, item.TurnKey(i))
+	}
+	return adj, nil
+}
+
+// The owner resets the conversation and starts a new one while a review is being
+// answered. The late reply is dropped, and so is the research the run derived from
+// the old thread, even though it is stamped after the new thread's research.
+func TestRunConverseDropsResearchOnClearedThread(t *testing.T) {
+	t0 := time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)
+	current := worklist.ResearchAdjustment{Relevance: 0.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "new thread", AppliedAt: t0, Turns: []string{"n1"}}
+	sink := &memSink{items: []worklist.WorkItem{{
+		ID:     "github:o/r#1",
+		Thread: []worklist.Message{{ID: "o1", Role: worklist.RoleUser, Content: "old question", At: t0}},
+	}}}
+	fc := &sideEffectConverser{reply: "answer to the old question", during: func() {
+		sink.items[0].Thread = []worklist.Message{{ID: "n1", Role: worklist.RoleUser, Content: "new question", At: t0.Add(time.Minute)}}
+		sink.items[0].Signals.Research = &current
+	}}
+	err := Run(context.Background(),
+		Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Converser: fc, Researcher: turnsResearcher{rationale: "old thread"}},
+		fakeVendor{token: "t"}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if th := sink.items[0].Thread; len(th) != 1 || th[0].ID != "n1" {
+		t.Fatalf("the reply to the cleared question must be dropped, got %+v", th)
+	}
+	if r := sink.items[0].Signals.Research; r == nil || r.Rationale != "new thread" {
+		t.Fatalf("research on the cleared thread replaced the current thread's: %+v", r)
+	}
+}

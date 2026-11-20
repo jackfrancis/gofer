@@ -272,6 +272,7 @@ func reconcileFetched(fetched, existing []worklist.WorkItem) []worklist.WorkItem
 		// the copy read above, which a discussion may have replaced since. The
 		// chained enrich and rank read the store again.
 		clearModelSignals(&fetched[i].Signals)
+		carryRequester(&fetched[i].Signals, old.Signals)
 		// CompletedAt is deliberately NOT carried over: the item was just fetched from
 		// the open set, so it is open, and a reopened item resurfaces (see Metadata).
 		if !old.CreatedAt.IsZero() {
@@ -304,6 +305,21 @@ func retireMissing(fetched, existing []worklist.WorkItem, now time.Time) []workl
 		retired = append(retired, it)
 	}
 	return retired
+}
+
+// carryRequester keeps the last known requester of a review that is still pending.
+// GitHub's search says a review is requested but not by whom; only enrich's timeline
+// read names the requester. Without this a refresh would blank it, the bot flag
+// would read "human", and a stored proposal the bot policy had set aside
+// (Signals.CurrentProposal) would apply again until enrich ran. Enrich replaces the
+// carried value whenever it reads the timeline.
+func carryRequester(fetched *worklist.Signals, stored worklist.Signals) {
+	if fetched.ReviewRequestedBy != "" || stored.ReviewRequestedBy == "" ||
+		!slices.Contains(fetched.Reasons, worklist.ReasonReviewRequested) {
+		return
+	}
+	fetched.ReviewRequestedBy = stored.ReviewRequestedBy
+	fetched.ReviewRequestedByBot = stored.ReviewRequestedByBot
 }
 
 // clearModelSignals drops the model proposal and research adjustment from a

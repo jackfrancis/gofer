@@ -596,3 +596,56 @@ func TestRunRankKeepsResearchWrittenMeanwhile(t *testing.T) {
 		t.Fatalf("rank restored the adjustment it read over a newer one: got %+v", got.Research)
 	}
 }
+
+// A Refresh of a still-pending review keeps who requested it: GitHub's search does
+// not say. Here enrich cannot read the timeline and rank fails, so nothing replaces
+// the stored values. The bot policy had set aside a proposal made when the requester
+// counted as human; it must stay set aside rather than apply again because the
+// refresh blanked the requester.
+func TestRunIngestKeepsPendingRequester(t *testing.T) {
+	srv := freshPR7GitHub(t) // answers the timeline with an object, so enrich fails
+	store := worklist.NewMemoryStore()
+	human := worklist.AxisProposal{Relevance: 0.9, Impact: 0.9, Engagement: 0.9, Urgency: 0.9, Confidence: 1, Rationale: "scored as a human ask"}
+	store.Seed("u1", worklist.WorkItem{
+		ID: "github:o/r#7", OwnerID: "u1", Source: "github", Type: worklist.TypePullRequest,
+		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 7, Title: "Stale title"},
+		Signals: worklist.Signals{
+			Reasons:           []worklist.Reason{worklist.ReasonReviewRequested},
+			ReviewRequestedBy: "k8s-ci-robot", ReviewRequestedByBot: true,
+			Proposed: &human, // made before k8s-ci-robot was on the bot list
+		},
+	})
+	sink := NewStoreSink(store, "u1").WithPolicy(worklist.NewRunPolicy([]string{"k8s-ci-robot"}))
+	if err := Run(context.Background(),
+		Params{JobType: JobIngest, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client(), Ranker: failRanker{}},
+		fakeVendor{token: "tok"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	items, _ := store.List(context.Background(), "u1")
+	got := items[0]
+	if got.GitHub.Title != "Fresh title" {
+		t.Fatalf("refresh should take the fetched title, got %q", got.GitHub.Title)
+	}
+	if got.Signals.ReviewRequestedBy != "k8s-ci-robot" || !got.Signals.ReviewRequestedByBot {
+		t.Fatalf("refresh blanked the pending request's requester: %q bot=%v", got.Signals.ReviewRequestedBy, got.Signals.ReviewRequestedByBot)
+	}
+	if p := got.Signals.CurrentProposal(); p != nil {
+		t.Fatalf("a proposal the bot policy had set aside applies again: %+v", p)
+	}
+}
+
+// The requester is carried only while the review is still requested: once the fetch
+// no longer finds the request, nothing is pending and no requester is kept.
+func TestCarryRequesterOnlyWhilePending(t *testing.T) {
+	stored := worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonReviewRequested}, ReviewRequestedBy: "alice"}
+	pending := worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonReviewRequested}}
+	carryRequester(&pending, stored)
+	if pending.ReviewRequestedBy != "alice" {
+		t.Fatalf("want the pending request's requester kept, got %q", pending.ReviewRequestedBy)
+	}
+	done := worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonAuthor}}
+	carryRequester(&done, stored)
+	if done.ReviewRequestedBy != "" {
+		t.Fatalf("no request is pending; want no requester, got %q", done.ReviewRequestedBy)
+	}
+}

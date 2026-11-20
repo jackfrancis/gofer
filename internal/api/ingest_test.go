@@ -364,3 +364,23 @@ func TestAgentListClassifiesByCurrentPolicy(t *testing.T) {
 		t.Fatalf("served flags %v, want stale-human=true stale-bot=false", got)
 	}
 }
+
+// Research on a long conversation lists one key per turn; a valid adjustment must
+// fit the route's budget (the reply it follows has already landed).
+func TestAgentResearchLongThread(t *testing.T) {
+	f := newPlane(t)
+	thread := make([]worklist.Message, 2500)
+	turns := make([]string, len(thread))
+	for i := range thread {
+		thread[i] = worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: "q"}
+		turns[i] = thread[i].ID
+	}
+	f.store.Seed("u1", worklist.WorkItem{ID: "a", Thread: thread})
+	adj := worklist.ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 1, AppliedAt: time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC), Turns: turns}
+	if code := f.post(t, f.research, "/agent/worklist/research", f.mint("signals:read", "metadata:write"), map[string]any{"item_id": "a", "adjustment": adj}); code != http.StatusOK {
+		t.Fatalf("want 200 for research on a 2,500-turn thread, got %d", code)
+	}
+	if got, _ := f.store.List(context.Background(), "u1"); got[0].Signals.Research == nil || len(got[0].Signals.Research.Turns) != len(turns) {
+		t.Fatal("the long thread's research must land with all its turns")
+	}
+}

@@ -144,8 +144,11 @@ func (a *researchAdjustment) value() worklist.ResearchAdjustment {
 	}
 }
 
-// maxResearchBody bounds a research request: four multipliers and a rationale.
-const maxResearchBody = 64 << 10
+// maxResearchBody bounds a research request. Besides four multipliers and a
+// rationale it lists the key of every thread turn the research read, so it is sized
+// like a write-back (Ingest), which carries whole threads: a long conversation's
+// research must not be refused after its reply has landed.
+const maxResearchBody = 8 << 20
 
 // Research handles POST /agent/worklist/research. A converse or research run writes
 // the research adjustment it derived here (worklist.ApplyResearch), and only that:

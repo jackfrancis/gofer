@@ -273,3 +273,24 @@ func TestBaselineScoreIgnoresModelSignals(t *testing.T) {
 		t.Fatal("BaselineScore must not change its argument")
 	}
 }
+
+// Research that read a turn no longer in the thread (the conversation was cleared)
+// is dropped whatever its stamp; research on turns still there, hidden or not, lands.
+func TestSetResearchRequiresItsTurns(t *testing.T) {
+	item := WorkItem{ID: "a", Thread: []Message{
+		{ID: "n1", Role: RoleUser, Content: "new", At: t2},
+		{ID: "n2", Role: RoleAgent, Content: "hidden later", At: t3, Hidden: true},
+		{Role: RoleUser, Content: "legacy turn without an id", At: t3},
+	}}
+	current := ResearchAdjustment{Relevance: 0.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "current", AppliedAt: t1, Turns: []string{"n1", "n2", "pos:2"}}
+	if ok, err := SetResearch(&item, current); err != nil || !ok {
+		t.Fatalf("research on turns still in the thread must land, got %v %v", ok, err)
+	}
+	cleared := ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "cleared", AppliedAt: t3, Turns: []string{"o1", "r1"}}
+	if ok, err := SetResearch(&item, cleared); err != nil || ok {
+		t.Fatalf("research on a cleared conversation must be dropped, got %v %v", ok, err)
+	}
+	if item.Signals.Research.Rationale != "current" {
+		t.Fatalf("want the current research kept, got %+v", item.Signals.Research)
+	}
+}

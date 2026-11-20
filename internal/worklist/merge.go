@@ -85,9 +85,12 @@ var ErrUnstampedResearch = errors.New("worklist: research adjustment has no appl
 // and writes back only what it derived: the GitHub fields, the other signals and
 // the thread are left as stored now, so a refresh that landed meanwhile stands.
 //
-// AppliedAt orders adjustments: one older than the stored adjustment is dropped,
-// so a resent write cannot undo a later result. It writes nothing, and returns no
-// error, when the item is gone or the adjustment is older.
+// An adjustment is dropped if any turn it read (ResearchAdjustment.Turns) is no
+// longer in the stored thread: the owner cleared the conversation, and research on
+// the old one must not outlive it. Then AppliedAt orders adjustments: one older than
+// the stored adjustment is dropped, so a resent write cannot undo a later result. It
+// writes nothing, and returns no error, when the item is gone or the adjustment is
+// dropped.
 func ApplyResearch(ctx context.Context, store Store, ownerID, itemID string, adj ResearchAdjustment) error {
 	if adj.AppliedAt.IsZero() {
 		return ErrUnstampedResearch
@@ -107,18 +110,41 @@ func ApplyResearch(ctx context.Context, store Store, ownerID, itemID string, adj
 	})
 }
 
-// SetResearch sets item's research adjustment unless the stored one is newer (by
-// AppliedAt), and reports whether it did. An adjustment with no AppliedAt is
-// ErrUnstampedResearch.
+// SetResearch sets item's research adjustment unless a turn it read is gone from
+// the thread or the stored adjustment is newer (by AppliedAt), and reports whether it
+// did. An adjustment with no AppliedAt is ErrUnstampedResearch.
 func SetResearch(item *WorkItem, adj ResearchAdjustment) (bool, error) {
 	if adj.AppliedAt.IsZero() {
 		return false, ErrUnstampedResearch
+	}
+	if !turnsInThread(*item, adj.Turns) {
+		return false, nil // read a conversation since cleared
 	}
 	if old := item.Signals.Research; old != nil && adj.AppliedAt.Before(old.AppliedAt) {
 		return false, nil // a newer adjustment is already stored
 	}
 	item.Signals.Research = &adj
 	return true, nil
+}
+
+// turnsInThread reports whether every key in turns names a turn in item's thread,
+// hidden or not: hiding a turn keeps it in the conversation (Discuss refuses research
+// that read one at read time, ResearchReflectsVisibleThread), while clearing the
+// conversation removes it.
+func turnsInThread(item WorkItem, turns []string) bool {
+	if len(turns) == 0 {
+		return true
+	}
+	have := make(map[string]bool, len(item.Thread))
+	for i := range item.Thread {
+		have[item.TurnKey(i)] = true
+	}
+	for _, k := range turns {
+		if !have[k] {
+			return false
+		}
+	}
+	return true
 }
 
 // ErrEmptyReply is returned by AppendReply for a reply with no content.
