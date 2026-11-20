@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"log/slog"
 	"math"
 	"mime"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackfrancis/gofer/internal/ingest"
 	"github.com/jackfrancis/gofer/internal/markdown"
 	"github.com/jackfrancis/gofer/internal/session"
 	"github.com/jackfrancis/gofer/internal/worklist"
@@ -263,6 +265,10 @@ type pageData struct {
 	PollSecs, IdlePollSecs   int                // worklist: how often reload.js polls while a refresh runs, and while none does
 	FallbackURL              string             // worklist, no script: where the <noscript> refresh goes while a refresh runs (refreshCheck)
 	ReplyStalled             bool               // a pending reply has not arrived within reviewStaleAfter (thread view)
+	StalledTurn              string             // the stalled turn's key, which the Retry form names; "" offers no Retry (thread view)
+	RetryOptions             []ModelOption      // the models Retry may use (retryChoices); a picker when more than one
+	RetryRefused             bool               // the last Retry was refused by the backend, so no run started
+	StalledHidden            bool               // the stalled turn is hidden: unhide it to retry
 	Message                  string             // failure detail rendered on the error view
 	Failure                  string             // a failed user action, rendered on the error view in place of the discovery wording
 	JustHidden               *worklist.WorkItem // the item the user just hid, offered for Undo on the radar
@@ -309,7 +315,19 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 			if it.ReplyPending(now, reviewStaleAfter) {
 				data.RefreshSecs = 3 // a reply is plausibly in flight — poll for it
 			} else if it.ReplyStalled(now, reviewStaleAfter) {
-				data.ReplyStalled = true // no reply within the window — show a retry hint, stop spinning
+				// No reply within the window: stop spinning and offer to retry the turn,
+				// with the models a retry of it may use. A turn the user hid is not
+				// offered (RetryableTurn), nor one no model can retry.
+				data.ReplyStalled = true
+				if i, ok := it.RetryableTurn(now, reviewStaleAfter); ok {
+					if choices, _, ok := h.retryChoices(it, i); ok {
+						data.StalledTurn = it.TurnKey(i)
+						data.RetryOptions = choices
+						data.RetryRefused = r.URL.Query().Get("retry") == "refused"
+					}
+				} else if i, _ := it.LastUserTurn(); it.Thread[i].Hidden {
+					data.StalledHidden = true
+				}
 			}
 			// Delivering the thread is the read receipt (the UI has no script to send
 			// one). The key is the newest reply on this page, taken from the snapshot
@@ -403,6 +421,140 @@ func (h *Handler) ThreadPost(w http.ResponseWriter, r *http.Request) {
 		_ = h.pipeline.Converse(r.Context(), user.ID, worklist.TurnRef{Item: id, Turn: msg.ID}, opt.Endpoint, opt.Model)
 	}
 	http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
+}
+
+// ThreadRetry handles POST /items/thread/retry, the thread view's Retry. It
+// re-dispatches the item's stalled turn under its existing key, as Review all does,
+// instead of starting a new turn and leaving the old one unanswered; then it
+// redirects back to the thread (Post/Redirect/Get). Form "turn" names the turn the
+// page offered to retry: if it is no longer the item's stalled turn (it was
+// answered, retried already, or the user has written since), nothing is
+// dispatched. Re-stamping and checking happen in one Store.Update, so a double
+// submit dispatches once; the in-flight gate and the store's one-answer rule cover a
+// run that is slow rather than lost.
+//
+// A review-panel request is retried as a blind review by a model other than the
+// item's first reviewer; any other turn as a Discuss turn by the chosen model.
+func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
+	user := h.sessions.CurrentUser(r)
+	if user == nil || !h.convEnabled {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	id := r.FormValue("id")
+	want := r.FormValue("turn")
+	back := "/items/thread?id=" + url.QueryEscape(id)
+	if id == "" || want == "" {
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	at := h.now().UTC()
+	choice := strings.TrimSpace(r.FormValue("choice"))
+	var (
+		turn        string
+		prev        time.Time // the turn's time before this attempt re-stamped it
+		independent bool
+		opt         ModelOption
+	)
+	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		turn = ""
+		for _, it := range current {
+			if it.ID != id {
+				continue
+			}
+			i, ok := it.RetryableTurn(at, reviewStaleAfter)
+			if !ok || it.TurnKey(i) != want {
+				// Answered, still plausibly in flight, hidden by the user, or the page is
+				// out of date: that is not a turn awaiting a retry.
+				return nil, nil
+			}
+			// Choose the model before re-stamping: never stamp a turn no run will answer.
+			var choices []ModelOption
+			choices, independent, ok = h.retryChoices(it, i)
+			if !ok {
+				return nil, nil // no model other than the first reviewer's
+			}
+			opt = pickOption(choices, choice)
+			prev = it.Thread[i].At
+			turn, _ = it.RetryStalled(at, reviewStaleAfter)
+			return []worklist.WorkItem{it}, nil
+		}
+		return nil, nil
+	})
+	if err != nil || turn == "" {
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	ref := worklist.TurnRef{Item: id, Turn: turn}
+	if independent {
+		err = h.pipeline.SecondOpinion(r.Context(), user.ID, ref, opt.Endpoint, opt.Model)
+	} else {
+		err = h.pipeline.Converse(r.Context(), user.ID, ref, opt.Endpoint, opt.Model)
+	}
+	if errors.Is(err, ingest.ErrNotAccepted) {
+		// The backend certainly holds no run for this attempt, so the turn is not in
+		// flight: put its time back, so the page offers Retry again at once, and say
+		// the attempt was refused. Any other error leaves it pending, since a run may
+		// exist. A later attempt or an answer that landed meanwhile is left alone.
+		//
+		// The refusal can be the request's own cancellation (the browser went away
+		// before the dispatch was sent), so the rollback must not use the request's
+		// context: it runs detached from it, under its own bound.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), undoRetryTimeout)
+		undone := false
+		err := h.store.Update(ctx, user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+			undone = false
+			for _, it := range current {
+				if it.ID == id && it.UndoRetry(turn, at, prev) {
+					undone = true
+					return []worklist.WorkItem{it}, nil
+				}
+			}
+			return nil, nil
+		})
+		cancel()
+		switch {
+		case err != nil:
+			// The turn stays pending until reviewStaleAfter, then offers Retry again.
+			slog.WarnContext(ctx, "retry refused, and restoring the turn failed", "user", user.ID, "item", id, "turn", turn, "err", err)
+		case undone:
+			back += "&retry=refused"
+		}
+	}
+	http.Redirect(w, r, back, http.StatusSeeOther)
+}
+
+// retryChoices returns the models a retry of item turn i may use, which the
+// thread view offers and ThreadRetry resolves the form's choice against. A
+// review-panel request is retried as a blind review (independent), by any
+// configured model other than the item's first reviewer; ok is false when no such
+// model exists, and Retry is then not offered. Any other turn may use every
+// configured model; with none configured the run uses its default.
+func (h *Handler) retryChoices(it worklist.WorkItem, i int) (choices []ModelOption, independent, ok bool) {
+	if !isSecondOpinionRequest(it.Thread[i]) {
+		return h.options, false, true
+	}
+	first := it.FirstReviewModel()
+	for _, o := range h.options {
+		if o.Model != first {
+			choices = append(choices, o)
+		}
+	}
+	return choices, true, len(choices) > 0
+}
+
+// pickOption returns the option in choices with the given value, else the first
+// (a missing or tampered value), else the zero option (the run's default).
+func pickOption(choices []ModelOption, value string) ModelOption {
+	for _, o := range choices {
+		if o.Value == value {
+			return o
+		}
+	}
+	if len(choices) > 0 {
+		return choices[0]
+	}
+	return ModelOption{}
 }
 
 // Refresh handles POST /items/refresh. It forces a re-ingest of the signed-in
@@ -585,12 +737,17 @@ const independentReviewPrompt = "Give an independent review of this PR. There ma
 // reviewStaleAfter is how long a pending user turn (a review awaiting its reply) is
 // treated as plausibly in-flight. Past it, the converse run has almost certainly
 // finished or failed (a rate-limited converse dies fast), so the thread stops
-// spinning and shows a retry hint, and "Review all PRs" re-dispatches the item —
-// making the button self-healing. It is a heuristic, not run-status tracking: a
-// genuinely slow run re-dispatched here may still reply, and the retry run then finds
-// the turn answered and does nothing (or, if both were already under way, the turn
-// gets two replies, which is harmless).
+// spinning and offers Retry (ThreadRetry), and "Review all PRs" re-dispatches the
+// item — making the button self-healing. Both retry the turn under its existing key.
+// It is a heuristic, not run-status tracking: a genuinely slow run re-dispatched here
+// may still reply, and the retry run then finds the turn answered and does nothing;
+// if both were already under way, the store keeps the first answer and drops the
+// other (worklist.AppendReply).
 const reviewStaleAfter = 5 * time.Minute
+
+// undoRetryTimeout bounds putting back a refused retry's turn (ThreadRetry), which
+// runs detached from the request so a browser that went away cannot stop it.
+const undoRetryTimeout = 10 * time.Second
 
 // pollSecs and idlePollSecs are how often the worklist asks whether a GitHub refresh
 // has ended (RefreshStatus): often while one runs, so its result lands quickly, and
@@ -632,15 +789,11 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 			if it.ReplyPending(at, reviewStaleAfter) {
 				continue // a reply is plausibly in flight
 			}
-			var turn string
-			if it.ReplyStalled(at, reviewStaleAfter) {
-				// The last request's run has finished or failed, so retry it — reusing the
-				// prompt (refresh its timestamp) rather than stacking a second one. This is
-				// what makes the button self-healing after a rate-limited batch.
-				i, _ := it.LastUserTurn()
-				it.Thread[i].At = at
-				turn = it.TurnKey(i)
-			} else {
+			// If the last request's run has finished or failed, retry it — reusing the
+			// prompt (refresh its timestamp) rather than stacking a second one. This is
+			// what makes the button self-healing after a rate-limited batch.
+			turn, retry := it.RetryStalled(at, reviewStaleAfter)
+			if !retry {
 				msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, At: at}
 				it.Thread = append(it.Thread, msg)
 				turn = msg.ID

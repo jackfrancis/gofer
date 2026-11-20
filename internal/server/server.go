@@ -130,6 +130,8 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// handlers check the session themselves.
 	mux.Handle("GET /items/thread", http.HandlerFunc(webHandler.Thread))
 	mux.Handle("POST /items/thread", http.HandlerFunc(webHandler.ThreadPost))
+	// Retry a stalled turn under its existing ID, rather than resending it as a new one.
+	mux.Handle("POST /items/thread/retry", http.HandlerFunc(webHandler.ThreadRetry))
 	// Hide/unhide one turn of a thread — declutter a long review and drop it from context.
 	mux.Handle("POST /items/thread/hide", http.HandlerFunc(webHandler.HideMessage))
 	mux.Handle("POST /items/hide", http.HandlerFunc(webHandler.HideItem))

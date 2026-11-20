@@ -33,15 +33,20 @@ type recordPipeline struct {
 	soModels          []string
 	soEndpoints       []string
 	turns             []worklist.TurnRef // every dispatched turn, in order
+	err               error              // what Converse and SecondOpinion return
+	onDispatch        func()             // when set, Converse and SecondOpinion call it first
 }
 
 func (p *recordPipeline) EnsureBackfill(context.Context, string) error { return nil }
 func (p *recordPipeline) Converse(_ context.Context, _ string, ref worklist.TurnRef, endpoint, model string) error {
+	if p.onDispatch != nil {
+		p.onDispatch()
+	}
 	p.converses = append(p.converses, ref.Item)
 	p.turns = append(p.turns, ref)
 	p.converseModels = append(p.converseModels, model)
 	p.converseEndpoints = append(p.converseEndpoints, endpoint)
-	return nil
+	return p.err
 }
 func (p *recordPipeline) ReviewAll(_ context.Context, _ string, refs []worklist.TurnRef, endpoint, model string) error {
 	for _, ref := range refs {
@@ -54,11 +59,14 @@ func (p *recordPipeline) ReviewAll(_ context.Context, _ string, refs []worklist.
 }
 func (p *recordPipeline) Refresh(context.Context, string) error { p.refreshed++; return nil }
 func (p *recordPipeline) SecondOpinion(_ context.Context, _ string, ref worklist.TurnRef, endpoint, model string) error {
+	if p.onDispatch != nil {
+		p.onDispatch()
+	}
 	p.secondOpinions = append(p.secondOpinions, ref.Item)
 	p.turns = append(p.turns, ref)
 	p.soModels = append(p.soModels, model)
 	p.soEndpoints = append(p.soEndpoints, endpoint)
-	return nil
+	return p.err
 }
 func (p *recordPipeline) SecondOpinionAll(_ context.Context, _ string, refs []worklist.TurnRef, endpoint, model string) error {
 	for _, ref := range refs {
@@ -76,11 +84,11 @@ func TestThreadStalledHint(t *testing.T) {
 	pr := worklist.WorkItem{ID: "github:o/r#1", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Number: 1, Repo: "o/r", Title: "A PR"}}
 	pr.Thread = []worklist.Message{{Role: worklist.RoleUser, Content: "Can you review this PR?"}}
 
-	if out := renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true, ReplyStalled: true}); !strings.Contains(out, "Resend to try again") {
-		t.Fatalf("expected the stalled retry hint, got:\n%s", out)
+	if out := renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true, ReplyStalled: true, StalledTurn: "pos:0"}); !strings.Contains(out, "hasn&rsquo;t responded") || !strings.Contains(out, `action="/items/thread/retry"`) {
+		t.Fatalf("expected the stalled notice with Retry, got:\n%s", out)
 	}
-	if out := renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true, ReplyStalled: false}); strings.Contains(out, "Resend to try again") {
-		t.Fatal("hint should be hidden when a reply is not stalled")
+	if out := renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true, ReplyStalled: false}); strings.Contains(out, "hasn&rsquo;t responded") || strings.Contains(out, "/items/thread/retry") {
+		t.Fatal("the notice and Retry should be hidden when a reply is not stalled")
 	}
 }
 

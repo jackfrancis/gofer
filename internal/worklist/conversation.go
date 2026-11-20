@@ -371,6 +371,50 @@ func (w WorkItem) ReplyStalled(now time.Time, staleAfter time.Duration) bool {
 	return now.Sub(w.Thread[i].At) >= staleAfter && !w.Answered(key) && !w.noticed()[key]
 }
 
+// RetryableTurn returns the position of the turn RetryStalled would retry: the
+// stalled most recent user turn (ReplyStalled), unless the user has hidden it. A
+// hidden turn is out of the model's context, and a retry would send it back as the
+// prompt, so it is not retried until the user unhides it.
+func (w WorkItem) RetryableTurn(now time.Time, staleAfter time.Duration) (int, bool) {
+	if !w.ReplyStalled(now, staleAfter) {
+		return 0, false
+	}
+	i, _ := w.LastUserTurn()
+	if w.Thread[i].Hidden {
+		return 0, false
+	}
+	return i, true
+}
+
+// RetryStalled prepares the RetryableTurn for a retry under its existing key: it
+// re-stamps the turn's time to now, so the turn is pending again and a second retry
+// within staleAfter finds nothing to do, and returns the key a dispatch must name.
+// It changes nothing and reports false when there is no such turn. The caller
+// persists the item in the same Store.Update that read it. A retry never adds a
+// turn, and the store keeps one answer per turn (AppendReply), so a first run that
+// answers late and its retry leave one reply.
+func (w *WorkItem) RetryStalled(now time.Time, staleAfter time.Duration) (string, bool) {
+	i, ok := w.RetryableTurn(now, staleAfter)
+	if !ok {
+		return "", false
+	}
+	w.Thread[i].At = now
+	return w.TurnKey(i), true
+}
+
+// UndoRetry reverses a RetryStalled stamped at, restoring the turn's earlier time
+// prev, when the dispatch it prepared certainly started no run. It changes nothing,
+// and reports false, unless the turn with key still carries exactly that attempt's
+// time and is still unanswered: a later retry, or an answer, wins.
+func (w *WorkItem) UndoRetry(key string, at, prev time.Time) bool {
+	i, ok := w.TurnIndex(key)
+	if !ok || w.Thread[i].Role != RoleUser || !w.Thread[i].At.Equal(at) || w.Answered(key) {
+		return false
+	}
+	w.Thread[i].At = prev
+	return true
+}
+
 // NeedsReview reports whether the pull request still needs a first review dispatched
 // now: it is on the radar (OnRadar), has no completed review, and none is currently
 // in flight (a stale pending request is treated as failed, so it is eligible again).
