@@ -41,6 +41,11 @@ spec:
         prometheus.io/path: /metrics
     spec:
       serviceAccountName: gofer
+      # The web tier calls no Kubernetes API, and its one cluster credential is the
+      # dispatch token projected below. Without this the pod would also carry the
+      # default ServiceAccount token, which the apiserver accepts for its own audience
+      # and which AEI admits for dispatch only while it still accepts legacy tokens.
+      automountServiceAccountToken: false
       # The server drains HTTP for up to 10s on SIGTERM, then checkpoints and closes
       # the database. 30s (the default, stated) leaves ample margin, and SQLite is
       # crash-safe if the pod is killed anyway.
@@ -77,6 +82,10 @@ spec:
             # read-only; this is the only writable path.
             - name: data
               mountPath: /var/lib/gofer
+            # Must match AEI_DISPATCH_TOKEN_PATH in gofer-config.
+            - name: aei-dispatch-token
+              mountPath: /var/run/secrets/aei
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /healthz
@@ -100,6 +109,19 @@ spec:
               memory: 64Mi
             limits:
               memory: 256Mi
+      volumes:
+        # gofer's dispatch identity: a ServiceAccount token minted for AEI's dispatch
+        # audience, which the aei-controller TokenReviews on its dispatch listener. A
+        # token for any other audience cannot dispatch, and this one is good only for
+        # dispatch. The kubelet rotates it in place and the app SDK re-reads it on
+        # every request.
+        - name: aei-dispatch-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: aei-dispatch
+                  expirationSeconds: 3600
   volumeClaimTemplates:
     # Creates the claim "data-gofer-0". No storageClassName, so the cluster default
     # is used (local-path on kind, the managed CSI disk on AKS). 1Gi is far more than

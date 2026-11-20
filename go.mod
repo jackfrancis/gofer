@@ -9,6 +9,7 @@ require (
 	github.com/prometheus/client_golang v1.24.0
 	github.com/yuin/goldmark v1.8.4
 	golang.org/x/oauth2 v0.36.0
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.62.0
 )
 

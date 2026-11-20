@@ -25,7 +25,7 @@ gofer's interfaces:
 
 | Concern | gofer (unchanged by the backend) | AEI backend |
 | --- | --- | --- |
-| Dispatch a run (`ingest.Dispatcher`) | constructs the `RunSpec` | `internal/runtime/aei` POSTs it to the aei-controller, authenticating with the web pod's ServiceAccount token |
+| Dispatch a run (`ingest.Dispatcher`) | constructs the `RunSpec` | `internal/runtime/aei` POSTs it to the aei-controller, authenticating with a ServiceAccount token projected into the web pod for AEI's `aei-dispatch` audience |
 | The agent WORKLOAD (`internal/agent`) | fetch GitHub, enrich, rank, converse | `cmd/runtime` runs it per run, out-of-process, in the runtime image |
 | Credential vend + write-back (`/agent/*`) | served by the web tier | the runtime calls them with its run credential |
 | Run-credential mint/verify (`internal/identity`) | verify-only (public key) | AEI's control plane is the sole minter |
@@ -151,6 +151,46 @@ by the cluster. It uses the kubeconfig's current context unless `KUBE_CONTEXT`
 names another, and refuses to run without an explicit target. `dev-up` runs the
 same apply step after its kind-specific setup. The other kubectl targets
 (`dev-forward`, `dev-logs`, `dev-down`) accept `KUBECONFIG=` the same way.
+
+#### Deploy permissions
+
+Before it applies anything, `deploy` (and `dev-up`) checks that AEI serves its
+dispatch listener: the `aei-controller` Service in `aei-system` must expose a port
+named `dispatch` on TCP 8081, the port in `AEI_DISPATCH_ENDPOINT`. gofer dispatches
+there with a ServiceAccount token projected for the `aei-dispatch` audience, which an
+AEI from before agent-execution-interface 34d0951 does not accept. So besides its rights in the
+`gofer` namespace and reading the `agentapps.agents.x-k8s.io` CRD, the identity that
+runs `deploy` needs `get` on that one Service:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gofer-deployer-aei-check
+  namespace: aei-system
+rules:
+  - apiGroups: [""]
+    resources: [services]
+    resourceNames: [aei-controller]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gofer-deployer-aei-check
+  namespace: aei-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gofer-deployer-aei-check
+subjects:
+  - kind: ServiceAccount # or the User/Group your CI deploys as
+    name: <deployer>
+    namespace: <its namespace>
+```
+
+Without it the check fails with the API server's `Forbidden` and names this
+permission; nothing is applied.
 
 ### Example: AKS, end to end
 
