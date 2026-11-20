@@ -1,10 +1,13 @@
--- Schema version 2: each owner's latest accepted ingest run (ingest.RunLedger), so
--- a restarted web tier still gates on a run the runtime may still be executing, and
--- the radar's refresh version keeps counting across restarts.
+-- Schema version 2: each owner's ingest gate state (ingest.RunLedger), so a
+-- restarted web tier still holds a run the runtime may still be executing, or one
+-- whose acceptance it never learned, and the radar's refresh version keeps counting
+-- across restarts.
 CREATE TABLE ingest_runs (
-    owner_id    TEXT    PRIMARY KEY,
-    run_id      TEXT    NOT NULL,          -- the runtime's id for the run
-    gen         INTEGER NOT NULL,          -- its generation: ingest runs accepted for the owner
-    done        INTEGER NOT NULL,          -- the highest generation known to have ended
-    accepted_at INTEGER NOT NULL           -- when the runtime accepted it (Unix nanoseconds)
+    owner_id TEXT    PRIMARY KEY,
+    gen      INTEGER NOT NULL,          -- the last generation handed to a reservation
+    done     INTEGER NOT NULL,          -- the highest generation known to have ended
+    run_gen  INTEGER NOT NULL,          -- the current run's generation; 0 if none
+    run_id   TEXT    NOT NULL,          -- its runtime id; '' while acceptance is unknown
+    run_at   INTEGER NOT NULL,          -- reserved, or accepted once it was (Unix nanoseconds)
+    pending  INTEGER NOT NULL           -- 1: whether the runtime accepted it is not known
 );

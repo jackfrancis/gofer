@@ -2,7 +2,6 @@ package ingest
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -36,7 +35,7 @@ func (d *gateDispatcher) Submit(_ context.Context, spec RunSpec) (string, error)
 	defer d.mu.Unlock()
 	if d.failNext {
 		d.failNext = false
-		return "", errors.New("backend unavailable")
+		return "", fmt.Errorf("backend unavailable: %w", ErrNotAccepted) // a definite refusal
 	}
 	d.specs = append(d.specs, spec)
 	return fmt.Sprintf("run-%d", len(d.specs)), nil

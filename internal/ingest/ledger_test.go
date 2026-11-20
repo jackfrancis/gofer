@@ -61,7 +61,7 @@ func TestLedgerKeepsARunningIngestAcrossRestart(t *testing.T) {
 	if ok, err := ig.ScheduledRefresh(ctx, "github:1"); !ok || err != nil {
 		t.Fatalf("first refresh: %v, %v", ok, err)
 	}
-	if rec := l.get("github:1"); rec.RunID != "run-1" || rec.Gen != 1 || rec.Done != 0 {
+	if rec := l.get("github:1"); rec.RunID != "run-1" || rec.RunGen != 1 || rec.Done != 0 || rec.Pending {
 		t.Fatalf("recorded %+v", rec)
 	}
 
@@ -88,7 +88,7 @@ func TestLedgerKeepsARunningIngestAcrossRestart(t *testing.T) {
 	if ok, _ := ig2.ScheduledRefresh(ctx, "github:1"); !ok {
 		t.Fatal("a refresh after the restored run ended must dispatch")
 	}
-	if rec := l.get("github:1"); rec.RunID != "run-2" || rec.Gen != 2 || rec.Done != 1 {
+	if rec := l.get("github:1"); rec.RunID != "run-2" || rec.RunGen != 2 || rec.Done != 1 {
 		t.Fatalf("recorded %+v, want run-2 at generation 2", rec)
 	}
 
@@ -103,13 +103,13 @@ func TestLedgerKeepsARunningIngestAcrossRestart(t *testing.T) {
 func TestLedgerStaleRunCountsAsEnded(t *testing.T) {
 	ctx := context.Background()
 	l := newMemLedger()
-	_ = l.PutIngestRun(ctx, "github:1", IngestRecord{RunID: "old", Gen: 4, Done: 3, AcceptedAt: time.Now().Add(-retryAfter - time.Minute)})
+	_ = l.PutIngestRun(ctx, "github:1", IngestRecord{Gen: 4, Done: 3, RunGen: 4, RunID: "old", RunAt: time.Now().Add(-retryAfter - time.Minute)})
 	d := &gateDispatcher{phase: "Running"}
 	ig := restart(t, d, l)
 	if done, active := ig.LocalRefreshState("github:1"); done != 4 || active {
 		t.Fatalf("stale run: done %d active %v, want 4, false", done, active)
 	}
-	if ok, _ := ig.ScheduledRefresh(ctx, "github:1"); !ok || l.get("github:1").Gen != 5 {
+	if ok, _ := ig.ScheduledRefresh(ctx, "github:1"); !ok || l.get("github:1").RunGen != 5 {
 		t.Fatalf("a refresh after a stale run must dispatch generation 5: %+v", l.get("github:1"))
 	}
 }
@@ -119,7 +119,7 @@ func TestLedgerStaleRunCountsAsEnded(t *testing.T) {
 func TestLedgerUnknownRunBlocksUntilItsDeadline(t *testing.T) {
 	ctx := context.Background()
 	l := newMemLedger()
-	_ = l.PutIngestRun(ctx, "github:1", IngestRecord{RunID: "gone", Gen: 1, AcceptedAt: time.Now()})
+	_ = l.PutIngestRun(ctx, "github:1", IngestRecord{Gen: 1, RunGen: 1, RunID: "gone", RunAt: time.Now()})
 	d := &errStatusDispatcher{}
 	ig := restart(t, d, l)
 	if ok, _ := ig.ScheduledRefresh(ctx, "github:1"); ok {
@@ -189,7 +189,7 @@ func (d *capacityDispatcher) Submit(_ context.Context, spec RunSpec) (string, er
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.left == 0 {
-		return "", errors.New("aei: overloaded")
+		return "", fmt.Errorf("aei: overloaded: %w", ErrNotAccepted)
 	}
 	d.left--
 	d.n++
@@ -221,5 +221,166 @@ func TestRefresherGivesDeferredOwnersTheNextTurn(t *testing.T) {
 	}
 	if lo != 4 || hi != 4 {
 		t.Fatalf("refreshes per owner %v over 6 passes with room for 2: an owner was starved", d.counts)
+	}
+}
+
+// lostDispatcher accepts each run but loses the answer: Submit fails without saying
+// the backend refused, as when the response never reaches gofer.
+type lostDispatcher struct {
+	gateDispatcher
+	lost bool
+}
+
+func (d *lostDispatcher) Submit(ctx context.Context, spec RunSpec) (string, error) {
+	id, err := d.gateDispatcher.Submit(ctx, spec)
+	if err == nil && d.lost {
+		return "", errors.New("aei: dispatch github-ingest (acceptance unknown): connection reset")
+	}
+	return id, err
+}
+
+// A dispatch whose answer was lost may have started a run, so the owner stays held
+// until the reservation's deadline: in this process and, from the ledger, after a
+// restart. Then it counts as ended, and the next refresh dispatches.
+func TestLostDispatchAnswerHoldsTheOwnerUntilItsDeadline(t *testing.T) {
+	ctx := context.Background()
+	d := &lostDispatcher{gateDispatcher: gateDispatcher{phase: "Running"}, lost: true}
+	l := newMemLedger()
+	ig := restart(t, d, l)
+	if ok, err := ig.ScheduledRefresh(ctx, "github:1"); ok || err == nil {
+		t.Fatalf("a lost answer: ok=%v err=%v, want the error", ok, err)
+	}
+	d.lost = false
+	if ok, _ := ig.ScheduledRefresh(ctx, "github:1"); ok {
+		t.Fatal("a second ingest started while the first may be running")
+	}
+	_ = ig.Refresh(ctx, "github:1")
+	_ = ig.EnsureBackfill(ctx, "github:1")
+	if d.count() != 1 {
+		t.Fatalf("the backend received %d runs, want 1", d.count())
+	}
+	if a, _ := ig.Active(ctx, "github:1"); !a {
+		t.Fatal("a run of unknown acceptance counts as in flight")
+	}
+	if rec := l.get("github:1"); !rec.Pending || rec.RunGen != 1 || rec.RunID != "" {
+		t.Fatalf("recorded %+v, want a pending reservation at generation 1", rec)
+	}
+
+	ig2 := restart(t, d, l)
+	if ok, _ := ig2.ScheduledRefresh(ctx, "github:1"); ok {
+		t.Fatal("after a restart, a second ingest started while the first may be running")
+	}
+	if done, active := ig2.LocalRefreshState("github:1"); done != 0 || !active {
+		t.Fatalf("restored: done %d active %v", done, active)
+	}
+
+	ig2.mu.Lock()
+	ig2.runs[ingestKey("github:1")].at = time.Now().Add(-retryAfter)
+	ig2.mu.Unlock()
+	if done, active := ig2.LocalRefreshState("github:1"); done != 1 || active {
+		t.Fatalf("past its deadline: done %d active %v, want 1, false", done, active)
+	}
+	if ok, _ := ig2.ScheduledRefresh(ctx, "github:1"); !ok {
+		t.Fatal("past the deadline the owner must be refreshed again")
+	}
+}
+
+// A definite refusal releases the reservation at once, and the record goes back to
+// what it was.
+func TestRefusedDispatchReleasesTheReservation(t *testing.T) {
+	ctx := context.Background()
+	d := &gateDispatcher{phase: "Succeeded", failNext: true} // a refusal (ErrNotAccepted)
+	l := newMemLedger()
+	ig := restart(t, d, l)
+	if ok, err := ig.ScheduledRefresh(ctx, "github:1"); ok || !errors.Is(err, ErrNotAccepted) {
+		t.Fatalf("refused: ok=%v err=%v", ok, err)
+	}
+	if rec := l.get("github:1"); rec.Pending || rec.RunGen != 0 {
+		t.Fatalf("after a refusal the record holds no run: %+v", rec)
+	}
+	if ok, _ := ig.ScheduledRefresh(ctx, "github:1"); !ok {
+		t.Fatal("after a refusal the next refresh dispatches")
+	}
+}
+
+// peekDispatcher reads the ledger when Submit is called.
+type peekDispatcher struct {
+	gateDispatcher
+	l    *memLedger
+	seen IngestRecord
+}
+
+func (d *peekDispatcher) Submit(ctx context.Context, spec RunSpec) (string, error) {
+	d.seen = d.l.get(spec.Subject)
+	return d.gateDispatcher.Submit(ctx, spec)
+}
+
+// failingLedger fails every write.
+type failingLedger struct{ memLedger }
+
+func (*failingLedger) PutIngestRun(context.Context, string, IngestRecord) error {
+	return errors.New("database is locked")
+}
+
+// The reservation is recorded before the backend sees the run; a reservation that
+// cannot be recorded is not dispatched.
+func TestReservationRecordedBeforeDispatch(t *testing.T) {
+	ctx := context.Background()
+	l := newMemLedger()
+	d := &peekDispatcher{gateDispatcher: gateDispatcher{phase: "Running"}, l: l}
+	ig := restart(t, d, l)
+	if ok, err := ig.ScheduledRefresh(ctx, "github:1"); !ok || err != nil {
+		t.Fatal(ok, err)
+	}
+	if !d.seen.Pending || d.seen.RunGen != 1 {
+		t.Fatalf("at dispatch the ledger held %+v, want the pending reservation", d.seen)
+	}
+
+	f := &failingLedger{memLedger: *newMemLedger()}
+	d2 := &gateDispatcher{phase: "Running"}
+	ig2 := restart(t, d2, f)
+	if ok, err := ig2.ScheduledRefresh(ctx, "github:1"); ok || err == nil || d2.count() != 0 {
+		t.Fatalf("unrecorded reservation: ok=%v err=%v runs=%d, want nothing dispatched", ok, err, d2.count())
+	}
+	if a, _ := ig2.Active(ctx, "github:1"); a {
+		t.Fatal("an unrecorded reservation must not hold the owner")
+	}
+}
+
+// A page that slept through a run and first polls after its deadline still learns
+// it ended: observing the expiry raises the version, and records it.
+func TestExpiryObservedByAPollRaisesTheVersion(t *testing.T) {
+	ctx := context.Background()
+	d := &gateDispatcher{phase: "Running"}
+	l := newMemLedger()
+	ig := restart(t, d, l)
+	_, _ = ig.ScheduledRefresh(ctx, "github:1")
+	d.set("Succeeded") // nobody asks before the deadline
+	ig.mu.Lock()
+	ig.runs[ingestKey("github:1")].at = time.Now().Add(-retryAfter)
+	ig.mu.Unlock()
+	if done, active, err := ig.RefreshState(ctx, "github:1"); done != 1 || active || err != nil {
+		t.Fatalf("poll after the deadline: done %d active %v err %v, want 1", done, active, err)
+	}
+	if rec := l.get("github:1"); rec.Done != 1 {
+		t.Fatalf("the expiry was not recorded: %+v", rec)
+	}
+}
+
+// failingRead fails to load.
+type failingRead struct{ memLedger }
+
+func (*failingRead) IngestRuns(context.Context) (map[string]IngestRecord, error) {
+	return nil, errors.New("database is locked")
+}
+
+// A ledger that cannot be read is an error, and is not attached.
+func TestUseLedgerReadFailure(t *testing.T) {
+	ig := New(&gateDispatcher{}, "", "", nil, "", "")
+	if err := ig.UseLedger(context.Background(), &failingRead{}); err == nil {
+		t.Fatal("want the read error")
+	}
+	if ig.ledger != nil {
+		t.Fatal("a ledger that could not be read must not be attached")
 	}
 }

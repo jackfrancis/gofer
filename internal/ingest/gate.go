@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -32,11 +33,15 @@ func ingestKey(ownerID string) runKey { return runKey{owner: ownerID, task: task
 // outcome is cached here, so the backend is probed once per run rather than once per
 // page render. Every field is read and written under Ingestor.mu.
 type run struct {
-	id        string
-	at        time.Time // when it was reserved, then when Submit succeeded
-	g         gate      // the policy the run was reserved under
-	pending   bool      // reserved; Submit has not returned yet
-	gen       uint64    // ingest only: the owner's refresh generation, set when the backend accepts it
+	id      string
+	at      time.Time // when it was reserved, then when Submit succeeded
+	g       gate      // the policy the run was reserved under
+	pending bool      // reserved; Submit has not returned yet
+	gen     uint64    // ingest only: the owner's refresh generation, taken when reserved
+	// uncertain (ingest only): Submit failed without saying the backend refused
+	// (ErrNotAccepted), so a run may exist that gofer cannot probe. It holds the key,
+	// and counts as in flight, until its deadline.
+	uncertain bool
 	failed    bool
 	succeeded bool
 	message   string
@@ -94,14 +99,17 @@ func (i *Ingestor) reserve(ctx context.Context, key runKey, g gate) (mine *run, 
 		i.mu.Lock()
 		cur := i.runs[key]
 		if cur == nil || !cur.live(now, g.probe) {
-			changed := cur != nil && i.markDoneLocked(key, cur) // failed, succeeded, or past its deadline
+			if cur != nil {
+				i.markDoneLocked(key, cur) // failed, succeeded, or past its deadline
+			}
 			mine = &run{at: now, g: g, pending: true, prev: cur}
+			if key.task == taskIngest {
+				i.gens[key.owner]++
+				mine.gen = i.gens[key.owner]
+			}
 			i.runs[key] = mine
 			i.pruneLocked(now)
 			i.mu.Unlock()
-			if changed {
-				i.persist(key.owner)
-			}
 			return mine, true
 		}
 		canProbe := g.probe && !probed && !cur.pending && cur.id != ""
@@ -118,8 +126,12 @@ func (i *Ingestor) reserve(ctx context.Context, key runKey, g gate) (mine *run, 
 }
 
 // settle records the outcome of Submit on the reservation mine, which is still the
-// key's current run (see reserve). On error the key goes back to the run mine
-// replaced, so the read model still knows how the previous run ended.
+// key's current run (see reserve). When the backend did not accept the run
+// (ErrNotAccepted) the key goes back to the run mine replaced, so the read model
+// still knows how the previous run ended. Any other error leaves acceptance unknown:
+// for ingest the reservation stays, uncertain, until its deadline, because a second
+// ingest started now could land out of order with one the backend did accept. A
+// converse turn is rolled back either way; the store keeps one answer per turn.
 func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -130,11 +142,11 @@ func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 		// window does too; until then it ran from the reservation.
 		mine.at = time.Now()
 		mine.prev = nil // never rolled back now
-		if key.task == taskIngest {
-			i.gens[key.owner]++
-			mine.gen = i.gens[key.owner]
-			i.accepted[key.owner] = acceptedRun{id: id, at: mine.at}
-		}
+		return
+	}
+	if key.task == taskIngest && !errors.Is(err, ErrNotAccepted) {
+		mine.uncertain = true // its deadline runs from the reservation
+		mine.prev = nil
 		return
 	}
 	p := mine.prev

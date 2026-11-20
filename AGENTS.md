@@ -306,13 +306,24 @@ Wired on the web-tier side; they define what a runtime must respect:
   ended between polls, or one that ended while the next was already running. A
   failed status read counts as still in flight until the run's deadline. The script
   never reloads while a `<details>` menu is open or a form control has focus.
-- With persistent storage, each owner's latest accepted ingest run (run id,
-  generation, version, accept time) is kept in `ingest_runs` (`ingest.RunLedger`,
-  implemented by `storage.WorklistStore`, loaded by `Ingestor.UseLedger` at
-  startup). Runs outlive a web-pod restart, so the new process restores a run
-  still within its deadline into the gate (no second ingest while it writes) and
-  keeps counting the version an open tab compares. A restored id AEI no longer
-  knows reads as a failed status read, which blocks only until the deadline.
+- With persistent storage, each owner's ingest gate state (generation counter,
+  refresh version, and the current run's generation, id, time and whether its
+  acceptance is known) is kept in `ingest_runs` (`ingest.RunLedger`, implemented by
+  `storage.WorklistStore`, loaded by `Ingestor.UseLedger`; `server.New` fails, and
+  the pod exits, if it cannot be read). A reservation is recorded BEFORE Submit, and
+  not dispatched if it cannot be. Runs outlive a web-pod restart, so the new process
+  restores a run within its deadline into the gate and keeps counting the version an
+  open tab compares. A run past its deadline counts as ended when anything observes
+  it (a poll, a render, a reservation), which raises the version.
+- `Dispatcher.Submit` errors say whether a run might exist: one wrapping
+  `ingest.ErrNotAccepted` is a definite refusal (the AEI backend: any answer but
+  202, no connection, or never sent; it watches its own transport, since the app SDK
+  types only 429), and releases the reservation. Any other error (an answer lost
+  after the request went out) leaves the ingest reservation held, unprobeable,
+  until its deadline. A converse turn is rolled back either way.
+- Without script, the radar's `<noscript>` refresh goes to `/?refresh=1`, whose
+  render asks AEI (within 5s) instead of reading local state, so it stops once the
+  run has ended.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

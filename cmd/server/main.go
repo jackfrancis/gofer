@@ -99,7 +99,12 @@ func main() {
 	}
 	var dispatcher ingest.Dispatcher = runtimeBackend
 
-	handler, cleanup := server.New(cfg, log, dispatcher, vlt, store, sessionStore)
+	handler, cleanup, err := server.New(cfg, log, dispatcher, vlt, store, sessionStore)
+	if err != nil {
+		log.Error("web tier startup failed", "err", err)
+		closeStorage()
+		os.Exit(1)
+	}
 	defer cleanup()
 
 	srv := &http.Server{

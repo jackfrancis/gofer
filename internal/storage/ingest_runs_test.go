@@ -18,16 +18,16 @@ func TestIngestRunsPersist(t *testing.T) {
 		t.Fatalf("empty: %v, %v", got, err)
 	}
 	at := time.Date(2026, 11, 20, 12, 0, 0, 123, time.UTC)
-	if err := s.PutIngestRun(ctx, "github:1", ingest.IngestRecord{RunID: "run-1", Gen: 1, AcceptedAt: at}); err != nil {
+	if err := s.PutIngestRun(ctx, "github:1", ingest.IngestRecord{Gen: 1, RunGen: 1, Pending: true, RunAt: at}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PutIngestRun(ctx, "github:1", ingest.IngestRecord{RunID: "run-2", Gen: 2, Done: 1, AcceptedAt: at.Add(time.Minute)}); err != nil {
+	if err := s.PutIngestRun(ctx, "github:1", ingest.IngestRecord{Gen: 2, Done: 1, RunGen: 2, RunID: "run-2", RunAt: at.Add(time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PutIngestRun(ctx, "github:2", ingest.IngestRecord{RunID: "run-a", Gen: 7, Done: 7, AcceptedAt: at}); err != nil {
+	if err := s.PutIngestRun(ctx, "github:2", ingest.IngestRecord{Gen: 7, Done: 7}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PutIngestRun(ctx, "", ingest.IngestRecord{RunID: "x", Gen: 1}); err == nil {
+	if err := s.PutIngestRun(ctx, "", ingest.IngestRecord{Gen: 1}); err == nil {
 		t.Fatal("an empty owner must be refused")
 	}
 	if err := db.Close(); err != nil {
@@ -39,15 +39,15 @@ func TestIngestRunsPersist(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]ingest.IngestRecord{
-		"github:1": {RunID: "run-2", Gen: 2, Done: 1, AcceptedAt: at.Add(time.Minute)},
-		"github:2": {RunID: "run-a", Gen: 7, Done: 7, AcceptedAt: at},
+		"github:1": {Gen: 2, Done: 1, RunGen: 2, RunID: "run-2", RunAt: at.Add(time.Minute)},
+		"github:2": {Gen: 7, Done: 7},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %+v", got)
 	}
 	for o, w := range want {
 		g := got[o]
-		if g.RunID != w.RunID || g.Gen != w.Gen || g.Done != w.Done || !g.AcceptedAt.Equal(w.AcceptedAt) {
+		if g.Gen != w.Gen || g.Done != w.Done || g.RunGen != w.RunGen || g.RunID != w.RunID || g.Pending != w.Pending || !g.RunAt.Equal(w.RunAt) {
 			t.Fatalf("%s: got %+v, want %+v", o, g, w)
 		}
 	}

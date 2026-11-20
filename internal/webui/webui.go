@@ -261,6 +261,7 @@ type pageData struct {
 	RefreshDone              uint64             // worklist: the refresh version read before the items were (every run up to it had ended)
 	Refreshing               bool               // worklist: a refresh was in flight before the items were read
 	PollSecs, IdlePollSecs   int                // worklist: how often reload.js polls while a refresh runs, and while none does
+	FallbackURL              string             // worklist, no script: where the <noscript> refresh goes while a refresh runs (refreshCheck)
 	ReplyStalled             bool               // a pending reply has not arrived within reviewStaleAfter (thread view)
 	Message                  string             // failure detail rendered on the error view
 	Failure                  string             // a failed user action, rendered on the error view in place of the discovery wording
@@ -817,7 +818,15 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		refreshing, watch bool
 	)
 	if p, ok := h.pipeline.(RefreshProber); ok {
-		done, refreshing = p.LocalRefreshState(user.ID)
+		if r.URL.Query().Get(refreshCheck) != "" {
+			// The no-script fallback's reload: there is no status poll to find out
+			// the run ended, so ask the backend here, bounded like the poll.
+			ctx, cancel := context.WithTimeout(r.Context(), statusTimeout)
+			done, refreshing, _ = p.RefreshState(ctx, user.ID)
+			cancel()
+		} else {
+			done, refreshing = p.LocalRefreshState(user.ID)
+		}
 		watch = true
 	}
 	res, err := worklist.Resolve(r.Context(), h.store, h.pipeline, h.now(), user.ID, worklist.DefaultSort, true)
@@ -897,10 +906,18 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		if watch {
 			data.WatchRefresh, data.RefreshDone, data.Refreshing = true, done, refreshing
 			data.PollSecs, data.IdlePollSecs = pollSecs, idlePollSecs
+			q := r.URL.Query()
+			q.Set(refreshCheck, "1")
+			data.FallbackURL = "/?" + q.Encode()
 		}
 		return data, http.StatusOK
 	}
 }
+
+// refreshCheck is the query parameter of the no-script fallback's reload: that render
+// asks the backend whether the refresh ended (within statusTimeout) instead of using
+// only local state, so the fallback stops once the run has ended.
+const refreshCheck = "refresh"
 
 // statusTimeout bounds RefreshStatus's read of the run's status from the backend. A
 // read that does not finish in time counts as still in flight, so the page polls

@@ -27,9 +27,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackfrancis/agent-execution-interface/sdks/go/aeiapp"
@@ -107,7 +111,11 @@ func New(cfg Config) (*Dispatcher, error) {
 	if client == nil {
 		client = &http.Client{Timeout: dispatchTimeout}
 	}
-	opts := []aeiapp.Option{aeiapp.WithHTTPClient(client)}
+	// Watch each dispatch's exchange (see observingTransport) on a copy, so a caller's
+	// client is never changed.
+	watched := *client
+	watched.Transport = observingTransport{base: client.Transport}
+	opts := []aeiapp.Option{aeiapp.WithHTTPClient(&watched)}
 	tokenSource := "default ServiceAccount token"
 	switch tokenPath := resolveTokenPath(cfg.TokenPath); {
 	case cfg.Token != "":
@@ -153,13 +161,23 @@ func checkTokenFile(path string) error {
 // Submit dispatches spec to the control plane and returns the run id. Dispatch is
 // non-blocking: the run outlives the request that triggered it, and its results land
 // in gofer's own store when the runtime writes them back through the agent plane.
+//
+// A failure wraps ingest.ErrNotAccepted only when the control plane certainly holds
+// no run: it answered with anything but 202 Accepted (an overload's 429 included), or
+// the request never reached it (no connection, or it was never sent). A failure after
+// the request was sent and before an answer was read, or a 202 whose run id could
+// not be read, leaves acceptance unknown.
 func (d *Dispatcher) Submit(ctx context.Context, spec ingest.RunSpec) (string, error) {
 	if spec.TaskRef == "" {
-		return "", errors.New("aei: run spec has no task ref")
+		return "", fmt.Errorf("aei: run spec has no task ref: %w", ingest.ErrNotAccepted)
 	}
-	runID, err := d.client.Dispatch(ctx, toAppSpec(spec))
+	ex := &exchange{}
+	runID, err := d.client.Dispatch(context.WithValue(ctx, exchangeKey{}, ex), toAppSpec(spec))
 	if err != nil {
-		return "", fmt.Errorf("aei: dispatch %s: %w", spec.TaskRef, err)
+		if ex.refused() {
+			return "", fmt.Errorf("aei: dispatch %s: %w: %w", spec.TaskRef, ingest.ErrNotAccepted, err)
+		}
+		return "", fmt.Errorf("aei: dispatch %s (acceptance unknown): %w", spec.TaskRef, err)
 	}
 	d.log.Info("aei: run dispatched", "run", runID, "task", spec.TaskRef, "app", d.app)
 	return runID, nil
@@ -176,6 +194,60 @@ func (d *Dispatcher) Status(ctx context.Context, runID string) (ingest.RunStatus
 		return ingest.RunStatus{}, fmt.Errorf("aei: read run %s: %w", runID, err)
 	}
 	return ingest.RunStatus{Phase: res.Phase, Message: res.Message}, nil
+}
+
+// exchange is what observingTransport saw of one dispatch request.
+type exchange struct {
+	mu        sync.Mutex
+	attempted bool // the request reached the transport
+	status    int  // the response status, when one arrived
+	noConn    bool // the transport failed before a connection existed
+}
+
+// refused reports whether the control plane certainly did not accept the run: it
+// answered other than 202, or the request never reached it.
+func (e *exchange) refused() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	switch {
+	case !e.attempted, e.noConn:
+		return true
+	case e.status != 0:
+		return e.status != http.StatusAccepted
+	}
+	return false
+}
+
+type exchangeKey struct{}
+
+// observingTransport records, for a request whose context carries an *exchange,
+// whether it was attempted, whether a connection was ever made, and the response
+// status. The app SDK reports a refusal other than 429 only as text, so this is how
+// the backend tells a refusal from a lost answer without parsing errors.
+type observingTransport struct{ base http.RoundTripper }
+
+func (t observingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	ex, _ := req.Context().Value(exchangeKey{}).(*exchange)
+	if ex == nil {
+		return base.RoundTrip(req)
+	}
+	var connected atomic.Bool
+	trace := &httptrace.ClientTrace{GotConn: func(httptrace.GotConnInfo) { connected.Store(true) }}
+	resp, err := base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
+	ex.mu.Lock()
+	ex.attempted = true
+	if resp != nil {
+		ex.status = resp.StatusCode
+	} else if err != nil && !connected.Load() {
+		var op *net.OpError
+		ex.noConn = errors.As(err, &op) && op.Op == "dial"
+	}
+	ex.mu.Unlock()
+	return resp, err
 }
 
 // toAppSpec translates gofer's run intent into the app SDK's dispatch spec. The

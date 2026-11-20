@@ -7,6 +7,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -30,8 +31,11 @@ import (
 // web tier speaks only gofer's neutral dispatch seam. The vault holds delegated
 // provider tokens the auth handler writes at login. sessionStore holds authenticated
 // sessions; nil keeps them in memory. The returned cleanup stops the scheduled refresh
-// (REFRESH_INTERVAL), if it runs; call it before closing the store.
-func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt vault.Vault, store worklist.Store, sessionStore session.Store) (http.Handler, func()) {
+// (REFRESH_INTERVAL), if it runs; call it before closing the store. It fails when the
+// store keeps ingest runs (ingest.RunLedger) and they cannot be read: serving with an
+// empty gate could start a second ingest while one is still writing, so the caller
+// should exit and let the pod restart.
+func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt vault.Vault, store worklist.Store, sessionStore session.Store) (http.Handler, func(), error) {
 	sessions := session.NewManager(cfg.SessionSecret, cfg.CookieSecure, session.WithStore(sessionStore),
 		session.WithAllow(func(u *session.User) bool { return cfg.SignInAllowed(u.Provider, u.Login) }))
 	authH := auth.NewHandler(cfg, sessions, vlt)
@@ -63,7 +67,7 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// radar's refresh version keeps counting (ingest.RunLedger).
 	if ledger, ok := store.(ingest.RunLedger); ok {
 		if err := ingestor.UseLedger(context.Background(), ledger); err != nil {
-			log.Warn("could not load the last ingest runs; a run still executing may be started again", "err", err)
+			return nil, nil, fmt.Errorf("load the last ingest runs: %w", err)
 		}
 	}
 	// The thread's model picker spans every configured connection's models (default
@@ -222,7 +226,7 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 		log.Info("scheduled refresh disabled (set REFRESH_INTERVAL to turn it on)")
 	}
 
-	return h, stopRefresh
+	return h, stopRefresh, nil
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

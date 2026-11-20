@@ -10,10 +10,10 @@ import (
 
 var _ ingest.RunLedger = (*WorklistStore)(nil)
 
-// IngestRuns returns every owner's latest accepted ingest run (ingest.RunLedger).
+// IngestRuns returns every owner's ingest record (ingest.RunLedger).
 func (s *WorklistStore) IngestRuns(ctx context.Context) (map[string]ingest.IngestRecord, error) {
 	rows, err := s.db.sql.QueryContext(ctx,
-		`SELECT owner_id, run_id, gen, done, accepted_at FROM ingest_runs`)
+		`SELECT owner_id, gen, done, run_gen, run_id, run_at, pending FROM ingest_runs`)
 	if err != nil {
 		return nil, fmt.Errorf("storage: list ingest runs: %w", err)
 	}
@@ -21,13 +21,17 @@ func (s *WorklistStore) IngestRuns(ctx context.Context) (map[string]ingest.Inges
 	out := map[string]ingest.IngestRecord{}
 	for rows.Next() {
 		var (
-			owner, runID  string
-			gen, done, at int64
+			owner, runID                   string
+			gen, done, runGen, runAt, pend int64
 		)
-		if err := rows.Scan(&owner, &runID, &gen, &done, &at); err != nil {
+		if err := rows.Scan(&owner, &gen, &done, &runGen, &runID, &runAt, &pend); err != nil {
 			return nil, fmt.Errorf("storage: list ingest runs: %w", err)
 		}
-		out[owner] = ingest.IngestRecord{RunID: runID, Gen: uint64(gen), Done: uint64(done), AcceptedAt: time.Unix(0, at)}
+		rec := ingest.IngestRecord{Gen: uint64(gen), Done: uint64(done), RunGen: uint64(runGen), RunID: runID, Pending: pend != 0}
+		if runAt != 0 {
+			rec.RunAt = time.Unix(0, runAt)
+		}
+		out[owner] = rec
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("storage: list ingest runs: %w", err)
@@ -35,17 +39,24 @@ func (s *WorklistStore) IngestRuns(ctx context.Context) (map[string]ingest.Inges
 	return out, nil
 }
 
-// PutIngestRun records ownerID's latest accepted ingest run, replacing the previous
-// record (ingest.RunLedger).
+// PutIngestRun replaces ownerID's ingest record (ingest.RunLedger).
 func (s *WorklistStore) PutIngestRun(ctx context.Context, ownerID string, rec ingest.IngestRecord) error {
 	if ownerID == "" {
 		return fmt.Errorf("storage: ingest run: owner is required")
 	}
+	var runAt, pend int64
+	if !rec.RunAt.IsZero() {
+		runAt = rec.RunAt.UnixNano()
+	}
+	if rec.Pending {
+		pend = 1
+	}
 	_, err := s.db.sql.ExecContext(ctx, `
-		INSERT INTO ingest_runs (owner_id, run_id, gen, done, accepted_at) VALUES (?, ?, ?, ?, ?)
+		INSERT INTO ingest_runs (owner_id, gen, done, run_gen, run_id, run_at, pending) VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (owner_id) DO UPDATE SET
-			run_id = excluded.run_id, gen = excluded.gen, done = excluded.done, accepted_at = excluded.accepted_at`,
-		ownerID, rec.RunID, int64(rec.Gen), int64(rec.Done), rec.AcceptedAt.UnixNano())
+			gen = excluded.gen, done = excluded.done, run_gen = excluded.run_gen,
+			run_id = excluded.run_id, run_at = excluded.run_at, pending = excluded.pending`,
+		ownerID, int64(rec.Gen), int64(rec.Done), int64(rec.RunGen), rec.RunID, runAt, pend)
 	if err != nil {
 		return fmt.Errorf("storage: record ingest run: %w", err)
 	}

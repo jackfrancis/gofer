@@ -179,7 +179,7 @@ func TestWorklistDuringARefresh(t *testing.T) {
 	w := x.watcherOf(out)
 	if w.active != "1" || !strings.Contains(out, "Old PR") ||
 		!strings.Contains(out, `<span data-refreshing role="status"> · refreshing from GitHub…</span>`) ||
-		!strings.Contains(out, `<noscript><meta http-equiv="refresh" content="3"></noscript>`) {
+		!strings.Contains(out, `<noscript><meta http-equiv="refresh" content="3; url=/?refresh=1"></noscript>`) {
 		t.Fatalf("during a refresh the radar stays visible and says so, got:\n%s", out)
 	}
 	if s := x.poll(w); s.Reload || !s.Active {
@@ -435,5 +435,38 @@ func TestOpenTabAcrossRestart(t *testing.T) {
 	}
 	if !strings.Contains(x.page(), "New PR") {
 		t.Fatal("the reload shows the new work")
+	}
+}
+
+// Without script, the page's refresh goes to /?refresh=1, which asks the backend
+// whether the run ended, so the fallback stops once it has: the plain render, which
+// reads only local state, would keep refreshing until the deadline.
+func TestNoScriptFallbackStopsWhenTheRunEnds(t *testing.T) {
+	ctx := context.Background()
+	mem := worklist.NewMemoryStore()
+	mem.Seed(owner, pr(1, "Old PR"))
+	x := newHarness(t, mem)
+	x.d.set("Running")
+	if err := x.ig.Refresh(ctx, owner); err != nil {
+		t.Fatal(err)
+	}
+	get := func(target string) string {
+		rec := httptest.NewRecorder()
+		x.h.Index(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		return rec.Body.String()
+	}
+	if out := get("/?hidden=pr9"); !strings.Contains(out, `content="3; url=/?hidden=pr9&amp;refresh=1"`) {
+		t.Fatalf("the fallback keeps the page's query and adds the check, got:\n%s", out)
+	}
+	if err := mem.Upsert(ctx, owner, pr(2, "New PR")); err != nil {
+		t.Fatal(err)
+	}
+	x.d.set("Succeeded")
+	if out := get("/"); !strings.Contains(out, "http-equiv") {
+		t.Fatal("(the plain render still thinks the run is going: it asks no one)")
+	}
+	out := get("/?refresh=1")
+	if strings.Contains(out, "http-equiv") || x.watcherOf(out).active != "0" || !strings.Contains(out, "New PR") {
+		t.Fatalf("the fallback's check render must see the run ended and stop, got:\n%s", out)
 	}
 }

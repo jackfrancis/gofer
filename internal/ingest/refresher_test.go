@@ -314,8 +314,8 @@ func (d *errStatusDispatcher) Status(context.Context, string) (RunStatus, error)
 	return RunStatus{}, errors.New("status unavailable")
 }
 
-// The refresh version counts ingest runs that ended, whoever started them; not a
-// run still going, a submission that failed, or a request the gate collapsed.
+// The refresh version follows ingest runs that ended, whoever started them; not a
+// run still going, a submission the backend refused, or a request the gate collapsed.
 func TestRefreshVersionCountsEndedIngestRuns(t *testing.T) {
 	ctx := context.Background()
 	d := &gateDispatcher{phase: "Running"}
@@ -351,8 +351,8 @@ func TestRefreshVersionCountsEndedIngestRuns(t *testing.T) {
 	}
 	_, _ = ig.ScheduledRefresh(ctx, "github:1")
 	d.set("Failed")
-	if done, _ := state(); done != 2 {
-		t.Fatalf("a failed run also ended: done %d, want 2", done)
+	if done, _ := state(); done != 3 {
+		t.Fatalf("a failed run also ended: done %d, want 3 (the refused reservation's generation 2 is never reused)", done)
 	}
 	if done, _, _ := ig.RefreshState(ctx, "github:2"); done != 0 {
 		t.Fatalf("another owner's version: %d", done)
