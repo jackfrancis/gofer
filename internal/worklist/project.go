@@ -86,7 +86,15 @@ var projectables = []projectable{
 		func(w *WorkItem) {
 			if r := clonePtr(w.Signals.Research); r != nil {
 				r.Rationale = cutString(r.Rationale)
-				r.Turns = cutStrings(r.Turns)
+				if len(r.Turns) > projectedList {
+					// A partial list of the turns the rationale read would let the
+					// visibility check pass without seeing them all (a hidden turn past
+					// the cut). With no list the research is unverifiable, so
+					// ResearchReflectsVisibleThread withholds it.
+					r.Turns = nil
+				} else {
+					r.Turns = cutStrings(r.Turns)
+				}
 				w.Signals.Research = r
 			}
 		}},

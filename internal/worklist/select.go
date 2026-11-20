@@ -79,9 +79,11 @@ func Select(items []WorkItem, sel Selection, now time.Time) (page []WorkItem, ne
 		if sel.Open && !it.Meta.CompletedAt.IsZero() {
 			continue
 		}
-		out = append(out, Project(it)) // the read cursors stay: they are not bodies
+		out = append(out, it)
 	}
 	if sel.Top > 0 {
+		// Rank by the whole item: projection would shorten the signals the score reads
+		// (a label past the cut), so it runs only on what is selected.
 		rank := make(map[string]float64, len(out))
 		for _, it := range out {
 			it.Signals.Proposed = nil // it is a copy
@@ -95,11 +97,12 @@ func Select(items []WorkItem, sel Selection, now time.Time) (page []WorkItem, ne
 		if offset < 0 || offset > len(out) {
 			offset = len(out)
 		}
-		n := fitBytes(out[offset:], MaxSelectBytes)
-		if offset+n < len(out) {
+		out = projectAll(out[offset:])
+		n := fitBytes(out, MaxSelectBytes)
+		if n < len(out) {
 			next = strconv.Itoa(offset + n)
 		}
-		return out[offset : offset+n], next
+		return out[:n], next
 	}
 	slices.SortFunc(out, func(a, b WorkItem) int { return cmp.Compare(a.ID, b.ID) })
 	i, _ := slices.BinarySearchFunc(out, sel.After, func(it WorkItem, id string) int { return cmp.Compare(it.ID, id) })
@@ -107,11 +110,22 @@ func Select(items []WorkItem, sel Selection, now time.Time) (page []WorkItem, ne
 		i++
 	}
 	out = out[i:]
-	n := fitBytes(out[:min(len(out), sel.Limit)], MaxSelectBytes)
+	page = projectAll(out[:min(len(out), sel.Limit)])
+	n := fitBytes(page, MaxSelectBytes)
 	if n < len(out) {
-		next = out[n-1].ID
+		next = page[n-1].ID
 	}
-	return out[:n], next
+	return page[:n], next
+}
+
+// projectAll returns a copy of items, each projected (Project): without its thread
+// and cut to MaxBriefBytes. The read cursors stay: they are not bodies.
+func projectAll(items []WorkItem) []WorkItem {
+	out := make([]WorkItem, len(items))
+	for i, it := range items {
+		out[i] = Project(it)
+	}
+	return out
 }
 
 // fitBytes returns how many of items, from the start, fit in budget bytes of JSON —
@@ -181,6 +195,11 @@ func ApplyBriefQuery(items []WorkItem, q BriefQuery) []WorkItem {
 	return out
 }
 
+// LatestUserTurn is the turn an item read (ReadItem, ThreadWindow) is given to name
+// the stored thread's newest user turn. It is never a turn's key: those are
+// generated IDs or "pos:N".
+const LatestUserTurn = "@latest-user"
+
 // ReadItem returns the owner's item with id and a window of its thread
 // (ThreadWindow) that keeps the turn named by turn, at most MaxItemBytes encoded. ok
 // is false if the owner has no such item: another owner's item is never found.
@@ -205,8 +224,12 @@ func ReadItem(ctx context.Context, store Store, ownerID, id, turn string) (WorkI
 // as many of the visible turns as fit, newest first; turns after it are left out
 // (none of them answers it, and the model sees only what precedes it).
 //
-// Without such a turn (research, or a run that names none), the window is the
-// newest turns that fit, oldest first.
+// LatestUserTurn names the stored thread's newest user turn (a Discuss run
+// dispatched without a turn answers it), resolved here against the whole thread,
+// so the window is built for it as for a named turn. A window of the newest turns
+// could hold only later replies and lose the question.
+//
+// Without a turn (research), the window is the newest turns that fit, oldest first.
 //
 // A turn the window must keep that does not fit is cut (truncateMessage), with a
 // note saying so.
@@ -226,6 +249,12 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 	}
 	keyed := item
 	keyed.Thread = th
+	if turn == LatestUserTurn {
+		turn = ""
+		if i, ok := keyed.LastUserTurn(); ok {
+			turn = th[i].ID
+		}
+	}
 	var window []Message
 	if anchor, ok := keyed.TurnIndex(turn); turn != "" && ok && th[anchor].Role == RoleUser {
 		if reply, answered := keyed.replies()[th[anchor].ID]; answered {

@@ -188,14 +188,17 @@ Wired on the web-tier side; they define what a runtime must respect:
   `Item` (`GET /agent/worklist/item`, `worklist.ReadItem`: one owner-scoped item, at
   most `MaxItemBytes` encoded, whose `ThreadWindow` is the dispatched turn and the
   visible history before it, or the turn and its reply if the store shows it
-  answered, or the newest turns when no turn is named; position keys are written into
-  legacy turns) and `Select` (`GET /agent/worklist/select`, `worklist.SelectFrom`: no
+  answered; a Discuss run without a turn asks for `worklist.LatestUserTurn`, which
+  the read resolves against the stored thread; research, naming none, gets the newest
+  turns; position keys are written into legacy turns) and `Select` (`GET /agent/worklist/select`, `worklist.SelectFrom`: no
   threads, at most `MaxSelectLimit` items and `MaxSelectBytes`, with a cursor).
   Stored data past the bounds still reads: an oversized message is cut with a note,
   and an item over `MaxBriefBytes` is projected (`worklist.Project`), which marks
   each cut field (`WorkItem.Projected`) so `MergeRunItems` restores it on write-back
-  unless the run rewrote it. Never store a projection. Ranking reads the top N by
-  baseline score (ties keep insertion order); ingest and enrichment page through
+  unless the run rewrote it. Never store a projection. Projection drops a research
+  adjustment's source-turn list rather than shorten it, so the visibility check
+  withholds research it cannot check whole. Ranking reads the top N by baseline score
+  of the whole item, projected only after it is chosen (ties keep insertion order); ingest and enrichment page through
   every item with `readAll`, and ingest fails if it cannot read the stored items.
   Enrichment must keep reaching every open item; never cap it. The stores serve these
   reads directly (`Store.Get`, `Store.Briefs`), so a page never decodes every thread.

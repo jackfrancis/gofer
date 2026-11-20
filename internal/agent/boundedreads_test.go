@@ -618,3 +618,37 @@ func TestOversizedStoredDataStaysReadable(t *testing.T) {
 		t.Fatal("the delayed turn was not answered")
 	}
 }
+
+// A Discuss run dispatched without a turn answers the newest user turn, even when a
+// large question (stored before the form limit) is followed by an out-of-order reply
+// to an older one: the read keeps the question, so the run answers it instead of
+// finding no turn and reporting success.
+func TestTurnlessDiscussAnswersTheLatestQuestion(t *testing.T) {
+	plane := newBoundedPlane(t)
+	ctx := context.Background()
+	question := strings.Repeat("w", worklist.MaxItemBytes)
+	if err := plane.store.Upsert(ctx, "u1", worklist.WorkItem{ID: "github:o/r#1", Source: "github",
+		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1},
+		Thread: []worklist.Message{
+			{ID: "q1", Role: worklist.RoleUser, Content: "first question"},
+			{ID: "q2", Role: worklist.RoleUser, Content: question},
+			{ID: "r1", Role: worklist.RoleAgent, Content: "late answer to q1", ReplyTo: "q1"},
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	fc := &fakeConverser{reply: "answer to q2"}
+	sink := plane.client("u1")
+	if err := Run(ctx, Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Converser: fc}, sink, sink); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(fc.gotUser, "www") {
+		t.Fatalf("the converser was asked %.20q, want the newest question", fc.gotUser)
+	}
+	it, _, err := plane.store.Get(ctx, "u1", "github:o/r#1")
+	if err != nil || !it.Answered("q2") {
+		t.Fatalf("q2 was not answered (err %v)", err)
+	}
+	if key, n := plane.largestRead(); n > worklist.MaxItemBytes+(64<<10) {
+		t.Fatalf("largest read %d bytes (%s)", n, key)
+	}
+}

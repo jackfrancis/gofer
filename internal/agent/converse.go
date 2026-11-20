@@ -23,8 +23,13 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		return fmt.Errorf("agent: github-converse requires an item id")
 	}
 	// Read just the dispatched item, with a bounded window of its thread, not the
-	// worklist.
-	item, ok, err := sink.Item(ctx, p.ItemID, p.Turn)
+	// worklist. A run dispatched without a turn answers the newest user turn, which
+	// the read resolves against the stored thread so the window keeps it.
+	readTurn := p.Turn
+	if readTurn == "" {
+		readTurn = worklist.LatestUserTurn
+	}
+	item, ok, err := sink.Item(ctx, p.ItemID, readTurn)
 	if err != nil {
 		return fmt.Errorf("read item: %w", err)
 	}

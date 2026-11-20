@@ -379,3 +379,50 @@ func TestSelectFromStore(t *testing.T) {
 		t.Fatalf("pages = %q", got)
 	}
 }
+
+// The top N is chosen by the whole item's score, before projection shortens the
+// signals it reads: a label past the projection's cut still counts.
+func TestSelectTopScoresTheWholeItem(t *testing.T) {
+	labels := make([]string, 0, projectedList+1)
+	for i := range projectedList {
+		labels = append(labels, fmt.Sprintf("area/%d", i))
+	}
+	labels = append(labels, "security") // past the cut
+	big := WorkItem{ID: "big", Signals: Signals{Labels: labels}, Meta: Metadata{Rationale: strings.Repeat("r", MaxBriefBytes)}}
+	plain := WorkItem{ID: "plain", Signals: Signals{Labels: []string{"kind/bug"}}}
+	now := time.Now().UTC()
+	full, cut, other := Score(big, now).Rank, Score(Project(big), now).Rank, Score(plain, now).Rank
+	if !(cut < other && other < full) {
+		t.Fatalf("fixture: want projected %.3f < plain %.3f < whole %.3f", cut, other, full)
+	}
+	page, _ := Select([]WorkItem{plain, big}, Selection{Top: 1}, now)
+	if len(page) != 1 || page[0].ID != "big" || page[0].Projected == nil {
+		t.Fatalf("top 1 = %v, want the (projected) item whose whole score is higher", ids(page))
+	}
+}
+
+// A Discuss run dispatched without a turn answers the newest user turn. The read
+// resolves it against the stored thread, so an out-of-order reply to an older turn
+// that lands after a large question cannot crowd the question out of the window.
+func TestThreadWindowFindsTheLatestUserTurn(t *testing.T) {
+	th := []Message{
+		{ID: "q1", Role: RoleUser, Content: "first question"},
+		{ID: "q2", Role: RoleUser, Content: strings.Repeat("w", MaxItemBytes)}, // stored before the form limit
+		{ID: "r1", Role: RoleAgent, Content: "late answer to q1", ReplyTo: "q1"},
+	}
+	item := WorkItem{ID: "x", Thread: th}
+	if got := ids2(ThreadWindow(item, "", MaxItemBytes).Thread); got != "r1" {
+		t.Fatalf("fixture: the newest-turns window = %s, want only r1", got)
+	}
+	w := ThreadWindow(item, LatestUserTurn, MaxItemBytes)
+	i, ok := w.LastUserTurn()
+	if !ok || w.TurnKey(i) != "q2" || w.Answered("q2") || !strings.HasPrefix(w.Thread[i].Content, "www") {
+		t.Fatalf("window = %s, want the newest user turn q2, unanswered", ids2(w.Thread))
+	}
+	if b, _ := json.Marshal(w); len(b) > MaxItemBytes {
+		t.Fatalf("window encodes to %d bytes, over %d", len(b), MaxItemBytes)
+	}
+	if w := ThreadWindow(WorkItem{ID: "y", Thread: th[2:]}, LatestUserTurn, MaxItemBytes); ids2(w.Thread) != "r1" {
+		t.Fatalf("with no user turn the window = %s, want the newest turns", ids2(w.Thread))
+	}
+}

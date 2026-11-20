@@ -1,6 +1,7 @@
 package worklist
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -70,5 +71,41 @@ func TestTruncateUTF8(t *testing.T) {
 		if got := truncateUTF8(c.in, c.n); got != c.want {
 			t.Fatalf("truncateUTF8(%q, %d) = %q, want %q", c.in, c.n, got, c.want)
 		}
+	}
+}
+
+// Projection never shortens the list of turns a research rationale read: a partial
+// list would let the visibility check pass without checking a turn past the cut
+// (here, one the owner has since hidden). The research is withheld instead, and the
+// write-back restores the whole list.
+func TestProjectionWithholdsResearchItCannotCheck(t *testing.T) {
+	item := func(turns int, hide int) WorkItem {
+		it := WorkItem{ID: "x", Meta: Metadata{Rationale: strings.Repeat("r", MaxBriefBytes)}}
+		var keys []string
+		for i := range turns {
+			id := fmt.Sprintf("t%d", i)
+			it.Thread = append(it.Thread, Message{ID: id, Role: RoleUser, Content: "q", Hidden: i == hide})
+			keys = append(keys, id)
+		}
+		it.Signals.Research = &ResearchAdjustment{Relevance: 2, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "derived", Turns: keys}
+		return it
+	}
+	stored := item(projectedList+8, projectedList+1) // hidden turn past the cut
+	if ResearchReflectsVisibleThread(stored) {
+		t.Fatal("fixture: the stored research reads a hidden turn")
+	}
+	w := ThreadWindow(stored, "", MaxItemBytes)
+	if w.Projected == nil || ResearchReflectsVisibleThread(w) {
+		t.Fatalf("the projected research passed the visibility check with %d of %d turns", len(w.Signals.Research.Turns), projectedList+8)
+	}
+	back := w
+	back.Thread = nil
+	merged := MergeRunItems([]WorkItem{stored}, []WorkItem{back})
+	if got := merged[0].Signals.Research; got == nil || len(got.Turns) != projectedList+8 {
+		t.Fatalf("write-back stored research turns %v, want the whole list", got)
+	}
+	// A list within the bound is kept whole, so the check still runs on it.
+	if w := ThreadWindow(item(projectedList, -1), "", MaxItemBytes); !ResearchReflectsVisibleThread(w) {
+		t.Fatal("research within the bound was withheld")
 	}
 }
