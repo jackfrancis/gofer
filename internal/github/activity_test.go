@@ -89,6 +89,9 @@ func timelinePages(t *testing.T, events []string, calls *int) *httptest.Server {
 		}
 		lo := min((page-1)*timelinePerPage, len(events))
 		hi := min(lo+timelinePerPage, len(events))
+		if hi < len(events) {
+			w.Header().Set("Link", fmt.Sprintf(`<%s?page=%d>; rel="next"`, r.URL.Path, page+1))
+		}
 		_, _ = w.Write([]byte("[" + strings.Join(events[lo:hi], ",") + "]"))
 	}))
 }
@@ -161,12 +164,14 @@ func TestItemActivityRequestRemoved(t *testing.T) {
 	}
 }
 
-// A timeline longer than the pages read leaves the latest events unseen, so the
-// requester is unknown rather than an older request's actor.
-func TestItemActivityTruncatedTimelineRequesterUnknown(t *testing.T) {
+// A timeline longer than the pages read leaves the latest events unseen (here, the
+// withdrawal of the request), so who is waiting is unknown: no requester and no
+// waiting timestamps, rather than values from older events.
+func TestItemActivityTruncatedTimelineWaitingUnknown(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	events := []string{`{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"k8s-ci-robot"}}`}
-	events = append(events, filler(timelinePerPage*timelineMaxPages, base.Add(time.Hour))...)
+	events = append(events, filler(timelinePerPage*timelineMaxPages-1, base.Add(time.Hour))...)
+	events = append(events, `{"event":"review_request_removed","created_at":"2026-02-01T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"bob"}}`)
 	var calls int
 	srv := timelinePages(t, events, &calls)
 	defer srv.Close()
@@ -174,10 +179,66 @@ func TestItemActivityTruncatedTimelineRequesterUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.RequestedByLogin != "" {
-		t.Fatalf("RequestedByLogin = %q from a truncated timeline, want unknown", a.RequestedByLogin)
+	if a.RequestedByLogin != "" || !a.AwaitingMeSince.IsZero() || !a.AwaitingOthersSince.IsZero() {
+		t.Fatalf("truncated timeline: requester %q, awaiting me %v, awaiting others %v; want all unset",
+			a.RequestedByLogin, a.AwaitingMeSince, a.AwaitingOthersSince)
 	}
 	if calls != timelineMaxPages {
 		t.Fatalf("timeline calls = %d, want the cap %d", calls, timelineMaxPages)
+	}
+}
+
+// A timeline of exactly the cap is read whole: the Link header, not a full last
+// page, says whether events remain.
+func TestItemActivityFullFinalPageIsComplete(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	events := filler(timelinePerPage*timelineMaxPages-1, base)
+	events = append(events, `{"event":"review_requested","created_at":"2026-02-01T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"k8s-ci-robot"}}`)
+	var calls int
+	srv := timelinePages(t, events, &calls)
+	defer srv.Close()
+	a, err := NewClient(srv.Client(), srv.URL).ItemActivity(context.Background(), "tok", "o/r", 1, "me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.RequestedByLogin != "k8s-ci-robot" || a.AwaitingMeSince.IsZero() {
+		t.Fatalf("requester %q, awaiting me %v; want the bot's request at the last event", a.RequestedByLogin, a.AwaitingMeSince)
+	}
+	if calls != timelineMaxPages {
+		t.Fatalf("timeline calls = %d, want %d", calls, timelineMaxPages)
+	}
+}
+
+// A comment by the requested user does not end their review request: the requester
+// is still reported (so a bot's request stays classified as automated) even though
+// the ball is no longer in their court. Submitting a review ends it.
+func TestItemActivityPendingRequestOutlivesComment(t *testing.T) {
+	srv := timelineServer(`[
+		{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"k8s-ci-robot"}},
+		{"event":"commented","created_at":"2026-01-02T00:00:00Z","actor":{"login":"me"}}
+	]`)
+	defer srv.Close()
+	a, err := NewClient(srv.Client(), srv.URL).ItemActivity(context.Background(), "tok", "o/r", 1, "me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.RequestedByLogin != "k8s-ci-robot" {
+		t.Fatalf("RequestedByLogin = %q after a comment, want the pending request's k8s-ci-robot", a.RequestedByLogin)
+	}
+	if !a.AwaitingMeSince.IsZero() {
+		t.Fatal("the user spoke last; the ball is not in their court")
+	}
+
+	srv2 := timelineServer(`[
+		{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"k8s-ci-robot"}},
+		{"event":"reviewed","state":"commented","submitted_at":"2026-01-02T00:00:00Z","user":{"login":"me"}}
+	]`)
+	defer srv2.Close()
+	a, err = NewClient(srv2.Client(), srv2.URL).ItemActivity(context.Background(), "tok", "o/r", 1, "me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.RequestedByLogin != "" {
+		t.Fatalf("RequestedByLogin = %q after the user's review, want none pending", a.RequestedByLogin)
 	}
 }

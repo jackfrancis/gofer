@@ -164,9 +164,11 @@ Wired on the web-tier side; they define what a runtime must respect:
   `BOT_REVIEWERS` (case-insensitive), replacing whatever the run sent. The agent
   plane's reads (`GET /agent/worklist`, `StoreSink.List`) re-derive the flag too
   (`RunPolicy.Classify`), so a run ranks by the current bot list. The requester is
-  the latest `review_requested` for the user on the timeline, unless a later
-  `review_request_removed` withdrew it; a timeline longer than the pages read leaves
-  it unknown. The deterministic scorer discounts a bot's request (no awaiting-me
+  the actor of the user's pending review request on the timeline: the latest
+  `review_requested` for them, until a `review_request_removed` or their own submitted
+  review ends it (a comment does not). The timeline is paged by its `Link` header up
+  to a cap, inside enrich's reserve-adjusted deadline; a timeline longer than the cap
+  leaves the requester and both waiting timestamps unset. The deterministic scorer discounts a bot's request (no awaiting-me
   pressure, low floors) unless the user is also an assignee. The web and runtime images must ship together: a runtime
   from before this rule posts its reply inside the item, where it is now ignored.
 - Replies can land out of order, so a turn's position does not say what it answers.

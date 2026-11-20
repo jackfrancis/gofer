@@ -36,7 +36,7 @@ type Activity struct {
 
 // The timeline is read oldest first, a page at a time, so the latest events, which
 // decide whose court the ball is in and who made the pending review request, come
-// last. timelineMaxPages bounds the calls per item.
+// last. timelineMaxPages bounds the calls per item; the caller bounds their time.
 const (
 	timelinePerPage  = 100
 	timelineMaxPages = 5
@@ -44,10 +44,16 @@ const (
 
 // ItemActivity reads the issue/PR timeline (up to timelineMaxPages pages) and
 // derives the engagement and centrality signals from it, plus how long the item has
-// been blocked on login's review and who asked. A review request is pending only if
-// no later review_request_removed withdrew it. When the timeline is longer than the
-// pages read, the latest events are unseen, so the requester is reported unknown
-// (empty) rather than taken from an older request.
+// been blocked on login's review and who asked.
+//
+// login's review request is pending from the latest review_requested for them until
+// a review_request_removed withdraws it or they submit a review, as on GitHub; a
+// comment does not end it. RequestedByLogin names the pending request's actor
+// whether or not the ball is in login's court.
+//
+// When the timeline is longer than the pages read, the latest events are unseen, so
+// who is waiting on whom is unknown: RequestedByLogin and both waiting timestamps
+// are left unset rather than taken from older events.
 func (c *Client) ItemActivity(ctx context.Context, token, repo string, number int, login string) (Activity, error) {
 	repo, err := c.gate(ctx, token, repo)
 	if err != nil {
@@ -87,6 +93,10 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 			if at.IsZero() {
 				at = e.CreatedAt
 			}
+			if l == login && !at.Before(requestChangedAt) {
+				// Submitting the review fulfils the pending request.
+				requestChangedAt, requestedAt, requestedByLogin = at, time.Time{}, ""
+			}
 			if at.After(lastActivityAt) {
 				lastActivityAt, lastActor = at, l
 				lastActivityDecisive = e.State == "changes_requested" || e.State == "approved"
@@ -112,11 +122,12 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 			}
 		}
 	}
-	if !complete {
-		requestedByLogin = ""
-	}
 	a := Activity{Participants: len(participants), InboundRefs: inbound, OtherReviewers: len(otherReviewers)}
 	a.Commented = !myLastActivityAt.IsZero()
+	if !complete {
+		return a, nil // the latest events are unread: who is waiting is unknown
+	}
+	a.RequestedByLogin = requestedByLogin
 
 	// Decide whose court the ball is in from the most recent court-changing event.
 	// Ball on login: a review was requested of them and they have not engaged
@@ -135,7 +146,6 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 	switch {
 	case meSince.After(othersSince):
 		a.AwaitingMeSince = meSince
-		a.RequestedByLogin = requestedByLogin
 	case !othersSince.IsZero():
 		a.AwaitingOthersSince = othersSince
 	}
@@ -143,11 +153,12 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 }
 
 // fetchTimeline reads the item's timeline, oldest first, up to timelineMaxPages
-// pages. complete is false when more events remain unread.
+// pages, following the Link header. complete is false when more events remain
+// unread.
 func (c *Client) fetchTimeline(ctx context.Context, token, repo string, number int) (events []timelineEvent, complete bool, err error) {
 	for page := 1; page <= timelineMaxPages; page++ {
 		path := fmt.Sprintf("/repos/%s/issues/%d/timeline?per_page=%d&page=%d", repo, number, timelinePerPage, page)
-		body, err := c.get(ctx, token, path)
+		body, header, err := c.getHeader(ctx, token, path)
 		if err != nil {
 			return nil, false, err
 		}
@@ -156,7 +167,7 @@ func (c *Client) fetchTimeline(ctx context.Context, token, repo string, number i
 			return nil, false, err
 		}
 		events = append(events, batch...)
-		if len(batch) < timelinePerPage {
+		if len(batch) == 0 || !hasNextPage(header) {
 			return events, true, nil
 		}
 	}

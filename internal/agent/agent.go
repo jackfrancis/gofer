@@ -116,6 +116,17 @@ func hasBudget(ctx context.Context, reserve time.Duration) bool {
 	return time.Until(deadline) > reserve
 }
 
+// reserveContext returns a context that ends reserve before ctx's deadline, so work
+// started under it cannot eat the time kept for what follows (writing results back,
+// ranking). A context without a deadline is returned as is.
+func reserveContext(ctx context.Context, reserve time.Duration) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return context.WithCancel(ctx)
+	}
+	return context.WithDeadline(ctx, deadline.Add(-reserve))
+}
+
 // writeBack persists items through the sink in bounded batches (writeBackChunk).
 func writeBack(ctx context.Context, sink Sink, items []worklist.WorkItem) error {
 	for start := 0; start < len(items); start += writeBackChunk {
