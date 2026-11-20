@@ -90,10 +90,14 @@ type Ingestor struct {
 
 	mu   sync.Mutex
 	runs map[runKey]*run // the most recent run per key: the in-flight gate (gate.go)
-	// gens counts, per owner, the ingest runs the backend has accepted: the refresh
-	// generation a worklist page compares to notice a pass that started after it was
-	// rendered (RefreshState). In memory, like the gate: a restart starts it again.
-	gens map[string]uint64
+	// gens counts, per owner, the ingest runs the backend has accepted; each accepted
+	// run takes the next generation (run.gen). dones is the highest generation known
+	// to have ended (failed, succeeded, or past its deadline): the refresh version a
+	// worklist page compares to notice results it does not show (RefreshState).
+	gens, dones map[string]uint64
+	accepted    map[string]acceptedRun // ownerID -> its latest accepted ingest run
+	ledger      RunLedger              // nil: all of this is lost on restart (ledger.go)
+	persistMu   sync.Mutex             // serializes ledger writes (persist)
 }
 
 var (
@@ -110,7 +114,7 @@ func New(d Dispatcher, audience, sinkURL string, log *slog.Logger, aiEndpoint, a
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log, runs: map[runKey]*run{}, gens: map[string]uint64{}}
+	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log, runs: map[runKey]*run{}, gens: map[string]uint64{}, dones: map[string]uint64{}, accepted: map[string]acceptedRun{}}
 }
 
 // runParams builds the parameters shared by every dispatched run: the owner, the sink
@@ -159,19 +163,34 @@ func (i *Ingestor) ScheduledRefresh(ctx context.Context, ownerID string) (bool, 
 	return i.dispatchIngest(ctx, ownerID, refreshGate)
 }
 
-// RefreshState reports ownerID's refresh generation (how many ingest runs the
-// backend has accepted for the owner) and whether one is in flight (Active). The
-// worklist page renders both, read before it reads the items, and polls for them
-// (webui.RefreshStatus): a pass that started after the render shows up as a new
-// generation, even when it also ended between two polls. The generation is read
-// first, so a run accepted in between is reported active, never as ended. err is a
-// failed status read; active is then still true until the run's deadline.
-func (i *Ingestor) RefreshState(ctx context.Context, ownerID string) (gen uint64, active bool, err error) {
-	i.mu.Lock()
-	gen = i.gens[ownerID]
-	i.mu.Unlock()
+// RefreshState reports ownerID's refresh version — the highest generation of an
+// ingest run known to have ended — and whether an ingest run is in flight, asking the
+// backend about one that still looks live (Active). The worklist polls it
+// (webui.RefreshStatus) and reloads when the version passes the one it rendered: a
+// run that ended since, even one that started and ended between two polls, or one
+// that ended while the next run was already going. err is a failed status read;
+// active is then still true until the run's deadline.
+func (i *Ingestor) RefreshState(ctx context.Context, ownerID string) (done uint64, active bool, err error) {
 	active, err = i.Active(ctx, ownerID)
-	return gen, active, err
+	i.mu.Lock()
+	done = i.dones[ownerID]
+	i.mu.Unlock()
+	return done, active, err
+}
+
+// LocalRefreshState is RefreshState from what gofer already knows, without asking the
+// backend, so rendering the worklist never waits on it. A run gofer has not seen end
+// counts as in flight; the page's first poll asks the backend. Every run up to done
+// ended before this returned, so items read after it hold everything those runs
+// wrote.
+func (i *Ingestor) LocalRefreshState(ownerID string) (done uint64, active bool) {
+	now := time.Now()
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	cur := i.runs[ingestKey(ownerID)]
+	active = cur != nil && now.Sub(cur.at) < cur.g.ttl &&
+		(cur.pending || (cur.id != "" && !cur.failed && !cur.succeeded))
+	return i.dones[ownerID], active
 }
 
 // Active reports whether a github-ingest run for ownerID is in flight: being
@@ -227,9 +246,7 @@ func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, g gate) (
 	})
 	i.settle(key, mine, id, err)
 	if err == nil {
-		i.mu.Lock()
-		i.gens[ownerID]++
-		i.mu.Unlock()
+		i.persist(ownerID)
 	}
 	return err == nil, err
 }
@@ -269,6 +286,7 @@ func (i *Ingestor) probeRun(ctx context.Context, key runKey) (failed, succeeded 
 	case "Failed":
 		i.mu.Lock()
 		// Record on the run we probed; a concurrent dispatch may have moved on.
+		changed := i.markDoneLocked(key, cur)
 		if i.runs[key] == cur {
 			cur.failed = true
 			cur.message = res.Message
@@ -278,13 +296,20 @@ func (i *Ingestor) probeRun(ctx context.Context, key runKey) (failed, succeeded 
 			}
 		}
 		i.mu.Unlock()
+		if changed {
+			i.persist(key.owner)
+		}
 		return true, false, res.Message, nil
 	case "Succeeded":
 		i.mu.Lock()
+		changed := i.markDoneLocked(key, cur)
 		if i.runs[key] == cur {
 			cur.succeeded = true
 		}
 		i.mu.Unlock()
+		if changed {
+			i.persist(key.owner)
+		}
 		return false, true, "", nil
 	}
 	return false, false, "", nil // still running

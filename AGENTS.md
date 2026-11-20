@@ -291,14 +291,28 @@ Wired on the web-tier side; they define what a runtime must respect:
   never replaced before its Submit returns. Turn the schedule on only against an AEI
   that contains provider failures (archive-plan item 11, AEI PR #21): scheduled
   runs dispatch with nobody watching.
-- The radar watches the refresh state (`Ingestor.RefreshState`: a per-owner count
-  of accepted ingest runs, and whether one is in flight). `signedInView` reads it
-  BEFORE the items, since a run writes before it ends; the page carries it to
-  `static/reload.js`, which polls `GET /items/refresh-status` (every 3s while a run
-  is in flight, 30s otherwise) and reloads once a run the page does not show has
-  ended, even one that started and ended between polls. A failed status read counts
-  as still in flight until the run's deadline. The script never reloads while a
-  `<details>` menu is open or a form control has focus.
+- Each pass of the scheduled refresh goes least recently served first, so an owner
+  whose submission failed (AEI's queue full) goes first on the next pass and owners
+  share a capacity limit evenly.
+- The radar watches a refresh version: the highest generation of an ingest run
+  known to have ended (each accepted ingest run takes the owner's next generation).
+  `signedInView` reads it BEFORE the items and from local state only
+  (`Ingestor.LocalRefreshState`: no backend call, so a slow AEI never delays the
+  radar; a run gofer has not seen end counts as in flight). Since a run writes
+  before it ends, the items hold everything up to that version. `static/reload.js`
+  polls `GET /items/refresh-status?done=` (every 3s while a run is in flight, 30s
+  otherwise), which asks AEI within 5s (`Ingestor.RefreshState`), and reloads once
+  the version moves: a run that ended since the render, even one that started and
+  ended between polls, or one that ended while the next was already running. A
+  failed status read counts as still in flight until the run's deadline. The script
+  never reloads while a `<details>` menu is open or a form control has focus.
+- With persistent storage, each owner's latest accepted ingest run (run id,
+  generation, version, accept time) is kept in `ingest_runs` (`ingest.RunLedger`,
+  implemented by `storage.WorklistStore`, loaded by `Ingestor.UseLedger` at
+  startup). Runs outlive a web-pod restart, so the new process restores a run
+  still within its deadline into the gate (no second ingest while it writes) and
+  keeps counting the version an open tab compares. A restored id AEI no longer
+  knows reads as a failed status read, which blocks only until the deadline.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

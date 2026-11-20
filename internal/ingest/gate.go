@@ -36,6 +36,7 @@ type run struct {
 	at        time.Time // when it was reserved, then when Submit succeeded
 	g         gate      // the policy the run was reserved under
 	pending   bool      // reserved; Submit has not returned yet
+	gen       uint64    // ingest only: the owner's refresh generation, set when the backend accepts it
 	failed    bool
 	succeeded bool
 	message   string
@@ -93,10 +94,14 @@ func (i *Ingestor) reserve(ctx context.Context, key runKey, g gate) (mine *run, 
 		i.mu.Lock()
 		cur := i.runs[key]
 		if cur == nil || !cur.live(now, g.probe) {
+			changed := cur != nil && i.markDoneLocked(key, cur) // failed, succeeded, or past its deadline
 			mine = &run{at: now, g: g, pending: true, prev: cur}
 			i.runs[key] = mine
 			i.pruneLocked(now)
 			i.mu.Unlock()
+			if changed {
+				i.persist(key.owner)
+			}
 			return mine, true
 		}
 		canProbe := g.probe && !probed && !cur.pending && cur.id != ""
@@ -125,6 +130,11 @@ func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 		// window does too; until then it ran from the reservation.
 		mine.at = time.Now()
 		mine.prev = nil // never rolled back now
+		if key.task == taskIngest {
+			i.gens[key.owner]++
+			mine.gen = i.gens[key.owner]
+			i.accepted[key.owner] = acceptedRun{id: id, at: mine.at}
+		}
 		return
 	}
 	p := mine.prev
@@ -137,6 +147,18 @@ func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 	} else {
 		i.runs[key] = p
 	}
+}
+
+// markDoneLocked records that r, an ingest run for key's owner, has ended (failed,
+// succeeded, or outlived its deadline), raising the owner's refresh version
+// (RefreshState). Reservations the backend never accepted carry no generation. The
+// caller holds i.mu.
+func (i *Ingestor) markDoneLocked(key runKey, r *run) (changed bool) {
+	if key.task == taskIngest && r.gen > i.dones[key.owner] {
+		i.dones[key.owner] = r.gen
+		return true
+	}
+	return false
 }
 
 // pruneLocked drops converse runs that no longer gate anything, so the tracker does

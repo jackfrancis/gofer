@@ -58,6 +58,14 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// that executes runs brings gofer to life without touching this package (see
 	// internal/runtime for the contract).
 	ingestor := ingest.New(dispatcher, cfg.Audience, cfg.SinkURL, log, aiEndpoint, aiModel)
+	// With persistent storage, each owner's last accepted ingest run survives a
+	// restart: the gate still holds a run the runtime is still executing, and the
+	// radar's refresh version keeps counting (ingest.RunLedger).
+	if ledger, ok := store.(ingest.RunLedger); ok {
+		if err := ingestor.UseLedger(context.Background(), ledger); err != nil {
+			log.Warn("could not load the last ingest runs; a run still executing may be started again", "err", err)
+		}
+	}
 	// The thread's model picker spans every configured connection's models (default
 	// first). A model id offered by more than one connection is disambiguated with the
 	// connection label; the selected option carries the connection endpoint the turn

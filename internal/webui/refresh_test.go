@@ -15,6 +15,7 @@ import (
 
 	"github.com/jackfrancis/gofer/internal/ingest"
 	"github.com/jackfrancis/gofer/internal/session"
+	"github.com/jackfrancis/gofer/internal/storage"
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
@@ -86,10 +87,10 @@ func (x *harness) page() string {
 	return rec.Body.String()
 }
 
-var watcherTag = regexp.MustCompile(`<script src="/static/reload.js" data-gen="(\d+)" data-active="([01])" data-poll-secs="3" data-idle-poll-secs="30" defer></script>`)
+var watcherTag = regexp.MustCompile(`<script src="/static/reload.js" data-done="(\d+)" data-active="([01])" data-poll-secs="3" data-idle-poll-secs="30" defer></script>`)
 
 // watcher is the refresh state a rendered page carries for reload.js.
-type watcher struct{ gen, active string }
+type watcher struct{ done, active string }
 
 func (x *harness) watcherOf(page string) watcher {
 	x.t.Helper()
@@ -107,7 +108,7 @@ func (x *harness) poll(w watcher) status {
 	x.t.Helper()
 	rec := httptest.NewRecorder()
 	x.h.RefreshStatus(rec, httptest.NewRequest(http.MethodGet,
-		"/items/refresh-status?gen="+url.QueryEscape(w.gen)+"&active="+w.active, nil))
+		"/items/refresh-status?done="+url.QueryEscape(w.done), nil))
 	if rec.Code != http.StatusOK || rec.Header().Get("Cache-Control") != "no-store" {
 		x.t.Fatalf("refresh-status: %d %q", rec.Code, rec.Header().Get("Cache-Control"))
 	}
@@ -277,7 +278,7 @@ func TestTransientStatusErrorKeepsWatching(t *testing.T) {
 func TestRefreshStatusWithoutSessionAndWithoutProber(t *testing.T) {
 	h := New(fakeSessions{}, worklist.NewMemoryStore(), &recordPipeline{}, nil, false, nil)
 	rec := httptest.NewRecorder()
-	h.RefreshStatus(rec, httptest.NewRequest(http.MethodGet, "/items/refresh-status?gen=0&active=0", nil))
+	h.RefreshStatus(rec, httptest.NewRequest(http.MethodGet, "/items/refresh-status?done=0", nil))
 	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), `"reload":true`) {
 		t.Fatalf("no session: %d %s", rec.Code, rec.Body.String())
 	}
@@ -291,7 +292,7 @@ func TestRefreshStatusWithoutSessionAndWithoutProber(t *testing.T) {
 		t.Fatal("a pipeline without RefreshProber must leave the radar static")
 	}
 	rec = httptest.NewRecorder()
-	static.RefreshStatus(rec, httptest.NewRequest(http.MethodGet, "/items/refresh-status?gen=0&active=1", nil))
+	static.RefreshStatus(rec, httptest.NewRequest(http.MethodGet, "/items/refresh-status?done=0", nil))
 	if strings.Contains(rec.Body.String(), `"reload":true`) {
 		t.Fatal("without a prober there is nothing to reload for")
 	}
@@ -309,5 +310,130 @@ func TestReloadScriptServedAndOtherViewsUnchanged(t *testing.T) {
 	out := renderPage(t, pageData{View: "processing", RefreshSecs: 3})
 	if !strings.Contains(out, `<meta http-equiv="refresh" content="3">`) || strings.Contains(out, "reload.js") {
 		t.Fatalf("the processing view keeps its meta refresh, got:\n%s", out)
+	}
+}
+
+// A refresh that ends while the next one is already running still reloads the page,
+// so its results show while the next pass runs.
+func TestCompletedRefreshShowsWhileTheNextRuns(t *testing.T) {
+	ctx := context.Background()
+	mem := worklist.NewMemoryStore()
+	mem.Seed(owner, pr(1, "Old PR"))
+	x := newHarness(t, mem)
+	w := x.watcherOf(x.page())
+
+	x.d.set("Running")
+	if err := x.ig.Refresh(ctx, owner); err != nil { // refresh A
+		t.Fatal(err)
+	}
+	if err := mem.Upsert(ctx, owner, pr(2, "From A")); err != nil {
+		t.Fatal(err)
+	}
+	x.d.set("Succeeded")
+	if n := ingest.NewRefresher(mem, x.ig, nil, time.Hour, nil).RefreshOnce(ctx); n != 1 { // refresh B starts
+		t.Fatalf("B dispatched %d runs", n)
+	}
+	x.d.set("Running")
+
+	if s := x.poll(w); !s.Reload || !s.Active {
+		t.Fatalf("A ended while B runs: poll = %+v, want reload while active", s)
+	}
+	out := x.page()
+	if !strings.Contains(out, "From A") || x.watcherOf(out).active != "1" {
+		t.Fatalf("the reload shows A's work and keeps watching B, got:\n%s", out)
+	}
+}
+
+// blockingStatus holds every status read until released, as a stalled backend would.
+type blockingStatus struct {
+	phaseDispatcher
+	release chan struct{}
+}
+
+func (b *blockingStatus) Status(ctx context.Context, id string) (ingest.RunStatus, error) {
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+		return ingest.RunStatus{}, ctx.Err()
+	}
+	return b.phaseDispatcher.Status(ctx, id)
+}
+
+// Opening the radar never waits on the backend: it renders from what gofer already
+// knows, and the status poll asks the backend, within statusTimeout.
+func TestRenderDoesNotWaitOnTheBackend(t *testing.T) {
+	ctx := context.Background()
+	mem := worklist.NewMemoryStore()
+	mem.Seed(owner, pr(1, "A PR"))
+	d := &blockingStatus{phaseDispatcher: phaseDispatcher{phase: "Running"}, release: make(chan struct{})}
+	defer close(d.release)
+	ig := ingest.New(d, "", "", nil, "", "")
+	h := New(fakeSessions{&session.User{ID: owner}}, mem, ig, nil, false, nil)
+	if err := ig.Refresh(ctx, owner); err != nil {
+		t.Fatal(err)
+	}
+	rendered := make(chan string, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		h.Index(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+		rendered <- rec.Body.String()
+	}()
+	select {
+	case out := <-rendered:
+		if !strings.Contains(out, "A PR") || !strings.Contains(out, `data-active="1"`) {
+			t.Fatalf("expected the radar, watching the refresh, got:\n%s", out)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("rendering the radar waited on the backend's status")
+	}
+}
+
+// A tab open across a web-tier restart still learns that the refresh it was waiting
+// for ended: the version is kept in the database, not just in the old process.
+func TestOpenTabAcrossRestart(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	store := db.Worklist()
+	if err := store.Upsert(ctx, owner, pr(1, "Old PR")); err != nil {
+		t.Fatal(err)
+	}
+	d := &phaseDispatcher{phase: "Succeeded"}
+	process := func() (*ingest.Ingestor, *Handler) {
+		ig := ingest.New(d, "", "", nil, "", "")
+		if err := ig.UseLedger(ctx, store); err != nil {
+			t.Fatal(err)
+		}
+		return ig, New(fakeSessions{&session.User{ID: owner}}, store, ig, nil, false, nil)
+	}
+	ig1, h1 := process()
+	x := &harness{t: t, store: store, d: d, ig: ig1, h: h1}
+	d.set("Running")
+	if _, err := ig1.ScheduledRefresh(ctx, owner); err != nil { // generation 1 starts
+		t.Fatal(err)
+	}
+	w := x.watcherOf(x.page()) // the tab, which then sleeps
+	if w.done != "0" || w.active != "1" {
+		t.Fatalf("rendered %+v, want done 0 while generation 1 runs", w)
+	}
+
+	// The web pod restarts; the run goes on in the runtime and writes its results.
+	ig2, h2 := process()
+	x.ig, x.h = ig2, h2
+	if ok, _ := ig2.ScheduledRefresh(ctx, owner); ok {
+		t.Fatal("the new process started a second ingest while generation 1 runs")
+	}
+	if err := store.Upsert(ctx, owner, pr(2, "New PR")); err != nil {
+		t.Fatal(err)
+	}
+	d.set("Succeeded")
+	if s := x.poll(w); !s.Reload {
+		t.Fatalf("the tab must learn that generation 1 ended, though the process that rendered it is gone: %+v", s)
+	}
+	if !strings.Contains(x.page(), "New PR") {
+		t.Fatal("the reload shows the new work")
 	}
 }

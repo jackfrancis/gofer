@@ -314,44 +314,48 @@ func (d *errStatusDispatcher) Status(context.Context, string) (RunStatus, error)
 	return RunStatus{}, errors.New("status unavailable")
 }
 
-// RefreshState counts the ingest runs the backend accepted, whoever started them,
-// and not a submission that failed or a request the gate collapsed.
-func TestRefreshStateCountsAcceptedIngestRuns(t *testing.T) {
+// The refresh version counts ingest runs that ended, whoever started them; not a
+// run still going, a submission that failed, or a request the gate collapsed.
+func TestRefreshVersionCountsEndedIngestRuns(t *testing.T) {
 	ctx := context.Background()
 	d := &gateDispatcher{phase: "Running"}
 	ig := New(d, "", "", nil, "", "")
 	state := func() (uint64, bool) {
 		t.Helper()
-		g, a, err := ig.RefreshState(ctx, "github:1")
+		done, a, err := ig.RefreshState(ctx, "github:1")
 		if err != nil {
 			t.Fatal(err)
 		}
-		return g, a
+		return done, a
 	}
-	if g, a := state(); g != 0 || a {
-		t.Fatalf("before any run: gen %d active %v", g, a)
+	if done, a := state(); done != 0 || a {
+		t.Fatalf("before any run: done %d active %v", done, a)
 	}
 	_ = ig.EnsureBackfill(ctx, "github:1")
 	_ = ig.Refresh(ctx, "github:1") // collapsed into the running backfill
-	if g, a := state(); g != 1 || !a {
-		t.Fatalf("one run in flight: gen %d active %v", g, a)
+	if done, a := state(); done != 0 || !a {
+		t.Fatalf("one run in flight: done %d active %v", done, a)
 	}
 	d.set("Succeeded")
+	if done, a := state(); done != 1 || a {
+		t.Fatalf("the run ended: done %d active %v", done, a)
+	}
 	d.mu.Lock()
 	d.failNext = true
 	d.mu.Unlock()
 	if err := ig.Refresh(ctx, "github:1"); err == nil {
 		t.Fatal("want the Submit error")
 	}
-	if g, a := state(); g != 1 || a {
-		t.Fatalf("after a failed submit: gen %d active %v", g, a)
+	if done, a := state(); done != 1 || a {
+		t.Fatalf("after a failed submit: done %d active %v", done, a)
 	}
 	_, _ = ig.ScheduledRefresh(ctx, "github:1")
-	if g, _ := state(); g != 2 {
-		t.Fatalf("after a scheduled run: gen %d, want 2", g)
+	d.set("Failed")
+	if done, _ := state(); done != 2 {
+		t.Fatalf("a failed run also ended: done %d, want 2", done)
 	}
-	if g, _, _ := ig.RefreshState(ctx, "github:2"); g != 0 {
-		t.Fatalf("another owner's generation: %d", g)
+	if done, _, _ := ig.RefreshState(ctx, "github:2"); done != 0 {
+		t.Fatalf("another owner's version: %d", done)
 	}
 }
 

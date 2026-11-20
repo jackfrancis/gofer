@@ -3,6 +3,7 @@ package ingest
 import (
 	"context"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +49,15 @@ type Refresher struct {
 	interval time.Duration
 	log      *slog.Logger
 
+	// served records, per owner, when a pass last settled its refresh (submitted, or
+	// shared with a run already in flight), as a sequence number. Each pass goes
+	// least recently served first, so an owner whose submission failed (the
+	// runtime's queue full, or unreachable) goes first on the next pass, and owners
+	// listed early cannot take every slot a capacity limit leaves.
+	mu     sync.Mutex
+	served map[string]uint64
+	seq    uint64
+
 	stopOnce sync.Once
 	stop     chan struct{}
 	done     chan struct{}
@@ -61,7 +71,7 @@ func NewRefresher(owners worklist.OwnerLister, ing ScheduledRefresher, eligible 
 	}
 	return &Refresher{
 		owners: owners, ing: ing, eligible: eligible, interval: interval, log: log,
-		stop: make(chan struct{}), done: make(chan struct{}),
+		stop: make(chan struct{}), done: make(chan struct{}), served: map[string]uint64{},
 	}
 }
 
@@ -101,13 +111,15 @@ func (r *Refresher) Stop() {
 
 // RefreshOnce requests a refresh for every GitHub owner with stored work and reports
 // how many runs it submitted. An owner whose ingest run is still in flight, or whom
-// the Eligibility does not confirm, is skipped. Exported for tests; safe to call concurrently.
+// the Eligibility does not confirm, is skipped. Owners least recently served go first
+// (see Refresher.served). Exported for tests; safe to call concurrently.
 func (r *Refresher) RefreshOnce(ctx context.Context) int {
 	owners, err := r.owners.Owners(ctx)
 	if err != nil {
 		r.log.Warn("scheduled refresh: list owners", "err", err)
 		return 0
 	}
+	owners = r.leastRecentlyServed(owners)
 	var submitted int
 	for _, owner := range owners {
 		if ctx.Err() != nil {
@@ -128,9 +140,10 @@ func (r *Refresher) RefreshOnce(ctx context.Context) int {
 		}
 		ok, err := r.ing.ScheduledRefresh(ctx, owner)
 		if err != nil {
-			r.log.Warn("scheduled refresh: dispatch", "owner", owner, "err", err)
+			r.log.Warn("scheduled refresh: dispatch failed; the owner goes first next pass", "owner", owner, "err", err)
 			continue
 		}
+		r.markServed(owner) // submitted, or sharing a run already in flight
 		if ok {
 			submitted++
 		}
@@ -139,6 +152,34 @@ func (r *Refresher) RefreshOnce(ctx context.Context) int {
 		r.log.Info("scheduled refresh: dispatched worklist refreshes", "runs", submitted, "owners", len(owners))
 	}
 	return submitted
+}
+
+// leastRecentlyServed orders owners for a pass, least recently served first (never
+// served first of all), keeping the listed order among equals. Owners no longer
+// listed are forgotten.
+func (r *Refresher) leastRecentlyServed(owners []string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	listed := make(map[string]bool, len(owners))
+	for _, o := range owners {
+		listed[o] = true
+	}
+	for o := range r.served {
+		if !listed[o] {
+			delete(r.served, o)
+		}
+	}
+	out := append([]string(nil), owners...)
+	sort.SliceStable(out, func(a, b int) bool { return r.served[out[a]] < r.served[out[b]] })
+	return out
+}
+
+// markServed records that this pass settled owner's refresh.
+func (r *Refresher) markServed(owner string) {
+	r.mu.Lock()
+	r.seq++
+	r.served[owner] = r.seq
+	r.mu.Unlock()
 }
 
 // ownerProvider is the provider prefix of an owner id ("github:123" -> "github").
