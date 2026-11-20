@@ -134,25 +134,49 @@ func savedSelection(r *http.Request, ownerID string) map[string]bool {
 }
 
 // formSelection reads the selection a bulk form was rendered with (form "scope"). No
-// scope means the page showed every project.
-func formSelection(r *http.Request) map[string]bool {
-	scope := r.PostFormValue("scope")
+// scope means the page showed every project. ok is false when the form cannot be read
+// at all: the caller must then change nothing, since a lost scope would otherwise read
+// as every project.
+func formSelection(r *http.Request) (selected map[string]bool, ok bool) {
+	if err := r.ParseForm(); err != nil {
+		return nil, false
+	}
+	scope := r.PostForm.Get("scope")
 	if scope == "" {
-		return nil
+		return nil, true
 	}
 	v, err := url.ParseQuery(scope)
 	if err != nil {
-		return map[string]bool{} // a garbled scope acts on nothing rather than on everything
+		return map[string]bool{}, true // a garbled scope acts on nothing rather than on everything
 	}
 	if sel := decodeSelection(v); sel != nil {
-		return sel
+		return sel, true
 	}
-	return map[string]bool{}
+	return map[string]bool{}, true
+}
+
+// shownSelection narrows a saved selection to the projects the checklist offers
+// (opts, the repositories on the radar). It is what each bulk form posts back, so an
+// action never reaches a repository the page does not name — say one whose last
+// visible item closed after it was selected, which may still hold archived threads.
+// A nil selection (every project) stays nil.
+func shownSelection(selected map[string]bool, opts []ProjectOption) map[string]bool {
+	if selected == nil {
+		return nil
+	}
+	shown := map[string]bool{}
+	for _, o := range opts {
+		if selected[o.Name] {
+			shown[o.Name] = true
+		}
+	}
+	return shown
 }
 
 // FilterProjects handles POST /items/projects, the project filter's Apply. The checked
 // projects (form "project", repeated) are saved for the signed-in account; checking
-// every project on the radar, or "Select all" (form "all"), clears the filter instead.
+// every project on the radar (at least one), or "Select all" (form "all"), clears the
+// filter instead.
 // An empty selection is saved too, and shows no items. A selection too large for the
 // cookie is refused and the previous filter kept. It redirects back to the radar
 // (Post/Redirect/Get).
@@ -189,7 +213,9 @@ func (h *Handler) FilterProjects(w http.ResponseWriter, r *http.Request) {
 				chosen[name] = true
 			}
 		}
-		clear = covers(chosen, opts)
+		// Checking every project means "Select all" — but only when there is a project to
+		// check: on an empty radar an unchanged empty selection must stay saved.
+		clear = len(opts) > 0 && covers(chosen, opts)
 		value = url.Values{"u": {user.ID}}.Encode() + "&" + encodeSelection(chosen)
 		if !clear && len(value) > maxProjectsCookie {
 			http.Redirect(w, r, "/?projects="+projectsTooMany, http.StatusSeeOther)

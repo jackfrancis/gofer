@@ -3,6 +3,7 @@ package webui
 import (
 	"context"
 	"html/template"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -462,5 +463,92 @@ func TestEveryBulkFormCarriesScope(t *testing.T) {
 		if got := strings.Count(out, field); got != tc.want || forms != tc.want {
 			t.Errorf("%s: %d of %d bulk forms carry the scope, want all %d", name, got, forms, tc.want)
 		}
+	}
+}
+
+// A saved project whose last visible item closed is no longer in the checklist, so
+// nothing the page offers may reach it: its archived thread is neither counted nor in
+// the scope the bulk forms post back.
+func TestBulkScopeNamesOnlyListedProjects(t *testing.T) {
+	archived := inRepo(worklist.WorkItem{ID: "done-a", Type: worklist.TypePullRequest,
+		Thread: []worklist.Message{{Role: worklist.RoleAgent, Content: "old"}}}, "a/one")
+	archived.Meta.CompletedAt = time.Now()
+	open := inRepo(worklist.WorkItem{ID: "open-b", Type: worklist.TypeIssue,
+		Thread: []worklist.Message{{Role: worklist.RoleAgent, Content: "hi"}}}, "b/two")
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", archived, open)
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{false}, true, nil)
+
+	page := getIndex(t, h, filterCookie("a/one"))
+	if !strings.Contains(page, "Projects: 0 of 1") {
+		t.Fatal("expected the filter to show no listed project selected")
+	}
+	if strings.Contains(page, "Reset Conversations") {
+		t.Fatal("no listed project is selected, so there is nothing to reset")
+	}
+	if strings.Contains(page, "a%2fone") || strings.Contains(page, "a%2Fone") {
+		t.Fatal("the page must not name the unlisted project in any form")
+	}
+	// Unfiltered, Reset still reaches every project, archived threads included.
+	if all := getIndex(t, h, nil); !strings.Contains(all, "Reset Conversations (2)") {
+		t.Fatal("an unfiltered radar counts archived threads in every project")
+	}
+}
+
+// errReader fails every read, like a request body cut off mid-upload.
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+// A bulk form that cannot be read changes nothing: its lost scope must not read as
+// every project.
+func TestBulkActionsRejectUnreadableForm(t *testing.T) {
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	opts := []ModelOption{{Value: "c0|default", Model: "default"}, {Value: "c1|alt", Model: "alt"}}
+	store := worklist.NewMemoryStore()
+	store.Seed("u1",
+		inRepo(worklist.WorkItem{ID: "new-a", Type: worklist.TypePullRequest}, "a/one"),
+		inRepo(reviewedByModel("rev-a", "default", now), "a/one"),
+	)
+	pipe := &recordPipeline{}
+	h := &Handler{sessions: fakeSessions{&session.User{ID: "u1"}}, store: store, pipeline: pipe, convEnabled: true, options: opts, now: func() time.Time { return now }}
+	for path, handle := range map[string]func(http.ResponseWriter, *http.Request){
+		"/items/review-all":          h.ReviewAllPRs,
+		"/items/second-opinion-all":  h.SecondOpinionAllPRs,
+		"/items/reset-conversations": h.ResetConversations,
+	} {
+		req := httptest.NewRequest(http.MethodPost, path, errReader{})
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		handle(rec, req)
+		if rec.Code != http.StatusSeeOther {
+			t.Errorf("%s: status = %d, want 303", path, rec.Code)
+		}
+	}
+	if len(pipe.turns) != 0 {
+		t.Errorf("an unreadable form dispatched %v", pipe.turns)
+	}
+	items, _ := store.List(context.Background(), "u1")
+	for _, it := range items {
+		if it.ID == "new-a" && len(it.Thread) != 0 || it.ID == "rev-a" && len(it.Thread) != 2 {
+			t.Errorf("%s: thread changed to %d turns", it.ID, len(it.Thread))
+		}
+	}
+}
+
+// On a radar with no visible project, Apply on an unchanged empty selection keeps it
+// saved, so the next repository to arrive stays filtered out.
+func TestProjectFilterEmptyRadarKeepsEmptySelection(t *testing.T) {
+	archived := inRepo(worklist.WorkItem{ID: "done-a"}, "a/one")
+	archived.Meta.CompletedAt = time.Now()
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", archived)
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{false}, false, nil)
+	c := postFilter(t, h, url.Values{})
+	if c == nil || c.MaxAge <= 0 {
+		t.Fatalf("expected the empty selection to stay saved, got %+v", c)
+	}
+	if v, _ := url.ParseQuery(c.Value); len(decodeSelection(v)) != 0 || decodeSelection(v) == nil {
+		t.Fatalf("saved %q, want an empty selection", c.Value)
 	}
 }

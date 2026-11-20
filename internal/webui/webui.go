@@ -379,7 +379,11 @@ func (h *Handler) ResetConversations(w http.ResponseWriter, r *http.Request) {
 	}
 	// One atomic update, so a run's write-back cannot restore a thread mid-clear. Only
 	// items that actually carry conversation state are written back.
-	selected := formSelection(r)
+	selected, ok := formSelection(r)
+	if !ok {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
 	_ = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		var cleared []worklist.WorkItem
 		for _, it := range current {
@@ -541,7 +545,11 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 	}
 	at := h.now().UTC()
 	var refs []worklist.TurnRef
-	selected := formSelection(r)
+	selected, ok := formSelection(r)
+	if !ok {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
 	// Choose and stamp the PRs in one atomic update, against the threads as stored.
 	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		var changed []worklist.WorkItem
@@ -625,9 +633,13 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
+	selected, ok := formSelection(r)
+	if !ok {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
 	now := h.now().UTC()
 	choice := strings.TrimSpace(r.FormValue("choice"))
-	selected := formSelection(r)
 	type dispatch struct {
 		ref worklist.TurnRef
 		opt ModelOption
@@ -743,12 +755,13 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		return pageData{View: "error", User: user, Message: res.Message}, http.StatusOK
 	default:
 		now := h.now()
-		// The project filter narrows what is shown, and the bulk actions' counts below
-		// cover only the shown items. Each bulk form posts this selection back
-		// (ProjectScope), so its handler acts on exactly these items.
+		// The project filter narrows what is shown. The bulk actions' counts below, and
+		// the scope each bulk form posts back (ProjectScope), cover only the selected
+		// projects the checklist names, so an action acts on what this page shows.
 		selected := savedSelection(r, user.ID)
 		projects := projectOptions(res.Items, selected)
 		shown := filterProjects(res.Items, selected)
+		scope := shownSelection(selected, projects)
 		selectedCount := 0
 		for _, p := range projects {
 			if p.Selected {
@@ -770,13 +783,13 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 			}
 		}
 		// The radar lists only items on it, but Reset clears every stored thread in the
-		// page's projects, hidden and closed items' included; and the item just hidden is
+		// selected projects the checklist names, hidden and closed items' included; and the item just hidden is
 		// off the radar, to be offered for Undo. Both come from Resolve's same read
 		// (res.OffRadar), so the page never offers Hide and Undo for one item.
 		var justHidden *worklist.WorkItem
 		hiddenID := r.URL.Query().Get("hidden")
 		for i, it := range res.OffRadar {
-			if inScope(selected, it) && hasConversation(it) {
+			if inScope(scope, it) && hasConversation(it) {
 				resetCount++
 			}
 			if hiddenID != "" && it.ID == hiddenID && !it.Meta.HiddenAt.IsZero() {
@@ -789,8 +802,8 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 			ResetCount: resetCount, JustHidden: justHidden,
 			Projects: projects, ProjectsFiltered: selected != nil, SelectedProjects: selectedCount, TotalItems: len(res.Items),
 		}
-		if selected != nil {
-			data.ProjectScope = encodeSelection(selected)
+		if scope != nil {
+			data.ProjectScope = encodeSelection(scope)
 		}
 		if r.URL.Query().Get("projects") == projectsTooMany {
 			data.ProjectsError = "Too many projects selected to save. Choose fewer, or Select all; your previous filter is unchanged."

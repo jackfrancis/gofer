@@ -150,3 +150,39 @@ func TestSortUnreadFloatsFirst(t *testing.T) {
 		t.Fatalf("an unread reply should float first, got %q", items[0].ID)
 	}
 }
+
+// Resolve lists only items on the radar and returns the hidden and completed ones it
+// dropped, from the same read, intact.
+func TestResolveReturnsOffRadarItems(t *testing.T) {
+	now := time.Now()
+	hidden := WorkItem{ID: "hidden", Thread: []Message{{Content: "kept"}}}
+	hidden.Meta.HiddenAt = now
+	done := WorkItem{ID: "done"}
+	done.Meta.CompletedAt = now
+	store := NewMemoryStore()
+	store.Seed("u1", WorkItem{ID: "a"}, hidden, WorkItem{ID: "b"}, done, WorkItem{ID: "c"})
+
+	res, err := Resolve(context.Background(), store, &fakeIngestor{}, now, "u1", DefaultSort, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := func(items []WorkItem) map[string]bool {
+		m := map[string]bool{}
+		for _, it := range items {
+			m[it.ID] = true
+		}
+		return m
+	}
+	if got := ids(res.Items); len(got) != 3 || !got["a"] || !got["b"] || !got["c"] {
+		t.Errorf("Items = %v, want a, b, c", got)
+	}
+	off := ids(res.OffRadar)
+	if len(off) != 2 || !off["hidden"] || !off["done"] {
+		t.Fatalf("OffRadar = %v, want hidden, done", off)
+	}
+	for _, it := range res.OffRadar {
+		if it.ID == "hidden" && (len(it.Thread) != 1 || it.Meta.HiddenAt.IsZero()) {
+			t.Errorf("hidden item altered: %+v", it)
+		}
+	}
+}

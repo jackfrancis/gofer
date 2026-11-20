@@ -182,11 +182,13 @@ Wired on the web-tier side; they define what a runtime must respect:
   preference kept in the `gofer_projects` cookie, bound to the account that saved it
   (none = all projects). It only drops items from the already-ranked list, never
   re-sorts. The cookie never decides what a bulk action touches: each bulk form posts
-  the selection its page was rendered with (`scope`), so a filter changed in another
-  tab cannot widen it. Review all PRs and Get 2nd Opinion act only on items the radar
-  shows (`WorkItem.OnRadar`, the rule `worklist.Resolve` applies); Reset
-  Conversations also clears hidden and completed items in scope, and its count
-  includes them.
+  the selection its page was rendered with (`scope`), narrowed to the projects the
+  checklist names, so neither a filter changed in another tab nor a saved repository
+  that left the radar can widen it; an unreadable form changes nothing. Review all
+  PRs and Get 2nd Opinion act only on items the radar shows (`WorkItem.OnRadar`, the
+  rule `worklist.Resolve` applies); Reset Conversations also clears hidden and
+  completed items in scope, and its count includes them (`Resolution.OffRadar`, from
+  the same read).
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,
