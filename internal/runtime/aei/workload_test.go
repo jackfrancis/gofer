@@ -88,6 +88,25 @@ func modelStub(t *testing.T) *httptest.Server {
 // AEI runtime ABI): the run id, the workload, its parameters, and the run credential.
 func loadRun(t *testing.T, taskRef string, params map[string]string) *aeiruntime.Runtime {
 	t.Helper()
+	return loadRunWith(t, taskRef, params, nil)
+}
+
+// loadRunWith is loadRun with extra or overriding ABI variables (a reachable control
+// URL, a dispatch time).
+func loadRunWith(t *testing.T, taskRef string, params, extra map[string]string) *aeiruntime.Runtime {
+	t.Helper()
+	env := runEnv(t, taskRef, params, extra)
+	rt, err := aeiruntime.Load(context.Background(), func(k string) string { return env[k] }, nil)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	return rt
+}
+
+// runEnv is the ABI environment a launcher injects for a run, with extra variables
+// added or overriding the defaults.
+func runEnv(t *testing.T, taskRef string, params, extra map[string]string) map[string]string {
+	t.Helper()
 	encoded, err := json.Marshal(params)
 	if err != nil {
 		t.Fatalf("encode params: %v", err)
@@ -99,11 +118,10 @@ func loadRun(t *testing.T, taskRef string, params map[string]string) *aeiruntime
 		aeiruntime.EnvControlURL: "http://aei-controller.invalid",
 		aeiruntime.EnvCredential: "run-credential",
 	}
-	rt, err := aeiruntime.Load(context.Background(), func(k string) string { return env[k] }, nil)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
+	for k, v := range extra {
+		env[k] = v
 	}
-	return rt
+	return env
 }
 
 // A dispatched run executes gofer's workload against the agent plane and writes its

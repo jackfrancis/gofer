@@ -24,8 +24,27 @@ import (
 // the AEI runtime SDK, which loads the run, executes work under the run's deadline,
 // and reports the terminal outcome — one shot on a workload substrate, or a standing
 // actor loop on a durable one, selected by the platform rather than by this code.
+// measured adds the run's model time and model and tool calls to that report.
 func RunWorkload() {
-	aeiruntime.Main(os.Getenv, nil, work)
+	aeiruntime.Main(os.Getenv, nil, measured(work))
+}
+
+// measured wraps fn so the SDK's completion report carries what the run spent on the
+// model. It attaches an llm.Collector to the run's context and, when fn returns, hands
+// the totals to rt.SetModelTiming, which the SDK merges into the one terminal report
+// it sends (with provisioning and runtime seconds, which it measures itself). gofer
+// never calls rt.Complete: the SDK owns delivery, its retry budget and, on a durable
+// actor, releasing the concurrency slot once that report is acknowledged.
+func measured(fn func(context.Context, *aeiruntime.Runtime) error) func(context.Context, *aeiruntime.Runtime) error {
+	return func(ctx context.Context, rt *aeiruntime.Runtime) error {
+		ctx, collector := llm.WithCollector(ctx)
+		runErr := fn(ctx, rt)
+		seconds := collector.ModelDuration().Seconds()
+		rt.SetModelTiming(seconds, collector.ModelCalls(), collector.ToolCalls())
+		slog.Default().Info("gofer runtime finished", "run", rt.Spec().RunID, "ok", runErr == nil,
+			"model_seconds", seconds, "model_calls", collector.ModelCalls(), "tool_calls", collector.ToolCalls())
+		return runErr
+	}
 }
 
 // work executes one gofer job for the loaded run. It is gofer's workload (agent.Run)
