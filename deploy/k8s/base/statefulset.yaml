@@ -30,6 +30,10 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: gofer
+        # AEI's NetworkPolicy admits only pods carrying this label to the
+        # aei-controller's dispatch port (8081); without it dispatch times out. It
+        # stays out of the selector above, which a StatefulSet cannot change.
+        agents.x-k8s.io/dispatch-client: "true"
       annotations:
         # gofer serves app-level Prometheus metrics at /metrics on the http port:
         # the "Review all PRs" batch wall-clock (gofer_review_all_*), the aggregate

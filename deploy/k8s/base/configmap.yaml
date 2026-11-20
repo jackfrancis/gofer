@@ -40,7 +40,9 @@ data:
   # AEI dispatch API (the pre-installed aei-controller's dispatch listener, port 8081,
   # apart from the runtime ABI and metrics on 8080), which gofer POSTs runs to through
   # the app SDK; the ServiceAccount token it authenticates with, projected for AEI's
-  # "aei-dispatch" audience (the StatefulSet's aei-dispatch-token volume); and the
+  # "aei-dispatch" audience (the StatefulSet's aei-dispatch-token volume), from a pod
+  # labelled agents.x-k8s.io/dispatch-client: "true" (AEI's NetworkPolicy admits
+  # only those to the dispatch port); and the
   # AgentApp it dispatches as (must match the AgentApp metadata.name). The control
   # plane bounds every run by that app's policy and fixes the credential's audience.
   AEI_DISPATCH_ENDPOINT: "http://aei-controller.aei-system.svc:8081"

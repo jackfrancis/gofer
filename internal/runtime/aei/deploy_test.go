@@ -20,13 +20,23 @@ const dispatchAudience = "aei-dispatch"
 // ABI and metrics on 8080, so a NetworkPolicy can keep runtime pods off dispatch.
 const dispatchPort = "8081"
 
+// dispatchClientLabel is the pod label AEI's NetworkPolicy requires of a client of the
+// dispatch port; an unlabelled pod's connection times out.
+const dispatchClientLabel = "agents.x-k8s.io/dispatch-client"
+
 type configMap struct {
 	Data map[string]string `yaml:"data"`
 }
 
 type statefulSet struct {
 	Spec struct {
+		Selector struct {
+			MatchLabels map[string]string `yaml:"matchLabels"`
+		} `yaml:"selector"`
 		Template struct {
+			Metadata struct {
+				Labels map[string]string `yaml:"labels"`
+			} `yaml:"metadata"`
 			Spec struct {
 				AutomountServiceAccountToken *bool `yaml:"automountServiceAccountToken"`
 				Containers                   []struct {
@@ -136,5 +146,19 @@ func TestDeploymentDispatchesWithTheProjectedDispatchToken(t *testing.T) {
 	}
 	if endpoint.Port() != dispatchPort {
 		t.Errorf("AEI_DISPATCH_ENDPOINT = %q, want the dispatch listener on port %s", endpoint, dispatchPort)
+	}
+}
+
+// AEI's NetworkPolicy admits only labelled pods to the dispatch port. The label is on
+// the pod template; the selector must not name it, because a StatefulSet's selector is
+// immutable and adding it there would break every upgrade of an existing deployment.
+func TestDeploymentPodIsALabelledDispatchClient(t *testing.T) {
+	var sts statefulSet
+	loadManifest(t, "statefulset.yaml", &sts)
+	if got := sts.Spec.Template.Metadata.Labels[dispatchClientLabel]; got != "true" {
+		t.Errorf("pod template label %s = %q, want \"true\"", dispatchClientLabel, got)
+	}
+	if _, ok := sts.Spec.Selector.MatchLabels[dispatchClientLabel]; ok {
+		t.Errorf("selector names %s; a StatefulSet selector is immutable, keep it on the pod template only", dispatchClientLabel)
 	}
 }
