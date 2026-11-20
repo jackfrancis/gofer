@@ -56,10 +56,11 @@ func Score(item WorkItem, now time.Time) Metadata {
 	// product is bounded to [0,1]. The metadata remains the anchor: a multiplier
 	// cannot manufacture an axis a near-zero foundation does not support.
 	if rsh := item.Signals.Research; rsh != nil {
-		rel = clampUnit(rel * clampMult(rsh.Relevance))
-		imp = clampUnit(imp * clampMult(rsh.Impact))
-		eng = clampUnit(eng * clampMult(rsh.Engagement))
-		urg = clampUnit(urg * clampMult(rsh.Urgency))
+		mRel, mImp, mEng, mUrg := rsh.Multipliers()
+		rel = clampUnit(rel * mRel)
+		imp = clampUnit(imp * mImp)
+		eng = clampUnit(eng * mEng)
+		urg = clampUnit(urg * mUrg)
 		detail := rsh.Rationale
 		if detail == "" {
 			detail = "research re-weighting"
@@ -89,6 +90,50 @@ func Score(item WorkItem, now time.Time) Metadata {
 		m.Rationale = rationale(contribs)
 	}
 	return m
+}
+
+// Rescore returns item's Metadata as the radar shows it at now: re-derived from
+// its Signals by Score, keeping the persisted write time and the hidden and
+// completed marks, which are not scoring. A human override (OriginUser) is
+// returned verbatim. The landing page and the assistant both read an item's
+// ranking through this, so Discuss explains the rank the user is looking at
+// rather than whatever was last stored.
+func Rescore(item WorkItem, now time.Time) Metadata {
+	if item.Meta.Origin == OriginUser {
+		return item.Meta
+	}
+	scored := Score(item, now)
+	scored.UpdatedAt = item.Meta.UpdatedAt
+	scored.HiddenAt = item.Meta.HiddenAt
+	scored.CompletedAt = item.Meta.CompletedAt
+	return scored
+}
+
+// ResearchReflectsVisibleThread reports whether item's research adjustment may be
+// shown to a model alongside item.Thread. Research is derived from the turns it
+// read (ResearchAdjustment.Turns), so it stands only while every one of them is in
+// item.Thread and visible. The caller passes the thread the model is allowed to
+// see — for a Discuss turn, the turns up to the one being answered — so research
+// that read a later turn, a hidden turn, or a conversation since cleared is
+// refused. Research that recorded no turns cannot be checked and is refused too.
+// It reports false when there is no research.
+func ResearchReflectsVisibleThread(item WorkItem) bool {
+	r := item.Signals.Research
+	if r == nil || len(r.Turns) == 0 {
+		return false
+	}
+	visible := make(map[string]bool, len(item.Thread)) // one pass, not TurnIndex per key
+	for i, m := range item.Thread {
+		if !m.Hidden {
+			visible[item.TurnKey(i)] = true
+		}
+	}
+	for _, key := range r.Turns {
+		if !visible[key] {
+			return false
+		}
+	}
+	return true
 }
 
 // baselineAxes returns the four deterministic, signal-based axis values without
@@ -215,8 +260,14 @@ func engagementScore(s Signals, c *[]Contribution) float64 {
 	velocity := saturate(s.CommentVelocity, 5)
 	eng := math.Min(1, 0.4*comments+0.3*participants+0.15*reactions+0.15*velocity)
 	if eng > 0 {
+		people := fmt.Sprintf(" from %d people", s.Participants)
+		if s.Participants == 0 && s.Comments > 0 {
+			// Search supplies the comment count; participants come from the timeline
+			// enrichment, which has not run or failed. Zero would be false.
+			people = " (participants not yet counted)"
+		}
 		add(c, "engagement", "discussion", eng,
-			fmt.Sprintf("%d comments from %d people, %d reactions", s.Comments, s.Participants, s.Reactions))
+			fmt.Sprintf("%d comments%s, %d reactions", s.Comments, people, s.Reactions))
 	}
 	return eng
 }

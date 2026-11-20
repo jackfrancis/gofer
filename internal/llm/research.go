@@ -90,7 +90,18 @@ func (r *ResearchRanker) Research(ctx context.Context, item worklist.WorkItem) (
 		Urgency:    mult(doc.Urgency),
 		Rationale:  strings.TrimSpace(doc.Rationale),
 		AppliedAt:  now,
+		Turns:      threadKeys(item),
 	}, nil
+}
+
+// threadKeys lists the keys of the turns researchUserPrompt sends, so the stored
+// adjustment records what it was derived from.
+func threadKeys(item worklist.WorkItem) []string {
+	keys := make([]string, len(item.Thread))
+	for i := range item.Thread {
+		keys[i] = item.TurnKey(i)
+	}
+	return keys
 }
 
 // neutralResearch is an all-1.0 adjustment (no change).

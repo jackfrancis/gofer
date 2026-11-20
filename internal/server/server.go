@@ -115,6 +115,7 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	mux.Handle("POST /items/thread", http.HandlerFunc(webHandler.ThreadPost))
 	// Hide/unhide one turn of a thread — declutter a long review and drop it from context.
 	mux.Handle("POST /items/thread/hide", http.HandlerFunc(webHandler.HideMessage))
+	mux.Handle("POST /items/hide", http.HandlerFunc(webHandler.HideItem))
 	// Batch action: concurrently schedule a review turn for every PR on the radar.
 	mux.Handle("POST /items/review-all", http.HandlerFunc(webHandler.ReviewAllPRs))
 	// Force a re-ingest to pull newly created or updated work onto the radar.
