@@ -125,6 +125,8 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	mux.Handle("POST /items/review-all", http.HandlerFunc(webHandler.ReviewAllPRs))
 	// Force a re-ingest to pull newly created or updated work onto the radar.
 	mux.Handle("POST /items/refresh", http.HandlerFunc(webHandler.Refresh))
+	// The radar's project filter: saves which repositories the radar shows.
+	mux.Handle("POST /items/projects", http.HandlerFunc(webHandler.FilterProjects))
 	// Clear every conversation thread, so the review workflows can be demoed or
 	// exercised again from scratch without rebuilding the environment.
 	mux.Handle("POST /items/reset-conversations", http.HandlerFunc(webHandler.ResetConversations))
