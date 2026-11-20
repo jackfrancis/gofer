@@ -21,51 +21,103 @@ import (
 // the runtime SDK learns the run through the runtime ABI, holds the run credential in
 // memory only, and reports completion idempotently.
 
-// RunWorkload is gofer's agent runtime entrypoint (cmd/runtime). It hands control to
-// the AEI runtime SDK, which loads the run, executes work under the run's deadline,
-// and reports the terminal outcome — one shot on a workload substrate, or a standing
-// actor loop on a durable one, selected by the platform rather than by this code.
+// RunWorkload is gofer's agent runtime entrypoint (cmd/runtime). On a workload
+// substrate it runs one shot itself (runOnce), so the run sends a single completion
+// report that carries its model timing. On a durable substrate, where the platform
+// sets AEI_SERVE_ADDR, it hands control to the AEI runtime SDK's standing actor loop,
+// with each run wrapped by measured.
 func RunWorkload() {
-	aeiruntime.Main(os.Getenv, nil, measured(work))
+	if os.Getenv(aeiruntime.EnvServeAddr) != "" {
+		aeiruntime.Main(os.Getenv, nil, measured(work))
+		return
+	}
+	os.Exit(runOnce(os.Getenv, work))
 }
 
-// measured wraps fn so the run reports what it spent on the model. The SDK's own
-// completion report carries only provisioning and runtime seconds, so the wrapper
-// attaches an llm.Collector to the run's context, times the run itself, and reports
-// the terminal outcome with the full Timing (model seconds, model calls, tool calls)
-// before handing fn's result back. The control plane keeps the first terminal report
-// it receives for a run, so the SDK's report after this one is a no-op; if this one
-// fails to land, the SDK's still reports the outcome, without the model numbers.
+// reportTimeout bounds the one completion report a run sends: the same single budget
+// the SDK's own report uses. A variable so tests can shorten it.
+var reportTimeout = 10 * time.Second
+
+// runOnce is the one-shot run gofer drives itself instead of aeiruntime.Main, and
+// returns the process exit code. Main reports the outcome after fn returns with only
+// provisioning and runtime seconds, and it reports even when fn already has, so an app
+// that reports its own model timing pays a second report timeout against a stalled
+// controller, which can push a finished run past its deadline. runOnce instead loads
+// the run, executes fn under the run's deadline, and sends exactly one report with the
+// full Timing. It keeps Main's exit codes: 2 when the run cannot load, 1 when fn
+// fails, 0 on success.
+func runOnce(getenv func(string) string, fn func(context.Context, *aeiruntime.Runtime) error) int {
+	rt, err := aeiruntime.Load(context.Background(), getenv, nil)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "aeiruntime:", err)
+		return 2
+	}
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	if deadline := rt.Spec().Deadline; !deadline.IsZero() {
+		ctx, cancel = context.WithDeadline(context.Background(), deadline)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+	}
+	timing, runErr := measure(ctx, rt, fn)
+	cancel()
+	report(rt, runErr, timing)
+	if runErr != nil {
+		fmt.Fprintln(os.Stderr, "aeiruntime: run failed:", runErr)
+		return 1
+	}
+	return 0
+}
+
+// measured wraps fn for the SDK's durable serve loop, which applies the run's deadline
+// and reports the outcome itself after fn returns, with only provisioning and runtime
+// seconds. The wrapper reports first, with the full Timing; the control plane keeps
+// the first terminal report for a run, so the loop's is a no-op. A standing actor has
+// no process exit racing the deadline, so the loop's second report costs only time on
+// a stalled controller, never the run's outcome.
 func measured(fn func(context.Context, *aeiruntime.Runtime) error) func(context.Context, *aeiruntime.Runtime) error {
 	return func(ctx context.Context, rt *aeiruntime.Runtime) error {
-		start := time.Now()
-		ctx, collector := llm.WithCollector(ctx)
-		runErr := fn(ctx, rt)
-
-		timing := aeiruntime.Timing{
-			RuntimeSeconds: time.Since(start).Seconds(),
-			ModelSeconds:   collector.ModelDuration().Seconds(),
-			ModelCalls:     collector.ModelCalls(),
-			ToolCalls:      collector.ToolCalls(),
-		}
-		// Provisioning is dispatch-start to work-start, measured the way the SDK does.
-		if at := rt.Spec().DispatchedAt; !at.IsZero() {
-			if d := start.Sub(at); d > 0 {
-				timing.ProvisioningSeconds = d.Seconds()
-			}
-		}
-		log := slog.Default() // work routes it to the run's JSON handler
-		log.Info("gofer runtime finished", "run", rt.Spec().RunID, "ok", runErr == nil,
-			"runtime_seconds", timing.RuntimeSeconds, "model_seconds", timing.ModelSeconds,
-			"model_calls", timing.ModelCalls, "tool_calls", timing.ToolCalls)
-
-		// A fresh context, so the report still lands after the run's deadline cancelled ctx.
-		reportCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := rt.Complete(reportCtx, runErr, timing, ""); err != nil {
-			log.Warn("completion report with model timing failed; the SDK reports the outcome without it", "run", rt.Spec().RunID, "err", err)
-		}
+		timing, runErr := measure(ctx, rt, fn)
+		report(rt, runErr, timing)
 		return runErr
+	}
+}
+
+// measure runs fn with an llm.Collector on its context and returns what the run spent:
+// provisioning (dispatch-start to work-start, the SDK's definition), runtime, and the
+// model time and model and tool calls the collector observed.
+func measure(ctx context.Context, rt *aeiruntime.Runtime, fn func(context.Context, *aeiruntime.Runtime) error) (aeiruntime.Timing, error) {
+	start := time.Now()
+	ctx, collector := llm.WithCollector(ctx)
+	runErr := fn(ctx, rt)
+
+	timing := aeiruntime.Timing{
+		RuntimeSeconds: time.Since(start).Seconds(),
+		ModelSeconds:   collector.ModelDuration().Seconds(),
+		ModelCalls:     collector.ModelCalls(),
+		ToolCalls:      collector.ToolCalls(),
+	}
+	if at := rt.Spec().DispatchedAt; !at.IsZero() {
+		if d := start.Sub(at); d > 0 {
+			timing.ProvisioningSeconds = d.Seconds()
+		}
+	}
+	slog.Default().Info("gofer runtime finished", "run", rt.Spec().RunID, "ok", runErr == nil,
+		"runtime_seconds", timing.RuntimeSeconds, "model_seconds", timing.ModelSeconds,
+		"model_calls", timing.ModelCalls, "tool_calls", timing.ToolCalls)
+	return timing, runErr
+}
+
+// report sends the run's terminal outcome within reportTimeout, on a fresh context so
+// it still lands after the run's deadline cancelled the run. A failed report is
+// logged, not fatal: the platform backstops it with its substrate watch and deadline.
+func report(rt *aeiruntime.Runtime, runErr error, timing aeiruntime.Timing) {
+	ctx, cancel := context.WithTimeout(context.Background(), reportTimeout)
+	defer cancel()
+	if err := rt.Complete(ctx, runErr, timing, ""); err != nil {
+		slog.Default().Warn("completion report failed", "run", rt.Spec().RunID, "err", err)
 	}
 }
 

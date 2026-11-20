@@ -110,28 +110,38 @@ func (o *oneTool) Invoke(context.Context, string, json.RawMessage) (string, erro
 	return "a pull request", nil
 }
 
+// run executes fn as the one-shot runtime does, against env, and returns its exit code.
+func run(env map[string]string, fn func(context.Context, *aeiruntime.Runtime) error) int {
+	return runOnce(func(k string) string { return env[k] }, fn)
+}
+
+// reviewWith is a run function that asks the model to review an item with box.
+func reviewWith(model *httptest.Server, box worklist.ToolBox) func(context.Context, *aeiruntime.Runtime) error {
+	return func(ctx context.Context, _ *aeiruntime.Runtime) error {
+		c := llm.NewConverser(llm.Config{Endpoint: model.URL, Model: "m", Token: "t"})
+		_, err := c.Reply(ctx, worklist.WorkItem{Type: worklist.TypePullRequest}, "alice", "", nil, "review this", box)
+		return err
+	}
+}
+
 // A tool-using review reports the calls the workload observed — two model calls, one
-// tool call — and its model time, on the completion the control plane receives. The
-// model time is part of the runtime, and provisioning (dispatch to start) is reported
-// beside it, so an operator can tell waiting for a provider from time in the model.
-func TestMeasuredReportsAToolUsingReview(t *testing.T) {
+// tool call — and its model time, on the one completion the control plane receives.
+// The model time is part of the runtime, and provisioning (dispatch to start) is
+// reported beside it, so an operator can tell waiting for a provider from time in the
+// model.
+func TestRunOnceReportsAToolUsingReview(t *testing.T) {
 	const delay = 25 * time.Millisecond
 	control := newFakeControl(t)
 	model := reviewModel(t, delay)
 	dispatched := time.Now().Add(-3 * time.Second)
-	rt := loadRunWith(t, "github-converse", nil, map[string]string{
+	env := runEnv(t, "github-converse", nil, map[string]string{
 		aeiruntime.EnvControlURL:   control.srv.URL,
 		aeiruntime.EnvDispatchedAt: strconv.FormatInt(dispatched.UnixMilli(), 10),
 	})
 
 	box := &oneTool{}
-	review := func(ctx context.Context, _ *aeiruntime.Runtime) error {
-		c := llm.NewConverser(llm.Config{Endpoint: model.URL, Model: "m", Token: "t"})
-		_, err := c.Reply(ctx, worklist.WorkItem{Type: worklist.TypePullRequest}, "alice", "", nil, "review this", box)
-		return err
-	}
-	if err := measured(review)(context.Background(), rt); err != nil {
-		t.Fatalf("measured review: %v", err)
+	if code := run(env, reviewWith(model, box)); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
 	}
 
 	got := control.only(t)
@@ -155,24 +165,24 @@ func TestMeasuredReportsAToolUsingReview(t *testing.T) {
 	}
 }
 
-// The real workload, wrapped as RunWorkload wraps it, reports its model calls: an
+// The real workload, run one shot as RunWorkload runs it, reports its model calls: an
 // llm-rank run over one item makes one model call and no tool calls.
-func TestMeasuredWorkReportsARankRun(t *testing.T) {
+func TestRunOnceReportsARankRun(t *testing.T) {
 	control := newFakeControl(t)
 	plane := newGoferPlane(t, []worklist.WorkItem{{
 		ID: "github:o/r#7", OwnerID: "github:1", Source: "github", Type: worklist.TypePullRequest,
 		GitHub: worklist.GitHubRef{Number: 7, Repo: "o/r", Title: "T", State: "open"},
 	}})
 	model := modelStub(t)
-	rt := loadRunWith(t, "llm-rank", map[string]string{
+	env := runEnv(t, "llm-rank", map[string]string{
 		"owner":       "github:1",
 		"gofer_url":   plane.srv.URL,
 		"ai_endpoint": model.URL + "/chat/completions",
 		"ai_model":    "test-model",
 	}, map[string]string{aeiruntime.EnvControlURL: control.srv.URL})
 
-	if err := measured(work)(context.Background(), rt); err != nil {
-		t.Fatalf("measured work: %v", err)
+	if code := run(env, work); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
 	}
 	got := control.only(t)
 	if got.Timing.ModelCalls != 1 || got.Timing.ToolCalls != 0 {
@@ -183,19 +193,112 @@ func TestMeasuredWorkReportsARankRun(t *testing.T) {
 	}
 }
 
-// A failed run reports its error with the timing it gathered, returns the same error
-// (so the SDK still exits non-zero), and reports even when the run's context is
-// already cancelled, as it is after the deadline.
-func TestMeasuredReportsAFailedRunAfterItsDeadline(t *testing.T) {
+// A failed run reports its error with the timing it gathered and exits 1, as
+// aeiruntime.Main does.
+func TestRunOnceReportsAFailedRun(t *testing.T) {
+	control := newFakeControl(t)
+	model := reviewModel(t, 0)
+	env := runEnv(t, "github-converse", nil, map[string]string{aeiruntime.EnvControlURL: control.srv.URL})
+
+	boom := errors.New("review failed")
+	review := reviewWith(model, &oneTool{})
+	fail := func(ctx context.Context, rt *aeiruntime.Runtime) error {
+		_ = review(ctx, rt)
+		return boom
+	}
+	if code := run(env, fail); code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	got := control.only(t)
+	if got.Error != boom.Error() {
+		t.Errorf("reported error = %q, want %q", got.Error, boom.Error())
+	}
+	if got.Timing.ModelCalls != 2 || got.Timing.ToolCalls != 1 {
+		t.Errorf("timing = %+v, want 2 model calls and 1 tool call", got.Timing)
+	}
+}
+
+// Against a stalled controller a run makes one completion attempt and gives up after
+// one report budget, so a finished run exits in time; aeiruntime.Main would wait out a
+// second budget for its own report after gofer's.
+func TestRunOnceSendsOneReportWithinOneBudget(t *testing.T) {
+	old := reportTimeout
+	reportTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { reportTimeout = old })
+
+	var (
+		mu       sync.Mutex
+		attempts int
+	)
+	release := make(chan struct{})
+	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts++
+		mu.Unlock()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(stalled.Close)
+	t.Cleanup(func() { close(release) }) // runs first: unblock the handler before Close
+	env := runEnv(t, "github-converse", nil, map[string]string{aeiruntime.EnvControlURL: stalled.URL})
+
+	began := time.Now()
+	if code := run(env, func(context.Context, *aeiruntime.Runtime) error { return nil }); code != 0 {
+		t.Fatalf("exit code = %d, want 0 (the run succeeded; only its report stalled)", code)
+	}
+	if took := time.Since(began); took >= 2*reportTimeout {
+		t.Errorf("run took %v against a stalled controller, want under %v (one report budget)", took, 2*reportTimeout)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if attempts != 1 {
+		t.Errorf("completion attempts = %d, want 1", attempts)
+	}
+}
+
+// The run executes under its deadline (AEI_DEADLINE), as it does under the SDK.
+func TestRunOnceAppliesTheRunDeadline(t *testing.T) {
+	control := newFakeControl(t)
+	deadline := time.Now().Add(time.Hour).Truncate(time.Millisecond)
+	env := runEnv(t, "github-converse", nil, map[string]string{
+		aeiruntime.EnvControlURL: control.srv.URL,
+		aeiruntime.EnvDeadline:   strconv.FormatInt(deadline.UnixMilli(), 10),
+	})
+
+	var got time.Time
+	var ok bool
+	run(env, func(ctx context.Context, _ *aeiruntime.Runtime) error {
+		got, ok = ctx.Deadline()
+		return nil
+	})
+	if !ok || !got.Equal(deadline) {
+		t.Errorf("run context deadline = %v (set %v), want %v", got, ok, deadline)
+	}
+}
+
+// A run that cannot load exits 2 and reports nothing, as aeiruntime.Main does.
+func TestRunOnceCannotLoad(t *testing.T) {
+	ran := false
+	code := run(map[string]string{}, func(context.Context, *aeiruntime.Runtime) error { ran = true; return nil })
+	if code != 2 || ran {
+		t.Errorf("exit code = %d, ran = %v; want 2 and not run", code, ran)
+	}
+}
+
+// On a durable substrate the SDK's serve loop runs each run; measured reports first,
+// with the full timing, even once the run's context is cancelled (after its deadline),
+// and hands back the run's error for the loop's own report.
+func TestMeasuredReportsFirstForTheServeLoop(t *testing.T) {
 	control := newFakeControl(t)
 	model := reviewModel(t, 0)
 	rt := loadRunWith(t, "github-converse", nil, map[string]string{aeiruntime.EnvControlURL: control.srv.URL})
 
 	boom := errors.New("deadline exceeded mid-review")
-	fail := func(ctx context.Context, _ *aeiruntime.Runtime) error {
-		// A review's model and tool calls on a live context, then the deadline passes.
-		c := llm.NewConverser(llm.Config{Endpoint: model.URL, Model: "m", Token: "t"})
-		_, _ = c.Reply(context.WithoutCancel(ctx), worklist.WorkItem{}, "", "", nil, "q", &oneTool{})
+	review := reviewWith(model, &oneTool{})
+	fail := func(ctx context.Context, rt *aeiruntime.Runtime) error {
+		_ = review(context.WithoutCancel(ctx), rt)
 		return boom
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -204,10 +307,7 @@ func TestMeasuredReportsAFailedRunAfterItsDeadline(t *testing.T) {
 		t.Fatalf("measured returned %v, want the run's error", err)
 	}
 	got := control.only(t)
-	if got.Error != boom.Error() {
-		t.Errorf("reported error = %q, want %q", got.Error, boom.Error())
-	}
-	if got.Timing.ModelCalls != 2 || got.Timing.ToolCalls != 1 {
-		t.Errorf("timing = %+v, want 2 model calls and 1 tool call", got.Timing)
+	if got.Error != boom.Error() || got.Timing.ModelCalls != 2 || got.Timing.ToolCalls != 1 {
+		t.Errorf("report = %+v, want the run's error with 2 model calls and 1 tool call", got)
 	}
 }

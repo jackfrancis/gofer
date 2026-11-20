@@ -228,8 +228,7 @@ func chatComplete(ctx context.Context, httpClient *http.Client, endpoint, token 
 // Every call, on either transport and whether or not it succeeds, is recorded on the
 // context's Collector (a no-op without one), so the run reports its model time.
 func chat(ctx context.Context, httpClient *http.Client, endpoint, token string, body chatRequest) (chatMessage, error) {
-	start := time.Now()
-	defer func() { recordModelCall(ctx, time.Since(start)) }()
+	defer beginModelCall(ctx)()
 	if isResponsesEndpoint(endpoint) {
 		return responsesChat(ctx, httpClient, endpoint, token, body)
 	}

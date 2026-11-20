@@ -118,6 +118,68 @@ func TestCollectorIsSafeForConcurrentCalls(t *testing.T) {
 	}
 }
 
+// Overlapping model calls count their elapsed time once: n requests held in flight
+// together for d report about d of model time, not n*d, while every request still
+// counts as a call. Ranking runs requests concurrently, so a sum would overstate the
+// model's share of the run.
+func TestCollectorCountsOverlappingTimeOnce(t *testing.T) {
+	const (
+		n = 8
+		d = 100 * time.Millisecond
+	)
+	var arrived sync.WaitGroup
+	arrived.Add(n)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived.Done()
+		<-release
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer srv.Close()
+	ctx, col := WithCollector(context.Background())
+
+	var done sync.WaitGroup
+	for range n {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			_, _ = chat(ctx, srv.Client(), srv.URL, "tok", chatRequest{Model: "m"})
+		}()
+	}
+	arrived.Wait() // all n in flight at once
+	time.Sleep(d)
+	close(release)
+	done.Wait()
+
+	if got := col.ModelCalls(); got != n {
+		t.Errorf("model calls = %d, want %d", got, n)
+	}
+	if got := col.ModelDuration(); got < d || got >= 2*d {
+		t.Errorf("model time = %v for %d overlapping calls held %v, want about %v (not %v)", got, n, d, d, n*d)
+	}
+}
+
+// Model time adds up across calls that do not overlap, and an open stretch counts
+// while a call is still in flight.
+func TestCollectorAddsSequentialStretches(t *testing.T) {
+	var c Collector
+	end := c.beginModelCall()
+	time.Sleep(20 * time.Millisecond)
+	if got := c.ModelDuration(); got < 20*time.Millisecond {
+		t.Errorf("open stretch = %v, want at least 20ms", got)
+	}
+	end()
+	end = c.beginModelCall()
+	time.Sleep(20 * time.Millisecond)
+	end()
+	if got := c.ModelDuration(); got < 40*time.Millisecond {
+		t.Errorf("model time = %v over two 20ms calls, want at least 40ms", got)
+	}
+	if got := c.ModelCalls(); got != 2 {
+		t.Errorf("model calls = %d, want 2", got)
+	}
+}
+
 // Without a collector on the context (tests, any caller outside a run), the tool loop
 // runs as before: recording is a no-op, not a nil dereference.
 func TestToolLoopRunsWithoutACollector(t *testing.T) {
