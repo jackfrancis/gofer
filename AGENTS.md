@@ -177,8 +177,10 @@ Wired on the web-tier side; they define what a runtime must respect:
   (`github.Fetch.ReviewRequestsComplete`) confirms a request was removed; after a
   partial one the stored request is kept, and the chained enrich drops that kept
   request only if the whole timeline shows it ended (`Activity.RequestEnded`: a
-  withdrawal or the user's own review). A request the search showed is never dropped
-  by the timeline, since a team request leaves no event for the user. A retired item
+  withdrawal or the user's own review, with no team request still pending after it,
+  since team membership is unknown and the search counts team requests). A request
+  the search showed is never dropped by the timeline, since a team request names the
+  team, not the user. A retired item
   carries no request into its resurfacing.
   Before the merge, every write-back path applies
   `worklist.RunPolicy` (the agent plane's ingest handler, and the in-process

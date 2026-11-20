@@ -189,6 +189,28 @@ func TestItemActivityRequestEnded(t *testing.T) {
 			{"event":"reviewed","submitted_at":"2026-01-01T00:00:00Z","state":"commented","user":{"login":"me"}},
 			{"event":"review_requested","created_at":"2026-01-02T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"bob"}}
 		]`, false},
+		// login may be on the team, which GitHub's review-requested search counts.
+		"team request after own review": {`[
+			{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"alice"}},
+			{"event":"reviewed","submitted_at":"2026-01-02T00:00:00Z","state":"approved","user":{"login":"me"}},
+			{"event":"review_requested","created_at":"2026-01-03T00:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"bob"}}
+		]`, false},
+		"team request withdrawn after own review": {`[
+			{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"alice"}},
+			{"event":"reviewed","submitted_at":"2026-01-02T00:00:00Z","state":"approved","user":{"login":"me"}},
+			{"event":"review_requested","created_at":"2026-01-03T00:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"bob"}},
+			{"event":"review_request_removed","created_at":"2026-01-04T00:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"bob"}}
+		]`, true},
+		"own review fulfils an earlier team request": {`[
+			{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"bob"}},
+			{"event":"review_requested","created_at":"2026-01-01T01:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"alice"}},
+			{"event":"reviewed","submitted_at":"2026-01-02T00:00:00Z","state":"approved","user":{"login":"me"}}
+		]`, true},
+		"personal withdrawal leaves a team request": {`[
+			{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"bob"}},
+			{"event":"review_requested","created_at":"2026-01-01T01:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"alice"}},
+			{"event":"review_request_removed","created_at":"2026-01-02T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"alice"}}
+		]`, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			srv := timelineServer(tc.timeline)

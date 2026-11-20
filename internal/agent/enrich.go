@@ -34,9 +34,10 @@ const (
 //
 // carried (optional) names the items whose review request the refresh that chains
 // into this pass kept although its search did not show it (see carryPendingRequest):
-// for those, a timeline that shows the user's request ended removes the request.
-// A request the search itself showed is never removed here: one made through a team
-// leaves no event for the user on the timeline.
+// for those, a timeline that shows the user's request ended removes the request
+// (Activity.RequestEnded, which a team request still pending after it rules out,
+// since the user may be on that team). A request the search itself showed is never
+// removed here: the timeline cannot tell whether a team request includes the user.
 func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried map[string]bool) error {
 	provider := p.Provider
 	if provider == "" {

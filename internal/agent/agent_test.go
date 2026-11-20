@@ -824,12 +824,28 @@ func TestRefreshReviewRequestEvidence(t *testing.T) {
 	})
 
 	// The search itself shows the request, though the user's own review ended their
-	// personal one (a team request leaves no event for them): the search wins.
+	// personal one (a team request names the team, not them): the search wins.
 	t.Run("a search-confirmed request survives the timeline", func(t *testing.T) {
 		sink := newSink()
 		item := reviewSnapshot(t, sink, true, "["+requested+","+reviewed+"]", false)
 		if !pending(item) {
 			t.Fatalf("a request the search showed was dropped: reasons %v", item.Signals.Reasons)
+		}
+	})
+
+	// The user reviewed personally, then their team was asked. A complete search
+	// records the team request; the next, partial one misses it. The timeline,
+	// unchanged, shows the personal request ended but a team request after it, which
+	// may include the user: the kept request stays.
+	t.Run("a team request after the user's review stays", func(t *testing.T) {
+		sink := newSink()
+		const team = `{"event":"review_requested","created_at":"2026-01-03T09:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"bob"}}`
+		timeline := "[" + requested + "," + reviewed + "," + team + "]"
+		if first := reviewSnapshot(t, sink, true, timeline, false); !pending(first) {
+			t.Fatalf("setup: the confirmed team request was not recorded: reasons %v", first.Signals.Reasons)
+		}
+		if item := reviewSnapshot(t, sink, false, timeline, false); !pending(item) {
+			t.Fatalf("a partial search lost the team request: reasons %v", item.Signals.Reasons)
 		}
 	})
 
