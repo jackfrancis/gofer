@@ -113,18 +113,15 @@
       </div>
       {{if .ReplyStalled}}
       <div class="zz-stalled">
-        <p>The assistant hasn&rsquo;t responded &mdash; it may have been rate-limited or the run failed.</p>
-        {{if .ConvEnabled}}
+        <p>The assistant hasn&rsquo;t responded &mdash; it may have been rate-limited or the run failed.{{if .StalledHidden}} Unhide your message to retry it.{{end}}</p>
+        {{if .RetryRefused}}<p role="alert">The retry could not be started. Try again in a moment.</p>{{end}}
+        {{if and .ConvEnabled .StalledTurn}}
         <form class="zz-retry-form" method="post" action="/items/thread/retry">
           <input type="hidden" name="id" value="{{.Item.ID}}">
           <input type="hidden" name="turn" value="{{.StalledTurn}}">
-          {{if .StalledIndependent}}{{if gt (len .SecondOpinionOptions) 1}}
+          {{if gt (len .RetryOptions) 1}}
           <select name="choice" aria-label="Model">
-            {{range .SecondOpinionOptions}}<option value="{{.Value}}">{{.Label}}</option>{{end}}
-          </select>
-          {{end}}{{else if gt (len .ModelOptions) 1}}
-          <select name="choice" aria-label="Model">
-            {{range .ModelOptions}}<option value="{{.Value}}">{{.Label}}</option>{{end}}
+            {{range .RetryOptions}}<option value="{{.Value}}">{{.Label}}</option>{{end}}
           </select>
           {{end}}
           <button class="btn btn-sm" type="submit" title="Ask again for an answer to the same message">Retry</button>

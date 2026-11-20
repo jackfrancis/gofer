@@ -2,6 +2,8 @@ package webui
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -9,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackfrancis/gofer/internal/ingest"
 	"github.com/jackfrancis/gofer/internal/session"
 	"github.com/jackfrancis/gofer/internal/storage"
 	"github.com/jackfrancis/gofer/internal/worklist"
@@ -296,5 +299,138 @@ func TestThreadRetryAcrossRestart(t *testing.T) {
 	got := storedItem(t, store, "pr1")
 	if replies := agentReplies(got); len(got.Thread) != 2 || len(replies) != 1 || replies[0].ID != "a-late" {
 		t.Fatalf("the original turn must keep exactly one answer, got %+v", got.Thread)
+	}
+}
+
+// A Retry the backend refused (ingest.ErrNotAccepted) started no run, so the turn
+// is not left pending: its time is put back, the page says the attempt was refused
+// and offers Retry again at once. A failure that may have started a run leaves the
+// turn pending, so the page polls instead of offering a second run.
+func TestThreadRetryRefusedDispatch(t *testing.T) {
+	now := retryNow
+	stalledAt := now.Add(-10 * time.Minute)
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest, Thread: []worklist.Message{
+		{ID: "t1", Role: worklist.RoleUser, Content: "Is this ready?", At: stalledAt},
+	}})
+	pipe := &recordPipeline{err: fmt.Errorf("aei: dispatch not sent: %w", ingest.ErrNotAccepted)}
+	h := retryHandler(store, pipe, &now)
+
+	rec := postRetry(h, url.Values{"id": {"pr1"}, "turn": {"t1"}})
+	loc := rec.Header().Get("Location")
+	if len(pipe.turns) != 1 || loc != "/items/thread?id=pr1&retry=refused" {
+		t.Fatalf("a refused retry must be dispatched once and reported, got %+v, Location %q", pipe.turns, loc)
+	}
+	if got := storedItem(t, store, "pr1"); !got.Thread[0].At.Equal(stalledAt) {
+		t.Fatalf("a refused retry must restore the turn's time, got %v", got.Thread[0].At)
+	}
+	rr := httptest.NewRecorder()
+	h.Thread(rr, httptest.NewRequest(http.MethodGet, loc, nil))
+	if page := rr.Body.String(); !strings.Contains(page, retryForm) || !strings.Contains(page, "could not be started") {
+		t.Fatalf("after a refusal the page must say so and offer Retry, got:\n%s", page)
+	}
+
+	// Unknown acceptance: a run may exist, so the turn stays pending.
+	pipe.err = errors.New("aei: dispatch: context deadline exceeded")
+	rec = postRetry(h, url.Values{"id": {"pr1"}, "turn": {"t1"}})
+	if len(pipe.turns) != 2 || rec.Header().Get("Location") != "/items/thread?id=pr1" {
+		t.Fatalf("want a second dispatch with no refusal, got %+v, Location %q", pipe.turns, rec.Header().Get("Location"))
+	}
+	if got := storedItem(t, store, "pr1"); !got.Thread[0].At.Equal(now) {
+		t.Fatalf("a retry whose acceptance is unknown must stay pending, got %v", got.Thread[0].At)
+	}
+	if page := openThread(t, h, "pr1"); strings.Contains(page, retryForm) {
+		t.Fatal("a turn that may be in flight must not offer Retry")
+	}
+}
+
+// A turn the user hid is not retried: a retry would send its content back to the
+// model as the prompt. The page asks the user to unhide it first; an old Retry form,
+// say from another tab, dispatches nothing; Review all reviews afresh instead of
+// re-sending a hidden review request.
+func TestThreadRetryHiddenTurn(t *testing.T) {
+	now := retryNow
+	old := now.Add(-10 * time.Minute)
+	store := worklist.NewMemoryStore()
+	store.Seed("u1",
+		worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest, Thread: []worklist.Message{
+			{ID: "t1", Role: worklist.RoleUser, Content: "secret", Hidden: true, At: old},
+		}},
+		worklist.WorkItem{ID: "pr2", Type: worklist.TypePullRequest, Thread: []worklist.Message{
+			{ID: "r1", Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, Hidden: true, At: old},
+		}},
+	)
+	pipe := &recordPipeline{}
+	h := retryHandler(store, pipe, &now)
+
+	page := openThread(t, h, "pr1")
+	if strings.Contains(page, retryForm) || !strings.Contains(page, "Unhide your message to retry it") {
+		t.Fatalf("a hidden stalled turn must not offer Retry, got:\n%s", page)
+	}
+	postRetry(h, url.Values{"id": {"pr1"}, "turn": {"t1"}})
+	if len(pipe.turns) != 0 {
+		t.Fatalf("a hidden turn must not be retried, got %+v", pipe.turns)
+	}
+	if got := storedItem(t, store, "pr1"); !got.Thread[0].At.Equal(old) {
+		t.Fatal("a refused Retry must not re-stamp the hidden turn")
+	}
+
+	h.ReviewAllPRs(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/items/review-all", nil))
+	for _, ref := range pipe.turns {
+		if ref.Item == "pr2" && ref.Turn == "r1" {
+			t.Fatal("Review all must not re-send a hidden review request")
+		}
+	}
+	if got := storedItem(t, store, "pr2"); !got.Thread[0].At.Equal(old) || len(got.Thread) != 2 {
+		t.Fatalf("Review all must leave the hidden request alone and post a new one, got %+v", got.Thread)
+	}
+}
+
+// Retry of a review-panel request offers exactly the models the handler will use:
+// every configured model but the first reviewer's, default included. With A
+// (default), B and C, and B the first reviewer, the picker offers A and C; a choice
+// of B is never honoured. With no model but the first reviewer's, no Retry is offered.
+func TestThreadRetryReviewPanelModels(t *testing.T) {
+	now := retryNow
+	abc := []ModelOption{
+		{Value: "c0|A", Label: "A", Endpoint: "https://a", Model: "A"},
+		{Value: "c1|B", Label: "B", Endpoint: "https://b", Model: "B"},
+		{Value: "c2|C", Label: "C", Endpoint: "https://c", Model: "C"},
+	}
+	panel := func(id, first string) worklist.WorkItem {
+		it := reviewedByModel(id, first, now.Add(-time.Hour))
+		it.Thread = append(it.Thread, worklist.Message{ID: "so-" + id, Role: worklist.RoleUser, Content: independentReviewPrompt, Kind: worklist.KindReviewRequest, At: now.Add(-10 * time.Minute)})
+		return it
+	}
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", panel("pr1", "B"), panel("pr2", "B"))
+	pipe := &recordPipeline{}
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, pipe, nil, true, abc)
+	h.now = func() time.Time { return now }
+
+	page := openThread(t, h, "pr1")
+	form := page[strings.Index(page, retryForm):]
+	form = form[:strings.Index(form, "</form>")]
+	if !strings.Contains(form, `value="c0|A"`) || !strings.Contains(form, `value="c2|C"`) || strings.Contains(form, `value="c1|B"`) {
+		t.Fatalf("the Retry picker must offer A and C only, got:\n%s", form)
+	}
+	postRetry(h, url.Values{"id": {"pr1"}, "turn": {"so-pr1"}, "choice": {"c2|C"}})
+	postRetry(h, url.Values{"id": {"pr2"}, "turn": {"so-pr2"}, "choice": {"c1|B"}})
+	if len(pipe.soModels) != 2 || pipe.soModels[0] != "C" || pipe.soModels[1] != "A" {
+		t.Fatalf("want C as chosen, then A for a choice of the first reviewer, got %v", pipe.soModels)
+	}
+
+	// Only the first reviewer's model is configured: nothing to retry with.
+	only := worklist.NewMemoryStore()
+	only.Seed("u1", panel("pr3", "A"))
+	pipe = &recordPipeline{}
+	h = New(fakeSessions{&session.User{ID: "u1"}}, only, pipe, nil, true, abc[:1])
+	h.now = func() time.Time { return now }
+	if page := openThread(t, h, "pr3"); strings.Contains(page, retryForm) {
+		t.Fatal("no Retry may be offered when no model but the first reviewer's exists")
+	}
+	postRetry(h, url.Values{"id": {"pr3"}, "turn": {"so-pr3"}})
+	if len(pipe.turns) != 0 {
+		t.Fatalf("want no dispatch, got %+v", pipe.turns)
 	}
 }

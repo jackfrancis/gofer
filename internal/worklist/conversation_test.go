@@ -187,3 +187,41 @@ func TestReconnectNotice(t *testing.T) {
 		t.Errorf("an unknown notice marker survived: %+v", forged.Thread[1])
 	}
 }
+
+// UndoRetry restores a refused attempt's turn only while it still carries exactly
+// that attempt's time and is unanswered: a later attempt, or an answer, wins.
+func TestUndoRetry(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	prev := now.Add(-10 * time.Minute)
+	stalled := func() WorkItem {
+		return WorkItem{ID: "i", Thread: []Message{{ID: "t1", Role: RoleUser, Content: "q", At: prev}}}
+	}
+
+	it := stalled()
+	key, ok := it.RetryStalled(now, 5*time.Minute)
+	if !ok || key != "t1" || !it.Thread[0].At.Equal(now) {
+		t.Fatalf("RetryStalled = %q %v, at %v", key, ok, it.Thread[0].At)
+	}
+	if !it.UndoRetry("t1", now, prev) || !it.Thread[0].At.Equal(prev) {
+		t.Fatal("UndoRetry must restore this attempt's turn")
+	}
+
+	later := stalled()
+	later.Thread[0].At = now.Add(time.Minute) // another attempt re-stamped it since
+	if later.UndoRetry("t1", now, prev) {
+		t.Fatal("UndoRetry must leave a later attempt alone")
+	}
+
+	answered := stalled()
+	answered.Thread[0].At = now
+	answered.Thread = append(answered.Thread, Message{ID: "a1", ReplyTo: "t1", Role: RoleAgent, Content: "a", At: now})
+	if answered.UndoRetry("t1", now, prev) {
+		t.Fatal("UndoRetry must leave an answered turn alone")
+	}
+
+	hidden := stalled()
+	hidden.Thread[0].Hidden = true
+	if _, ok := hidden.RetryStalled(now, 5*time.Minute); ok || !hidden.Thread[0].At.Equal(prev) {
+		t.Fatal("RetryStalled must not retry a hidden turn")
+	}
+}
