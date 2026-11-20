@@ -1,9 +1,11 @@
 package webui
 
 import (
+	"bytes"
 	"context"
 	"html/template"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -501,38 +503,75 @@ type errReader struct{}
 func (errReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 
 // A bulk form that cannot be read changes nothing: its lost scope must not read as
-// every project.
+// every project. Each body below scopes the action to b/two, which has no items, so
+// any change to a/one's items means the scope was dropped. Only a URL-encoded body is
+// read: Go's ParseForm leaves multipart and other bodies unread.
 func TestBulkActionsRejectUnreadableForm(t *testing.T) {
 	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
 	opts := []ModelOption{{Value: "c0|default", Model: "default"}, {Value: "c1|alt", Model: "alt"}}
-	store := worklist.NewMemoryStore()
-	store.Seed("u1",
-		inRepo(worklist.WorkItem{ID: "new-a", Type: worklist.TypePullRequest}, "a/one"),
-		inRepo(reviewedByModel("rev-a", "default", now), "a/one"),
-	)
-	pipe := &recordPipeline{}
-	h := &Handler{sessions: fakeSessions{&session.User{ID: "u1"}}, store: store, pipeline: pipe, convEnabled: true, options: opts, now: func() time.Time { return now }}
-	for path, handle := range map[string]func(http.ResponseWriter, *http.Request){
-		"/items/review-all":          h.ReviewAllPRs,
-		"/items/second-opinion-all":  h.SecondOpinionAllPRs,
-		"/items/reset-conversations": h.ResetConversations,
+	scoped := url.Values{"scope": {scopeOf("b/two")}, "choice": {"c1|alt"}}.Encode()
+	multipartBody := func() (io.Reader, string) {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		_ = mw.WriteField("scope", scopeOf("b/two"))
+		_ = mw.WriteField("choice", "c1|alt")
+		_ = mw.Close()
+		return &buf, mw.FormDataContentType()
+	}
+	for name, body := range map[string]func() (io.Reader, string){
+		"cut-off body": func() (io.Reader, string) { return errReader{}, "application/x-www-form-urlencoded" },
+		"multipart":    multipartBody,
+		"plain text":   func() (io.Reader, string) { return strings.NewReader(scoped), "text/plain" },
+		"untyped":      func() (io.Reader, string) { return strings.NewReader(scoped), "" },
+		"bad type":     func() (io.Reader, string) { return strings.NewReader(scoped), "application/x-www-form-urlencoded; =" },
 	} {
-		req := httptest.NewRequest(http.MethodPost, path, errReader{})
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		rec := httptest.NewRecorder()
-		handle(rec, req)
-		if rec.Code != http.StatusSeeOther {
-			t.Errorf("%s: status = %d, want 303", path, rec.Code)
+		store := worklist.NewMemoryStore()
+		store.Seed("u1",
+			inRepo(worklist.WorkItem{ID: "new-a", Type: worklist.TypePullRequest}, "a/one"),
+			inRepo(reviewedByModel("rev-a", "default", now), "a/one"),
+		)
+		pipe := &recordPipeline{}
+		h := &Handler{sessions: fakeSessions{&session.User{ID: "u1"}}, store: store, pipeline: pipe, convEnabled: true, options: opts, now: func() time.Time { return now }}
+		for path, handle := range map[string]func(http.ResponseWriter, *http.Request){
+			"/items/review-all":          h.ReviewAllPRs,
+			"/items/second-opinion-all":  h.SecondOpinionAllPRs,
+			"/items/reset-conversations": h.ResetConversations,
+		} {
+			b, ct := body()
+			req := httptest.NewRequest(http.MethodPost, path, b)
+			if ct != "" {
+				req.Header.Set("Content-Type", ct)
+			}
+			rec := httptest.NewRecorder()
+			handle(rec, req)
+			if rec.Code != http.StatusSeeOther {
+				t.Errorf("%s %s: status = %d, want 303", name, path, rec.Code)
+			}
+		}
+		if len(pipe.turns) != 0 {
+			t.Errorf("%s: dispatched %v", name, pipe.turns)
+		}
+		items, _ := store.List(context.Background(), "u1")
+		for _, it := range items {
+			if it.ID == "new-a" && len(it.Thread) != 0 || it.ID == "rev-a" && len(it.Thread) != 2 {
+				t.Errorf("%s: %s thread changed to %d turns", name, it.ID, len(it.Thread))
+			}
 		}
 	}
-	if len(pipe.turns) != 0 {
-		t.Errorf("an unreadable form dispatched %v", pipe.turns)
-	}
-	items, _ := store.List(context.Background(), "u1")
-	for _, it := range items {
-		if it.ID == "new-a" && len(it.Thread) != 0 || it.ID == "rev-a" && len(it.Thread) != 2 {
-			t.Errorf("%s: thread changed to %d turns", it.ID, len(it.Thread))
-		}
+}
+
+// The page's own URL-encoded scope is honored by the same check, so the rejection
+// above is about the body, not the scope.
+func TestBulkActionsReadURLEncodedScope(t *testing.T) {
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", inRepo(reviewedByModel("rev-a", "default", now), "a/one"))
+	h := &Handler{sessions: fakeSessions{&session.User{ID: "u1"}}, store: store, now: func() time.Time { return now }}
+	req := httptest.NewRequest(http.MethodPost, "/items/reset-conversations", strings.NewReader(url.Values{"scope": {scopeOf("a/one")}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	h.ResetConversations(httptest.NewRecorder(), req)
+	if items, _ := store.List(context.Background(), "u1"); len(items[0].Thread) != 0 {
+		t.Fatal("a URL-encoded form (with a charset parameter) must be read and applied")
 	}
 }
 
@@ -550,5 +589,30 @@ func TestProjectFilterEmptyRadarKeepsEmptySelection(t *testing.T) {
 	}
 	if v, _ := url.ParseQuery(c.Value); len(decodeSelection(v)) != 0 || decodeSelection(v) == nil {
 		t.Fatalf("saved %q, want an empty selection", c.Value)
+	}
+}
+
+// A filtered page offers "Show all projects", a plain submit that clears the filter
+// without JavaScript — the only way back on a radar with no project left to check.
+// Apply stays the form's first (default) button.
+func TestProjectFilterShowAllButton(t *testing.T) {
+	archived := inRepo(worklist.WorkItem{ID: "done-a"}, "a/one")
+	archived.Meta.CompletedAt = time.Now()
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", archived, inRepo(worklist.WorkItem{ID: "x"}, "b/two"))
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{false}, false, nil)
+
+	page := getIndex(t, h, filterCookie("a/one"))
+	apply, showAll := strings.Index(page, ">Apply</button>"), strings.Index(page, `name="all" value="1">Show all projects</button>`)
+	if showAll < 0 || apply < 0 || apply > showAll {
+		t.Fatalf("expected Apply, then Show all projects, in the filtered page's form (apply=%d, showAll=%d)", apply, showAll)
+	}
+	if all := getIndex(t, h, nil); strings.Contains(all, "Show all projects") {
+		t.Error("an unfiltered page has nothing to show all of")
+	}
+
+	store.Seed("u1", archived) // the radar empties
+	if c := postFilter(t, h, url.Values{"all": {"1"}}); c == nil || c.MaxAge >= 0 {
+		t.Fatalf("Show all projects must clear the filter on an empty radar, got %+v", c)
 	}
 }

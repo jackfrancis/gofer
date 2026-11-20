@@ -91,7 +91,8 @@ body {
 .zz-filter-all { font-weight: 600; border-bottom: 1px solid var(--border); border-radius: 6px 6px 0 0; padding-bottom: 6px; margin-bottom: 2px; }
 .zz-filter-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .zz-filter-count { color: var(--muted); font-size: 12px; }
-.zz-filter-list .btn { align-self: flex-end; margin-top: 4px; }
+/* Apply comes first in the markup (the form's default button) but sits on the right. */
+.zz-filter-actions { display: flex; flex-direction: row-reverse; justify-content: flex-start; gap: 6px; margin-top: 4px; }
 
 .zz-item {
   border: 1px solid var(--border); border-radius: 8px;

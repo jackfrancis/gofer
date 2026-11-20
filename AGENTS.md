@@ -184,7 +184,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   re-sorts. The cookie never decides what a bulk action touches: each bulk form posts
   the selection its page was rendered with (`scope`), narrowed to the projects the
   checklist names, so neither a filter changed in another tab nor a saved repository
-  that left the radar can widen it; an unreadable form changes nothing. Review all
+  that left the radar can widen it; an unreadable form changes nothing, and only a
+  URL-encoded body is read (`ParseForm` leaves multipart unread, which would drop the
+  scope). Review all
   PRs and Get 2nd Opinion act only on items the radar shows (`WorkItem.OnRadar`, the
   rule `worklist.Resolve` applies); Reset Conversations also clears hidden and
   completed items in scope, and its count includes them (`Resolution.OffRadar`, from

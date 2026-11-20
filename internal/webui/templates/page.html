@@ -166,7 +166,10 @@
                 <label class="zz-filter-opt"><input type="checkbox" name="project" value="{{.Name}}" data-filter-project{{if .Selected}} checked{{end}}> <span class="zz-filter-name">{{.Name}}</span> <span class="zz-filter-count">{{.Count}}</span></label>
                 {{end}}
               </div>
-              <button class="btn btn-primary btn-sm" type="submit">Apply</button>
+              <div class="zz-filter-actions">
+                <button class="btn btn-primary btn-sm" type="submit">Apply</button>
+                {{if .ProjectsFiltered}}<button class="btn btn-sm" type="submit" name="all" value="1">Show all projects</button>{{end}}
+              </div>
             </form>
           </details>
           {{end}}

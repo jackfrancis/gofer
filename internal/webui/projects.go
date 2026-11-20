@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"mime"
 	"net/http"
 	"net/url"
 	"sort"
@@ -134,10 +135,20 @@ func savedSelection(r *http.Request, ownerID string) map[string]bool {
 }
 
 // formSelection reads the selection a bulk form was rendered with (form "scope"). No
-// scope means the page showed every project. ok is false when the form cannot be read
-// at all: the caller must then change nothing, since a lost scope would otherwise read
-// as every project.
+// scope means the page showed every project. ok is false when the form cannot be read:
+// the caller must then change nothing, since a lost scope would otherwise read as every
+// project. The page's forms are URL-encoded, and that is the only body accepted: Go's
+// ParseForm leaves any other body (multipart, plain text) unread, which would drop the
+// scope silently. A POST with no body at all carries no scope and reads as every
+// project, like an unfiltered page's form.
 func formSelection(r *http.Request) (selected map[string]bool, ok bool) {
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		if mt, _, err := mime.ParseMediaType(ct); err != nil || mt != "application/x-www-form-urlencoded" {
+			return nil, false
+		}
+	} else if r.ContentLength != 0 {
+		return nil, false // a body of unstated type
+	}
 	if err := r.ParseForm(); err != nil {
 		return nil, false
 	}
@@ -175,8 +186,8 @@ func shownSelection(selected map[string]bool, opts []ProjectOption) map[string]b
 
 // FilterProjects handles POST /items/projects, the project filter's Apply. The checked
 // projects (form "project", repeated) are saved for the signed-in account; checking
-// every project on the radar (at least one), or "Select all" (form "all"), clears the
-// filter instead.
+// every project on the radar (at least one), "Select all", or the "Show all projects"
+// button (both form "all") clears the filter instead.
 // An empty selection is saved too, and shows no items. A selection too large for the
 // cookie is refused and the previous filter kept. It redirects back to the radar
 // (Post/Redirect/Get).
