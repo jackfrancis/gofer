@@ -283,8 +283,11 @@ Wired on the web-tier side; they define what a runtime must respect:
   has no scratch volume or storage limit) — see `docs/adr/0003-repository-checkout-tools.md`.
 - The runtime reports a run's model time and model/tool call counts on completion
   (`internal/runtime/aei/workload.go`). A one-shot run goes through gofer's `runOnce`,
-  not `aeiruntime.Main`, so it sends exactly one report within one timeout; the
-  durable serve loop still runs under `Main`, wrapped by `measured`. The counts come
+  not `aeiruntime.Main`, so it sends exactly one report, and `rt.Complete` applies
+  the SDK's deadline-aware retry budget (never wrap it in a timeout of gofer's own).
+  The durable serve loop still runs under `Main`, wrapped by `measured`, which
+  measures and logs but sends no report: the loop sends the run's one report and
+  holds the actor's slot until it is done, and it cannot yet carry an app's timing. The counts come
   from an `llm.Collector` on the run's context: model time is elapsed time with any
   call in flight (concurrent ranking calls count once), recorded in `llm.chat`, so
   any new model transport must go through `chat`; tool calls are recorded in the

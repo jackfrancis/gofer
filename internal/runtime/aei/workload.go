@@ -34,18 +34,18 @@ func RunWorkload() {
 	os.Exit(runOnce(os.Getenv, work))
 }
 
-// reportTimeout bounds the one completion report a run sends: the same single budget
-// the SDK's own report uses. A variable so tests can shorten it.
-var reportTimeout = 10 * time.Second
-
 // runOnce is the one-shot run gofer drives itself instead of aeiruntime.Main, and
 // returns the process exit code. Main reports the outcome after fn returns with only
 // provisioning and runtime seconds, and it reports even when fn already has, so an app
-// that reports its own model timing pays a second report timeout against a stalled
-// controller, which can push a finished run past its deadline. runOnce instead loads
+// that reported its own model timing would pay for two reports against a stalled
+// controller and could push a finished run past its deadline. runOnce instead loads
 // the run, executes fn under the run's deadline, and sends exactly one report with the
 // full Timing. It keeps Main's exit codes: 2 when the run cannot load, 1 when fn
 // fails, 0 on success.
+//
+// The report gets no timeout of gofer's own: on a one-shot run rt.Complete applies the
+// SDK's budget, which retries a failed or stalled attempt and stops in time for the
+// process to exit before the run deadline.
 func runOnce(getenv func(string) string, fn func(context.Context, *aeiruntime.Runtime) error) int {
 	rt, err := aeiruntime.Load(context.Background(), getenv, nil)
 	if err != nil {
@@ -63,7 +63,10 @@ func runOnce(getenv func(string) string, fn func(context.Context, *aeiruntime.Ru
 	}
 	timing, runErr := measure(ctx, rt, fn)
 	cancel()
-	report(rt, runErr, timing)
+	// A fresh context, so the report still lands after the deadline cancelled the run.
+	if err := rt.Complete(context.Background(), runErr, timing, ""); err != nil {
+		slog.Default().Warn("completion report failed", "run", rt.Spec().RunID, "err", err)
+	}
 	if runErr != nil {
 		fmt.Fprintln(os.Stderr, "aeiruntime: run failed:", runErr)
 		return 1
@@ -72,15 +75,16 @@ func runOnce(getenv func(string) string, fn func(context.Context, *aeiruntime.Ru
 }
 
 // measured wraps fn for the SDK's durable serve loop, which applies the run's deadline
-// and reports the outcome itself after fn returns, with only provisioning and runtime
-// seconds. The wrapper reports first, with the full Timing; the control plane keeps
-// the first terminal report for a run, so the loop's is a no-op. A standing actor has
-// no process exit racing the deadline, so the loop's second report costs only time on
-// a stalled controller, never the run's outcome.
+// and sends the run's one terminal report itself after fn returns, holding the actor's
+// concurrency slot until that report is done. The SDK takes no timing from fn, so a
+// report of gofer's own would be a second one, and the loop's duplicate could hold the
+// slot for its whole retry budget after the controller had already accepted gofer's.
+// So the wrapper measures and logs the run's model time and calls but sends nothing:
+// on a durable substrate the completion carries provisioning and runtime seconds only,
+// until the SDK can take an app's timing into its own report.
 func measured(fn func(context.Context, *aeiruntime.Runtime) error) func(context.Context, *aeiruntime.Runtime) error {
 	return func(ctx context.Context, rt *aeiruntime.Runtime) error {
-		timing, runErr := measure(ctx, rt, fn)
-		report(rt, runErr, timing)
+		_, runErr := measure(ctx, rt, fn)
 		return runErr
 	}
 }
@@ -113,17 +117,6 @@ func measure(ctx context.Context, rt *aeiruntime.Runtime, fn func(context.Contex
 		"runtime_seconds", timing.RuntimeSeconds, "model_seconds", timing.ModelSeconds,
 		"model_calls", timing.ModelCalls, "tool_calls", timing.ToolCalls)
 	return timing, runErr
-}
-
-// report sends the run's terminal outcome within reportTimeout, on a fresh context so
-// it still lands after the run's deadline cancelled the run. A failed report is
-// logged, not fatal: the platform backstops it with its substrate watch and deadline.
-func report(rt *aeiruntime.Runtime, runErr error, timing aeiruntime.Timing) {
-	ctx, cancel := context.WithTimeout(context.Background(), reportTimeout)
-	defer cancel()
-	if err := rt.Complete(ctx, runErr, timing, ""); err != nil {
-		slog.Default().Warn("completion report failed", "run", rt.Spec().RunID, "err", err)
-	}
 }
 
 // work executes one gofer job for the loaded run. It is gofer's workload (agent.Run)

@@ -254,43 +254,118 @@ func TestRunOnceReportsAFailedRun(t *testing.T) {
 	}
 }
 
-// Against a stalled controller a run makes one completion attempt and gives up after
-// one report budget, so a finished run exits in time; aeiruntime.Main would wait out a
-// second budget for its own report after gofer's.
-func TestRunOnceSendsOneReportWithinOneBudget(t *testing.T) {
-	old := reportTimeout
-	reportTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { reportTimeout = old })
+// attempt is how flakyControl treats one completion attempt.
+type attempt int
 
-	var (
-		mu       sync.Mutex
-		attempts int
-	)
+const (
+	accept   attempt = iota // record the report and acknowledge it
+	stall                   // hold the request until the client gives up
+	answered                // behave already wrote the response
+)
+
+// flakyControl is a /complete endpoint that treats attempt n (from 1) as behave
+// says, and records the reports it accepts.
+type flakyControl struct {
+	srv      *httptest.Server
+	mu       sync.Mutex
+	attempts int
+	accepted []completion
+}
+
+func newFlakyControl(t *testing.T, behave func(n int, w http.ResponseWriter) attempt) *flakyControl {
+	t.Helper()
+	c := &flakyControl{}
 	release := make(chan struct{})
-	stalled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		attempts++
-		mu.Unlock()
-		select {
-		case <-r.Context().Done():
-		case <-release:
+	c.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.mu.Lock()
+		c.attempts++
+		n := c.attempts
+		c.mu.Unlock()
+		switch behave(n, w) {
+		case stall:
+			select {
+			case <-r.Context().Done():
+			case <-release:
+			}
+			return
+		case answered:
+			return
+		}
+		var body completion
+		if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+			c.mu.Lock()
+			c.accepted = append(c.accepted, body)
+			c.mu.Unlock()
 		}
 	}))
-	t.Cleanup(stalled.Close)
-	t.Cleanup(func() { close(release) }) // runs first: unblock the handler before Close
-	env := runEnv(t, "github-converse", nil, map[string]string{aeiruntime.EnvControlURL: stalled.URL})
+	t.Cleanup(c.srv.Close)
+	t.Cleanup(func() { close(release) }) // runs first: unblock stalled handlers before Close
+	return c
+}
 
-	began := time.Now()
+// A report that the controller first answers with 503 is retried, and the retry
+// delivers the model timing: gofer's call keeps the SDK's retries.
+func TestRunOnceRetriesARejectedReport(t *testing.T) {
+	control := newFlakyControl(t, func(n int, w http.ResponseWriter) attempt {
+		if n == 1 {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return answered
+		}
+		return accept
+	})
+	env := runEnv(t, "github-converse", nil, map[string]string{aeiruntime.EnvControlURL: control.srv.URL})
+
+	if code := run(env, reviewWith(reviewModel(t, 0), &oneTool{})); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	if len(control.accepted) != 1 || control.accepted[0].Timing.ModelCalls != 2 {
+		t.Fatalf("accepted %+v after %d attempts, want one report with 2 model calls", control.accepted, control.attempts)
+	}
+}
+
+// A first attempt that stalls past the SDK's per-attempt timeout (10s) is retried
+// within the SDK's one-shot report budget, so the model timing still lands. A
+// gofer-imposed 10s budget would give up with the first attempt.
+func TestRunOnceRetriesAStalledReport(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits out the SDK's 10s per-attempt timeout")
+	}
+	control := newFlakyControl(t, func(n int, _ http.ResponseWriter) attempt {
+		if n == 1 {
+			return stall
+		}
+		return accept
+	})
+	env := runEnv(t, "github-converse", nil, map[string]string{aeiruntime.EnvControlURL: control.srv.URL})
+
+	if code := run(env, reviewWith(reviewModel(t, 0), &oneTool{})); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	if len(control.accepted) != 1 || control.accepted[0].Timing.ModelCalls != 2 {
+		t.Fatalf("accepted %+v after %d attempts, want one report with 2 model calls", control.accepted, control.attempts)
+	}
+}
+
+// Against a controller that never answers, the report stops in time for the process
+// to exit before the run deadline (the SDK reserves 10s for exit), rather than holding
+// a finished run past it.
+func TestRunOnceReportStopsBeforeTheDeadline(t *testing.T) {
+	control := newFlakyControl(t, func(int, http.ResponseWriter) attempt { return stall })
+	deadline := time.Now().Add(11500 * time.Millisecond)
+	env := runEnv(t, "github-converse", nil, map[string]string{
+		aeiruntime.EnvControlURL: control.srv.URL,
+		aeiruntime.EnvDeadline:   strconv.FormatInt(deadline.UnixMilli(), 10),
+	})
+
 	if code := run(env, func(context.Context, *aeiruntime.Runtime) error { return nil }); code != 0 {
 		t.Fatalf("exit code = %d, want 0 (the run succeeded; only its report stalled)", code)
 	}
-	if took := time.Since(began); took >= 2*reportTimeout {
-		t.Errorf("run took %v against a stalled controller, want under %v (one report budget)", took, 2*reportTimeout)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if attempts != 1 {
-		t.Errorf("completion attempts = %d, want 1", attempts)
+	if left := time.Until(deadline); left < 9*time.Second {
+		t.Errorf("run returned %v before its deadline, want about 10s left for the process to exit", left)
 	}
 }
 
@@ -323,27 +398,26 @@ func TestRunOnceCannotLoad(t *testing.T) {
 	}
 }
 
-// On a durable substrate the SDK's serve loop runs each run; measured reports first,
-// with the full timing, even once the run's context is cancelled (after its deadline),
-// and hands back the run's error for the loop's own report.
-func TestMeasuredReportsFirstForTheServeLoop(t *testing.T) {
+// On a durable substrate the SDK's serve loop sends the run's one terminal report,
+// so measured sends none: a second report would let the loop's duplicate hold the
+// actor's slot after the controller accepted gofer's. It hands back the run's error.
+func TestMeasuredLeavesTheReportToTheServeLoop(t *testing.T) {
 	control := newFakeControl(t)
 	model := reviewModel(t, 0)
 	rt := loadRunWith(t, "github-converse", nil, map[string]string{aeiruntime.EnvControlURL: control.srv.URL})
 
-	boom := errors.New("deadline exceeded mid-review")
+	boom := errors.New("review failed")
 	review := reviewWith(model, &oneTool{})
 	fail := func(ctx context.Context, rt *aeiruntime.Runtime) error {
-		_ = review(context.WithoutCancel(ctx), rt)
+		_ = review(ctx, rt)
 		return boom
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := measured(fail)(ctx, rt); !errors.Is(err, boom) {
+	if err := measured(fail)(context.Background(), rt); !errors.Is(err, boom) {
 		t.Fatalf("measured returned %v, want the run's error", err)
 	}
-	got := control.only(t)
-	if got.Error != boom.Error() || got.Timing.ModelCalls != 2 || got.Timing.ToolCalls != 1 {
-		t.Errorf("report = %+v, want the run's error with 2 model calls and 1 tool call", got)
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	if len(control.reports) != 0 {
+		t.Errorf("measured sent %d completion reports, want none (the serve loop reports)", len(control.reports))
 	}
 }
