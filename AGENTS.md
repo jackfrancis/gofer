@@ -171,9 +171,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   (`ResearchAdjustment.Turns`) is no longer in the stored thread (the conversation
   was cleared); otherwise adjustments are ordered by `AppliedAt` (required), and an
   older one is dropped, so a resend cannot undo a later result. A refresh keeps the
-  last known `ReviewRequestedBy` of a review still requested (search does not name
-  the requester; enrich's timeline read replaces it), so a proposal the bot policy
-  set aside stays set aside.
+  last known `ReviewRequestedBy` of a review that may still be pending (search does
+  not name the requester; enrich's timeline read replaces it), so a proposal the bot
+  policy set aside stays set aside. Only a complete review-request search
+  (`github.Fetch.ReviewRequestsComplete`) confirms a request was removed; after a
+  partial one the stored request is kept. A retired item carries no request into
+  its resurfacing.
   Before the merge, every write-back path applies
   `worklist.RunPolicy` (the agent plane's ingest handler, and the in-process
   `StoreSink`): workload metadata is stamped `OriginAgent`, so a run cannot claim the

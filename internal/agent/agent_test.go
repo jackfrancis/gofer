@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -603,26 +604,9 @@ func TestRunRankKeepsResearchWrittenMeanwhile(t *testing.T) {
 // counted as human; it must stay set aside rather than apply again because the
 // refresh blanked the requester.
 func TestRunIngestKeepsPendingRequester(t *testing.T) {
-	srv := freshPR7GitHub(t) // answers the timeline with an object, so enrich fails
 	store := worklist.NewMemoryStore()
-	human := worklist.AxisProposal{Relevance: 0.9, Impact: 0.9, Engagement: 0.9, Urgency: 0.9, Confidence: 1, Rationale: "scored as a human ask"}
-	store.Seed("u1", worklist.WorkItem{
-		ID: "github:o/r#7", OwnerID: "u1", Source: "github", Type: worklist.TypePullRequest,
-		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 7, Title: "Stale title"},
-		Signals: worklist.Signals{
-			Reasons:           []worklist.Reason{worklist.ReasonReviewRequested},
-			ReviewRequestedBy: "k8s-ci-robot", ReviewRequestedByBot: true,
-			Proposed: &human, // made before k8s-ci-robot was on the bot list
-		},
-	})
-	sink := NewStoreSink(store, "u1").WithPolicy(worklist.NewRunPolicy([]string{"k8s-ci-robot"}))
-	if err := Run(context.Background(),
-		Params{JobType: JobIngest, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client(), Ranker: failRanker{}},
-		fakeVendor{token: "tok"}, sink); err != nil {
-		t.Fatal(err)
-	}
-	items, _ := store.List(context.Background(), "u1")
-	got := items[0]
+	botRequestSeed(store, time.Time{})
+	got := runRefresh(t, freshPR7GitHub(t), store)
 	if got.GitHub.Title != "Fresh title" {
 		t.Fatalf("refresh should take the fetched title, got %q", got.GitHub.Title)
 	}
@@ -634,18 +618,110 @@ func TestRunIngestKeepsPendingRequester(t *testing.T) {
 	}
 }
 
-// The requester is carried only while the review is still requested: once the fetch
-// no longer finds the request, nothing is pending and no requester is kept.
-func TestCarryRequesterOnlyWhilePending(t *testing.T) {
+// The pending request is carried while it may still be pending: when the fetch
+// still shows it, or when the review search was partial and could have missed it.
+// A complete search that no longer shows it confirms the request is gone.
+func TestCarryPendingRequest(t *testing.T) {
 	stored := worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonReviewRequested}, ReviewRequestedBy: "alice"}
+
 	pending := worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonReviewRequested}}
-	carryRequester(&pending, stored)
+	carryPendingRequest(&pending, stored, true)
 	if pending.ReviewRequestedBy != "alice" {
-		t.Fatalf("want the pending request's requester kept, got %q", pending.ReviewRequestedBy)
+		t.Fatalf("still requested: want the requester kept, got %q", pending.ReviewRequestedBy)
 	}
-	done := worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonAuthor}}
-	carryRequester(&done, stored)
-	if done.ReviewRequestedBy != "" {
-		t.Fatalf("no request is pending; want no requester, got %q", done.ReviewRequestedBy)
+
+	removed := worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonAuthor}}
+	carryPendingRequest(&removed, stored, true)
+	if removed.ReviewRequestedBy != "" || slices.Contains(removed.Reasons, worklist.ReasonReviewRequested) {
+		t.Fatalf("a complete search confirms the request is gone; got %+v", removed)
+	}
+
+	missed := worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonAuthor}}
+	carryPendingRequest(&missed, stored, false)
+	if missed.ReviewRequestedBy != "alice" || !slices.Contains(missed.Reasons, worklist.ReasonReviewRequested) || !slices.Contains(missed.Reasons, worklist.ReasonAuthor) {
+		t.Fatalf("a partial search proves nothing: want the request kept, got %+v", missed)
+	}
+}
+
+// botRequestSeed is a stored PR whose review a bot requested, carrying a proposal
+// made when that requester still counted as human: the bot policy sets it aside.
+func botRequestSeed(store *worklist.MemoryStore, completedAt time.Time) *worklist.AxisProposal {
+	human := &worklist.AxisProposal{Relevance: 0.9, Impact: 0.9, Engagement: 0.9, Urgency: 0.9, Confidence: 1, Rationale: "scored as a human ask"}
+	store.Seed("u1", worklist.WorkItem{
+		ID: "github:o/r#7", OwnerID: "u1", Source: "github", Type: worklist.TypePullRequest,
+		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 7, Title: "Stale title"},
+		Signals: worklist.Signals{
+			Reasons:           []worklist.Reason{worklist.ReasonReviewRequested},
+			ReviewRequestedBy: "k8s-ci-robot", ReviewRequestedByBot: true,
+			Proposed: human,
+		},
+		Meta: worklist.Metadata{CompletedAt: completedAt},
+	})
+	return human
+}
+
+// runRefresh runs an ingest against srv with enrich unable to read timelines (the
+// stubs answer them with an object) and ranking failing, so nothing replaces what
+// the refresh itself stores, and returns the stored item.
+func runRefresh(t *testing.T, srv *httptest.Server, store *worklist.MemoryStore) worklist.WorkItem {
+	t.Helper()
+	sink := NewStoreSink(store, "u1").WithPolicy(worklist.NewRunPolicy([]string{"k8s-ci-robot"}))
+	if err := Run(context.Background(),
+		Params{JobType: JobIngest, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client(), Ranker: failRanker{}},
+		fakeVendor{token: "tok"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	items, _ := store.List(context.Background(), "u1")
+	return items[0]
+}
+
+// The review search reports incomplete results and misses the PR, which arrives
+// through involves: alone. That is no evidence the request was removed: the request
+// and its bot requester are kept, and the set-aside proposal stays set aside.
+func TestRunIngestPartialReviewSearchKeepsRequest(t *testing.T) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		switch {
+		case r.URL.Path == "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case strings.Contains(q, "review-requested:@me"):
+			_, _ = w.Write([]byte(`{"incomplete_results":true,"items":[]}`))
+		case strings.Contains(q, "is:pr") && strings.Contains(q, "involves:@me"):
+			_, _ = w.Write([]byte(`{"items":[{"number":7,"title":"Fresh title","html_url":"u","state":"open","repository_url":"https://api.github.com/repos/o/r","pull_request":{"url":"x"}}]}`))
+		default:
+			_, _ = w.Write([]byte(`{"items":[]}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	store := worklist.NewMemoryStore()
+	botRequestSeed(store, time.Time{})
+
+	got := runRefresh(t, srv, store)
+	if got.GitHub.Title != "Fresh title" {
+		t.Fatalf("refresh should take the fetched title, got %q", got.GitHub.Title)
+	}
+	if !slices.Contains(got.Signals.Reasons, worklist.ReasonReviewRequested) {
+		t.Fatalf("a partial review search dropped the pending request: reasons %v", got.Signals.Reasons)
+	}
+	if got.Signals.ReviewRequestedBy != "k8s-ci-robot" || !got.Signals.ReviewRequestedByBot {
+		t.Fatalf("a partial review search blanked the requester: %q bot=%v", got.Signals.ReviewRequestedBy, got.Signals.ReviewRequestedByBot)
+	}
+	if p := got.Signals.CurrentProposal(); p != nil {
+		t.Fatalf("a proposal the bot policy had set aside applies again: %+v", p)
+	}
+}
+
+// A complete fetch retired the PR; it later resurfaces with a new review request.
+// The retired request's bot requester must not be carried onto the new one.
+func TestRunIngestResurfacedItemDropsOldRequester(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	botRequestSeed(store, time.Now().Add(-24*time.Hour).UTC())
+
+	got := runRefresh(t, freshPR7GitHub(t), store)
+	if !got.Meta.CompletedAt.IsZero() {
+		t.Fatal("the resurfaced item should be open again")
+	}
+	if got.Signals.ReviewRequestedBy != "" || got.Signals.ReviewRequestedByBot {
+		t.Fatalf("the resurfaced request inherited the retired one's requester: %q bot=%v", got.Signals.ReviewRequestedBy, got.Signals.ReviewRequestedByBot)
 	}
 }

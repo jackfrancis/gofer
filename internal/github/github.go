@@ -121,21 +121,43 @@ var signals = []struct {
 // repository that is not confirmed public is left out; one whose check had no answer
 // also makes the result incomplete, since its item may still be open.
 func (c *Client) FetchWorklist(ctx context.Context, token string) (items []worklist.WorkItem, complete bool, err error) {
+	f, err := c.FetchWorklistDetail(ctx, token)
+	return f.Items, f.Complete, err
+}
+
+// Fetch is FetchWorklist's result with the completeness of the review-request
+// search reported on its own.
+type Fetch struct {
+	Items    []worklist.WorkItem
+	Complete bool // see FetchWorklist
+	// ReviewRequestsComplete reports that the review-requested search was walked
+	// whole. Only then does an item without ReasonReviewRequested prove that no
+	// review is requested: when that search is partial, an item may arrive through
+	// involves: alone while its request is still pending.
+	ReviewRequestsComplete bool
+}
+
+// FetchWorklistDetail is FetchWorklist, also reporting whether the review-request
+// search was complete (Fetch.ReviewRequestsComplete).
+func (c *Client) FetchWorklistDetail(ctx context.Context, token string) (Fetch, error) {
 	now := time.Now().UTC()
 	// The relationship a union query cannot report is derived from each item's payload,
 	// which needs the viewer's own login to compare against.
 	viewer, err := c.Login(ctx, token)
 	if err != nil {
-		return nil, false, fmt.Errorf("github login: %w", err)
+		return Fetch{}, fmt.Errorf("github login: %w", err)
 	}
 	seen := make(map[string]worklist.WorkItem)
-	complete = true
+	complete, reviewsComplete := true, true
 	for _, s := range signals {
 		found, whole, err := c.searchIssues(ctx, token, s.query)
 		if err != nil {
-			return nil, false, fmt.Errorf("github %s search: %w", s.reason, err)
+			return Fetch{}, fmt.Errorf("github %s search: %w", s.reason, err)
 		}
 		complete = complete && whole
+		if s.reason == worklist.ReasonReviewRequested {
+			reviewsComplete = reviewsComplete && whole
+		}
 		for _, it := range found {
 			wi, ok := it.toWorkItem(s.reason, viewer, now)
 			if !ok {
@@ -168,7 +190,7 @@ func (c *Client) FetchWorklist(ctx context.Context, token string) (items []workl
 		}
 		return strings.Compare(a.ID, b.ID)
 	})
-	return out, complete, nil
+	return Fetch{Items: out, Complete: complete, ReviewRequestsComplete: reviewsComplete}, nil
 }
 
 // appendReason adds r to rs if not already present, keeping reasons unique and in
