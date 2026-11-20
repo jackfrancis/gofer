@@ -77,6 +77,23 @@ body {
 }
 .zz-menu-item:hover { background: var(--bg-subtle); }
 
+/* Project filter: the toolbar's lead group holds the filter dropdown beside the item
+   count. Its menu is a checklist form; long lists scroll inside the menu. */
+.zz-toolbar-lead { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.zz-filter-list { min-width: 260px; max-width: min(420px, calc(100vw - 32px)); padding: 8px; gap: 4px; }
+.zz-filter-options { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+.zz-filter-opt {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 6px; border-radius: 6px; font-size: 13px; cursor: pointer;
+}
+.zz-filter-opt:hover { background: var(--bg-subtle); }
+.zz-filter-opt[hidden] { display: none; } /* "Select all" until projects.js enables it */
+.zz-filter-all { font-weight: 600; border-bottom: 1px solid var(--border); border-radius: 6px 6px 0 0; padding-bottom: 6px; margin-bottom: 2px; }
+.zz-filter-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.zz-filter-count { color: var(--muted); font-size: 12px; }
+/* Apply comes first in the markup (the form's default button) but sits on the right. */
+.zz-filter-actions { display: flex; flex-direction: row-reverse; justify-content: flex-start; gap: 6px; margin-top: 4px; }
+
 .zz-item {
   border: 1px solid var(--border); border-radius: 8px;
   padding: 14px 16px; margin-bottom: 12px;
