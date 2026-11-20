@@ -34,10 +34,14 @@ type recordPipeline struct {
 	soEndpoints       []string
 	turns             []worklist.TurnRef // every dispatched turn, in order
 	err               error              // what Converse and SecondOpinion return
+	onDispatch        func()             // when set, Converse and SecondOpinion call it first
 }
 
 func (p *recordPipeline) EnsureBackfill(context.Context, string) error { return nil }
 func (p *recordPipeline) Converse(_ context.Context, _ string, ref worklist.TurnRef, endpoint, model string) error {
+	if p.onDispatch != nil {
+		p.onDispatch()
+	}
 	p.converses = append(p.converses, ref.Item)
 	p.turns = append(p.turns, ref)
 	p.converseModels = append(p.converseModels, model)
@@ -55,6 +59,9 @@ func (p *recordPipeline) ReviewAll(_ context.Context, _ string, refs []worklist.
 }
 func (p *recordPipeline) Refresh(context.Context, string) error { p.refreshed++; return nil }
 func (p *recordPipeline) SecondOpinion(_ context.Context, _ string, ref worklist.TurnRef, endpoint, model string) error {
+	if p.onDispatch != nil {
+		p.onDispatch()
+	}
 	p.secondOpinions = append(p.secondOpinions, ref.Item)
 	p.turns = append(p.turns, ref)
 	p.soModels = append(p.soModels, model)

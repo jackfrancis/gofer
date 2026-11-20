@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"log/slog"
 	"math"
 	"mime"
 	"net/http"
@@ -495,15 +496,30 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 		// flight: put its time back, so the page offers Retry again at once, and say
 		// the attempt was refused. Any other error leaves it pending, since a run may
 		// exist. A later attempt or an answer that landed meanwhile is left alone.
-		_ = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		//
+		// The refusal can be the request's own cancellation (the browser went away
+		// before the dispatch was sent), so the rollback must not use the request's
+		// context: it runs detached from it, under its own bound.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), undoRetryTimeout)
+		undone := false
+		err := h.store.Update(ctx, user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+			undone = false
 			for _, it := range current {
 				if it.ID == id && it.UndoRetry(turn, at, prev) {
+					undone = true
 					return []worklist.WorkItem{it}, nil
 				}
 			}
 			return nil, nil
 		})
-		back += "&retry=refused"
+		cancel()
+		switch {
+		case err != nil:
+			// The turn stays pending until reviewStaleAfter, then offers Retry again.
+			slog.WarnContext(ctx, "retry refused, and restoring the turn failed", "user", user.ID, "item", id, "turn", turn, "err", err)
+		case undone:
+			back += "&retry=refused"
+		}
 	}
 	http.Redirect(w, r, back, http.StatusSeeOther)
 }
@@ -728,6 +744,10 @@ const independentReviewPrompt = "Give an independent review of this PR. There ma
 // if both were already under way, the store keeps the first answer and drops the
 // other (worklist.AppendReply).
 const reviewStaleAfter = 5 * time.Minute
+
+// undoRetryTimeout bounds putting back a refused retry's turn (ThreadRetry), which
+// runs detached from the request so a browser that went away cannot stop it.
+const undoRetryTimeout = 10 * time.Second
 
 // pollSecs and idlePollSecs are how often the worklist asks whether a GitHub refresh
 // has ended (RefreshStatus): often while one runs, so its result lands quickly, and

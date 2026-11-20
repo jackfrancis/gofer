@@ -434,3 +434,48 @@ func TestThreadRetryReviewPanelModels(t *testing.T) {
 		t.Fatalf("want no dispatch, got %+v", pipe.turns)
 	}
 }
+
+// The browser can go away after Retry stamped the turn but before the dispatch was
+// sent: the backend then refuses the run (ErrNotAccepted) because the request was
+// canceled. No run exists, so the turn's time must still be put back, which needs a
+// store write that the canceled request cannot stop. The durable store honours
+// cancellation, so this runs against it.
+func TestThreadRetryRefusedAfterDisconnect(t *testing.T) {
+	ctx := context.Background()
+	now := retryNow
+	stalledAt := now.Add(-10 * time.Minute)
+	db, err := storage.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	store := db.Worklist()
+	if err := store.Upsert(ctx, "u1", worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest, Thread: []worklist.Message{
+		{ID: "t1", Role: worklist.RoleUser, Content: "Is this ready?", At: stalledAt},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	reqCtx, disconnect := context.WithCancel(ctx)
+	defer disconnect()
+	pipe := &recordPipeline{
+		onDispatch: disconnect, // the browser goes away mid-dispatch
+		err:        fmt.Errorf("aei: dispatch not sent: %w: %w", ingest.ErrNotAccepted, context.Canceled),
+	}
+	h := retryHandler(store, pipe, &now)
+	form := url.Values{"id": {"pr1"}, "turn": {"t1"}}
+	req := httptest.NewRequest(http.MethodPost, "/items/thread/retry", strings.NewReader(form.Encode())).WithContext(reqCtx)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.ThreadRetry(httptest.NewRecorder(), req)
+
+	if len(pipe.turns) != 1 {
+		t.Fatalf("want one (refused) dispatch, got %+v", pipe.turns)
+	}
+	if got := storedItem(t, store, "pr1"); !got.Thread[0].At.Equal(stalledAt) {
+		t.Fatalf("a retry refused after the browser left must still restore the turn's time, got %v", got.Thread[0].At)
+	}
+	pipe.onDispatch, pipe.err = nil, nil
+	if page := openThread(t, h, "pr1"); !strings.Contains(page, retryForm) {
+		t.Fatal("reopening the thread must offer Retry again")
+	}
+}
