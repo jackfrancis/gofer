@@ -275,3 +275,28 @@ func TestScheduledRefreshFollowsASuccessfulBackfill(t *testing.T) {
 		t.Fatalf("EnsureBackfill dispatched after a successful refresh: %d runs, want 2", d.count())
 	}
 }
+
+// A Refresh click during a scheduled refresh shares its run rather than starting a
+// second ingest that could land out of order; once the run ends, a click dispatches.
+func TestRefreshClickDuringAScheduledRun(t *testing.T) {
+	ctx := context.Background()
+	d := &gateDispatcher{phase: "Running"}
+	ig := New(d, "", "", nil, "", "")
+	r := NewRefresher(seeded("github:1"), ig, nil, time.Hour, nil)
+	if n := r.RefreshOnce(ctx); n != 1 {
+		t.Fatalf("tick dispatched %d, want 1", n)
+	}
+	if err := ig.Refresh(ctx, "github:1"); err != nil {
+		t.Fatal(err)
+	}
+	if d.count() != 1 {
+		t.Fatalf("a click during the scheduled run dispatched a second ingest (%d runs)", d.count())
+	}
+	d.set("Succeeded")
+	if err := ig.Refresh(ctx, "github:1"); err != nil {
+		t.Fatal(err)
+	}
+	if d.count() != 2 {
+		t.Fatalf("a click after the scheduled run ended dispatched %d runs in all, want 2", d.count())
+	}
+}

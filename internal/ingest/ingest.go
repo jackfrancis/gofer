@@ -132,14 +132,17 @@ func (i *Ingestor) runParams(ownerID string) map[string]string {
 // executes them. A failed or stale run (older than retryAfter) is re-dispatched, so a
 // reload retries after a failure or a lost run.
 func (i *Ingestor) EnsureBackfill(ctx context.Context, ownerID string) error {
-	_, err := i.dispatchIngest(ctx, ownerID, ingestGate, false)
+	_, err := i.dispatchIngest(ctx, ownerID, ingestGate)
 	return err
 }
 
-// Refresh forces a github-ingest run for ownerID so a user who just created or updated
-// work can pull it onto the radar on demand.
+// Refresh requests a github-ingest run for ownerID so a user who just created or
+// updated work can pull it onto the radar on demand. Like a scheduled tick, it starts
+// nothing while an ingest run for the owner is still running: two runs at once could
+// leave the older one's GitHub fields stored. The radar reloads until the running
+// pass lands (Active), and a click after it has ended dispatches at once.
 func (i *Ingestor) Refresh(ctx context.Context, ownerID string) error {
-	_, err := i.dispatchIngest(ctx, ownerID, ingestGate, true)
+	_, err := i.dispatchIngest(ctx, ownerID, refreshGate)
 	return err
 }
 
@@ -149,7 +152,7 @@ func (i *Ingestor) Refresh(ctx context.Context, ownerID string) error {
 // run that still looks live, so overlapping ticks (and a tick during a backfill or a
 // Refresh) share one run per owner.
 func (i *Ingestor) ScheduledRefresh(ctx context.Context, ownerID string) (bool, error) {
-	return i.dispatchIngest(ctx, ownerID, refreshGate, false)
+	return i.dispatchIngest(ctx, ownerID, refreshGate)
 }
 
 // Active reports whether a github-ingest run for ownerID is in flight: being
@@ -186,11 +189,11 @@ func (i *Ingestor) Active(ctx context.Context, ownerID string) (bool, error) {
 
 // dispatchIngest submits a github-ingest run for ownerID under gate g and tracks it,
 // so BackfillFailure can report its outcome and EnsureBackfill can gate on it, and
-// reports whether it submitted one. Unless force is set it submits nothing while the
-// owner's ingest run is in flight.
-func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, g gate, force bool) (bool, error) {
+// reports whether it submitted one. It submits nothing while the owner's ingest run
+// is in flight.
+func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, g gate) (bool, error) {
 	key := ingestKey(ownerID)
-	mine, ok := i.reserve(ctx, key, g, force)
+	mine, ok := i.reserve(ctx, key, g)
 	if !ok {
 		return false, nil
 	}
@@ -365,7 +368,7 @@ func (i *Ingestor) dispatchConverse(ctx context.Context, ownerID string, ref wor
 		params["independent"] = "true"
 	}
 	key := runKey{owner: ownerID, task: taskConverse, item: ref.Item, turn: ref.Turn}
-	mine, ok := i.reserve(ctx, key, converseGate, false)
+	mine, ok := i.reserve(ctx, key, converseGate)
 	if !ok {
 		return nil // a run for this turn is already in flight
 	}

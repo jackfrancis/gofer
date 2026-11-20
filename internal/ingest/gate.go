@@ -36,14 +36,12 @@ type run struct {
 	at        time.Time // when it was reserved, then when Submit succeeded
 	g         gate      // the policy the run was reserved under
 	pending   bool      // reserved; Submit has not returned yet
-	noRun     bool      // Submit failed: there is no run behind this reservation
 	failed    bool
 	succeeded bool
 	message   string
 	logged    bool
 	// prev is the run this reservation replaced, restored if Submit fails. It is kept
-	// only while it may still be needed: until this reservation's Submit succeeds, or
-	// until it is rolled back.
+	// only until this reservation's Submit returns.
 	prev *run
 }
 
@@ -77,24 +75,24 @@ type gate struct {
 var (
 	ingestGate   = gate{ttl: retryAfter}
 	converseGate = gate{ttl: converseDeadline, probe: true}
-	// refreshGate is the scheduled refresh's policy for the owner's ingest key: it
-	// starts nothing while any ingest run for the owner (a backfill, a Refresh, an
-	// earlier tick) is still running, and asks the backend rather than waiting out the
-	// ttl, so a tick after a finished run dispatches the next one.
+	// refreshGate is the policy of a Refresh click and a scheduled refresh tick for
+	// the owner's ingest key: it starts nothing while any ingest run for the owner (a
+	// backfill, a Refresh, an earlier tick) is still running, so two ingest runs never
+	// write one owner's worklist at once, and it asks the backend rather than waiting
+	// out the ttl, so a refresh after a finished run dispatches the next one.
 	refreshGate = gate{ttl: retryAfter, probe: true}
 )
 
 // reserve claims key for a new run under g and reports whether the caller should
-// submit it. It refuses while a run for key is in flight. A reservation is settled
-// with settle once Submit returns. With force set, a live run does not block (an
-// explicit Refresh); the reservation still replaces it, so a concurrent poll waits on
-// the forced run.
-func (i *Ingestor) reserve(ctx context.Context, key runKey, g gate, force bool) (mine *run, ok bool) {
+// submit it. It refuses while a run for key is in flight, which includes a
+// reservation whose Submit has not returned, so a reservation is never replaced
+// before it is settled. A reservation is settled with settle once Submit returns.
+func (i *Ingestor) reserve(ctx context.Context, key runKey, g gate) (mine *run, ok bool) {
 	for probed := false; ; probed = true {
 		now := time.Now()
 		i.mu.Lock()
 		cur := i.runs[key]
-		if force || cur == nil || !cur.live(now, g.probe) {
+		if cur == nil || !cur.live(now, g.probe) {
 			mine = &run{at: now, g: g, pending: true, prev: cur}
 			i.runs[key] = mine
 			i.pruneLocked(now)
@@ -114,10 +112,9 @@ func (i *Ingestor) reserve(ctx context.Context, key runKey, g gate, force bool) 
 	}
 }
 
-// settle records the outcome of Submit on the reservation mine, whether or not it is
-// still the key's current run, so a run restored by a later rollback is accurate. On
-// error, if mine is current, the key goes back to the run mine replaced, skipping any
-// reservation whose own Submit failed.
+// settle records the outcome of Submit on the reservation mine, which is still the
+// key's current run (see reserve). On error the key goes back to the run mine
+// replaced, so the read model still knows how the previous run ended.
 func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -130,17 +127,11 @@ func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 		mine.prev = nil // never rolled back now
 		return
 	}
-	mine.noRun = true
-	if i.runs[key] != mine {
-		// Superseded: keep prev, so a rollback of the reservation that replaced mine
-		// can reach past it.
-		return
-	}
 	p := mine.prev
-	for p != nil && p.noRun {
-		p = p.prev
-	}
 	mine.prev = nil
+	if i.runs[key] != mine {
+		return // not reachable while reserve never replaces a pending reservation
+	}
 	if p == nil {
 		delete(i.runs, key)
 	} else {
