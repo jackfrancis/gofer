@@ -154,27 +154,58 @@ Wired on the web-tier side; they define what a runtime must respect:
   read-modify-write), never `List` then `Upsert`, which overwrites anything written
   in between. A run's write-back is merged into the stored item
   (`worklist.MergeRunItems`): runs own the GitHub fields, signals and scoring; the
-  thread, read cursor, hidden flag and creation time always come from the store. A
-  write-back that carries no model proposal or research adjustment
-  (`Signals.Proposed` / `Signals.Research`) keeps the stored one
+  thread, read cursor, hidden flag and creation time always come from the store,
+  except that a hidden item resurfaces when the run's GitHub update time is after
+  the hide (`worklist.HiddenAfter`). Hidden and closed items are off the radar
+  (`WorkItem.OnRadar`), and no bulk action (Review all, the second-opinion batch)
+  draws from them. A
+  run adds a thread turn only through `POST /agent/worklist/reply`
+  (`worklist.AppendReply`). A write-back that carries no model proposal or research
+  adjustment (`Signals.Proposed` / `Signals.Research`) keeps the stored one
   (`worklist.KeepModelSignals`), and every workload pass sends only the model signal
   it derived (ingest and enrich none, rank only the proposal), never the copy it
-  read, which a newer write may have replaced. Rank picks which items go to the
-  model by `worklist.BaselineScore`, which ignores stored model signals. A run adds a
-  thread turn only through `POST /agent/worklist/reply` (`worklist.AppendReply`),
-  and a converse or research run writes its research adjustment only through
-  `POST /agent/worklist/research` (`worklist.ApplyResearch`), never the whole item
-  it read before the model call, so a refresh that landed meanwhile stands. Research
-  adjustments are ordered by `AppliedAt` (required); an older one is dropped, so a
-  resend cannot undo a later result. The web and runtime images must ship
-  together: a runtime from before these rules posts its reply inside the item, where
-  it is now ignored, and a web tier from before them has no research route.
+  read, which a newer write may have replaced. A converse or research run writes its
+  research adjustment only through `POST /agent/worklist/research`
+  (`worklist.ApplyResearch`), never the whole item it read before the model call, so
+  a refresh that landed meanwhile stands; adjustments are ordered by `AppliedAt`
+  (required), and an older one is dropped, so a resend cannot undo a later result.
+  Before the merge, every write-back path applies
+  `worklist.RunPolicy` (the agent plane's ingest handler, and the in-process
+  `StoreSink`): workload metadata is stamped `OriginAgent`, so a run cannot claim the
+  `OriginUser` override that `Resolve` leaves unrescored, and
+  `Signals.ReviewRequestedByBot` is derived from `ReviewRequestedBy` against
+  `BOT_REVIEWERS` (case-insensitive), replacing whatever the run sent. The agent
+  plane's reads (`GET /agent/worklist`, `StoreSink.List`) re-derive the flag too
+  (`RunPolicy.Classify`), so a run ranks by the current bot list, and so do the user's
+  (the JSON worklist and the radar get `RunPolicy.ClassifyReads(store)`), so the rank
+  shown and the rank Discuss explains agree. The rank job picks candidates by
+  `worklist.BaselineScore`, which clears the previous proposal and research. A proposal records the bot
+  classification it was made under (`AxisProposal.ReviewRequestedByBot`); read it
+  through `Signals.CurrentProposal`, which drops it once the classification changes. The requester is
+  the actor of the user's pending review request on the timeline: the latest
+  `review_requested` for them, until a `review_request_removed` or their own submitted
+  review ends it (a comment does not). The timeline is paged by its `Link` header up
+  to a cap, inside enrich's reserve-adjusted deadline; a timeline longer than the cap
+  leaves the requester and both waiting timestamps unset. The deterministic scorer discounts a bot's request (no awaiting-me
+  pressure, low floors) unless the user is also an assignee. The web and runtime images must ship together: a runtime
+  from before these rules posts its reply inside the item, where it is now ignored,
+  and a web tier from before them has no research route.
 - Replies can land out of order, so a turn's position does not say what it answers.
   Every new turn gets an ID; an agent turn's `ReplyTo` names the user turn it
   answers; dispatch carries the turn a run must answer (`worklist.TurnRef`, run
   parameter `turn`). Review and pending state (`HasReview`, `ReplyPending`, …) follow
   those links. Turns stored before IDs are keyed by position (`WorkItem.TurnKey`),
   and a legacy reply answers the user turn directly before it.
+- The read cursor (`WorkItem.ThreadReadThrough`) is the key of the newest agent
+  turn the owner has seen, never a time: reply times are stamped by the run and
+  replies land out of order. Delivering the thread page is the read receipt (the UI
+  has no script): after a GET renders and flushes to the client without error,
+  `webui.Thread` acknowledges the newest reply in the snapshot it rendered
+  (`worklist.MarkThreadRead`), so a reply landing mid-request stays unread, and a
+  HEAD or failed write marks nothing. A middleware that wraps the
+  `http.ResponseWriter` must implement `Unwrap` (as `statusRecorder` does), or the
+  flush fails and no thread is ever marked read. The
+  cursor only moves forward; a re-render of an already-read thread skips the store.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

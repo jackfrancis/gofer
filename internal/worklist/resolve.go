@@ -15,11 +15,15 @@ const (
 // Resolution is the shared read-model outcome for a user's worklist. Status is one
 // of StatusReady, StatusProcessing, or StatusFailed; Items carries the ranked work
 // items (StatusReady only); Message carries a human-facing explanation when the
-// backfill run failed (StatusFailed only).
+// backfill run failed (StatusFailed only). OffRadar carries the stored items left
+// out of Items because they are hidden or completed (StatusReady only), from the same
+// read, so a caller that also needs them (the radar's Reset count and Undo) does not
+// read the store a second time and cannot see the two halves disagree.
 type Resolution struct {
-	Status  string
-	Items   []WorkItem
-	Message string
+	Status   string
+	Items    []WorkItem
+	OffRadar []WorkItem
+	Message  string
 }
 
 // BackfillProber optionally reports whether an owner's in-flight backfill run has
@@ -87,31 +91,32 @@ func Resolve(ctx context.Context, store Store, ingestor Ingestor, now time.Time,
 		return Resolution{Status: StatusProcessing}, nil
 	}
 	for i := range items {
-		if items[i].Meta.Origin == OriginUser {
-			continue // human overrides are preserved verbatim
-		}
-		hidden := items[i].Meta.HiddenAt       // survives the rescore below
-		completed := items[i].Meta.CompletedAt // survives the rescore below
-		scored := Score(items[i], now)
-		scored.UpdatedAt = items[i].Meta.UpdatedAt // preserve persisted write time
-		scored.HiddenAt = hidden
-		scored.CompletedAt = completed
-		items[i].Meta = scored
+		items[i].Meta = Rescore(items[i], now) // human overrides are preserved verbatim
 	}
 	// Hidden items (user-set) and completed items (closed/merged, agent-set) stay
 	// in the store so an agent can still see and revive them, but are dropped from
 	// the user-facing list.
 	visible := items[:0]
+	var off []WorkItem
 	for _, it := range items {
-		if it.Meta.HiddenAt.IsZero() && it.Meta.CompletedAt.IsZero() {
+		if it.OnRadar() {
 			visible = append(visible, it)
+		} else {
+			off = append(off, it)
 		}
 	}
 	items = visible
 	if err := Sort(items, key, desc); err != nil {
 		return Resolution{}, err
 	}
-	return Resolution{Status: StatusReady, Items: items}, nil
+	return Resolution{Status: StatusReady, Items: items, OffRadar: off}, nil
+}
+
+// OnRadar reports whether the item belongs on the owner's radar: it is neither
+// hidden by the owner nor completed (closed or merged). Resolve shows only these,
+// and every bulk action (Review all, the second-opinion batch) draws only from them.
+func (w WorkItem) OnRadar() bool {
+	return w.Meta.HiddenAt.IsZero() && w.Meta.CompletedAt.IsZero()
 }
 
 // HiddenAfter returns the HiddenAt to keep for a re-ingested item: it preserves a

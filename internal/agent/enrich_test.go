@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackfrancis/gofer/internal/github/githubtest"
 	"github.com/jackfrancis/gofer/internal/worklist"
@@ -160,5 +161,46 @@ func TestRunRankPicksHighestBaseline(t *testing.T) {
 	}
 	if len(ranked) != 1 || ranked[0] != "hot" {
 		t.Fatalf("rank should spend its one slot on the highest-baseline item, got %v", ranked)
+	}
+}
+
+// Timeline reads end at the enrichment deadline (the run deadline less
+// enrichReserve), not the run deadline: a slow, multi-page item cannot hold the
+// batch past the time kept for writing back what the other items found.
+func TestRunEnrichTimelineReadsKeepTheReserve(t *testing.T) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case strings.Contains(r.URL.Path, "/issues/2/timeline"):
+			select { // hang until the client gives up
+			case <-r.Context().Done():
+			case <-time.After(20 * time.Second):
+			}
+		case strings.Contains(r.URL.Path, "/timeline"):
+			_, _ = w.Write([]byte(`[{"event":"review_requested","created_at":"2026-01-02T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"bob"}}]`))
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+
+	sink := &memSink{items: []worklist.WorkItem{
+		{ID: "github:o/r#1", Source: "github", GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1}},
+		{ID: "github:o/r#2", Source: "github", GitHub: worklist.GitHubRef{Repo: "o/r", Number: 2}},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), enrichReserve+time.Second)
+	defer cancel()
+	start := time.Now()
+	err := Run(ctx, Params{JobType: JobEnrich, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+		fakeVendor{token: "t"}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("enrich took %v; the hung timeline read was not cut at the enrichment deadline", elapsed)
+	}
+	if got := itemByID(t, sink.items, "github:o/r#1").Signals.ReviewRequestedBy; got != "bob" {
+		t.Fatalf("item 1 ReviewRequestedBy = %q, want its result written back", got)
 	}
 }

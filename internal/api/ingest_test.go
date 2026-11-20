@@ -33,7 +33,7 @@ func TestAgentIngestWithRunToken(t *testing.T) {
 	)
 
 	store := worklist.NewMemoryStore()
-	h := NewIngestHandler(store, nil)
+	h := NewIngestHandler(store, nil, worklist.NewRunPolicy(nil))
 	ingest := auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Ingest))
 
 	body, _ := json.Marshal(map[string]any{"items": []worklist.WorkItem{
@@ -94,7 +94,7 @@ func newPlane(t *testing.T) planeFixture {
 		authn.NewIdentityValidator(identity.NewEd25519Verifier(pub, "gofer-agent")),
 	)
 	store := worklist.NewMemoryStore()
-	h := NewIngestHandler(store, nil)
+	h := NewIngestHandler(store, nil, worklist.NewRunPolicy(nil))
 	return planeFixture{
 		store:    store,
 		ingest:   auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Ingest)),
@@ -209,7 +209,7 @@ func TestAgentResearch(t *testing.T) {
 		Thread:  []worklist.Message{{ID: "q1", Role: worklist.RoleUser, Content: "q"}},
 	})
 	full := f.mint("signals:read", "metadata:write")
-	adj := worklist.ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 0.5, Rationale: "discussed", AppliedAt: time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC)}
+	adj := worklist.ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 0.5, Rationale: "discussed", AppliedAt: time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC), Turns: []string{"q1"}}
 
 	srv := httptest.NewServer(f.research)
 	defer srv.Close()
@@ -219,7 +219,7 @@ func TestAgentResearch(t *testing.T) {
 	}
 	got, _ := f.store.List(context.Background(), "u1")
 	it := got[0]
-	if it.Signals.Research == nil || !it.Signals.Research.AppliedAt.Equal(adj.AppliedAt) || it.Signals.Research.Relevance != 1.5 || it.Signals.Research.Rationale != "discussed" {
+	if r := it.Signals.Research; r == nil || !r.AppliedAt.Equal(adj.AppliedAt) || r.Relevance != 1.5 || r.Rationale != "discussed" || len(r.Turns) != 1 || r.Turns[0] != "q1" {
 		t.Fatalf("the adjustment must land, got %+v", it.Signals.Research)
 	}
 	if it.GitHub.Title != "Refreshed title" || it.GitHub.State != "closed" || it.Signals.Comments != 9 || it.Signals.Proposed == nil || len(it.Thread) != 1 {
@@ -273,5 +273,94 @@ func TestAgentResearch(t *testing.T) {
 	// A token without metadata:write cannot write it.
 	if code := f.post(t, f.research, "/agent/worklist/research", f.mint("signals:read"), map[string]any{"item_id": "a", "adjustment": adj}); code != http.StatusForbidden {
 		t.Fatalf("want 403 without metadata:write, got %d", code)
+	}
+}
+
+// The agent-plane write-back applies the web tier's policy: a review requested by a
+// configured bot is stored as an automated assignment, a human's request is stored
+// as a human ask whatever the run claims, and a run's metadata is stored as
+// agent-derived even when the run claims the human override.
+func TestAgentIngestAppliesRunPolicy(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	h := NewIngestHandler(store, nil, worklist.NewRunPolicy([]string{"k8s-ci-robot"}))
+	now := time.Now().UTC()
+
+	body, _ := json.Marshal(map[string]any{"items": []worklist.WorkItem{
+		{ID: "github:o/r#1", GitHub: worklist.GitHubRef{Number: 1, Repo: "o/r", UpdatedAt: now},
+			Signals: worklist.Signals{ReviewRequestedBy: "k8s-ci-robot", AwaitingMeSince: now.Add(-48 * time.Hour)},
+			Meta:    worklist.Metadata{Origin: worklist.OriginUser, Rank: 0.99}},
+		{ID: "github:o/r#2", GitHub: worklist.GitHubRef{Number: 2, Repo: "o/r", UpdatedAt: now},
+			Signals: worklist.Signals{ReviewRequestedBy: "alice", ReviewRequestedByBot: true, AwaitingMeSince: now.Add(-48 * time.Hour)}},
+	}})
+	req := httptest.NewRequest(http.MethodPost, "/agent/worklist", bytes.NewReader(body))
+	req = req.WithContext(principal.NewContext(req.Context(), &principal.Principal{
+		Kind: principal.KindWorkload, Subject: "run1", ActingUserID: "u1", Scopes: []principal.Scope{principal.ScopeMetadataWrite},
+	}))
+	rec := httptest.NewRecorder()
+	h.Ingest(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body)
+	}
+
+	items, _ := store.List(context.Background(), "u1")
+	byID := map[string]worklist.WorkItem{}
+	for _, it := range items {
+		byID[it.ID] = it
+	}
+	bot, human := byID["github:o/r#1"], byID["github:o/r#2"]
+	if !bot.Signals.ReviewRequestedByBot {
+		t.Error("a review requested by a configured bot was not stored as automated")
+	}
+	if human.Signals.ReviewRequestedByBot {
+		t.Error("a human's review request was stored as automated")
+	}
+	for _, it := range items {
+		if it.Meta.Origin != worklist.OriginAgent {
+			t.Errorf("%s: stored Origin = %q, want %q", it.ID, it.Meta.Origin, worklist.OriginAgent)
+		}
+	}
+	// The forged override does not survive the read model either.
+	res, err := worklist.Resolve(context.Background(), store, nil, now, "u1", worklist.SortRank, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range res.Items {
+		if it.ID == "github:o/r#1" && it.Meta.Rank == 0.99 {
+			t.Error("Resolve served the run's claimed rank instead of rescoring")
+		}
+	}
+}
+
+// GET /agent/worklist serves the bot flag by the current policy, not the stored
+// value, so a run ranks by the classification its write-back will store (after an
+// upgrade or a change to BOT_REVIEWERS).
+func TestAgentListClassifiesByCurrentPolicy(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	store.Seed("u1",
+		worklist.WorkItem{ID: "stale-human", OwnerID: "u1", Signals: worklist.Signals{ReviewRequestedBy: "k8s-ci-robot"}},
+		worklist.WorkItem{ID: "stale-bot", OwnerID: "u1", Signals: worklist.Signals{ReviewRequestedBy: "alice", ReviewRequestedByBot: true}},
+	)
+	h := NewIngestHandler(store, nil, worklist.NewRunPolicy([]string{"k8s-ci-robot"}))
+	req := httptest.NewRequest(http.MethodGet, "/agent/worklist", nil)
+	req = req.WithContext(principal.NewContext(req.Context(), &principal.Principal{
+		Kind: principal.KindWorkload, Subject: "run1", ActingUserID: "u1", Scopes: []principal.Scope{principal.ScopeSignalsRead},
+	}))
+	rec := httptest.NewRecorder()
+	h.List(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+	var body struct {
+		Items []worklist.WorkItem `json:"items"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, it := range body.Items {
+		got[it.ID] = it.Signals.ReviewRequestedByBot
+	}
+	if !got["stale-human"] || got["stale-bot"] {
+		t.Fatalf("served flags %v, want stale-human=true stale-bot=false", got)
 	}
 }

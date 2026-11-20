@@ -122,6 +122,17 @@ func hasBudget(ctx context.Context, reserve time.Duration) bool {
 	return time.Until(deadline) > reserve
 }
 
+// reserveContext returns a context that ends reserve before ctx's deadline, so work
+// started under it cannot eat the time kept for what follows (writing results back,
+// ranking). A context without a deadline is returned as is.
+func reserveContext(ctx context.Context, reserve time.Duration) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return context.WithCancel(ctx)
+	}
+	return context.WithDeadline(ctx, deadline.Add(-reserve))
+}
+
 // writeBack persists items through the sink in bounded batches (writeBackChunk).
 func writeBack(ctx context.Context, sink Sink, items []worklist.WorkItem) error {
 	for start := 0; start < len(items); start += writeBackChunk {
@@ -252,7 +263,10 @@ func reconcileFetched(fetched, existing []worklist.WorkItem) []worklist.WorkItem
 		}
 		fetched[i].Thread = old.Thread
 		fetched[i].ThreadReadAt = old.ThreadReadAt
-		fetched[i].Meta.HiddenAt = old.Meta.HiddenAt
+		fetched[i].ThreadReadThrough = old.ThreadReadThrough
+		// A hidden item stays hidden until GitHub shows it changed after the hide; the
+		// plane's merge applies the same rule, so the run's view and the store agree.
+		fetched[i].Meta.HiddenAt = worklist.HiddenAfter(old.Meta.HiddenAt, fetched[i].GitHub.UpdatedAt)
 		// A fetch derives no model proposal or research adjustment, so it sends none:
 		// the plane's merge then keeps whatever is stored when this write lands, not
 		// the copy read above, which a discussion may have replaced since. The
@@ -331,9 +345,11 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 	if len(items) > limit {
 		// Spend the model budget on the items the cheap, deterministic scorer already
 		// rates highest rather than on an arbitrary slice. enrich has just run, so those
-		// baselines are computed from complete signals. The baseline ignores stored
-		// model signals: an old low proposal must not keep a newly requested review
-		// from being re-scored.
+		// baselines are computed from complete signals. The baseline ignores the item's
+		// model signals (worklist.BaselineScore): the previous proposal is what this
+		// pass replaces, and it may rest on a classification since changed (e.g. a
+		// requester removed from BOT_REVIEWERS), so neither it nor an old research
+		// adjustment may keep the item out of the pass.
 		now := time.Now().UTC()
 		baseline := make(map[string]float64, len(items))
 		for _, it := range items {
@@ -367,6 +383,9 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 			if err != nil {
 				return // best-effort: leave the item unchanged
 			}
+			// Record the classification the ranker saw, so the proposal is dropped if
+			// it changes (worklist.Signals.CurrentProposal).
+			prop.ReviewRequestedByBot = items[i].Signals.ReviewRequestedByBot
 			items[i].Signals.Proposed = &prop
 			// Rank derives only the proposal; the stored research adjustment stays.
 			items[i].Signals.Research = nil

@@ -16,6 +16,23 @@ type AxisProposal struct {
 	Urgency    float64 `json:"urgency"`
 	Confidence float64 `json:"confidence"`
 	Rationale  string  `json:"rationale,omitempty"`
+	// ReviewRequestedByBot is the item's Signals.ReviewRequestedByBot when the
+	// proposal was made. A proposal made under another classification (the requester
+	// was added to or removed from BOT_REVIEWERS since) is stale: CurrentProposal
+	// drops it, so the item falls back to its baseline until it is ranked again.
+	// Proposals from before this field were all made with the flag unset, which is
+	// what its zero value records.
+	ReviewRequestedByBot bool `json:"review_requested_by_bot,omitempty"`
+}
+
+// CurrentProposal returns the item's model proposal, or nil when there is none or it
+// was made under a different bot classification than the item has now. Everything
+// that uses a proposal reads it through here.
+func (s Signals) CurrentProposal() *AxisProposal {
+	if s.Proposed == nil || s.Proposed.ReviewRequestedByBot != s.ReviewRequestedByBot {
+		return nil
+	}
+	return s.Proposed
 }
 
 // AxisRanker proposes the four axes for an item. The real implementation calls an
@@ -65,6 +82,17 @@ type ResearchAdjustment struct {
 	Urgency    float64   `json:"urgency"`
 	Rationale  string    `json:"rationale,omitempty"`
 	AppliedAt  time.Time `json:"applied_at"`
+	// Turns are the keys (WorkItem.TurnKey) of the thread turns the research read,
+	// so a reader can tell whether they still belong to the conversation it is
+	// shown alongside (ResearchReflectsVisibleThread). Empty on research stored
+	// before it recorded them, and on research that read no turns.
+	Turns []string `json:"turns,omitempty"`
+}
+
+// Multipliers returns the per-axis factors Score actually applies: each bounded to
+// [0,2]. An explanation of a score must use these, not the raw fields.
+func (r ResearchAdjustment) Multipliers() (rel, imp, eng, urg float64) {
+	return clampMult(r.Relevance), clampMult(r.Impact), clampMult(r.Engagement), clampMult(r.Urgency)
 }
 
 // ResearchRanker proposes the research re-weighting for an item from its

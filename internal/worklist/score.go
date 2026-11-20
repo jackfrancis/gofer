@@ -16,6 +16,15 @@ const (
 	wEngagement = 0.15
 )
 
+// BaselineScore is Score without the model-derived signals: the deterministic
+// metadata scorer alone, as computed from GitHub's signals. Choosing which items
+// to send to the model uses it, so a stored proposal cannot decide its own refresh.
+func BaselineScore(item WorkItem, now time.Time) Metadata {
+	item.Signals.Proposed = nil
+	item.Signals.Research = nil
+	return Score(item, now)
+}
+
 // Score computes an item's gofer Metadata from its Signals, as of now. It is a
 // pure function of the item, so a worklist can be re-scored when the weights
 // change without re-fetching from the provider. Origin is preserved; the caller
@@ -28,15 +37,6 @@ const (
 //
 // Time-dependent axes (Engagement, Urgency) are evaluated against now, so a later
 // read-time rescore keeps them fresh.
-// BaselineScore is Score without the model-derived signals: the deterministic
-// metadata scorer alone, as computed from GitHub's signals. Choosing which items
-// to send to the model uses it, so a stored proposal cannot decide its own refresh.
-func BaselineScore(item WorkItem, now time.Time) Metadata {
-	item.Signals.Proposed = nil
-	item.Signals.Research = nil
-	return Score(item, now)
-}
-
 func Score(item WorkItem, now time.Time) Metadata {
 	var contribs []Contribution
 
@@ -48,7 +48,7 @@ func Score(item WorkItem, now time.Time) Metadata {
 	// An LLM proposal is authoritative for the four axes it returns: gofer uses
 	// the proposed values directly, bounded only to [0,1]. The baseline above is
 	// the fallback when no proposal is present.
-	if p := item.Signals.Proposed; p != nil {
+	if p := item.Signals.CurrentProposal(); p != nil {
 		rel = clampUnit(p.Relevance)
 		imp = clampUnit(p.Impact)
 		eng = clampUnit(p.Engagement)
@@ -65,10 +65,11 @@ func Score(item WorkItem, now time.Time) Metadata {
 	// product is bounded to [0,1]. The metadata remains the anchor: a multiplier
 	// cannot manufacture an axis a near-zero foundation does not support.
 	if rsh := item.Signals.Research; rsh != nil {
-		rel = clampUnit(rel * clampMult(rsh.Relevance))
-		imp = clampUnit(imp * clampMult(rsh.Impact))
-		eng = clampUnit(eng * clampMult(rsh.Engagement))
-		urg = clampUnit(urg * clampMult(rsh.Urgency))
+		mRel, mImp, mEng, mUrg := rsh.Multipliers()
+		rel = clampUnit(rel * mRel)
+		imp = clampUnit(imp * mImp)
+		eng = clampUnit(eng * mEng)
+		urg = clampUnit(urg * mUrg)
 		detail := rsh.Rationale
 		if detail == "" {
 			detail = "research re-weighting"
@@ -92,12 +93,56 @@ func Score(item WorkItem, now time.Time) Metadata {
 	switch {
 	case item.Signals.Research != nil && item.Signals.Research.Rationale != "":
 		m.Rationale = item.Signals.Research.Rationale
-	case item.Signals.Proposed != nil && item.Signals.Proposed.Rationale != "":
-		m.Rationale = item.Signals.Proposed.Rationale
+	case item.Signals.CurrentProposal() != nil && item.Signals.CurrentProposal().Rationale != "":
+		m.Rationale = item.Signals.CurrentProposal().Rationale
 	default:
 		m.Rationale = rationale(contribs)
 	}
 	return m
+}
+
+// Rescore returns item's Metadata as the radar shows it at now: re-derived from
+// its Signals by Score, keeping the persisted write time and the hidden and
+// completed marks, which are not scoring. A human override (OriginUser) is
+// returned verbatim. The landing page and the assistant both read an item's
+// ranking through this, so Discuss explains the rank the user is looking at
+// rather than whatever was last stored.
+func Rescore(item WorkItem, now time.Time) Metadata {
+	if item.Meta.Origin == OriginUser {
+		return item.Meta
+	}
+	scored := Score(item, now)
+	scored.UpdatedAt = item.Meta.UpdatedAt
+	scored.HiddenAt = item.Meta.HiddenAt
+	scored.CompletedAt = item.Meta.CompletedAt
+	return scored
+}
+
+// ResearchReflectsVisibleThread reports whether item's research adjustment may be
+// shown to a model alongside item.Thread. Research is derived from the turns it
+// read (ResearchAdjustment.Turns), so it stands only while every one of them is in
+// item.Thread and visible. The caller passes the thread the model is allowed to
+// see — for a Discuss turn, the turns up to the one being answered — so research
+// that read a later turn, a hidden turn, or a conversation since cleared is
+// refused. Research that recorded no turns cannot be checked and is refused too.
+// It reports false when there is no research.
+func ResearchReflectsVisibleThread(item WorkItem) bool {
+	r := item.Signals.Research
+	if r == nil || len(r.Turns) == 0 {
+		return false
+	}
+	visible := make(map[string]bool, len(item.Thread)) // one pass, not TurnIndex per key
+	for i, m := range item.Thread {
+		if !m.Hidden {
+			visible[item.TurnKey(i)] = true
+		}
+	}
+	for _, key := range r.Turns {
+		if !visible[key] {
+			return false
+		}
+	}
+	return true
 }
 
 // baselineAxes returns the four deterministic, signal-based axis values without
@@ -118,6 +163,13 @@ func clampUnit(f float64) float64 { return math.Max(0, math.Min(1, f)) }
 // clampMult bounds a research multiplier to [0,2]; 1.0 is neutral.
 func clampMult(f float64) float64 { return math.Max(0, math.Min(2, f)) }
 
+// A review a bot requested (Signals.ReviewRequestedByBot) is a bare assignment, not
+// a person asking, so it weighs less than a human request on both axes it drives.
+const (
+	botReviewRelevance = 0.6
+	botReviewUrgency   = 0.3
+)
+
 // relevanceScore: the strongest relationship reason wins, with a small bump for
 // corroborating reasons.
 func relevanceScore(s Signals, c *[]Contribution) float64 {
@@ -130,6 +182,11 @@ func relevanceScore(s Signals, c *[]Contribution) float64 {
 		ReasonMentioned:       0.5,
 		ReasonInvolved:        0.5,
 		ReasonTeamMentioned:   0.4,
+	}
+	if s.ReviewRequestedByBot {
+		// A bot's review request (e.g. CI assigning code owners) is not an explicit
+		// ask; an actual assignment still counts in full.
+		weights[ReasonReviewRequested] = botReviewRelevance
 	}
 	var best float64
 	var bestReason Reason
@@ -153,7 +210,11 @@ func relevanceScore(s Signals, c *[]Contribution) float64 {
 func urgencyScore(s Signals, now time.Time, c *[]Contribution) float64 {
 	var urg float64
 
-	if !s.AwaitingMeSince.IsZero() {
+	// AwaitingMeSince dates a pending review request. When a bot made that request
+	// no person is waiting on the user, so it adds no pressure, and the request
+	// itself sets only a low floor (unless the user is also an assignee). Other
+	// signals, such as a deadline, are unaffected.
+	if !s.AwaitingMeSince.IsZero() && !s.ReviewRequestedByBot {
 		days := now.Sub(s.AwaitingMeSince).Hours() / 24
 		u := math.Min(1, 0.6+0.1*days)
 		if u > urg {
@@ -162,9 +223,17 @@ func urgencyScore(s Signals, now time.Time, c *[]Contribution) float64 {
 		add(c, "urgency", "awaiting_me", u, "awaiting your response since "+s.AwaitingMeSince.Format("Jan 2"))
 	}
 
-	if containsReason(s.Reasons, ReasonReviewRequested) && urg < 0.6 {
-		urg = 0.6
-		add(c, "urgency", string(ReasonReviewRequested), 0.6, "review requested")
+	if containsReason(s.Reasons, ReasonReviewRequested) {
+		switch {
+		case !s.ReviewRequestedByBot || containsReason(s.Reasons, ReasonAssignee):
+			if urg < 0.6 {
+				urg = 0.6
+				add(c, "urgency", string(ReasonReviewRequested), 0.6, "review requested")
+			}
+		case urg < botReviewUrgency:
+			urg = botReviewUrgency
+			add(c, "urgency", string(ReasonReviewRequested), botReviewUrgency, "review auto-requested by a bot")
+		}
 	}
 
 	if !s.DeadlineAt.IsZero() {
@@ -200,8 +269,14 @@ func engagementScore(s Signals, c *[]Contribution) float64 {
 	velocity := saturate(s.CommentVelocity, 5)
 	eng := math.Min(1, 0.4*comments+0.3*participants+0.15*reactions+0.15*velocity)
 	if eng > 0 {
+		people := fmt.Sprintf(" from %d people", s.Participants)
+		if s.Participants == 0 && s.Comments > 0 {
+			// Search supplies the comment count; participants come from the timeline
+			// enrichment, which has not run or failed. Zero would be false.
+			people = " (participants not yet counted)"
+		}
 		add(c, "engagement", "discussion", eng,
-			fmt.Sprintf("%d comments from %d people, %d reactions", s.Comments, s.Participants, s.Reactions))
+			fmt.Sprintf("%d comments%s, %d reactions", s.Comments, people, s.Reactions))
 	}
 	return eng
 }

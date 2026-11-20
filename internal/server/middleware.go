@@ -18,6 +18,10 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap exposes the underlying writer to http.ResponseController, so a handler's
+// Flush reaches the connection (the thread page flushes before its read receipt).
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 // recoverer converts panics into 500 responses so one bad request cannot take
 // down the server.
 func recoverer(log *slog.Logger, next http.Handler) http.Handler {

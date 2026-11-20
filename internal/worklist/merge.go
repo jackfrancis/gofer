@@ -17,7 +17,10 @@ import (
 // the scoring metadata, and whether the item is completed. The OWNER's state always
 // comes from the stored item: the conversation thread (its messages and their hidden
 // flags), the read cursor, the hidden-item flag, and when gofer first saw the item.
-// A run adds to the thread only through AppendReply.
+// A run adds to the thread only through AppendReply. The one thing a run can do to
+// the hidden flag is clear it: an item whose GitHub update time (a run-owned field)
+// is later than when the owner hid it has changed since, so it resurfaces
+// (HiddenAfter).
 //
 // The two model-derived signals are the exception to "the run owns its signals": a
 // GitHub fetch cannot produce them, so a refresh sends none, and a scoring pass that
@@ -43,13 +46,15 @@ func MergeRunItems(current, incoming []WorkItem) []WorkItem {
 		if !ok {
 			it.Thread = nil
 			it.ThreadReadAt = time.Time{}
+			it.ThreadReadThrough = ""
 			it.Meta.HiddenAt = time.Time{}
 			out = append(out, it)
 			continue
 		}
 		it.Thread = old.Thread
 		it.ThreadReadAt = old.ThreadReadAt
-		it.Meta.HiddenAt = old.Meta.HiddenAt
+		it.ThreadReadThrough = old.ThreadReadThrough
+		it.Meta.HiddenAt = HiddenAfter(old.Meta.HiddenAt, it.GitHub.UpdatedAt)
 		if !old.CreatedAt.IsZero() {
 			it.CreatedAt = old.CreatedAt
 		}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -141,7 +142,8 @@ func TestRunIngestPreservesThreads(t *testing.T) {
 			{Role: worklist.RoleUser, Content: "Can you review this PR?", Kind: worklist.KindReviewRequest},
 			{Role: worklist.RoleAgent, Content: "Looks good."},
 		},
-		Meta: worklist.Metadata{HiddenAt: hidden},
+		ThreadReadThrough: "pos:1",
+		Meta:              worklist.Metadata{HiddenAt: hidden},
 	}}}
 
 	if err := Run(context.Background(),
@@ -164,6 +166,9 @@ func TestRunIngestPreservesThreads(t *testing.T) {
 	}
 	if got.Meta.HiddenAt.IsZero() {
 		t.Error("re-ingest dropped the user's hidden override")
+	}
+	if got.ThreadReadThrough != "pos:1" || got.HasUnreadReply() {
+		t.Errorf("re-ingest dropped the read cursor, got %q", got.ThreadReadThrough)
 	}
 	if got.GitHub.Title != "Fresh title" {
 		t.Errorf("re-ingest should refresh GitHub fields, got title %q", got.GitHub.Title)
@@ -459,7 +464,7 @@ func TestRunIngestKeepsModelSignals(t *testing.T) {
 	if got.Signals.Proposed == nil || *got.Signals.Proposed != prop {
 		t.Errorf("refresh dropped the model proposal: got %+v", got.Signals.Proposed)
 	}
-	if got.Signals.Research == nil || *got.Signals.Research != adj {
+	if got.Signals.Research == nil || !reflect.DeepEqual(*got.Signals.Research, adj) {
 		t.Errorf("refresh dropped the research adjustment: got %+v", got.Signals.Research)
 	}
 }
@@ -523,15 +528,15 @@ func TestRunIngestKeepsResearchWrittenMeanwhile(t *testing.T) {
 	}
 }
 
-// recordingRanker records which items reach the model and runs during() inside the
+// sideEffectRanker records which items reach the model and runs during() inside the
 // first call, to stand in for what lands in the web tier meanwhile.
-type recordingRanker struct {
+type sideEffectRanker struct {
 	mu     sync.Mutex
 	got    []string
 	during func()
 }
 
-func (r *recordingRanker) Propose(_ context.Context, it worklist.WorkItem) (worklist.AxisProposal, error) {
+func (r *sideEffectRanker) Propose(_ context.Context, it worklist.WorkItem) (worklist.AxisProposal, error) {
 	r.mu.Lock()
 	r.got = append(r.got, it.ID)
 	f := r.during
@@ -563,7 +568,7 @@ func TestRunRankSelectsOnBaseline(t *testing.T) {
 	}
 
 	sink := &memSink{items: []worklist.WorkItem{commented, requested}}
-	rr := &recordingRanker{}
+	rr := &sideEffectRanker{}
 	if err := Run(context.Background(), Params{JobType: JobRank, Ranker: rr, RankLimit: 1}, fakeVendor{}, sink); err != nil {
 		t.Fatal(err)
 	}
@@ -579,7 +584,7 @@ func TestRunRankKeepsResearchWrittenMeanwhile(t *testing.T) {
 	older := worklist.ResearchAdjustment{Relevance: 0.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "older", AppliedAt: t0}
 	newer := worklist.ResearchAdjustment{Relevance: 1.8, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "newer", AppliedAt: t0.Add(time.Hour)}
 	sink := &memSink{items: []worklist.WorkItem{{ID: "github:o/r#1", Signals: worklist.Signals{Research: &older}}}}
-	rr := &recordingRanker{during: func() { sink.items[0].Signals.Research = &newer }}
+	rr := &sideEffectRanker{during: func() { sink.items[0].Signals.Research = &newer }}
 	if err := Run(context.Background(), Params{JobType: JobRank, Ranker: rr}, fakeVendor{}, sink); err != nil {
 		t.Fatal(err)
 	}
