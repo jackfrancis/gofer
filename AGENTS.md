@@ -439,7 +439,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   `completions` and `responses`), and its config is the plain file
   `deploy/k8s/model-gateway/config.yaml`, which `internal/modelgateway`'s test runs
   unchanged: edit that file, not a copy, and re-run `make model-gateway-test` when you
-  change it or bump the pinned release.
+  change it or bump the pinned release. The cluster steps live in
+  `hack/model-gateway/model-gateway.sh` (fake-kubectl tests beside it): check and read
+  back every write, remove gofer's `AI_TOKEN` only after the gateway holds the key and
+  gofer's config points at it, restore the saved `AI_CONNECTIONS_BEFORE_GATEWAY`
+  verbatim on rollback, and never write a key from `make deploy`. `/agent/*` gets no
+  CORS handling: a 204 from `/agent/model-access` authorizes a model call.
 - `go test` binds httptest sockets; run it outside a restrictive sandbox.
 
 ## Build / test / run

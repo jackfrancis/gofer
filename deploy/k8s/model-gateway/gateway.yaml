@@ -5,6 +5,11 @@ metadata:
   labels:
     app.kubernetes.io/name: gofer-model-gateway
     app.kubernetes.io/part-of: gofer
+  annotations:
+    # The provider this gateway fronts, recorded at install. Later applies and make
+    # deploy reuse it, so the provider never changes without an explicit
+    # model-gateway-down and re-apply (hack/model-gateway/model-gateway.sh).
+    gofer/model-gateway-upstream: "@UPSTREAM@"
 spec:
   # Exactly one: the shared budget is a local token bucket, so a second replica would
   # double it.

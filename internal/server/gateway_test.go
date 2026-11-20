@@ -29,6 +29,7 @@ func gatewayRouter(t *testing.T, conn config.AIConnection) (http.Handler, identi
 		MintPublicKey:       pub,
 		ConversationEnabled: true,
 		AIConnections:       []config.AIConnection{conn},
+		AllowedOrigins:      []string{"https://gofer.example"},
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h, _, err := New(cfg, log, ingest.NoopDispatcher{}, vault.NewMemoryVault(), worklist.NewMemoryStore(), nil)
@@ -63,7 +64,22 @@ func TestModelAccessBehindTheGateway(t *testing.T) {
 	noScope, _ := minter.Mint(identity.Claims{RunID: "r2", Subject: "github:1", Scopes: []string{"metadata:write"}})
 	otherAud, _ := minter.Mint(identity.Claims{RunID: "r3", Subject: "github:1", Scopes: []string{"signals:read"}, Audience: "someone-else"})
 
-	for _, method := range []string{http.MethodPost, http.MethodGet} {
+	// A browser preflight shortcut must not answer here: on this route a 204 means
+	// "authorized". OPTIONS gets the same check as any other method.
+	for name, bearer := range map[string]string{"no bearer": "", "garbage": "x.y"} {
+		req := httptest.NewRequest(http.MethodOptions, "/agent/model-access", nil)
+		req.Header.Set("Origin", "https://gofer.example")
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized && rec.Code != http.StatusForbidden {
+			t.Errorf("OPTIONS with %s: %d, want 401 or 403", name, rec.Code)
+		}
+	}
+	for _, method := range []string{http.MethodPost, http.MethodGet, http.MethodOptions} {
 		if rec := call(t, h, method, "/agent/model-access", run); rec.Code != http.StatusNoContent {
 			t.Errorf("%s with a run credential: %d %s, want 204", method, rec.Code, rec.Body)
 		}

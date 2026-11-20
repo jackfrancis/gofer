@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -70,6 +71,14 @@ func securityHeaders(next http.Handler) http.Handler {
 // permitted, and credentials are allowed so the session cookie is sent.
 func cors(allowed []string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The agent plane serves runs, never browsers, so it gets no CORS handling and
+		// no preflight shortcut: every request, OPTIONS included, reaches its
+		// RequireScope. That matters most for /agent/model-access, where a 204 IS the
+		// authorization decision the model gateway acts on.
+		if strings.HasPrefix(r.URL.Path, "/agent/") {
+			next.ServeHTTP(w, r)
+			return
+		}
 		origin := r.Header.Get("Origin")
 		if origin != "" && slices.Contains(allowed, origin) {
 			h := w.Header()

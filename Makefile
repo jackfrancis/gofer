@@ -13,7 +13,7 @@
         install-ingress deploy-tls tls-status \
         aei-check secrets-check dev-secrets \
         backup-apply backup-down snapshot snapshots restore \
-        model-gateway-apply model-gateway-key model-gateway-config model-gateway-check model-gateway-down model-gateway-test \
+        model-gateway-apply model-gateway-check model-gateway-down model-gateway-test \
         monitoring-load dev-monitoring dev-monitoring-down dev-forward-grafana dev-forward-prometheus
 
 build:
@@ -412,7 +412,13 @@ dev-secrets:
 			-p "{\"stringData\":{\"MINT_PUBLIC_KEY\":\"$$mpk\"}}"
 	@[ -z "$$GITHUB_CLIENT_ID" ] || $(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"GITHUB_CLIENT_ID\":\"$$GITHUB_CLIENT_ID\"}}"
 	@[ -z "$$GITHUB_CLIENT_SECRET" ] || $(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"GITHUB_CLIENT_SECRET\":\"$$GITHUB_CLIENT_SECRET\"}}"
-	@[ -z "$$AI_TOKEN" ] || $(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"AI_TOKEN\":\"$$AI_TOKEN\"}}"
+	@# With the model gateway installed the key is the gateway's alone: AI_TOKEN in the
+	@# shell is not written to gofer-secrets (rotate it with make model-gateway-apply).
+	@if [ -n "$$AI_TOKEN" ]; then \
+		if $(KUBECTL) -n $(KUBE_NS) get deployment gofer-model-gateway >/dev/null 2>&1; then \
+			echo "AI_TOKEN not written to gofer-secrets: the model gateway holds the key (make model-gateway-apply AI_TOKEN=... rotates it)."; \
+		else $(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"AI_TOKEN\":\"$$AI_TOKEN\"}}"; fi; \
+	fi
 	@# A gofer-secrets created before persistent storage has no token-encryption key.
 	@# Add one if it is missing; never replace an existing key (it seals stored tokens).
 	@$(KUBECTL) -n $(KUBE_NS) get secret gofer-secrets -o jsonpath='{.data.VAULT_ENCRYPTION_KEY}' | grep -q . || \
@@ -428,17 +434,18 @@ deploy-apply:
 	$(KUBECTL) -n $(KUBE_NS) delete deployment gofer --ignore-not-found
 	@# The manifests name the kind-loaded dev images; substitute the ones being deployed
 	@# (a no-op for the dev defaults).
+	@# With the model gateway installed, refuse before applying anything if gofer would
+	@# get AI_TOKEN beside it.
+	@$(MODEL_GATEWAY_SH) preflight $(KUBECTL)
 	$(KUBECTL) kustomize deploy/k8s/base | sed 's|image: localhost/gofer:dev$$|image: $(IMAGE)|' | $(KUBECTL) apply -f -
 	@[ -z "$$AI_CONNECTIONS" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$$AI_CONNECTIONS" '{data:{AI_CONNECTIONS:$$v}}')"
 	@[ -z "$(BASE_URL)" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$(BASE_URL)" '{data:{BASE_URL:$$v}}')"
 	@[ -z "$(ALLOWED_GITHUB_LOGINS)" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$(ALLOWED_GITHUB_LOGINS)" '{data:{ALLOWED_GITHUB_LOGINS:$$v}}')"
 	@[ "$(PUBLIC_SERVICE)" != true ] || $(MAKE) --no-print-directory deploy-public
 	@[ -z "$(TLS_HOST)" ] || $(MAKE) --no-print-directory deploy-tls
-	@# The base config just re-applied names the upstream again. If the model gateway is
-	@# installed, keep gofer pointed at it (and its key out of gofer-secrets), or the web
-	@# tier refuses to start.
-	@if $(KUBECTL) -n $(KUBE_NS) get deployment gofer-model-gateway >/dev/null 2>&1; then \
-		$(MAKE) --no-print-directory model-gateway-key && $(MAKE) --no-print-directory model-gateway-config; fi
+	@# The base config just re-applied names the provider again. If the model gateway is
+	@# installed, point gofer back at it (routing only: a deploy never writes a key).
+	@$(MODEL_GATEWAY_SH) sync $(KUBECTL)
 	sed 's|image: localhost/gofer-runtime:dev$$|image: $(RUNTIME_IMAGE)|' deploy/k8s/overlays/dev/agentapp.yaml | $(KUBECTL) apply -f -
 	@# Point the AgentApp at the well-known class name the admin published on the AEI side
 	@# (AGENT_PROVIDER_CLASS). gofer references a capability by name, not a substrate — an
@@ -669,13 +676,20 @@ restore: deploy-target
 #   make model-gateway-down  KUBECONFIG=<file>   back to per-run vending
 #   make model-gateway-test                      the end-to-end check, locally
 #
-# The key: model-gateway-apply takes it from AI_TOKEN in your shell, or else moves it
-# out of gofer-secrets; either way gofer-secrets ends with none. The upstream is the
-# origin every AI_CONNECTIONS endpoint names today; the gateway serves each endpoint's
-# API (.../chat/completions or .../responses) at its own /v1 path and passes the
-# model through. The budget: MODEL_GATEWAY_BURST requests at once, then
-# MODEL_GATEWAY_REFILL per MODEL_GATEWAY_INTERVAL.
-MODEL_GATEWAY_UPSTREAM ?= https://api.githubcopilot.com
+# The key: model-gateway-apply takes it from AI_TOKEN in your shell (also how to
+# rotate it), or else moves it out of gofer-secrets; either way gofer-secrets ends
+# with none. Only model-gateway-apply writes the key: make deploy never does.
+# The upstream (MODEL_GATEWAY_UPSTREAM) is the origin every AI_CONNECTIONS endpoint
+# names today, and is recorded on the gateway: later applies and deploys reuse it, and
+# changing it takes model-gateway-down first. The gateway serves each endpoint's API
+# (.../chat/completions or .../responses) at its own /v1 path and passes the model
+# through. model-gateway-down restores the AI_CONNECTIONS saved at installation.
+# The budget: MODEL_GATEWAY_BURST requests at once, then MODEL_GATEWAY_REFILL per
+# MODEL_GATEWAY_INTERVAL.
+#
+# MODEL_GATEWAY_UPSTREAM empty means the provider an installed gateway already
+# fronts, else GitHub Copilot.
+MODEL_GATEWAY_UPSTREAM ?=
 MODEL_GATEWAY_BURST ?= 20
 MODEL_GATEWAY_REFILL ?= 2
 MODEL_GATEWAY_INTERVAL ?= 1s
@@ -683,111 +697,34 @@ MODEL_GATEWAY_VERSION ?= v1.7.0
 MODEL_GATEWAY_URL = http://gofer-model-gateway.$(KUBE_NS).svc.cluster.local
 MODEL_GATEWAY_LOCAL_PORT ?= 18480
 
+MODEL_GATEWAY_ENV = KUBE_NS="$(KUBE_NS)" MODEL_GATEWAY_URL="$(MODEL_GATEWAY_URL)" MODEL_GATEWAY_UPSTREAM="$(MODEL_GATEWAY_UPSTREAM)" \
+	MODEL_GATEWAY_BURST="$(MODEL_GATEWAY_BURST)" MODEL_GATEWAY_REFILL="$(MODEL_GATEWAY_REFILL)" MODEL_GATEWAY_INTERVAL="$(MODEL_GATEWAY_INTERVAL)" \
+	MODEL_GATEWAY_LOCAL_PORT="$(MODEL_GATEWAY_LOCAL_PORT)" ROLLOUT_TIMEOUT="$(ROLLOUT_TIMEOUT)"
+MODEL_GATEWAY_SH = $(MODEL_GATEWAY_ENV) bash hack/model-gateway/model-gateway.sh
+
+# Install (or update, or rotate the key with AI_TOKEN=...) and point gofer at it.
+# hack/model-gateway/model-gateway.sh checks every write and removes gofer's copy of
+# the key only once the gateway holds it and gofer's config points at the gateway.
 model-gateway-apply: deploy-target
 	@case "$(MODEL_GATEWAY_BURST)$(MODEL_GATEWAY_REFILL)" in *[!0-9]*) echo "ERROR: MODEL_GATEWAY_BURST and MODEL_GATEWAY_REFILL must be positive integers."; exit 1;; esac
 	@[ "$(MODEL_GATEWAY_BURST)" -gt 0 ] && [ "$(MODEL_GATEWAY_REFILL)" -gt 0 ] || { echo "ERROR: MODEL_GATEWAY_BURST and MODEL_GATEWAY_REFILL must be positive integers."; exit 1; }
 	@echo "$(MODEL_GATEWAY_INTERVAL)" | grep -Eq '^[0-9]+(ms|s|m|h)$$' || { echo "ERROR: MODEL_GATEWAY_INTERVAL must be a duration such as 1s, 500ms or 1m."; exit 1; }
-	@echo "$(MODEL_GATEWAY_UPSTREAM)" | grep -Eq '^https?://[^/@[:space:]]+(/[^[:space:]]*)?$$' || { echo "ERROR: MODEL_GATEWAY_UPSTREAM must be an http(s) URL."; exit 1; }
-	@$(KUBECTL) -n $(KUBE_NS) get statefulset gofer >/dev/null 2>&1 || { echo "ERROR: gofer is not deployed here; deploy it first."; exit 1; }
-	@$(MAKE) --no-print-directory model-gateway-key
-	@$(KUBECTL) kustomize deploy/k8s/model-gateway | sed \
-		-e 's|@UPSTREAM@|$(MODEL_GATEWAY_UPSTREAM)|' \
-		-e 's|@AUTHZ_HOST@|gofer.$(KUBE_NS).svc.cluster.local:8080|' \
-		-e 's|@BURST@|$(MODEL_GATEWAY_BURST)|' \
-		-e 's|@REFILL@|$(MODEL_GATEWAY_REFILL)|' \
-		-e 's|@INTERVAL@|$(MODEL_GATEWAY_INTERVAL)|' | $(KUBECTL) -n $(KUBE_NS) apply -f -
-	@# The config's name does not change with the values filled in, so restart to load them.
-	$(KUBECTL) -n $(KUBE_NS) rollout restart deployment/gofer-model-gateway
-	$(KUBECTL) -n $(KUBE_NS) rollout status deployment/gofer-model-gateway --timeout=$(ROLLOUT_TIMEOUT)
-	@$(MAKE) --no-print-directory model-gateway-config
-	$(KUBECTL) -n $(KUBE_NS) rollout restart statefulset/gofer
-	$(KUBECTL) -n $(KUBE_NS) rollout status statefulset/gofer --timeout=$(ROLLOUT_TIMEOUT)
-	@echo "model gateway: upstream $(MODEL_GATEWAY_UPSTREAM), budget $(MODEL_GATEWAY_BURST) at once then $(MODEL_GATEWAY_REFILL) per $(MODEL_GATEWAY_INTERVAL). Check it with 'make model-gateway-check'."
+	@[ -z "$(MODEL_GATEWAY_UPSTREAM)" ] || echo "$(MODEL_GATEWAY_UPSTREAM)" | grep -Eq '^https?://[^/@|[:space:]]+(/[^|[:space:]]*)?$$' || { echo "ERROR: MODEL_GATEWAY_UPSTREAM must be an http(s) URL."; exit 1; }
+	@$(MODEL_GATEWAY_SH) apply $(KUBECTL)
+	@echo "model gateway: budget $(MODEL_GATEWAY_BURST) at once then $(MODEL_GATEWAY_REFILL) per $(MODEL_GATEWAY_INTERVAL). Check it with 'make model-gateway-check'."
 
-# The upstream key belongs to the gateway alone. Take it from AI_TOKEN in the shell, or
-# move it out of gofer-secrets; then make sure gofer-secrets holds none (the web tier
-# refuses to start with both AI_TOKEN and AI_GATEWAY_URL). No cluster guard: callers
-# have one (model-gateway-apply, deploy-apply).
-model-gateway-key:
-	@gw="$$($(KUBECTL) -n $(KUBE_NS) get secret gofer-model-gateway -o jsonpath='{.data.AI_TOKEN}' 2>/dev/null)"; \
-		web="$$($(KUBECTL) -n $(KUBE_NS) get secret gofer-secrets -o jsonpath='{.data.AI_TOKEN}' 2>/dev/null)"; \
-		if [ -n "$$AI_TOKEN" ]; then \
-			$(KUBECTL) -n $(KUBE_NS) create secret generic gofer-model-gateway --from-literal=AI_TOKEN="$$AI_TOKEN" \
-				--dry-run=client -o yaml | $(KUBECTL) -n $(KUBE_NS) apply -f - >/dev/null; \
-			gw="$$(printf '%s' "$$AI_TOKEN" | base64 | tr -d '\n')"; \
-			echo "model gateway: upstream key set from AI_TOKEN"; \
-		elif [ -z "$$gw" ] && [ -n "$$web" ]; then \
-			$(KUBECTL) -n $(KUBE_NS) create secret generic gofer-model-gateway \
-				--from-literal=AI_TOKEN="$$(printf '%s' "$$web" | base64 -d)" \
-				--dry-run=client -o yaml | $(KUBECTL) -n $(KUBE_NS) apply -f - >/dev/null; \
-			gw="$$web"; \
-			echo "model gateway: upstream key moved from gofer-secrets"; \
-		fi; \
-		[ -n "$$gw" ] || { echo "ERROR: no upstream key. Set AI_TOKEN in your shell, or create Secret $(KUBE_NS)/gofer-model-gateway with key AI_TOKEN."; exit 1; }; \
-		if [ -n "$$web" ]; then \
-			[ "$$web" = "$$gw" ] || { echo "ERROR: gofer-secrets and gofer-model-gateway hold different AI_TOKENs. Remove AI_TOKEN from gofer-secrets, or put the one you want in gofer-model-gateway, and re-run."; exit 1; }; \
-			$(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=json -p '[{"op":"remove","path":"/data/AI_TOKEN"}]' >/dev/null; \
-			echo "model gateway: removed AI_TOKEN from gofer-secrets (the gateway holds it)"; \
-		fi
-
-# Point gofer at the gateway: AI_GATEWAY_URL, and every AI_CONNECTIONS endpoint on the
-# upstream rewritten to the gateway's path for the same API. Endpoints already on the
-# gateway are kept, so this is safe to repeat; deploy-apply repeats it after
-# re-applying the base config. The web tier refuses to start if any endpoint is not on
-# the gateway, so a run credential never reaches the upstream.
-model-gateway-config:
-	@cur="$$($(KUBECTL) -n $(KUBE_NS) get configmap gofer-config -o jsonpath='{.data.AI_CONNECTIONS}')"; \
-		new="$$(printf '%s' "$$cur" | jq -ce --arg gw '$(MODEL_GATEWAY_URL)' --arg up '$(MODEL_GATEWAY_UPSTREAM)' ' \
-			def origin: capture("^(?<o>[A-Za-z]+://[^/]+)").o | ascii_downcase; \
-			map(.endpoint |= ( \
-				if origin == ($$gw | origin) then . \
-				elif origin != ($$up | origin) then error("AI_CONNECTIONS endpoint \(.) is not on MODEL_GATEWAY_UPSTREAM \($$up)") \
-				elif test("/chat/completions/?$$") then $$gw + "/v1/chat/completions" \
-				elif test("/responses/?$$") then $$gw + "/v1/responses" \
-				else error("AI_CONNECTIONS endpoint \(.) is neither .../chat/completions nor .../responses") end))')" || { \
-			echo "ERROR: could not point AI_CONNECTIONS at the gateway (above)."; exit 1; }; \
-		$(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge \
-			-p "$$(jq -nc --arg c "$$new" --arg g '$(MODEL_GATEWAY_URL)' '{data:{AI_CONNECTIONS:$$c, AI_GATEWAY_URL:$$g}}')" >/dev/null; \
-		echo "model gateway: AI_CONNECTIONS = $$new"
-
-# A check of the deployed profile: the gateway is up, gofer holds no model key and
-# routes every connection through the gateway, and the gateway refuses a caller
-# without a run credential. That a run's call succeeds without the key, on a shared
-# budget, and per model is model-gateway-test's job (internal/modelgateway).
+# A check of the deployed profile: the gateway is up, gofer holds no model key, routes
+# every connection through the gateway and has its original endpoints saved, and the
+# gateway refuses a caller without a run credential. That a run's call succeeds
+# without the key, on a shared budget, and per model is model-gateway-test's job.
 model-gateway-check: deploy-target
-	@$(KUBECTL) -n $(KUBE_NS) rollout status deployment/gofer-model-gateway --timeout=10s >/dev/null || { echo "FAIL: the gateway is not running (make model-gateway-apply)."; exit 1; }
-	@gw="$$($(KUBECTL) -n $(KUBE_NS) get configmap gofer-config -o jsonpath='{.data.AI_GATEWAY_URL}')"; \
-		[ "$$gw" = '$(MODEL_GATEWAY_URL)' ] || { echo "FAIL: gofer-config AI_GATEWAY_URL is '$$gw', want $(MODEL_GATEWAY_URL)."; exit 1; }; \
-		$(KUBECTL) -n $(KUBE_NS) get configmap gofer-config -o jsonpath='{.data.AI_CONNECTIONS}' | \
-			jq -e --arg gw "$$gw" 'length > 0 and all(.[]; .endpoint | startswith($$gw + "/"))' >/dev/null || { \
-			echo "FAIL: an AI_CONNECTIONS endpoint is not on the gateway."; exit 1; }
-	@! $(KUBECTL) -n $(KUBE_NS) get secret gofer-secrets -o jsonpath='{.data.AI_TOKEN}' | grep -q . || { echo "FAIL: gofer-secrets still holds AI_TOKEN."; exit 1; }
-	@$(KUBECTL) -n $(KUBE_NS) get secret gofer-model-gateway -o jsonpath='{.data.AI_TOKEN}' | grep -q . || { echo "FAIL: the gateway has no upstream key."; exit 1; }
-	@$(KUBECTL) -n $(KUBE_NS) port-forward svc/gofer-model-gateway $(MODEL_GATEWAY_LOCAL_PORT):80 >/dev/null 2>&1 & pf=$$!; \
-		trap 'kill $$pf 2>/dev/null' EXIT; \
-		for i in 1 2 3 4 5 6 7 8 9 10; do curl -s -o /dev/null http://127.0.0.1:$(MODEL_GATEWAY_LOCAL_PORT)/ && break; sleep 1; done; \
-		for auth in "" "Authorization: Bearer forged.credential"; do \
-			code=$$(curl -s -o /dev/null -w '%{http_code}' -H "Content-Type: application/json" $${auth:+-H "$$auth"} \
-				-d '{"model":"any","messages":[{"role":"user","content":"hi"}]}' http://127.0.0.1:$(MODEL_GATEWAY_LOCAL_PORT)/v1/chat/completions); \
-			case "$$code" in 401|403) ;; *) echo "FAIL: the gateway answered $$code to a caller with '$${auth:-no credential}', want 401 or 403."; exit 1;; esac; \
-		done
-	@echo "OK: the gateway holds the model key, gofer holds none, and callers without a run credential are refused."
+	@$(MODEL_GATEWAY_SH) check $(KUBECTL)
 
-# Back to per-run vending: the key returns to gofer-secrets, AI_CONNECTIONS to the
-# upstream, and the gateway is removed. The gofer-model-gateway Secret is kept.
+# Back to per-run vending: the key returns to gofer-secrets and AI_CONNECTIONS to the
+# endpoints saved at installation (verbatim; no upstream is assumed), then the gateway
+# is removed. The gofer-model-gateway Secret is kept.
 model-gateway-down: deploy-target
-	@key="$$($(KUBECTL) -n $(KUBE_NS) get secret gofer-model-gateway -o jsonpath='{.data.AI_TOKEN}' 2>/dev/null)"; \
-		[ -z "$$key" ] || $(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"data\":{\"AI_TOKEN\":\"$$key\"}}" >/dev/null
-	@cur="$$($(KUBECTL) -n $(KUBE_NS) get configmap gofer-config -o jsonpath='{.data.AI_CONNECTIONS}')"; \
-		new="$$(printf '%s' "$$cur" | jq -c --arg gw '$(MODEL_GATEWAY_URL)' --arg up '$(MODEL_GATEWAY_UPSTREAM)' ' \
-			($$up | sub("/+$$"; "")) as $$base | map(.endpoint |= ( \
-				if startswith($$gw + "/v1/") then $$base + "/" + ltrimstr($$gw + "/v1/") else . end))')"; \
-		$(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg c "$$new" '{data:{AI_CONNECTIONS:$$c}}')" >/dev/null; \
-		$(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=json -p '[{"op":"remove","path":"/data/AI_GATEWAY_URL"}]' >/dev/null 2>&1 || true; \
-		echo "AI_CONNECTIONS = $$new"
-	$(KUBECTL) kustomize deploy/k8s/model-gateway | $(KUBECTL) -n $(KUBE_NS) delete --ignore-not-found -f -
-	$(KUBECTL) -n $(KUBE_NS) rollout restart statefulset/gofer
-	$(KUBECTL) -n $(KUBE_NS) rollout status statefulset/gofer --timeout=$(ROLLOUT_TIMEOUT)
+	@$(MODEL_GATEWAY_SH) down $(KUBECTL)
 
 # The end-to-end check on this machine: the pinned agentgateway release, on the
 # shipped config, in front of a fake provider (internal/modelgateway). Fetches the

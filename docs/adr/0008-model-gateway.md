@@ -46,7 +46,10 @@ run credential is not a JWT (`internal/identity`), so the gateway cannot verify 
 its own. It forwards the caller's `Authorization` to gofer over HTTP `extAuthz`. gofer
 answers 204 at `/agent/model-access`, behind the same `RequireScope` as the credential
 broker. Exactly the runs that could vend the model token without the gateway can use
-the model through it, and a browser session never can. The gateway then replaces the
+the model through it, and a browser session never can. The gateway forwards each
+call's original method, OPTIONS included. Here a 204 *is* the authorization decision,
+so the whole `/agent/` plane is exempt from the CORS middleware's preflight shortcut.
+That plane serves runs, never browsers. The gateway then replaces the
 `Authorization` header with the upstream key, so the run credential stops at the
 gateway.
 
@@ -65,13 +68,39 @@ Over budget the gateway answers 429, and the workload's existing backoff applies
 `_INTERVAL`; ZZ's 20 / 2 per second by default).
 
 **Deployment.** `deploy/k8s/model-gateway/` holds the gateway, pinned at
-agentgateway v1.7.0. Its config is a plain file (`config.yaml`) whose upstream,
-budget and authorization address `make model-gateway-apply` fills in. That target
-moves the key into the `gofer-model-gateway` Secret, which only the gateway mounts,
-and removes it from `gofer-secrets`. It rewrites `AI_CONNECTIONS` to the gateway's
-paths and sets `AI_GATEWAY_URL`. `make deploy` re-applies the base config, so it
-repeats that rewrite whenever the gateway is installed. `make model-gateway-down`
-reverses all of this.
+agentgateway v1.7.0. Its config is a plain file (`config.yaml`). `make
+model-gateway-apply` fills in the upstream, the budget and the authorization address.
+The cluster steps are in `hack/model-gateway/model-gateway.sh`. Each write is checked
+and read back, and the steps run in an order that never loses the only copy of the
+key or of the provider endpoints:
+
+- **Apply:**
+  1. Write the key to the `gofer-model-gateway` Secret, which only the gateway mounts.
+  2. Roll out the gateway.
+  3. Point gofer at it: rewrite `AI_CONNECTIONS` to the gateway's paths, set
+     `AI_GATEWAY_URL`, and save the original `AI_CONNECTIONS` once, as
+     `AI_CONNECTIONS_BEFORE_GATEWAY`.
+  4. Only then remove `AI_TOKEN` from `gofer-secrets`, and restart gofer.
+
+  A failure at any step leaves gofer's key and pod as they were. The upstream is
+  recorded on the gateway Deployment, and later runs reuse it. Asking an installed
+  gateway for a different provider is refused, because its key and the saved
+  endpoints belong to the old one.
+- **Down:**
+  1. Put the key back in `gofer-secrets`.
+  2. In one patch, restore the saved `AI_CONNECTIONS` *verbatim* and drop
+     `AI_GATEWAY_URL`. The provider is never rebuilt from the current invocation's
+     settings.
+  3. Restart gofer, and only then delete the gateway.
+- **`make deploy`:** it re-applies the base config. When the gateway is installed, it
+  points that config back at the gateway, and it never writes a key, even with
+  `AI_TOKEN` in the shell. It refuses up front if `gofer-secrets` holds `AI_TOKEN`
+  beside the gateway, and `dev-up` stops writing `AI_TOKEN` there once the gateway is
+  installed. Rotating the key is `make model-gateway-apply AI_TOKEN=...`.
+
+`hack/model-gateway`'s tests drive the script against a stateful fake kubectl. They
+cover every refused or silently ignored write on both paths, and the order of the
+writes.
 
 ## Consequences
 
