@@ -209,6 +209,13 @@ Wired on the web-tier side; they define what a runtime must respect:
   rule `worklist.Resolve` applies); Reset Conversations also clears hidden and
   completed items in scope, and its count includes them (`Resolution.OffRadar`, from
   the same read).
+- A user turn keeps one answer: `worklist.AppendReply` drops any reply to a turn that
+  already has a substantive one (a notice such as `NoticeReconnect` is not an answer),
+  so the first answer stored wins. That store rule is what makes retrying a turn safe,
+  across a restart or a first run that finishes late. The ingest package's in-flight
+  gate (`internal/ingest/gate.go`) holds one run per (owner, task, item, turn) and
+  only saves the cost of a duplicate run: it is in memory and guarantees nothing.
+  A second opinion posts its own user turn, so it is never a duplicate.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,
