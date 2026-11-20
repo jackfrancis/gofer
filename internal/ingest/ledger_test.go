@@ -457,7 +457,87 @@ func TestIngestSubmitIsDetachedAndBounded(t *testing.T) {
 	l := newMemLedger()
 	pd := &peekDispatcher{gateDispatcher: gateDispatcher{phase: "Running"}, l: l}
 	_, _ = restart(t, pd, l).ScheduledRefresh(context.Background(), "github:2")
-	if want := pd.seen.RunAt.Add(holdPending); !pd.seen.Pending || !pd.seen.RunUntil.Equal(want) {
-		t.Fatalf("at dispatch the record held %+v, want expiry %v", pd.seen, want)
+	if !pd.seen.Pending || pd.seen.RunUntil.Before(pd.seen.RunAt.Add(holdPending)) {
+		t.Fatalf("at dispatch the record held %+v, want an expiry at least %v after the reservation", pd.seen, holdPending)
+	}
+}
+
+// stallDispatcher blocks each Submit until its context ends.
+type stallDispatcher struct {
+	gateDispatcher
+	entered chan struct{}
+	ctxErr  chan error
+}
+
+func (d *stallDispatcher) Submit(ctx context.Context, _ RunSpec) (string, error) {
+	d.entered <- struct{}{}
+	<-ctx.Done()
+	d.ctxErr <- ctx.Err()
+	return "", ctx.Err()
+}
+
+// Stopping the Refresher cancels a scheduled dispatch stalled on the backend, so
+// shutdown does not wait out submitTimeout; a browser's Refresh stays detached
+// (TestIngestSubmitIsDetachedAndBounded).
+func TestRefresherStopCancelsAStalledDispatch(t *testing.T) {
+	d := &stallDispatcher{entered: make(chan struct{}, 1), ctxErr: make(chan error, 1)}
+	r := NewRefresher(seeded("github:1"), New(d, "", "", nil, "", ""), nil, time.Millisecond, nil)
+	r.Start()
+	<-d.entered
+	start := time.Now()
+	r.Stop()
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("Stop took %v with a dispatch stalled", took)
+	}
+	if err := <-d.ctxErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the stalled dispatch ended with %v, want cancellation", err)
+	}
+}
+
+// The recorded expiry of a pending reservation counts from when the record is
+// written, after any wait for earlier ledger writes, not from the reservation.
+func TestPendingExpiryCountsFromTheWrite(t *testing.T) {
+	l := newMemLedger()
+	pd := &peekDispatcher{gateDispatcher: gateDispatcher{phase: "Running"}, l: l}
+	ig := restart(t, pd, l)
+	ig.persistMu.Lock() // an earlier write still in progress
+	done := make(chan struct{})
+	go func() {
+		_, _ = ig.ScheduledRefresh(context.Background(), "github:1")
+		close(done)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	released := time.Now()
+	ig.persistMu.Unlock()
+	<-done
+	if want := released.Add(holdPending); pd.seen.RunUntil.Before(want) {
+		t.Fatalf("recorded expiry %v is before %v: the wait for the ledger was not counted", pd.seen.RunUntil, want)
+	}
+}
+
+// A reservation whose Submit has not returned never expires in this process,
+// however long it waited: the backend may still accept it.
+func TestPendingReservationNeverExpiresInProcess(t *testing.T) {
+	d := &gateDispatcher{phase: "Running", hold: make(chan struct{}), arrived: make(chan struct{}, 1)}
+	ig := New(d, "", "", nil, "", "")
+	done := make(chan struct{})
+	go func() {
+		_, _ = ig.ScheduledRefresh(context.Background(), "github:1")
+		close(done)
+	}()
+	<-d.arrived
+	ig.mu.Lock()
+	ig.runs[ingestKey("github:1")].at = time.Now().Add(-2 * retryAfter)
+	ig.mu.Unlock()
+	if ok, _ := ig.ScheduledRefresh(context.Background(), "github:1"); ok {
+		t.Fatal("a second ingest started while the first was still being submitted")
+	}
+	if a, _ := ig.Active(context.Background(), "github:1"); !a {
+		t.Fatal("a reservation being submitted is in flight")
+	}
+	close(d.hold)
+	<-done
+	if d.count() != 1 {
+		t.Fatalf("dispatched %d runs, want 1", d.count())
 	}
 }

@@ -149,7 +149,7 @@ func (i *Ingestor) runParams(ownerID string) map[string]string {
 // executes them. A failed or stale run (older than retryAfter) is re-dispatched, so a
 // reload retries after a failure or a lost run.
 func (i *Ingestor) EnsureBackfill(ctx context.Context, ownerID string) error {
-	_, err := i.dispatchIngest(ctx, ownerID, ingestGate)
+	_, err := i.dispatchIngest(ctx, ownerID, ingestGate, true)
 	return err
 }
 
@@ -159,7 +159,7 @@ func (i *Ingestor) EnsureBackfill(ctx context.Context, ownerID string) error {
 // leave the older one's GitHub fields stored. The radar reloads until the running
 // pass lands (Active), and a click after it has ended dispatches at once.
 func (i *Ingestor) Refresh(ctx context.Context, ownerID string) error {
-	_, err := i.dispatchIngest(ctx, ownerID, refreshGate)
+	_, err := i.dispatchIngest(ctx, ownerID, refreshGate, true)
 	return err
 }
 
@@ -167,9 +167,10 @@ func (i *Ingestor) Refresh(ctx context.Context, ownerID string) error {
 // periodic refresh (Refresher), and reports whether it submitted one. It submits
 // nothing while any ingest run for the owner is in flight, asking the backend about a
 // run that still looks live, so overlapping ticks (and a tick during a backfill or a
-// Refresh) share one run per owner.
+// Refresh) share one run per owner. Its dispatch honours ctx (the Refresher's, which
+// Stop cancels), so shutting down never waits out a stalled dispatch.
 func (i *Ingestor) ScheduledRefresh(ctx context.Context, ownerID string) (bool, error) {
-	return i.dispatchIngest(ctx, ownerID, refreshGate)
+	return i.dispatchIngest(ctx, ownerID, refreshGate, false)
 }
 
 // RefreshState reports ownerID's refresh version — the highest generation of an
@@ -255,8 +256,11 @@ func (i *Ingestor) Active(ctx context.Context, ownerID string) (bool, error) {
 // reports whether it submitted one. It submits nothing while the owner's ingest run
 // is in flight. With a ledger, the reservation is recorded before the backend sees
 // the run, so a restart while the backend's answer is outstanding (or lost) still
-// holds the owner; if it cannot be recorded, nothing is submitted.
-func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, g gate) (bool, error) {
+// holds the owner; if it cannot be recorded, nothing is submitted. The dispatch is
+// bounded by submitTimeout; with detach it also outlives ctx (a browser request that
+// goes away must not leave acceptance unknown), while without it ctx cancels it (the
+// Refresher's shutdown).
+func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, g gate, detach bool) (bool, error) {
 	key := ingestKey(ownerID)
 	mine, ok := i.reserve(ctx, key, g)
 	if !ok {
@@ -266,9 +270,11 @@ func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, g gate) (
 		i.settle(key, mine, "", ErrNotAccepted)
 		return false, fmt.Errorf("ingest: record the reservation before dispatch: %w", err)
 	}
-	// The dispatch is bounded, and outlives the request that asked for it: a browser
-	// that goes away mid-dispatch must not leave acceptance unknown.
-	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), submitTimeout)
+	parent := ctx
+	if detach {
+		parent = context.WithoutCancel(ctx)
+	}
+	sctx, cancel := context.WithTimeout(parent, submitTimeout)
 	defer cancel()
 	id, err := i.d.Submit(sctx, RunSpec{
 		TaskRef:    taskIngest,

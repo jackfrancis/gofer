@@ -68,8 +68,13 @@ func (r *run) live(now time.Time, probe bool) bool {
 	return !r.expired(now)
 }
 
-// expired reports whether r is past its deadline: until when set, else at + ttl.
+// expired reports whether r is past its deadline: until when set, else at + ttl. A
+// reservation whose Submit has not returned never is: the backend may yet accept it,
+// and settle gives it its real deadline (Submit is bounded by submitTimeout).
 func (r *run) expired(now time.Time) bool {
+	if r.pending {
+		return false
+	}
 	return !now.Before(r.deadline())
 }
 
@@ -97,8 +102,9 @@ const (
 	// the backend accepted it is held this long from when Submit returned.
 	holdUncertain = acceptGrace + ingestDeadline
 	// holdPending: a reservation whose Submit had not returned when gofer last
-	// recorded it (a restart mid-dispatch) is held this long from the reservation:
-	// recording it, then the whole Submit, then holdUncertain.
+	// recorded it (a restart mid-dispatch) is held this long from when that record
+	// was written (after any wait for earlier writes): the rest of the write, then
+	// the whole Submit, then holdUncertain.
 	holdPending = ledgerTimeout + submitTimeout + holdUncertain
 )
 

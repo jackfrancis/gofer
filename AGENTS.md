@@ -325,9 +325,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   reservation is held, unprobeable, until the backend's own deadline could have
   passed: AEI starts that clock at acceptance, so the hold runs from when Submit
   returned plus a grace (`holdUncertain`), or, for a record written before Submit
-  returned, from the reservation through the whole bounded dispatch window
-  (`holdPending`). Each hold is recorded (`RunUntil`). An ingest Submit gets its own
-  30s context, detached from the request. A converse turn is rolled back either way.
+  returned, from that write (after any wait for earlier writes) through the whole
+  bounded dispatch window (`holdPending`). Each hold is recorded (`RunUntil`). In
+  process, a reservation whose Submit has not returned never expires. An ingest
+  Submit is bounded at 30s; a browser's is detached from its request, while a
+  scheduled one honours the Refresher's context, so `Stop` cancels it. A converse
+  turn is rolled back either way.
 - Without script, the radar's `<noscript>` refresh goes to `/?refresh=1`, whose
   render asks AEI (within 5s) instead of reading local state, so it stops once the
   run has ended.

@@ -89,9 +89,11 @@ func (i *Ingestor) persist(ownerID string) error {
 		rec.Pending = cur.pending || cur.uncertain
 		rec.RunUntil = cur.deadline()
 		if cur.pending {
-			// Submit has not returned: if gofer stops now, the backend may still
-			// accept the run up to the end of the dispatch window.
-			rec.RunUntil = cur.at.Add(holdPending)
+			// Submit has not returned (and starts only after this write): if gofer
+			// stops now, the backend may still accept the run up to the end of the
+			// dispatch window, counted from this write, not from the reservation,
+			// since the wait for earlier writes is not bounded by ledgerTimeout.
+			rec.RunUntil = time.Now().Add(holdPending)
 		}
 	}
 	i.mu.Unlock()
