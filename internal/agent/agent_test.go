@@ -34,7 +34,7 @@ func (m *memSink) Item(_ context.Context, id, turn string) (worklist.WorkItem, b
 	if !ok {
 		return worklist.WorkItem{}, false, nil
 	}
-	return worklist.ThreadWindow(it, turn, worklist.MaxThreadBytes), true, nil
+	return worklist.ThreadWindow(it, turn, worklist.MaxItemBytes), true, nil
 }
 
 func (m *memSink) Select(_ context.Context, sel worklist.Selection) ([]worklist.WorkItem, string, error) {

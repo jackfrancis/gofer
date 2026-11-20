@@ -25,7 +25,8 @@ import (
 // MergeRunItems returns the items a run's write-back should store, given the
 // owner's current items. An item that exists keeps the owner's state from its
 // stored copy and takes everything else from the run. A new item carries no owner
-// state: a run cannot create a thread.
+// state: a run cannot create a thread. A field the run read cut to size (Project)
+// and returned unchanged takes its stored value again.
 func MergeRunItems(current, incoming []WorkItem) []WorkItem {
 	stored := make(map[string]WorkItem, len(current))
 	for _, it := range current {
@@ -39,9 +40,11 @@ func MergeRunItems(current, incoming []WorkItem) []WorkItem {
 			it.ThreadReadAt = time.Time{}
 			it.ThreadReadThrough = ""
 			it.Meta.HiddenAt = time.Time{}
+			it.Projected = nil
 			out = append(out, it)
 			continue
 		}
+		restoreProjected(&it, old)
 		it.Thread = old.Thread
 		it.ThreadReadAt = old.ThreadReadAt
 		it.ThreadReadThrough = old.ThreadReadThrough

@@ -165,17 +165,22 @@ Wired on the web-tier side; they define what a runtime must respect:
 - A run never reads the whole worklist: its threads grow without bound and the agent
   plane caps a response at 8 MiB. `agent.Sink` has only bounded reads, served by the
   same `internal/worklist/select.go` functions in process and on the plane:
-  `Item` (`GET /agent/worklist/item`, `worklist.ReadItem`: one owner-scoped item with
-  a `ThreadWindow` of its thread, at most `MaxThreadBytes`, that keeps the dispatched
-  turn, the turns after it and the newest history, with position keys written into
+  `Item` (`GET /agent/worklist/item`, `worklist.ReadItem`: one owner-scoped item, at
+  most `MaxItemBytes` encoded, whose `ThreadWindow` is the dispatched turn and the
+  visible history before it, or the turn and its reply if the store shows it
+  answered, or the newest turns when no turn is named; position keys are written into
   legacy turns) and `Select` (`GET /agent/worklist/select`, `worklist.SelectFrom`: no
   threads, at most `MaxSelectLimit` items and `MaxSelectBytes`, with a cursor).
-  Ranking reads the top N by baseline score (ties keep insertion order); ingest and
-  enrichment page through every item with `readAll`. Enrichment must keep reaching
-  every open item; never cap it. The stores serve these reads directly
-  (`Store.Get`, `Store.Briefs`), so a page never decodes every thread. Selections
-  have their own route so a runtime facing an older web tier fails instead of
-  getting the whole list. A write-back need not carry a thread (`MergeRunItems`
+  Stored data past the bounds still reads: an oversized message is cut with a note,
+  and an item over `MaxBriefBytes` is projected (`worklist.Project`), which marks
+  each cut field (`WorkItem.Projected`) so `MergeRunItems` restores it on write-back
+  unless the run rewrote it. Never store a projection. Ranking reads the top N by
+  baseline score (ties keep insertion order); ingest and enrichment page through
+  every item with `readAll`, and ingest fails if it cannot read the stored items.
+  Enrichment must keep reaching every open item; never cap it. The stores serve these
+  reads directly (`Store.Get`, `Store.Briefs`), so a page never decodes every thread.
+  Selections have their own route so a runtime facing an older web tier fails instead
+  of getting the whole list. A write-back need not carry a thread (`MergeRunItems`
   keeps the stored one). A user message is capped at 16 KiB (`webui.maxMessageBytes`).
 - Replies can land out of order, so a turn's position does not say what it answers.
   Every new turn gets an ID; an agent turn's `ReplyTo` names the user turn it

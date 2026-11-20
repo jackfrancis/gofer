@@ -31,8 +31,8 @@ import (
 
 // maxSinkResponse bounds one read from the agent plane. It matches the server's own
 // request limit. No read a run makes approaches it however large the worklist grows:
-// a run reads one item with a bounded window of its thread (worklist.MaxThreadBytes),
-// or a page of items without threads (worklist.MaxSelectBytes).
+// a run reads one item with a window of its thread, at most worklist.MaxItemBytes,
+// or a page of items without threads, at most worklist.MaxSelectBytes.
 const maxSinkResponse = 8 << 20
 
 // defaultPlaneTimeout bounds a single call to gofer's agent plane. These are gofer's

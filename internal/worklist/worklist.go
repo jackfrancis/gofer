@@ -139,6 +139,10 @@ type WorkItem struct {
 	ThreadReadAt time.Time `json:"thread_read_at,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+	// Projected is set only on an item a run read cut to size (Project): it names
+	// each cut field with a fingerprint of the value the run received, so the
+	// write-back restores the stored value (MergeRunItems). It is never stored.
+	Projected map[string]string `json:"projected,omitempty"`
 }
 
 // Signals are the observed FACTS about an item — measured, not judged. They are

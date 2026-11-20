@@ -119,10 +119,15 @@ func TestSelectBoundsPageBytes(t *testing.T) {
 			t.Fatalf("%+v: read %d items (%d distinct) in %d pages, want all %d in several", base, len(all), len(seen), pages, n)
 		}
 	}
-	// A single item over the budget still makes progress.
-	huge := []WorkItem{{ID: "a", Signals: Signals{Labels: []string{strings.Repeat("x", MaxSelectBytes)}}}, {ID: "b"}}
-	if page, next := Select(huge, Selection{}, now); ids(page) != "a" || next != "a" {
-		t.Fatalf("oversized item: page %q next %q", ids(page), next)
+	// A single item over the budget is projected: the page still holds it, and still
+	// fits.
+	huge := []WorkItem{{ID: "a", Signals: Signals{Labels: []string{strings.Repeat("x", 5<<20)}}}, {ID: "b"}}
+	page, next := Select(huge, Selection{}, now)
+	if b, _ := json.Marshal(page); ids(page) != "ab" || next != "" || len(b) > MaxSelectBytes {
+		t.Fatalf("oversized item: page %q (%d bytes) next %q", ids(page), len(b), next)
+	}
+	if page[0].Projected == nil || encodedSize(page[0]) > MaxBriefBytes {
+		t.Fatalf("oversized item was not projected: %d bytes", encodedSize(page[0]))
 	}
 }
 
@@ -161,8 +166,8 @@ func TestFindCopiesTheOwnersItem(t *testing.T) {
 	}
 }
 
-// ThreadWindow bounds one item's thread and keeps what a run needs: the turn it
-// answers, every turn after it, and the newest turns before it that fit.
+// ThreadWindow bounds the whole encoded item and keeps what a run needs: the turn it
+// answers and the newest turns before it that fit.
 func TestThreadWindowBoundsOneLongConversation(t *testing.T) {
 	big := strings.Repeat("x", 16<<10)
 	var th []Message
@@ -174,10 +179,13 @@ func TestThreadWindowBoundsOneLongConversation(t *testing.T) {
 	th = append(th, Message{ID: "ask", Role: RoleUser, Content: "what next?"})
 	item := WorkItem{ID: "x", Thread: th}
 
-	w := ThreadWindow(item, "ask", MaxThreadBytes)
-	if b, _ := json.Marshal(w.Thread); len(b) > MaxThreadBytes {
-		t.Fatalf("window is %d bytes, want ≤ %d", len(b), MaxThreadBytes)
+	for _, turn := range []string{"ask", "", "u10"} {
+		w := ThreadWindow(item, turn, MaxItemBytes)
+		if n := encodedSize(w); n > MaxItemBytes {
+			t.Fatalf("turn %q: window is %d bytes, want ≤ %d", turn, n, MaxItemBytes)
+		}
 	}
+	w := ThreadWindow(item, "ask", MaxItemBytes)
 	last := w.Thread[len(w.Thread)-1]
 	if last.ID != "ask" || w.Answered("ask") {
 		t.Fatalf("window must end with the unanswered turn, got %+v", last)
@@ -188,22 +196,84 @@ func TestThreadWindowBoundsOneLongConversation(t *testing.T) {
 	if len(item.Thread) != len(th) {
 		t.Fatal("ThreadWindow changed its input")
 	}
-	// An older turn named by the run anchors the window, and the reply after it
-	// still answers it, however large the turns after it are.
-	w = ThreadWindow(item, "u10", MaxThreadBytes)
-	if w.Thread[0].ID != "u10" {
-		t.Fatalf("window starts at %q, want the anchor u10 (the turns after it fill the budget)", w.Thread[0].ID)
+	// An answered turn's window is the turn and its reply, so the run sees it is done.
+	w = ThreadWindow(item, "u10", MaxItemBytes)
+	if len(w.Thread) != 2 || w.Thread[0].ID != "u10" || w.Thread[1].ID != "a10" || !w.Answered("u10") {
+		t.Fatalf("answered turn window = %+v", w.Thread)
 	}
-	if i, ok := w.TurnIndex("u10"); !ok || !w.Answered("u10") || w.Thread[i].Content != big {
-		t.Fatalf("u10 must be kept, whole, and still answered")
-	}
-	if b, _ := json.Marshal(w.Thread); len(b) > MaxThreadBytes+600*2*256 {
-		t.Fatalf("anchored window is %d bytes", len(b))
+	// Without a turn, the window is the newest turns.
+	w = ThreadWindow(item, "", MaxItemBytes)
+	if w.Thread[len(w.Thread)-1].ID != "ask" || w.Thread[len(w.Thread)-2].ID != "a599" {
+		t.Fatalf("newest window ends %q", w.Thread[len(w.Thread)-1].ID)
 	}
 	// A short thread is returned whole.
 	short := WorkItem{Thread: th[:4]}
-	if got := ThreadWindow(short, "", MaxThreadBytes); len(got.Thread) != 4 {
+	if got := ThreadWindow(short, "", MaxItemBytes); len(got.Thread) != 4 {
 		t.Fatalf("short thread cut to %d turns", len(got.Thread))
+	}
+}
+
+// A delayed Discuss turn keeps the history it refers to, however much the thread
+// grew after it: later turns are not what the model reads, so they do not take the
+// window.
+func TestThreadWindowKeepsHistoryForADelayedTurn(t *testing.T) {
+	th := []Message{
+		{ID: "q1", Role: RoleUser, Content: "is this safe to merge?"},
+		{ID: "r1", Role: RoleAgent, Content: "not yet: the migration is unguarded", ReplyTo: "q1"},
+		{ID: "q2", Role: RoleUser, Content: "what did you mean about the migration?"},
+	}
+	big := strings.Repeat("y", 16<<10)
+	for i := range 400 { // later turns ≈ 6.3 MiB
+		th = append(th,
+			Message{ID: fmt.Sprintf("u%d", i), Role: RoleUser, Content: big},
+			Message{ID: fmt.Sprintf("a%d", i), Role: RoleAgent, Content: "ok", ReplyTo: fmt.Sprintf("u%d", i)})
+	}
+	w := ThreadWindow(WorkItem{ID: "x", Thread: th}, "q2", MaxItemBytes)
+	if got := ids2(w.Thread); got != "q1 r1 q2" {
+		t.Fatalf("window = %s, want the turn and the history before it", got)
+	}
+	if w.Answered("q2") {
+		t.Fatal("q2 must read as unanswered")
+	}
+}
+
+func ids2(th []Message) string {
+	var s []string
+	for _, m := range th {
+		s = append(s, m.ID)
+	}
+	return strings.Join(s, " ")
+}
+
+// A message too large for any read (one stored before the form limit) is cut with a
+// note that says so, whether it is the turn being answered, its reply, or the newest
+// turn; the whole item still fits.
+func TestThreadWindowCutsAnOversizedMessage(t *testing.T) {
+	huge := strings.Repeat("<z>", 3<<20) // 9 MiB, and JSON escaping grows it further
+	cases := map[string]struct {
+		thread []Message
+		turn   string
+	}{
+		"unanswered turn": {[]Message{{ID: "ok", Role: RoleUser, Content: "hi"}, {ID: "big", Role: RoleUser, Content: huge}}, "big"},
+		"answered turn":   {[]Message{{ID: "big", Role: RoleUser, Content: huge}, {ID: "r", Role: RoleAgent, Content: huge, ReplyTo: "big"}}, "big"},
+		"newest turn":     {[]Message{{ID: "a", Role: RoleUser, Content: "q"}, {ID: "big", Role: RoleAgent, Content: huge, ReplyTo: "a"}}, ""},
+	}
+	for name, c := range cases {
+		item := WorkItem{ID: "x", Signals: Signals{Labels: []string{strings.Repeat("l", 1<<20)}}, Thread: c.thread}
+		w := ThreadWindow(item, c.turn, MaxItemBytes)
+		if n := encodedSize(w); n > MaxItemBytes {
+			t.Fatalf("%s: item is %d bytes, want ≤ %d", name, n, MaxItemBytes)
+		}
+		i, ok := w.TurnIndex("big")
+		if !ok || !strings.Contains(w.Thread[i].Content, "[gofer: this message was cut from") || !strings.HasPrefix(w.Thread[i].Content, "<z>") {
+			t.Fatalf("%s: the oversized turn must be kept, cut, with a note", name)
+		}
+		if name == "answered turn" && !w.Answered("big") {
+			t.Fatalf("%s: the reply must still answer the turn", name)
+		}
+		if w.Projected == nil {
+			t.Fatalf("%s: the oversized item fields must be projected", name)
+		}
 	}
 }
 
@@ -223,6 +293,9 @@ func TestThreadWindowKeepsLegacyKeys(t *testing.T) {
 	answered := item.TurnKey(len(th) - 3)
 
 	w := ThreadWindow(item, ask, 1<<20)
+	if n := encodedSize(w); n > 1<<20 {
+		t.Fatalf("window is %d bytes", n)
+	}
 	if len(w.Thread) >= len(th) {
 		t.Fatal("expected a cut window")
 	}

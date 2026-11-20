@@ -347,6 +347,7 @@ func TestPreviousWebTierFailsTheBoundedReads(t *testing.T) {
 		items = append(items, it)
 	}
 	whole, _ := json.Marshal(map[string]any{"items": items})
+	var writes int
 	old := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/agent/credential":
@@ -354,6 +355,7 @@ func TestPreviousWebTierFailsTheBoundedReads(t *testing.T) {
 		case r.URL.Path == "/agent/worklist" && r.Method == http.MethodGet:
 			_, _ = w.Write(whole) // the previous tier: every query ignored
 		case r.URL.Path == "/agent/worklist" && r.Method == http.MethodPost:
+			writes++
 			_, _ = w.Write([]byte(`{}`))
 		default:
 			http.NotFound(w, r)
@@ -380,6 +382,15 @@ func TestPreviousWebTierFailsTheBoundedReads(t *testing.T) {
 	fc := &fakeConverser{reply: "x"}
 	if err := Run(ctx, Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Converser: fc}, sink, sink); err == nil || fc.gotUser != "" {
 		t.Fatalf("converse against the previous web tier = %v (converser saw %q), want an error", err, fc.gotUser)
+	}
+	// Ingest: a complete fetch with no open items would retire every stored open
+	// item. Reading none of them must fail the run before it writes, not pass for an
+	// empty worklist and report success with nothing retired.
+	if err := Run(ctx, Params{JobType: JobIngest, Provider: "github", GitHubBaseURL: gh.URL, Client: gh.Client()}, sink, sink); err == nil {
+		t.Fatal("ingest against the previous web tier succeeded")
+	}
+	if writes != 0 {
+		t.Fatalf("the runs made %d write-backs against the previous web tier, want none", writes)
 	}
 }
 
@@ -507,5 +518,103 @@ func TestSinksApplyTheSameSelectionBounds(t *testing.T) {
 				t.Fatalf("%s %+v: %d items, next %q, err %v; want %d and a cursor", name, sel, len(page), next, err, worklist.MaxSelectLimit)
 			}
 		}
+	}
+}
+
+// Data stored before the bounds (a message past the form limit, an item whose
+// labels alone pass a page) still reads: an oversized turn is cut with a note, an
+// oversized item is projected, every job completes, and no write-back stores a cut
+// value. A delayed Discuss turn still sees the history it refers to.
+func TestOversizedStoredDataStaysReadable(t *testing.T) {
+	plane := newBoundedPlane(t)
+	ctx := context.Background()
+	huge := strings.Repeat("m", 9<<20)
+	label := strings.Repeat("l", 5<<20)
+	later := strings.Repeat("y", 16<<10)
+	delayed := []worklist.Message{
+		{ID: "q1", Role: worklist.RoleUser, Content: "is this safe to merge?"},
+		{ID: "r1", Role: worklist.RoleAgent, Content: "not yet: the migration is unguarded", ReplyTo: "q1"},
+		{ID: "q2", Role: worklist.RoleUser, Content: "what did you mean about the migration?"},
+	}
+	for i := range 400 {
+		delayed = append(delayed,
+			worklist.Message{ID: fmt.Sprintf("u%d", i), Role: worklist.RoleUser, Content: later},
+			worklist.Message{ID: fmt.Sprintf("a%d", i), Role: worklist.RoleAgent, Content: "ok", ReplyTo: fmt.Sprintf("u%d", i)})
+	}
+	if err := plane.store.Upsert(ctx, "u1",
+		worklist.WorkItem{ID: "github:o/r#1", Source: "github", GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1},
+			Thread: []worklist.Message{{ID: "big", Role: worklist.RoleUser, Content: huge}}},
+		worklist.WorkItem{ID: "github:o/r#2", Source: "github", GitHub: worklist.GitHubRef{Repo: "o/r", Number: 2},
+			Signals: worklist.Signals{Labels: []string{label}}},
+		worklist.WorkItem{ID: "github:o/r#3", Source: "github", GitHub: worklist.GitHubRef{Repo: "o/r", Number: 3}, Thread: delayed},
+	); err != nil {
+		t.Fatal(err)
+	}
+	gh, enriched := boundedGitHub(t, 3)
+	sink := plane.client("u1")
+	run := func(p Params) {
+		t.Helper()
+		if err := Run(ctx, p, sink, sink); err != nil {
+			t.Fatalf("%s %s: %v", p.JobType, p.ItemID, err)
+		}
+	}
+	base := Params{Provider: "github", GitHubBaseURL: gh.URL, Client: gh.Client()}
+	stored := func(id string) worklist.WorkItem {
+		t.Helper()
+		it, _, err := plane.store.Get(ctx, "u1", id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return it
+	}
+	// Enrich and rank write back the projected item: the cut labels must not land.
+	for _, job := range []string{JobEnrich, JobRank} {
+		p := base
+		p.JobType = job
+		run(p)
+	}
+	two := stored("github:o/r#2")
+	if len(two.Signals.Labels) != 1 || two.Signals.Labels[0] != label || two.Projected != nil {
+		t.Fatalf("a projected item's write-back stored the cut labels (%d labels)", len(two.Signals.Labels))
+	}
+	if two.Signals.ReviewRequestedBy != "bob" || two.Signals.Proposed == nil {
+		t.Fatalf("the projected item lost the runs' own results: %+v", two.Signals)
+	}
+	if n := len(enriched()); n != 3 {
+		t.Fatalf("enriched %d items, want 3", n)
+	}
+	// Ingest reads every item, the oversized ones included (GitHub's fresh fields then
+	// replace the stored ones, as on any refresh).
+	p := base
+	p.JobType = JobIngest
+	run(p)
+	big := &fakeConverser{reply: "answered the long one"}
+	run(Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Turn: "big", Converser: big})
+	if !strings.Contains(big.gotUser, "[gofer: this message was cut from") || !strings.HasPrefix(big.gotUser, "mmm") {
+		t.Fatalf("the oversized turn reached the model as %d bytes without the cut note", len(big.gotUser))
+	}
+	dc := &fakeConverser{reply: "the migration runs without a lock"}
+	run(Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#3", Turn: "q2", Converser: dc})
+	if len(dc.gotHistory) != 2 || dc.gotHistory[1].Content != "not yet: the migration is unguarded" {
+		t.Fatalf("the delayed turn's history = %+v, want q1 and r1", dc.gotHistory)
+	}
+	run(Params{JobType: JobResearch, ItemID: "github:o/r#2", Researcher: &fakeResearcher{adj: worklist.ResearchAdjustment{Rationale: "r"}}})
+
+	if key, n := plane.largestRead(); n > worklist.MaxItemBytes+(64<<10) {
+		t.Fatalf("largest read %d bytes (%s)", n, key)
+	}
+	got, _ := plane.store.List(ctx, "u1")
+	byID := map[string]worklist.WorkItem{}
+	for _, it := range got {
+		byID[it.ID] = it
+	}
+	if it := byID["github:o/r#1"]; it.Thread[0].Content != huge || !it.Answered("big") {
+		t.Fatal("the oversized message must stay whole in the store, and be answered")
+	}
+	if two := byID["github:o/r#2"]; two.Signals.Research == nil || two.Projected != nil {
+		t.Fatalf("research on the item was not stored cleanly: %+v", two.Signals.Research)
+	}
+	if it := byID["github:o/r#3"]; !it.Answered("q2") {
+		t.Fatal("the delayed turn was not answered")
 	}
 }

@@ -228,14 +228,15 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	// empty-worklist backfill) never clobbers per-item state GitHub cannot supply —
 	// the conversation thread and its read cursor, and the user/agent metadata
 	// overrides. The fresh GitHub fields and base signals come from the fetch; the
-	// chained enrich+rank re-derive the score. If the existing items cannot be read we
-	// proceed unreconciled rather than skip the refresh — a rare case, logged loudly.
+	// chained enrich+rank re-derive the score. If the existing items cannot be read,
+	// the run fails before it writes anything: proceeding without them would skip
+	// retirement and report success (and a web tier without the bounded reads answers
+	// 404, which must not pass for an empty worklist).
 	// Only IDs, completion and the per-item state above are needed, so the read omits
 	// thread bodies (the agent plane keeps the stored thread on every write-back).
 	existing, lerr := readAll(ctx, p, sink, worklist.Selection{})
 	if lerr != nil {
-		log.Warn("ingest: could not read existing items to reconcile; threads may reset", "err", lerr)
-		existing = nil
+		return fmt.Errorf("ingest: read existing items: %w", lerr)
 	}
 	items = reconcileFetched(items, existing)
 	// Retire what left the open set. Only a COMPLETE fetch proves an item is gone: a
