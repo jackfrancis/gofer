@@ -31,6 +31,7 @@ case "$*" in
 		exit 1 ;;
 	esac ;;
 *"get secret gofer-secrets"*) printf 'eA==' ;;
+*"get secret aei-signing"*) printf 'eA==' ;;
 *"config current-context"*) echo review-fake ;;
 *"get cronjob gofer-snapshot"*) exit 1 ;;
 esac
@@ -54,7 +55,8 @@ func (r result) index(part string) int {
 }
 
 // run drives the real make target with kubectl replaced by fakeKubectl; no kubeconfig
-// or live cluster is touched.
+// or live cluster is touched. The fake is found through PATH, so the recipe shell
+// never word-splits its path (a TMPDIR with a space in it).
 func run(t *testing.T, scenario string, env []string, args ...string) result {
 	t.Helper()
 	for _, tool := range []string{"make", "bash", "awk", "sed"} {
@@ -74,13 +76,13 @@ func run(t *testing.T, scenario string, env []string, args ...string) result {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "make", append([]string{"--no-print-directory", "SHELL=/bin/sh",
-		"KUBE_NS=gofer", "KUBE_CONTEXT=review-fake", "KUBECTL=" + kubectl + " --context review-fake",
+		"KUBE_NS=gofer", "KUBE_CONTEXT=review-fake", "KUBECTL=kubectl --context review-fake",
 		"ROLLOUT_TIMEOUT=1s"}, args...)...)
 	cmd.Dir = filepath.Clean(filepath.Join(wd, "../.."))
 	// Keep only the tool search path: no Make overrides, shell hooks or deployment
 	// configuration from the caller.
 	cmd.Env = append([]string{
-		"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "TMPDIR=" + dir, "LC_ALL=C",
+		"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + dir, "TMPDIR=" + dir, "LC_ALL=C",
 		"MOCK_DIR=" + dir, "MOCK_SCENARIO=" + scenario,
 	}, env...)
 	out, err := cmd.CombinedOutput()
@@ -169,5 +171,49 @@ func TestDeployAppliesNothingUntilTheChecksPass(t *testing.T) {
 	lookup, apply := r.index("get service aei-controller"), r.index(" apply ")
 	if lookup < 0 || apply < 0 || apply < lookup {
 		t.Errorf("apply (call %d) did not follow the dispatch check (call %d):\n%s", apply, lookup, strings.Join(r.calls, "\n"))
+	}
+}
+
+// writes reports the calls that change the cluster.
+func (r result) writes() []string {
+	var w []string
+	for _, c := range r.calls {
+		for _, verb := range []string{" apply ", " create ", " patch ", " delete ", "rollout"} {
+			if strings.Contains(" "+c+" ", verb) {
+				w = append(w, c)
+				break
+			}
+		}
+	}
+	return w
+}
+
+// dev-up, too, writes nothing to the cluster (namespace, gofer-secrets with the verify
+// key and any supplied GitHub credential, the manifests) until aei-check has passed,
+// also under make -j. The kind and image steps are skipped with -o; they never touch
+// gofer's objects.
+func TestDevUpWritesNothingUntilTheChecksPass(t *testing.T) {
+	env := []string{"MOCK_SLOW=1", "MINT_PUBLIC_KEY=test-key", "GITHUB_CLIENT_ID=test-client"}
+	skip := []string{"-o", "cluster-up", "-o", "kind-load", "-o", "kind-load-runtime", "-j4", "dev-up"}
+
+	r := run(t, "old", env, skip...)
+	if r.err == nil {
+		t.Fatalf("dev-up passed against an AEI without the dispatch listener:\n%s", r.output)
+	}
+	if w := r.writes(); len(w) > 0 {
+		t.Errorf("dev-up wrote to the cluster although aei-check failed:\n%s", strings.Join(w, "\n"))
+	}
+
+	r = run(t, "ok", env, skip...)
+	if r.err != nil {
+		t.Fatalf("dev-up: %v\n%s", r.err, r.output)
+	}
+	lookup := r.index("get service aei-controller")
+	w := r.writes()
+	if lookup < 0 || len(w) == 0 || r.index(w[0]) < lookup {
+		t.Errorf("dev-up wrote before the dispatch check (call %d):\n%s", lookup, strings.Join(r.calls, "\n"))
+	}
+	if r.index("patch secret gofer-secrets") < 0 {
+		t.Errorf("dev-up did not write gofer-secrets:\n%s", strings.Join(r.calls, "\n"))
 	}
 }

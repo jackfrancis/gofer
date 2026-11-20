@@ -532,9 +532,11 @@ tls-status:
 	@$(KUBECTL) -n $(KUBE_NS) get certificate,certificaterequest,order,challenge 2>&1
 
 dev-up: DATA_RECLAIM_POLICY = Delete
-dev-up: cluster-up kind-load kind-load-runtime aei-check dev-secrets
-	@# A sub-make, as in deploy, so the apply waits for aei-check. A target-specific
+dev-up: cluster-up kind-load kind-load-runtime aei-check
+	@# Sub-makes, one per line, as in deploy: nothing writes to the cluster (the Secret,
+	@# then the apply) until aei-check has passed, also under make -j. A target-specific
 	@# variable does not reach a sub-make, so pass the reclaim policy on.
+	@$(MAKE) --no-print-directory dev-secrets
 	@$(MAKE) --no-print-directory deploy-apply DATA_RECLAIM_POLICY=$(DATA_RECLAIM_POLICY)
 	@# Durable pulls actor images from a registry BY DIGEST (a tag invalidates ate's golden
 	@# snapshot; kind-loaded images are not registry-pullable). So for the durable class,
