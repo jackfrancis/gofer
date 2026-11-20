@@ -370,3 +370,38 @@ func (i *Ingestor) tracked(ownerID string) string {
 	}
 	return ""
 }
+
+// The retry window runs from when the backend accepted the run, not from when gofer
+// reserved it: a slow Submit must not shorten the gate on the accepted run.
+func TestRetryWindowStartsWhenSubmitSucceeds(t *testing.T) {
+	ctx := context.Background()
+	const acceptDelay = 20 * time.Second
+	d := &scriptedDispatcher{calls: make(chan chan step), phase: "Running"}
+	ig := New(d, "", "", nil, "", "")
+	done := make(chan error, 1)
+	go func() { done <- ig.EnsureBackfill(ctx, "github:1") }()
+	submit := <-d.calls
+	// Simulate the backend taking acceptDelay to accept the run.
+	ig.mu.Lock()
+	ig.runs[ingestKey("github:1")].at = time.Now().Add(-acceptDelay)
+	ig.mu.Unlock()
+	submit <- step{id: "run-1"}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	// 15s short of the window measured from acceptance (but past it if measured from
+	// the reservation), the run must still gate the owner.
+	ig.mu.Lock()
+	ig.runs[ingestKey("github:1")].at = ig.runs[ingestKey("github:1")].at.Add(-(retryAfter - 15*time.Second))
+	ig.mu.Unlock()
+	polled := make(chan error, 1)
+	go func() { polled <- ig.EnsureBackfill(ctx, "github:1") }()
+	select {
+	case <-d.calls:
+		t.Fatal("a poll inside the accepted run's retry window dispatched another backfill")
+	case err := <-polled:
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}

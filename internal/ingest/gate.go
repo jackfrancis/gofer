@@ -33,10 +33,10 @@ func ingestKey(ownerID string) runKey { return runKey{owner: ownerID, task: task
 // page render. Every field is read and written under Ingestor.mu.
 type run struct {
 	id        string
-	at        time.Time
-	g         gate // the policy the run was reserved under
-	pending   bool // reserved; Submit has not returned yet
-	noRun     bool // Submit failed: there is no run behind this reservation
+	at        time.Time // when it was reserved, then when Submit succeeded
+	g         gate      // the policy the run was reserved under
+	pending   bool      // reserved; Submit has not returned yet
+	noRun     bool      // Submit failed: there is no run behind this reservation
 	failed    bool
 	succeeded bool
 	message   string
@@ -116,6 +116,9 @@ func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 	mine.pending = false
 	if err == nil {
 		mine.id = id
+		// The run's deadline runs from when the backend accepted it, so the retry
+		// window does too; until then it ran from the reservation.
+		mine.at = time.Now()
 		mine.prev = nil // never rolled back now
 		return
 	}
