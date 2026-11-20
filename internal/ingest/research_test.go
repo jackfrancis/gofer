@@ -392,3 +392,39 @@ func TestScheduledResearchHoldsAnUncertainDispatch(t *testing.T) {
 		t.Fatalf("a definite refusal must free the item at once: attempts=%d", refused.attempts)
 	}
 }
+
+// With one slot a tick, which refresh takes on refresh-first ticks, owners share
+// research evenly: the owner rotation advances only when an owner is served, not on
+// a pass that submitted nothing.
+func TestResearchOwnersTakeTurnsWhenCapacityIsScarce(t *testing.T) {
+	t0 := time.Now().UTC().Add(-time.Hour)
+	store := worklist.NewMemoryStore()
+	store.Seed("github:1", discussed("a", t0, nil))
+	store.Seed("github:2", discussed("b", t0, nil))
+	d := &queueDispatcher{cap: 1, tasks: map[string]int{}}
+	ig := New(d, "", "", nil, "e", "m")
+	served := map[string]int{}
+	r := NewRefresher(store, ig, nil, time.Hour, nil).WithResearch(store, researchCounter{ig, served})
+	for range 12 {
+		r.Tick(context.Background())
+		d.drain()
+	}
+	a, b := served["github:1"], served["github:2"]
+	if a == 0 || b == 0 || a-b > 1 || b-a > 1 {
+		t.Fatalf("research slots were not shared evenly between owners: %v", served)
+	}
+}
+
+// researchCounter dispatches through ig and counts submitted runs per owner.
+type researchCounter struct {
+	ig     *Ingestor
+	served map[string]int
+}
+
+func (c researchCounter) ScheduledResearch(ctx context.Context, ownerID, itemID string) (bool, error) {
+	ok, err := c.ig.ScheduledResearch(ctx, ownerID, itemID)
+	if ok {
+		c.served[ownerID]++
+	}
+	return ok, err
+}

@@ -15,11 +15,12 @@ import "time"
 //     (ResearchAdjustment.GitHubUpdatedAt). The comparison is with what was read,
 //     not with when the research was applied, so a refresh that lands while the
 //     model works still counts.
-//   - The thread: a turn the research read is gone or hidden now, or a visible turn
-//     newer than the oldest one it read was not read: posted after the read, or
-//     hidden at the read and unhidden since. A research read is the newest visible
-//     turns that fit (ThreadWindow), so visible turns older than the oldest one read
-//     were left out for size, and do not make it stale.
+//   - The thread: a turn the research read is gone or hidden now, or the window a
+//     research run would read now (ReadItem's ThreadWindow, with no turn) holds a
+//     turn the research did not read: posted after the read, or hidden at the read
+//     and unhidden since, wherever it sits in the thread. A window that now holds
+//     fewer turns than were read (stored data grew, so fewer fit) does not count:
+//     the research saw everything the window shows.
 //
 // Research stored before it recorded these is judged by time: applied before the
 // GitHub update, or before the newest visible turn.
@@ -57,28 +58,24 @@ func ResearchStale(item WorkItem) bool {
 
 // readTheVisibleThread reports whether research that read the turns keyed by read
 // still reflects item's visible thread: every turn it read is present and visible,
-// and every visible turn after the oldest one it read was read.
+// and every turn a research run would read now was read.
 func readTheVisibleThread(item WorkItem, visible []int, read []string) bool {
-	wasRead := make(map[string]bool, len(read))
-	for _, k := range read {
-		wasRead[k] = true
-	}
-	oldest := -1
 	isVisible := make(map[string]bool, len(visible))
 	for _, i := range visible {
-		k := item.TurnKey(i)
-		isVisible[k] = true
-		if oldest < 0 && wasRead[k] {
-			oldest = i
-		}
+		isVisible[item.TurnKey(i)] = true
 	}
+	wasRead := make(map[string]bool, len(read))
 	for _, k := range read {
 		if !isVisible[k] {
 			return false // gone, or hidden since
 		}
+		wasRead[k] = true
 	}
-	for _, i := range visible {
-		if i > oldest && !wasRead[item.TurnKey(i)] {
+	// The window a research run reads now: the same read as the agent plane serves
+	// (ReadItem), so it is exactly what the next run would be given. Its turns carry
+	// their keys as IDs.
+	for _, m := range ThreadWindow(item, "", MaxItemBytes).Thread {
+		if !wasRead[m.ID] {
 			return false // posted since, or unhidden since
 		}
 	}

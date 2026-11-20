@@ -68,12 +68,13 @@ type Refresher struct {
 	log      *slog.Logger
 
 	// The research pass, when set (WithResearch): items reads an owner's items, and
-	// research dispatches a run for one. passes rotates the owner the pass starts
-	// with, so when dispatch stops early (the runtime's queue full), the same owner
-	// does not take the first slot every time.
-	items    ItemLister
-	research ScheduledResearcher
-	passes   uint64
+	// research dispatches a run for one. lastResearched is the owner whose research
+	// run was submitted last; each pass starts with the owner after it, so when
+	// dispatch stops early (the runtime's queue full) owners take the first slot in
+	// turn. A pass that submits nothing leaves it where it was.
+	items          ItemLister
+	research       ScheduledResearcher
+	lastResearched string
 	// ticks counts Ticks, to alternate which pass goes first (Tick).
 	ticks uint64
 
@@ -207,7 +208,8 @@ func (r *Refresher) RefreshOnce(ctx context.Context) int {
 // confirms, and reports how many runs it submitted. Only items with a visible
 // discussion are eligible, so an item with current research or no discussion costs
 // nothing. Within an owner the item researched longest ago goes first, and owners
-// take turns, one item each, so a pass that stops early is shared out. A dispatch
+// take turns, one item each, starting after the owner last served
+// (Refresher.lastResearched), so a pass that stops early is shared out across passes. A dispatch
 // error (the runtime's queue full, or unreachable) ends the pass; the next tick
 // carries on. It does nothing without WithResearch. Exported for tests; safe to call
 // concurrently (the Ingestor's gate holds one run per item).
@@ -256,10 +258,25 @@ func (r *Refresher) ResearchOnce(ctx context.Context) int {
 	if len(queues) == 0 {
 		return 0
 	}
+	// Start with the first owner after the last one served, in listed order.
 	r.mu.Lock()
-	start := int(r.passes % uint64(len(queues)))
-	r.passes++
+	last := r.lastResearched
 	r.mu.Unlock()
+	start := 0
+	if last != "" {
+		pos := map[string]int{}
+		for n, o := range owners {
+			pos[o] = n
+		}
+		if lp, ok := pos[last]; ok {
+			for n, q := range queues {
+				if pos[q.owner] > lp {
+					start = n
+					break
+				}
+			}
+		}
+	}
 	queues = append(queues[start:], queues[:start]...)
 
 	var submitted int
@@ -290,6 +307,9 @@ func (r *Refresher) ResearchOnce(ctx context.Context) int {
 			}
 			if ok {
 				submitted++
+				r.mu.Lock()
+				r.lastResearched = q.owner
+				r.mu.Unlock()
 			}
 		}
 		if !more {

@@ -1,6 +1,7 @@
 package worklist
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -13,6 +14,11 @@ func TestResearchStale(t *testing.T) {
 	}
 	turn := func(id, role string, m int, hidden bool) Message {
 		return Message{ID: id, Role: role, Content: id, At: at(m), Hidden: hidden}
+	}
+	// huge is a visible turn too large for a research read's budget alongside the
+	// turns after it, so a read leaves it out.
+	huge := func(id, role string, m int) Message {
+		return Message{ID: id, Role: role, Content: strings.Repeat("x", MaxItemBytes), At: at(m)}
 	}
 	withRead := func(r *ResearchAdjustment, github time.Time) *ResearchAdjustment {
 		r.GitHubUpdatedAt = github
@@ -51,8 +57,17 @@ func TestResearchStale(t *testing.T) {
 			turn("u1", RoleUser, 1, false), turn("u2", RoleUser, 2, false), turn("a1", RoleAgent, 3, false)},
 			Signals: Signals{Research: withRead(research(5, "u1", "a1"), at(0))}}, true},
 		{"older turns left out of a bounded read", WorkItem{Thread: []Message{
-			turn("old1", RoleUser, 0, false), turn("old2", RoleAgent, 0, false), turn("u1", RoleUser, 1, false), turn("a1", RoleAgent, 2, false)},
+			turn("old1", RoleUser, 0, false), huge("old2", RoleAgent, 0), turn("u1", RoleUser, 1, false), turn("a1", RoleAgent, 2, false)},
 			Signals: Signals{Research: withRead(research(5, "u1", "a1"), at(0))}}, false},
+		{"older turns that would fit, never read", WorkItem{Thread: []Message{
+			turn("old1", RoleUser, 0, false), turn("old2", RoleAgent, 0, false), turn("u1", RoleUser, 1, false), turn("a1", RoleAgent, 2, false)},
+			Signals: Signals{Research: withRead(research(5, "u1", "a1"), at(0))}}, true},
+		{"the first turn unhidden since the research", WorkItem{Thread: []Message{
+			turn("u1", RoleUser, 1, false), turn("a1", RoleAgent, 2, false)},
+			Signals: Signals{Research: withRead(research(5, "a1"), at(0))}}, true},
+		{"fewer turns fit now than were read", WorkItem{Thread: []Message{
+			huge("old1", RoleUser, 0), turn("u1", RoleUser, 1, false), turn("a1", RoleAgent, 2, false)},
+			Signals: Signals{Research: withRead(research(5, "old1", "u1", "a1"), at(0))}}, false},
 		{"research that read no turn, now with one", WorkItem{Thread: answered,
 			Signals: Signals{Research: withRead(research(5), at(0))}}, true},
 		{"hidden item", WorkItem{Thread: answered, Meta: Metadata{HiddenAt: at(4)}}, false},

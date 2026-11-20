@@ -302,10 +302,13 @@ Wired on the web-tier side; they define what a runtime must respect:
   research by what it READ, never by when it was applied (a refresh or a new turn
   can land while the model works): the GitHub version it read
   (`ResearchAdjustment.GitHubUpdatedAt`, stamped by `agent.stampResearch`) against
-  the stored one, and its `Turns` against the visible thread (a read turn gone or
-  hidden, or a visible turn newer than the oldest read one left unread: posted or
-  unhidden since). The refresh and research passes alternate going first each tick
-  (`Refresher.Tick`), and eligibility is re-checked right before every research
+  the stored one, and its `Turns` against the thread (a read turn gone or hidden, or
+  a turn in the window a research run would read now, `ThreadWindow` with no turn as
+  `ReadItem` serves it, left unread: posted or unhidden since; a window holding fewer
+  turns than were read does not count). The refresh and research passes alternate
+  going first each tick (`Refresher.Tick`); within the research pass owners take
+  turns starting after the last owner actually served (`lastResearched`), and
+  eligibility is re-checked right before every research
   dispatch, since research vends no GitHub credential that a logout would revoke. A
   research run writes back only the adjustment and never adds a turn, so it is how a
   failed post-reply adjustment is retried. The gate holds one research run per

@@ -215,3 +215,31 @@ func TestResearchIsStaleAfterARefreshLandsDuringIt(t *testing.T) {
 		t.Fatal("research that never saw the GitHub change must be stale")
 	}
 }
+
+// The reviewer's case: hide the question of a two-turn thread, research reads only
+// the answer; unhiding the question, which now fits the next read, makes the
+// research stale although it comes before every turn the research read.
+func TestResearchIsStaleOnceTheFirstTurnIsUnhidden(t *testing.T) {
+	now := time.Now().UTC()
+	sink := &memSink{items: []worklist.WorkItem{{
+		ID:     "github:o/r#1",
+		GitHub: worklist.GitHubRef{UpdatedAt: now.Add(-time.Hour)},
+		Thread: []worklist.Message{
+			{ID: "u1", Role: worklist.RoleUser, Content: "q", At: now.Add(-2 * time.Minute), Hidden: true},
+			{ID: "a1", Role: worklist.RoleAgent, Content: "a", ReplyTo: "u1", At: now.Add(-time.Minute)},
+		},
+	}}}
+	if err := Run(context.Background(), Params{JobType: JobResearch, ItemID: "github:o/r#1", Researcher: turnsResearcher{}}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if r := sink.items[0].Signals.Research; r == nil || len(r.Turns) != 1 || r.Turns[0] != "a1" {
+		t.Fatalf("want research that read only the answer, got %+v", r)
+	}
+	if worklist.ResearchStale(sink.items[0]) {
+		t.Fatal("fresh research is stale")
+	}
+	sink.items[0].Thread[0].Hidden = false // the owner unhides the question
+	if !worklist.ResearchStale(sink.items[0]) {
+		t.Fatal("research that never read the unhidden question must be stale")
+	}
+}
