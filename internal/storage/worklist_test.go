@@ -472,3 +472,73 @@ func TestWorklistNestedFieldsAreCopies(t *testing.T) {
 		})
 	}
 }
+
+// Get and Briefs serve a run's bounded reads straight from the store. Both stores
+// agree with the reference (worklist.ApplyBriefQuery): Get never crosses owners,
+// Briefs returns no threads, the open filter drops retired items, and a page is the
+// rows after the cursor in ID order, while an unpaged read keeps first-insertion
+// order.
+func TestWorklistGetAndBriefsParity(t *testing.T) {
+	retired := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+	seed := func() []worklist.WorkItem {
+		var items []worklist.WorkItem
+		for _, id := range []string{"c", "a", "e", "b", "d"} {
+			it := item(id, "T"+id)
+			it.Thread = []worklist.Message{{ID: "m-" + id, Role: worklist.RoleUser, Content: "body " + id}}
+			if id == "b" || id == "e" {
+				it.Meta.CompletedAt = retired
+			}
+			items = append(items, it)
+		}
+		return items
+	}
+	queries := []worklist.BriefQuery{
+		{},
+		{Open: true},
+		{Limit: 2},
+		{After: "a", Limit: 2},
+		{Open: true, After: "a", Limit: 10},
+		{After: "zzz", Limit: 3},
+	}
+	for name, s := range worklistImpls(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			if err := s.Upsert(ctx, "u1", seed()...); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Upsert(ctx, "u2", item("z", "other")); err != nil {
+				t.Fatal(err)
+			}
+			for _, q := range queries {
+				got, err := s.Briefs(ctx, "u1", q)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := worklist.ApplyBriefQuery(seed(), q)
+				gotIDs, wantIDs := "", ""
+				for _, it := range got {
+					gotIDs += it.ID
+					if it.Thread != nil || it.OwnerID != "u1" || it.GitHub.Title != "T"+it.ID {
+						t.Fatalf("%+v: brief %+v must be the whole item without its thread", q, it)
+					}
+				}
+				for _, it := range want {
+					wantIDs += it.ID
+				}
+				if gotIDs != wantIDs {
+					t.Fatalf("%+v: got %q, want %q", q, gotIDs, wantIDs)
+				}
+			}
+			it, ok, err := s.Get(ctx, "u1", "a")
+			if err != nil || !ok || len(it.Thread) != 1 || it.Thread[0].Content != "body a" {
+				t.Fatalf("Get(u1, a) = %+v %v %v", it, ok, err)
+			}
+			if _, ok, err := s.Get(ctx, "u1", "z"); err != nil || ok {
+				t.Fatalf("Get(u1, z) crossed owners: %v %v", ok, err)
+			}
+			if _, ok, err := s.Get(ctx, "u1", "nope"); err != nil || ok {
+				t.Fatalf("Get(u1, nope) = %v %v", ok, err)
+			}
+		})
+	}
+}

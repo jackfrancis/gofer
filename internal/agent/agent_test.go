@@ -24,23 +24,30 @@ func (f fakeVendor) Vend(context.Context, string) (string, error) { return f.tok
 // is merged into the stored item (worklist.MergeRunItems) and a reply is appended
 // through worklist.AppendReply, and a research adjustment is set alone (as
 // worklist.ApplyResearch does), so tests see what a real run's writes produce.
+// Reads go through worklist.Find and worklist.Select, as on the agent plane.
 type memSink struct {
 	items      []worklist.WorkItem
-	ingests    int // write-back calls, so batching is observable
-	replies    int // Reply calls
-	researches int // Research calls
+	ingests    int                  // write-back calls, so batching is observable
+	replies    int                  // Reply calls
+	researches int                  // Research calls
+	selects    []worklist.Selection // Select calls, so paging is observable
 
 	// beforeIngest, if set, runs once just before the first write-back is merged.
 	beforeIngest func()
 }
 
-func (m *memSink) List(context.Context) ([]worklist.WorkItem, error) {
-	out := make([]worklist.WorkItem, len(m.items))
-	for i, it := range m.items {
-		it.Thread = append([]worklist.Message(nil), it.Thread...)
-		out[i] = it
+func (m *memSink) Item(_ context.Context, id, turn string) (worklist.WorkItem, bool, error) {
+	it, ok := worklist.Find(m.items, id)
+	if !ok {
+		return worklist.WorkItem{}, false, nil
 	}
-	return out, nil
+	return worklist.ThreadWindow(it, turn, worklist.MaxItemBytes), true, nil
+}
+
+func (m *memSink) Select(_ context.Context, sel worklist.Selection) ([]worklist.WorkItem, string, error) {
+	m.selects = append(m.selects, sel)
+	page, next := worklist.Select(m.items, sel, time.Now().UTC())
+	return page, next, nil
 }
 
 func (m *memSink) Ingest(_ context.Context, items []worklist.WorkItem) error {
@@ -781,7 +788,7 @@ func reviewSnapshot(t *testing.T, sink Sink, reviewFound bool, timeline string, 
 	if err := Run(ctx, Params{JobType: JobIngest, GitHubBaseURL: srv.URL, Client: srv.Client()}, fakeVendor{token: "test"}, sink); err != nil {
 		t.Fatal(err)
 	}
-	items, err := sink.List(ctx)
+	items, err := readAll(ctx, Params{}, sink, worklist.Selection{})
 	if err != nil || len(items) != 1 {
 		t.Fatalf("list returned %d items, error %v", len(items), err)
 	}

@@ -87,8 +87,9 @@ func TestRunEnrichUpgradesInvolvedReason(t *testing.T) {
 }
 
 // enrich covers EVERY item, not a capped prefix: it feeds the deterministic baseline
-// score, so a skipped item is scored from missing signals and can never rise. Its
-// write-back is batched, so a large worklist never posts one oversized body.
+// score, so a skipped item is scored from missing signals and can never rise. It
+// reads the worklist a bounded page at a time and pages through all of it, and its
+// write-back is batched, so a large worklist never crosses in one oversized body.
 func TestRunEnrichCoversEveryItemInBatches(t *testing.T) {
 	var (
 		mu        sync.Mutex
@@ -118,11 +119,20 @@ func TestRunEnrichCoversEveryItemInBatches(t *testing.T) {
 		})
 	}
 
+	const pageSize = 7
 	err := Run(context.Background(),
-		Params{JobType: JobEnrich, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+		Params{JobType: JobEnrich, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client(), ReadPageSize: pageSize},
 		fakeVendor{token: "t"}, sink)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if want := (total + pageSize - 1) / pageSize; len(sink.selects) != want {
+		t.Fatalf("enrich read %d pages, want %d pages of %d", len(sink.selects), want, pageSize)
+	}
+	for _, sel := range sink.selects {
+		if sel.Limit != pageSize || sel.Top != 0 || !sel.Open {
+			t.Fatalf("enrich read %+v, want open pages of %d", sel, pageSize)
+		}
 	}
 	if timelines != total {
 		t.Fatalf("enriched %d items, want all %d", timelines, total)

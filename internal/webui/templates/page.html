@@ -116,7 +116,7 @@
       {{if .ConvEnabled}}
       <form class="zz-chat-form" method="post" action="/items/thread">
         <input type="hidden" name="id" value="{{.Item.ID}}">
-        <textarea name="content" rows="3" placeholder="e.g. draft a review request for this PR"></textarea>
+        {{/* maxlength matches maxMessageBytes in webui.go, which the server enforces in bytes */}}<textarea name="content" rows="3" maxlength="16384" placeholder="e.g. draft a review request for this PR"></textarea>
         <div class="zz-chat-actions">
           {{if gt (len .ModelOptions) 1}}
           <label class="zz-model-picker">

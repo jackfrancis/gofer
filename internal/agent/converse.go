@@ -22,21 +22,20 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	if p.ItemID == "" {
 		return fmt.Errorf("agent: github-converse requires an item id")
 	}
-	items, err := sink.List(ctx)
+	// Read just the dispatched item, with a bounded window of its thread, not the
+	// worklist. A run dispatched without a turn answers the newest user turn, which
+	// the read resolves against the stored thread so the window keeps it.
+	readTurn := p.Turn
+	if readTurn == "" {
+		readTurn = worklist.LatestUserTurn
+	}
+	item, ok, err := sink.Item(ctx, p.ItemID, readTurn)
 	if err != nil {
-		return fmt.Errorf("list worklist: %w", err)
+		return fmt.Errorf("read item: %w", err)
 	}
-	idx := -1
-	for i := range items {
-		if items[i].ID == p.ItemID {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
+	if !ok {
 		return nil // item gone; nothing to answer
 	}
-	item := items[idx]
 
 	trigger, triggerKey, history, ok := turnToAnswer(item, p.Turn)
 	if !ok {
@@ -162,12 +161,26 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	}
 	// A completed conversation turn is fresh evidence: re-weight the item's ranking
 	// from the thread (best-effort). The GitHub-metadata foundation stays
-	// authoritative — research only nuances it. The write-back carries only the
-	// adjustment (Sink.Research): this copy of the item was read when the run
-	// started, and a refresh that landed since must keep its GitHub fields.
+	// authoritative — research only nuances it. Research reads the thread again, as
+	// a research run does (the newest turns): the window read above ends at the turn
+	// just answered, and turns answered and researched while this run worked would
+	// otherwise be left out of an adjustment that replaces theirs. The write-back
+	// carries only the adjustment (Sink.Research), so a refresh that landed since
+	// keeps its GitHub fields.
 	if p.Researcher != nil {
-		item.Thread = append(item.Thread, msg)
-		if adj, rerr := p.Researcher.Research(ctx, item); rerr == nil {
+		latest, ok, err := sink.Item(ctx, item.ID, "")
+		if err != nil {
+			// The answer is saved and a retry would skip the answered turn, so a
+			// failed read only costs this best-effort research, not the run.
+			p.logger().Warn("converse: reply saved; skipping research after a failed read", "item", item.ID, "err", err)
+			return nil
+		}
+		if _, kept := latest.TurnIndex(msg.ID); !ok || !kept {
+			// The item is gone, or the reply was dropped (the thread was cleared, or
+			// another run answered first): this run has nothing to research.
+			return nil
+		}
+		if adj, rerr := p.Researcher.Research(ctx, latest); rerr == nil {
 			if err := sink.Research(ctx, item.ID, stampResearch(adj)); err != nil {
 				return fmt.Errorf("research: %w", err)
 			}

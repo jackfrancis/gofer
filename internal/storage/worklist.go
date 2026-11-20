@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -28,6 +29,64 @@ var (
 // items yields an empty, non-nil slice.
 func (s *WorklistStore) List(ctx context.Context, ownerID string) ([]worklist.WorkItem, error) {
 	return listOwner(ctx, s.db.sql, ownerID)
+}
+
+// Get reads the owner's one item with id.
+func (s *WorklistStore) Get(ctx context.Context, ownerID, id string) (worklist.WorkItem, bool, error) {
+	var doc []byte
+	err := s.db.sql.QueryRowContext(ctx,
+		`SELECT doc FROM work_items WHERE owner_id = ? AND id = ?`, ownerID, id).Scan(&doc)
+	if errors.Is(err, sql.ErrNoRows) {
+		return worklist.WorkItem{}, false, nil
+	}
+	if err != nil {
+		return worklist.WorkItem{}, false, fmt.Errorf("storage: get work item: %w", err)
+	}
+	it, err := decodeItem(doc, ownerID)
+	if err != nil {
+		return worklist.WorkItem{}, false, err
+	}
+	return it, true, nil
+}
+
+// Briefs reads the owner's items that q names without their threads: SQLite drops
+// each document's thread before it is returned, a page reads only its rows (through
+// the (owner_id, id) index), and the open filter runs in the query. It matches
+// worklist.ApplyBriefQuery.
+func (s *WorklistStore) Briefs(ctx context.Context, ownerID string, q worklist.BriefQuery) ([]worklist.WorkItem, error) {
+	query := `SELECT json_remove(doc, '$.thread') FROM work_items WHERE owner_id = ?`
+	args := []any{ownerID}
+	if q.Open {
+		// A zero time.Time encodes as its zero value, not as an absent field.
+		query += ` AND coalesce(json_extract(doc, '$.gofer.completed_at'), '0001-01-01T00:00:00Z') = '0001-01-01T00:00:00Z'`
+	}
+	if q.Limit > 0 {
+		query += ` AND id > ? ORDER BY id LIMIT ?`
+		args = append(args, q.After, q.Limit)
+	} else {
+		query += ` ORDER BY seq`
+	}
+	rows, err := s.db.sql.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list work item briefs: %w", err)
+	}
+	defer rows.Close()
+	out := []worklist.WorkItem{}
+	for rows.Next() {
+		var doc []byte
+		if err := rows.Scan(&doc); err != nil {
+			return nil, fmt.Errorf("storage: list work item briefs: %w", err)
+		}
+		it, err := decodeItem(doc, ownerID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: list work item briefs: %w", err)
+	}
+	return out, nil
 }
 
 // queryer is what listOwner reads through: the pool, or an open transaction.

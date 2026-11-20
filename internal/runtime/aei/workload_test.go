@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackfrancis/agent-execution-interface/aeiruntime"
 
@@ -38,9 +39,15 @@ func newGoferPlane(t *testing.T, items []worklist.WorkItem) *goferPlane {
 		}
 		_ = json.NewEncoder(w).Encode(map[string]string{"access_token": "vended-" + r.URL.Query().Get("provider")})
 	})
-	mux.HandleFunc("GET /agent/worklist", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /agent/worklist/select", func(w http.ResponseWriter, r *http.Request) {
 		p.bearers[r.Header.Get("Authorization")] = true
-		_ = json.NewEncoder(w).Encode(map[string]any{"items": p.items})
+		sel, err := worklist.ParseSelection(r.URL.Query())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		page, next := worklist.Select(p.items, sel, time.Now())
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": page, "next": next})
 	})
 	mux.HandleFunc("POST /agent/worklist", func(w http.ResponseWriter, r *http.Request) {
 		p.bearers[r.Header.Get("Authorization")] = true

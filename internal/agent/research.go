@@ -20,21 +20,15 @@ func runResearch(ctx context.Context, p Params, sink Sink) error {
 	if p.ItemID == "" {
 		return fmt.Errorf("agent: github-research requires an item id")
 	}
-	items, err := sink.List(ctx)
+	// Read just the dispatched item, with a bounded window of its thread, not the
+	// worklist.
+	item, ok, err := sink.Item(ctx, p.ItemID, "")
 	if err != nil {
-		return fmt.Errorf("list worklist: %w", err)
+		return fmt.Errorf("read item: %w", err)
 	}
-	idx := -1
-	for i := range items {
-		if items[i].ID == p.ItemID {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
+	if !ok {
 		return nil // item gone
 	}
-	item := items[idx]
 
 	adj, err := p.Researcher.Research(ctx, item)
 	if err != nil {

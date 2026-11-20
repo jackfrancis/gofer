@@ -60,9 +60,9 @@ func (p RunPolicy) Classify(items []WorkItem) {
 	}
 }
 
-// ClassifyReads returns s with List classified by the policy (Classify), so the
-// user's own reads score an item by the same bot list as the agent plane's: the
-// radar's rank and the one Discuss explains agree even for an item stored before an
+// ClassifyReads returns s with its reads (List, Get, Briefs) classified by the
+// policy (Classify), so the user's own reads score an item by the same bot list as
+// the agent plane's: the radar's rank and the one Discuss explains agree even for an item stored before an
 // upgrade or a change to BOT_REVIEWERS. Writes pass through unchanged.
 func (p RunPolicy) ClassifyReads(s Store) Store {
 	return classifiedStore{Store: s, policy: p}
@@ -75,6 +75,28 @@ type classifiedStore struct {
 
 func (c classifiedStore) List(ctx context.Context, ownerID string) ([]WorkItem, error) {
 	items, err := c.Store.List(ctx, ownerID)
+	if err != nil {
+		return nil, err
+	}
+	c.policy.Classify(items)
+	return items, nil
+}
+
+// Get is the store's Get, classified: a run's single-item read (ReadItem).
+func (c classifiedStore) Get(ctx context.Context, ownerID, id string) (WorkItem, bool, error) {
+	it, ok, err := c.Store.Get(ctx, ownerID, id)
+	if err != nil || !ok {
+		return it, ok, err
+	}
+	one := []WorkItem{it}
+	c.policy.Classify(one)
+	return one[0], true, nil
+}
+
+// Briefs is the store's Briefs, classified: a run's bounded selection (SelectFrom),
+// whose top-N ranking scores by the classification.
+func (c classifiedStore) Briefs(ctx context.Context, ownerID string, q BriefQuery) ([]WorkItem, error) {
+	items, err := c.Store.Briefs(ctx, ownerID, q)
 	if err != nil {
 		return nil, err
 	}

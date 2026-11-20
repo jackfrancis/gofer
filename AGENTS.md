@@ -189,11 +189,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   `OriginUser` override that `Resolve` leaves unrescored, and
   `Signals.ReviewRequestedByBot` is derived from `ReviewRequestedBy` against
   `BOT_REVIEWERS` (case-insensitive), replacing whatever the run sent. The agent
-  plane's reads (`GET /agent/worklist`, `StoreSink.List`) re-derive the flag too
-  (`RunPolicy.Classify`), so a run ranks by the current bot list, and so do the user's
+  plane's reads (`GET /agent/worklist`, its `select` and `item` reads, and
+  `StoreSink.Item`/`Select`, all through `RunPolicy.ClassifyReads`, which classifies
+  `List`, `Get` and `Briefs`) re-derive the flag too (`RunPolicy.Classify`), so a run
+  ranks by the current bot list, and so do the user's
   (the JSON worklist and the radar get `RunPolicy.ClassifyReads(store)`), so the rank
   shown and the rank Discuss explains agree. The rank job picks candidates by
-  `worklist.BaselineScore`, which clears the previous proposal and research. A proposal records the bot
+  `worklist.BaselineScore`, which clears the previous proposal and research (the
+  top-N selection, `worklist.Select`). A proposal records the bot
   classification it was made under (`AxisProposal.ReviewRequestedByBot`); read it
   through `Signals.CurrentProposal`, which drops it once the classification changes. The requester is
   the actor of the user's pending review request on the timeline: the latest
@@ -205,6 +208,32 @@ Wired on the web-tier side; they define what a runtime must respect:
   pressure, low floors) unless the user is also an assignee. The web and runtime images must ship together: a runtime
   from before these rules posts its reply inside the item, where it is now ignored,
   and a web tier from before them has no research route.
+- A run never reads the whole worklist: its threads grow without bound and the agent
+  plane caps a response at 8 MiB. `agent.Sink` has only bounded reads, served by the
+  same `internal/worklist/select.go` functions in process and on the plane:
+  `Item` (`GET /agent/worklist/item`, `worklist.ReadItem`: one owner-scoped item, at
+  most `MaxItemBytes` encoded, whose `ThreadWindow` is the dispatched turn and the
+  visible history before it, or the turn and its reply if the store shows it
+  answered; a Discuss run without a turn asks for `worklist.LatestUserTurn`, which
+  the read resolves against the stored thread; research, naming none, gets the newest
+  turns, and so does Discuss's research pass, which reads again after its reply
+  lands and skips research if the reply was dropped; position keys are written into legacy turns) and `Select` (`GET /agent/worklist/select`, `worklist.SelectFrom`: no
+  threads, at most `MaxSelectLimit` items and `MaxSelectBytes`, with a cursor).
+  Stored data past the bounds still reads: an oversized message is cut with a note,
+  and an item over `MaxBriefBytes` is projected (`worklist.Project`), which marks
+  each cut field (`WorkItem.Projected`) so `MergeRunItems` restores it on write-back
+  unless the run rewrote it. Never store a projection. A cut keeps what the score
+  reads (the strongest labels, every distinct reason), so a projected item scores as
+  the whole item does for the ranker and Discuss. Projection drops a research
+  adjustment's source-turn list rather than shorten it, so the visibility check
+  withholds research it cannot check whole. Ranking reads the top N by `worklist.BaselineScore`
+  of the whole item, projected only after it is chosen (ties keep insertion order); ingest and enrichment page through
+  every item with `readAll`, and ingest fails if it cannot read the stored items.
+  Enrichment must keep reaching every open item; never cap it. The stores serve these
+  reads directly (`Store.Get`, `Store.Briefs`), so a page never decodes every thread.
+  Selections have their own route so a runtime facing an older web tier fails instead
+  of getting the whole list. A write-back need not carry a thread (`MergeRunItems`
+  keeps the stored one); research is written back alone (`Sink.Research`). A user message is capped at 16 KiB (`webui.maxMessageBytes`).
 - Replies can land out of order, so a turn's position does not say what it answers.
   Every new turn gets an ID; an agent turn's `ReplyTo` names the user turn it
   answers; dispatch carries the turn a run must answer (`worklist.TurnRef`, run

@@ -32,6 +32,25 @@ func (s *MemoryStore) List(_ context.Context, ownerID string) ([]WorkItem, error
 	return cloneItems(s.items[ownerID]), nil
 }
 
+// Get returns a copy of the owner's item with id.
+func (s *MemoryStore) Get(_ context.Context, ownerID, id string) (WorkItem, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, it := range s.items[ownerID] {
+		if it.ID == id {
+			return cloneItems([]WorkItem{it})[0], true, nil
+		}
+	}
+	return WorkItem{}, false, nil
+}
+
+// Briefs returns copies of the owner's items that q names, without their threads.
+func (s *MemoryStore) Briefs(_ context.Context, ownerID string, q BriefQuery) ([]WorkItem, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneItems(ApplyBriefQuery(s.items[ownerID], q)), nil
+}
+
 // Seed replaces the items for an owner. Development and test helper.
 func (s *MemoryStore) Seed(ownerID string, items ...WorkItem) {
 	s.mu.Lock()

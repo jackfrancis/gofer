@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/jackfrancis/gofer/internal/vault"
@@ -47,14 +48,20 @@ func TestStoreSinkScopesToOwner(t *testing.T) {
 	if err := sink.Ingest(ctx, []worklist.WorkItem{{ID: "i1", OwnerID: "u1"}}); err != nil {
 		t.Fatalf("Ingest: %v", err)
 	}
-	items, err := sink.List(ctx)
-	if err != nil || len(items) != 1 || items[0].ID != "i1" {
-		t.Fatalf("List = (%+v, %v), want the one written item", items, err)
+	items, next, err := sink.Select(ctx, worklist.Selection{})
+	if err != nil || len(items) != 1 || items[0].ID != "i1" || next != "" {
+		t.Fatalf("Select = (%+v, %q, %v), want the one written item", items, next, err)
 	}
-	// Another owner's sink sees nothing.
-	other, err := NewStoreSink(store, "u2").List(ctx)
-	if err != nil || len(other) != 0 {
-		t.Fatalf("other owner List = (%+v, %v), want empty", other, err)
+	if it, ok, err := sink.Item(ctx, "i1", ""); err != nil || !ok || it.ID != "i1" {
+		t.Fatalf("Item(i1) = (%+v, %v, %v), want it", it, ok, err)
+	}
+	// Another owner's sink sees nothing, and cannot read the item by ID.
+	other := NewStoreSink(store, "u2")
+	if got, _, err := other.Select(ctx, worklist.Selection{}); err != nil || len(got) != 0 {
+		t.Fatalf("other owner Select = (%+v, %v), want empty", got, err)
+	}
+	if it, ok, err := other.Item(ctx, "i1", ""); err != nil || ok {
+		t.Fatalf("other owner Item(i1) = (%+v, %v, %v), want not found", it, ok, err)
 	}
 	// An empty write is a no-op.
 	if err := sink.Ingest(ctx, nil); err != nil {
@@ -66,6 +73,8 @@ func TestStoreSinkScopesToOwner(t *testing.T) {
 // authenticates every call with the run credential.
 func TestPlaneClient(t *testing.T) {
 	var seenAuth, seenProvider string
+	var seenQuery url.Values
+	var seenTurn string
 	var posted struct {
 		Items []worklist.WorkItem `json:"items"`
 	}
@@ -75,8 +84,16 @@ func TestPlaneClient(t *testing.T) {
 		case r.URL.Path == "/agent/credential":
 			seenProvider = r.URL.Query().Get("provider")
 			_, _ = w.Write([]byte(`{"access_token":"vended","token_type":"bearer"}`))
-		case r.URL.Path == "/agent/worklist" && r.Method == http.MethodGet:
-			_, _ = w.Write([]byte(`{"items":[{"id":"i1"}]}`))
+		case r.URL.Path == "/agent/worklist/select":
+			seenQuery = r.URL.Query()
+			_, _ = w.Write([]byte(`{"items":[{"id":"i1"}],"next":"i1"}`))
+		case r.URL.Path == "/agent/worklist/item":
+			seenTurn = r.URL.Query().Get("turn")
+			if r.URL.Query().Get("id") == "i1" {
+				_, _ = w.Write([]byte(`{"found":true,"item":{"id":"i1","thread":[{"role":"user","content":"hi"}]}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"found":false}`))
 		case r.URL.Path == "/agent/worklist" && r.Method == http.MethodPost:
 			_ = json.NewDecoder(r.Body).Decode(&posted)
 			w.WriteHeader(http.StatusOK)
@@ -100,9 +117,19 @@ func TestPlaneClient(t *testing.T) {
 		t.Fatalf("provider = %q, want github", seenProvider)
 	}
 
-	items, err := c.List(ctx)
-	if err != nil || len(items) != 1 || items[0].ID != "i1" {
-		t.Fatalf("List = (%+v, %v), want one item", items, err)
+	items, next, err := c.Select(ctx, worklist.Selection{Open: true, After: "a", Limit: 5})
+	if err != nil || len(items) != 1 || items[0].ID != "i1" || next != "i1" {
+		t.Fatalf("Select = (%+v, %q, %v), want one item and its cursor", items, next, err)
+	}
+	if got := seenQuery.Encode(); got != "after=a&limit=5&open=1" {
+		t.Fatalf("Select query = %q", got)
+	}
+	it, ok, err := c.Item(ctx, "i1", "t1")
+	if err != nil || !ok || it.ID != "i1" || len(it.Thread) != 1 || seenTurn != "t1" {
+		t.Fatalf("Item(i1) = (%+v, %v, %v), turn %q; want it with its thread", it, ok, err, seenTurn)
+	}
+	if _, ok, err := c.Item(ctx, "gone", ""); err != nil || ok {
+		t.Fatalf("Item(gone) = (%v, %v), want not found", ok, err)
 	}
 
 	if err := c.Ingest(ctx, []worklist.WorkItem{{ID: "i2"}}); err != nil {
@@ -128,8 +155,12 @@ func TestPlaneClientSurfacesHTTPErrors(t *testing.T) {
 	if _, err := c.Vend(context.Background(), "github"); err == nil {
 		t.Fatal("expected an error for a 401 vend")
 	}
-	if _, err := c.List(context.Background()); err == nil {
+	if _, _, err := c.Select(context.Background(), worklist.Selection{}); err == nil {
 		t.Fatal("expected an error for a 401 list")
+	}
+	// A 401 (or a 404 from a web tier without the route) is an error, never "gone".
+	if _, _, err := c.Item(context.Background(), "i1", ""); err == nil {
+		t.Fatal("expected an error for a 401 item read")
 	}
 	if err := c.Ingest(context.Background(), []worklist.WorkItem{{ID: "i1"}}); err == nil {
 		t.Fatal("expected an error for a 401 ingest")

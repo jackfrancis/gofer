@@ -196,6 +196,56 @@ func TestAgentReply(t *testing.T) {
 	}
 }
 
+// The agent plane's reads are bounded and owner-scoped: a selection returns a page
+// without threads and the next cursor, a malformed one is refused, and the
+// single-item read finds only the acting user's item.
+func TestAgentReadsAreBoundedAndOwnerScoped(t *testing.T) {
+	f := newPlane(t)
+	h := NewIngestHandler(f.store, nil, worklist.NewRunPolicy(nil))
+	ctx := context.Background()
+	_ = f.store.Upsert(ctx, "u1",
+		worklist.WorkItem{ID: "a", Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "secret-a"}}},
+		worklist.WorkItem{ID: "b"},
+		worklist.WorkItem{ID: "c"},
+	)
+	_ = f.store.Upsert(ctx, "u2", worklist.WorkItem{ID: "z", Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "secret-z"}}})
+	get := func(hf http.HandlerFunc, target string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req = req.WithContext(principal.NewContext(req.Context(), &principal.Principal{ActingUserID: "u1"}))
+		rec := httptest.NewRecorder()
+		hf(rec, req)
+		return rec
+	}
+
+	rec := get(h.Select, "/agent/worklist/select?limit=2")
+	var page struct {
+		Items []worklist.WorkItem `json:"items"`
+		Next  string              `json:"next"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil || rec.Code != http.StatusOK {
+		t.Fatalf("selection: %d %v", rec.Code, err)
+	}
+	if len(page.Items) != 2 || page.Items[0].ID != "a" || page.Next != "b" || bytes.Contains(rec.Body.Bytes(), []byte("secret")) {
+		t.Fatalf("selection page = %s", rec.Body.String())
+	}
+	if rec := get(h.Select, "/agent/worklist/select?limit=x"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("a malformed selection got %d, want 400", rec.Code)
+	}
+
+	rec = get(h.Item, "/agent/worklist/item?id=a")
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"found":true`)) || !bytes.Contains(rec.Body.Bytes(), []byte("secret-a")) {
+		t.Fatalf("own item = %d %s, want it with its thread", rec.Code, rec.Body.String())
+	}
+	rec = get(h.Item, "/agent/worklist/item?id=z")
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"found":false`)) || bytes.Contains(rec.Body.Bytes(), []byte("secret-z")) {
+		t.Fatalf("another owner's item = %d %s, want not found", rec.Code, rec.Body.String())
+	}
+	if rec := get(h.Item, "/agent/worklist/item"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("no id got %d, want 400", rec.Code)
+	}
+}
+
 // A research write-back sets the adjustment and nothing else: an item refreshed after
 // the run read it keeps its refreshed GitHub fields, signals and thread. The workload's
 // plane client and this handler agree on the request.
@@ -331,7 +381,8 @@ func TestAgentIngestAppliesRunPolicy(t *testing.T) {
 	}
 }
 
-// GET /agent/worklist serves the bot flag by the current policy, not the stored
+// Every agent-plane read (the legacy whole list, a selection, a top-N selection and
+// the single-item read) serves the bot flag by the current policy, not the stored
 // value, so a run ranks by the classification its write-back will store (after an
 // upgrade or a change to BOT_REVIEWERS).
 func TestAgentListClassifiesByCurrentPolicy(t *testing.T) {
@@ -341,27 +392,48 @@ func TestAgentListClassifiesByCurrentPolicy(t *testing.T) {
 		worklist.WorkItem{ID: "stale-bot", OwnerID: "u1", Signals: worklist.Signals{ReviewRequestedBy: "alice", ReviewRequestedByBot: true}},
 	)
 	h := NewIngestHandler(store, nil, worklist.NewRunPolicy([]string{"k8s-ci-robot"}))
-	req := httptest.NewRequest(http.MethodGet, "/agent/worklist", nil)
-	req = req.WithContext(principal.NewContext(req.Context(), &principal.Principal{
-		Kind: principal.KindWorkload, Subject: "run1", ActingUserID: "u1", Scopes: []principal.Scope{principal.ScopeSignalsRead},
-	}))
-	rec := httptest.NewRecorder()
-	h.List(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d", rec.Code)
+	get := func(hf http.HandlerFunc, target string) []byte {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req = req.WithContext(principal.NewContext(req.Context(), &principal.Principal{
+			Kind: principal.KindWorkload, Subject: "run1", ActingUserID: "u1", Scopes: []principal.Scope{principal.ScopeSignalsRead},
+		}))
+		rec := httptest.NewRecorder()
+		hf(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: want 200, got %d", target, rec.Code)
+		}
+		return rec.Body.Bytes()
 	}
-	var body struct {
-		Items []worklist.WorkItem `json:"items"`
+	for _, target := range []string{"/agent/worklist", "/agent/worklist/select", "/agent/worklist/select?top=2"} {
+		hf := h.Select
+		if target == "/agent/worklist" {
+			hf = h.List
+		}
+		var body struct {
+			Items []worklist.WorkItem `json:"items"`
+		}
+		if err := json.Unmarshal(get(hf, target), &body); err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]bool{}
+		for _, it := range body.Items {
+			got[it.ID] = it.Signals.ReviewRequestedByBot
+		}
+		if len(got) != 2 || !got["stale-human"] || got["stale-bot"] {
+			t.Fatalf("%s served flags %v, want stale-human=true stale-bot=false", target, got)
+		}
 	}
-	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
-		t.Fatal(err)
-	}
-	got := map[string]bool{}
-	for _, it := range body.Items {
-		got[it.ID] = it.Signals.ReviewRequestedByBot
-	}
-	if !got["stale-human"] || got["stale-bot"] {
-		t.Fatalf("served flags %v, want stale-human=true stale-bot=false", got)
+	for id, want := range map[string]bool{"stale-human": true, "stale-bot": false} {
+		var body struct {
+			Item worklist.WorkItem `json:"item"`
+		}
+		if err := json.Unmarshal(get(h.Item, "/agent/worklist/item?id="+id), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Item.Signals.ReviewRequestedByBot != want {
+			t.Fatalf("item %s served flag %v, want %v", id, body.Item.Signals.ReviewRequestedByBot, want)
+		}
 	}
 }
 

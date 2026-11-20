@@ -32,6 +32,9 @@ const (
 // a large worklist); it is bounded by concurrency and by the run clock instead of by
 // an arbitrary count. Params.EnrichLimit still caps it when a caller wants that.
 //
+// The read pages through the open items without their threads (readAll), so it
+// stays bounded however large the worklist grows without dropping any item.
+//
 // carried (optional) names the items whose review request the refresh that chains
 // into this pass kept although its search did not show it (see carryPendingRequest):
 // for those, a timeline that shows the user's request ended removes the request
@@ -56,7 +59,7 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 		}
 		return fmt.Errorf("github login: %w", err)
 	}
-	items, err := sink.List(ctx)
+	items, err := readAll(ctx, p, sink, worklist.Selection{Open: true})
 	if err != nil {
 		return fmt.Errorf("list worklist: %w", err)
 	}
