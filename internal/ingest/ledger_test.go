@@ -275,7 +275,7 @@ func TestLostDispatchAnswerHoldsTheOwnerUntilItsDeadline(t *testing.T) {
 	}
 
 	ig2.mu.Lock()
-	ig2.runs[ingestKey("github:1")].at = time.Now().Add(-retryAfter)
+	ig2.runs[ingestKey("github:1")].until = time.Now()
 	ig2.mu.Unlock()
 	if done, active := ig2.LocalRefreshState("github:1"); done != 1 || active {
 		t.Fatalf("past its deadline: done %d active %v, want 1, false", done, active)
@@ -382,5 +382,82 @@ func TestUseLedgerReadFailure(t *testing.T) {
 	}
 	if ig.ledger != nil {
 		t.Fatal("a ledger that could not be read must not be attached")
+	}
+}
+
+// An uncertain run is held until the backend's own deadline for it could have
+// passed: the backend starts that clock when it accepts, which can be as late as the
+// end of the dispatch, so the hold runs from when Submit returned (plus a grace for a
+// backend still finishing the request), not from the reservation. A restart honours
+// the recorded expiry, even when the reservation itself is older than a deadline.
+func TestUncertainRunHeldThroughTheBackendsDeadline(t *testing.T) {
+	ctx := context.Background()
+	d := &lostDispatcher{gateDispatcher: gateDispatcher{phase: "Running"}, lost: true}
+	l := newMemLedger()
+	ig := restart(t, d, l)
+	before := time.Now()
+	_, _ = ig.ScheduledRefresh(ctx, "github:1")
+	returned := time.Now()
+	rec := l.get("github:1")
+	// Submit returned (and any acceptance happened) between before and returned.
+	if !rec.Pending || rec.RunUntil.Before(before.Add(holdUncertain)) || rec.RunUntil.After(returned.Add(holdUncertain)) {
+		t.Fatalf("recorded expiry %v, want Submit's return (%v..%v) + %v", rec.RunUntil, before, returned, holdUncertain)
+	}
+	if rec.RunAt.Before(before) || rec.RunAt.After(returned) {
+		t.Fatalf("recorded reservation time %v", rec.RunAt)
+	}
+
+	// The reservation is older than a run deadline, but the backend may have
+	// accepted it late: the recorded expiry still holds the owner after a restart.
+	_ = l.PutIngestRun(ctx, "github:1", IngestRecord{Gen: 1, RunGen: 1, Pending: true,
+		RunAt: time.Now().Add(-ingestDeadline - time.Second), RunUntil: time.Now().Add(time.Minute)})
+	d.lost = false
+	if ok, _ := restart(t, d, l).ScheduledRefresh(ctx, "github:1"); ok {
+		t.Fatal("dispatched before the uncertain run's recorded expiry")
+	}
+
+	// A pending record from before expiries were recorded assumes the longest hold.
+	_ = l.PutIngestRun(ctx, "github:1", IngestRecord{Gen: 1, RunGen: 1, Pending: true,
+		RunAt: time.Now().Add(-ingestDeadline - time.Second)})
+	if ok, _ := restart(t, d, l).ScheduledRefresh(ctx, "github:1"); ok {
+		t.Fatal("dispatched within holdPending of a reservation with no recorded expiry")
+	}
+}
+
+// ctxDispatcher records the context Submit was called with.
+type ctxDispatcher struct {
+	gateDispatcher
+	err      error
+	deadline time.Time
+}
+
+func (d *ctxDispatcher) Submit(ctx context.Context, spec RunSpec) (string, error) {
+	d.err = ctx.Err()
+	d.deadline, _ = ctx.Deadline()
+	return d.gateDispatcher.Submit(ctx, spec)
+}
+
+// An ingest dispatch is bounded by submitTimeout and does not end with the request
+// that asked for it, so a browser going away cannot leave acceptance unknown; and
+// while gofer has not heard back, the record holds the owner through the whole
+// dispatch window.
+func TestIngestSubmitIsDetachedAndBounded(t *testing.T) {
+	cctx, cancel := context.WithCancel(context.Background())
+	d := &ctxDispatcher{gateDispatcher: gateDispatcher{phase: "Running"}}
+	ig := restart(t, d, newMemLedger())
+	cancel()
+	start := time.Now()
+	if err := ig.Refresh(cctx, "github:1"); err != nil {
+		t.Fatal(err)
+	}
+	if d.err != nil || d.deadline.IsZero() || d.deadline.After(start.Add(submitTimeout+time.Second)) {
+		t.Fatalf("Submit's context: err %v, deadline %v; want live and bounded by %v", d.err, d.deadline, submitTimeout)
+	}
+
+	l := newMemLedger()
+	pd := &peekDispatcher{gateDispatcher: gateDispatcher{phase: "Running"}, l: l}
+	_, _ = restart(t, pd, l).ScheduledRefresh(context.Background(), "github:2")
+	if want := pd.seen.RunAt.Add(holdPending); !pd.seen.Pending || !pd.seen.RunUntil.Equal(want) {
+		t.Fatalf("at dispatch the record held %+v, want expiry %v", pd.seen, want)
 	}
 }

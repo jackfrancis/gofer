@@ -197,7 +197,7 @@ func (i *Ingestor) LocalRefreshState(ownerID string) (done uint64, active bool) 
 	now := time.Now()
 	i.mu.Lock()
 	cur := i.runs[key]
-	expired := cur != nil && now.Sub(cur.at) >= cur.g.ttl
+	expired := cur != nil && cur.expired(now)
 	changed := expired && i.markDoneLocked(key, cur)
 	active = cur != nil && !expired &&
 		(cur.pending || cur.uncertain || (cur.id != "" && !cur.failed && !cur.succeeded))
@@ -225,7 +225,7 @@ func (i *Ingestor) Active(ctx context.Context, ownerID string) (bool, error) {
 	var pending, uncertain, stale, noID, changed bool
 	if cur != nil {
 		pending, uncertain = cur.pending, cur.uncertain
-		stale = now.Sub(cur.at) >= cur.g.ttl
+		stale = cur.expired(now)
 		noID = cur.id == ""
 		if stale {
 			changed = i.markDoneLocked(key, cur)
@@ -266,7 +266,11 @@ func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, g gate) (
 		i.settle(key, mine, "", ErrNotAccepted)
 		return false, fmt.Errorf("ingest: record the reservation before dispatch: %w", err)
 	}
-	id, err := i.d.Submit(ctx, RunSpec{
+	// The dispatch is bounded, and outlives the request that asked for it: a browser
+	// that goes away mid-dispatch must not leave acceptance unknown.
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), submitTimeout)
+	defer cancel()
+	id, err := i.d.Submit(sctx, RunSpec{
 		TaskRef:    taskIngest,
 		Parameters: i.runParams(ownerID),
 		Subject:    ownerID,

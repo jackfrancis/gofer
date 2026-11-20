@@ -15,6 +15,11 @@ type IngestRecord struct {
 	RunID   string    // the backend's id for it; empty while acceptance is unknown
 	RunAt   time.Time // when it was reserved, or accepted once it was
 	Pending bool      // reserved, and whether the backend accepted it is not known
+	// RunUntil is when the run stops counting as in flight however it went: for one
+	// of unknown acceptance, the latest moment the backend could have accepted it
+	// plus the run's deadline (holdPending, holdUncertain); for an accepted run,
+	// RunAt plus the deadline.
+	RunUntil time.Time
 }
 
 // RunLedger persists each owner's IngestRecord. The in-flight gate and the refresh
@@ -38,7 +43,8 @@ const ledgerTimeout = 5 * time.Second
 // schedule, a Refresh, nor the empty-worklist poll starts another until it ends: an
 // accepted run until the backend reports it ended (an id the backend no longer knows
 // reads as a failed status read, which blocks only until the deadline), one of
-// unknown acceptance until its deadline. A run past its deadline counts as ended.
+// unknown acceptance until the latest moment it could still be running (RunUntil). A
+// run past that counts as ended.
 // Call it before serving.
 func (i *Ingestor) UseLedger(ctx context.Context, l RunLedger) error {
 	recs, err := l.IngestRuns(ctx)
@@ -54,12 +60,16 @@ func (i *Ingestor) UseLedger(ctx context.Context, l RunLedger) error {
 		if rec.RunGen <= rec.Done {
 			continue
 		}
-		if now.Sub(rec.RunAt) >= refreshGate.ttl {
+		r := &run{id: rec.RunID, at: rec.RunAt, g: refreshGate, gen: rec.RunGen,
+			uncertain: rec.Pending || rec.RunID == "", until: rec.RunUntil}
+		if r.uncertain && r.until.IsZero() {
+			r.until = rec.RunAt.Add(holdPending) // a record without its expiry: assume the longest
+		}
+		if r.expired(now) {
 			i.dones[owner] = rec.RunGen
 			continue
 		}
-		i.runs[ingestKey(owner)] = &run{id: rec.RunID, at: rec.RunAt, g: refreshGate, gen: rec.RunGen,
-			uncertain: rec.Pending || rec.RunID == ""}
+		i.runs[ingestKey(owner)] = r
 	}
 	return nil
 }
@@ -77,6 +87,12 @@ func (i *Ingestor) persist(ownerID string) error {
 	if cur := i.runs[ingestKey(ownerID)]; cur != nil && cur.gen > 0 {
 		rec.RunGen, rec.RunID, rec.RunAt = cur.gen, cur.id, cur.at
 		rec.Pending = cur.pending || cur.uncertain
+		rec.RunUntil = cur.deadline()
+		if cur.pending {
+			// Submit has not returned: if gofer stops now, the backend may still
+			// accept the run up to the end of the dispatch window.
+			rec.RunUntil = cur.at.Add(holdPending)
+		}
 	}
 	i.mu.Unlock()
 	if l == nil || rec.Gen == 0 {

@@ -316,11 +316,18 @@ Wired on the web-tier side; they define what a runtime must respect:
   open tab compares. A run past its deadline counts as ended when anything observes
   it (a poll, a render, a reservation), which raises the version.
 - `Dispatcher.Submit` errors say whether a run might exist: one wrapping
-  `ingest.ErrNotAccepted` is a definite refusal (the AEI backend: any answer but
-  202, no connection, or never sent; it watches its own transport, since the app SDK
-  types only 429), and releases the reservation. Any other error (an answer lost
-  after the request went out) leaves the ingest reservation held, unprobeable,
-  until its deadline. A converse turn is rolled back either way.
+  `ingest.ErrNotAccepted` is a definite refusal, and releases the reservation. The
+  AEI backend judges the final attempt (after redirects) by watching its own
+  transport, since the app SDK types only 429: refused if it was never sent (ctx
+  already done, or no connection) or answered with a 3xx or 4xx. A 5xx (a gateway
+  can answer 502/503/504 after AEI accepted the POST), an answer lost after the
+  request went out, or an unreadable 202 leaves acceptance unknown, and the ingest
+  reservation is held, unprobeable, until the backend's own deadline could have
+  passed: AEI starts that clock at acceptance, so the hold runs from when Submit
+  returned plus a grace (`holdUncertain`), or, for a record written before Submit
+  returned, from the reservation through the whole bounded dispatch window
+  (`holdPending`). Each hold is recorded (`RunUntil`). An ingest Submit gets its own
+  30s context, detached from the request. A converse turn is rolled back either way.
 - Without script, the radar's `<noscript>` refresh goes to `/?refresh=1`, whose
   render asks AEI (within 5s) instead of reading local state, so it stops once the
   run has ended.

@@ -27,7 +27,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httptrace"
 	"os"
@@ -163,13 +162,18 @@ func checkTokenFile(path string) error {
 // in gofer's own store when the runtime writes them back through the agent plane.
 //
 // A failure wraps ingest.ErrNotAccepted only when the control plane certainly holds
-// no run: it answered with anything but 202 Accepted (an overload's 429 included), or
-// the request never reached it (no connection, or it was never sent). A failure after
-// the request was sent and before an answer was read, or a 202 whose run id could
-// not be read, leaves acceptance unknown.
+// no run. That is judged on the request's final attempt (after any redirect): it was
+// never sent (ctx already done, or no connection was made), or the answer was a
+// refusal, a 4xx (an overload's 429 included) or a redirect not followed. Anything
+// else leaves acceptance unknown: a 5xx (a gateway's 502/503/504 can come after the
+// control plane accepted the POST), a failure after the request went out, or a 202
+// whose run id could not be read.
 func (d *Dispatcher) Submit(ctx context.Context, spec ingest.RunSpec) (string, error) {
 	if spec.TaskRef == "" {
 		return "", fmt.Errorf("aei: run spec has no task ref: %w", ingest.ErrNotAccepted)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("aei: dispatch %s not sent: %w: %w", spec.TaskRef, ingest.ErrNotAccepted, err)
 	}
 	ex := &exchange{}
 	runID, err := d.client.Dispatch(context.WithValue(ctx, exchangeKey{}, ex), toAppSpec(spec))
@@ -196,16 +200,17 @@ func (d *Dispatcher) Status(ctx context.Context, runID string) (ingest.RunStatus
 	return ingest.RunStatus{Phase: res.Phase, Message: res.Message}, nil
 }
 
-// exchange is what observingTransport saw of one dispatch request.
+// exchange is what observingTransport saw of a dispatch request's latest attempt; a
+// redirect starts a new attempt, which replaces what the earlier one saw.
 type exchange struct {
 	mu        sync.Mutex
-	attempted bool // the request reached the transport
-	status    int  // the response status, when one arrived
-	noConn    bool // the transport failed before a connection existed
+	attempted bool // an attempt reached the transport
+	status    int  // the latest attempt's response status, when one arrived
+	noConn    bool // the latest attempt never had a connection, so it sent nothing
 }
 
-// refused reports whether the control plane certainly did not accept the run: it
-// answered other than 202, or the request never reached it.
+// refused reports whether the control plane certainly did not accept the run, judged
+// on the final attempt: it sent nothing, or it was answered with a 3xx or 4xx.
 func (e *exchange) refused() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -213,7 +218,7 @@ func (e *exchange) refused() bool {
 	case !e.attempted, e.noConn:
 		return true
 	case e.status != 0:
-		return e.status != http.StatusAccepted
+		return e.status >= 300 && e.status < 500
 	}
 	return false
 }
@@ -240,11 +245,13 @@ func (t observingTransport) RoundTrip(req *http.Request) (*http.Response, error)
 	resp, err := base.RoundTrip(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
 	ex.mu.Lock()
 	ex.attempted = true
+	ex.status = 0
+	ex.noConn = false
 	if resp != nil {
 		ex.status = resp.StatusCode
-	} else if err != nil && !connected.Load() {
-		var op *net.OpError
-		ex.noConn = errors.As(err, &op) && op.Op == "dial"
+	} else if err != nil {
+		// A request is written only on a connection; without one it never left.
+		ex.noConn = !connected.Load()
 	}
 	ex.mu.Unlock()
 	return resp, err

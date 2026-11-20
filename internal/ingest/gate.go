@@ -42,6 +42,10 @@ type run struct {
 	// (ErrNotAccepted), so a run may exist that gofer cannot probe. It holds the key,
 	// and counts as in flight, until its deadline.
 	uncertain bool
+	// until, when set, is the run's deadline instead of at + the gate's ttl: for a
+	// run whose acceptance is unknown, the latest moment it could still be running
+	// (see holdUncertain, holdPending).
+	until     time.Time
 	failed    bool
 	succeeded bool
 	message   string
@@ -61,8 +65,42 @@ func (r *run) live(now time.Time, probe bool) bool {
 	if r.failed || (r.succeeded && probe) {
 		return false
 	}
-	return now.Sub(r.at) < r.g.ttl
+	return !r.expired(now)
 }
+
+// expired reports whether r is past its deadline: until when set, else at + ttl.
+func (r *run) expired(now time.Time) bool {
+	return !now.Before(r.deadline())
+}
+
+// deadline is when r stops counting as in flight however it went.
+func (r *run) deadline() time.Time {
+	if !r.until.IsZero() {
+		return r.until
+	}
+	return r.at.Add(r.g.ttl)
+}
+
+// The backend starts a run's deadline when it accepts the run, which can be later
+// than gofer reserved it. An accepted run's deadline here runs from when Submit
+// returned, after any acceptance, so it already covers that. A run whose acceptance
+// is unknown must be held until the latest moment the backend could have accepted
+// it, plus the run's deadline:
+const (
+	// submitTimeout bounds one ingest Submit (dispatchIngest), so a dispatch window
+	// is bounded however the caller's request goes.
+	submitTimeout = 30 * time.Second
+	// acceptGrace covers a backend still finishing a dispatch request after gofer
+	// stopped waiting for its answer.
+	acceptGrace = time.Minute
+	// holdUncertain: a reservation whose Submit returned without saying whether
+	// the backend accepted it is held this long from when Submit returned.
+	holdUncertain = acceptGrace + ingestDeadline
+	// holdPending: a reservation whose Submit had not returned when gofer last
+	// recorded it (a restart mid-dispatch) is held this long from the reservation:
+	// recording it, then the whole Submit, then holdUncertain.
+	holdPending = ledgerTimeout + submitTimeout + holdUncertain
+)
 
 // gate is the in-flight policy for one kind of run.
 type gate struct {
@@ -145,7 +183,8 @@ func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 		return
 	}
 	if key.task == taskIngest && !errors.Is(err, ErrNotAccepted) {
-		mine.uncertain = true // its deadline runs from the reservation
+		mine.uncertain = true
+		mine.until = time.Now().Add(holdUncertain)
 		mine.prev = nil
 		return
 	}

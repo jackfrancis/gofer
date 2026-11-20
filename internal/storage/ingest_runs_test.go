@@ -21,7 +21,7 @@ func TestIngestRunsPersist(t *testing.T) {
 	if err := s.PutIngestRun(ctx, "github:1", ingest.IngestRecord{Gen: 1, RunGen: 1, Pending: true, RunAt: at}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PutIngestRun(ctx, "github:1", ingest.IngestRecord{Gen: 2, Done: 1, RunGen: 2, RunID: "run-2", RunAt: at.Add(time.Minute)}); err != nil {
+	if err := s.PutIngestRun(ctx, "github:1", ingest.IngestRecord{Gen: 2, Done: 1, RunGen: 2, RunID: "run-2", RunAt: at.Add(time.Minute), RunUntil: at.Add(11 * time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.PutIngestRun(ctx, "github:2", ingest.IngestRecord{Gen: 7, Done: 7}); err != nil {
@@ -39,7 +39,7 @@ func TestIngestRunsPersist(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]ingest.IngestRecord{
-		"github:1": {Gen: 2, Done: 1, RunGen: 2, RunID: "run-2", RunAt: at.Add(time.Minute)},
+		"github:1": {Gen: 2, Done: 1, RunGen: 2, RunID: "run-2", RunAt: at.Add(time.Minute), RunUntil: at.Add(11 * time.Minute)},
 		"github:2": {Gen: 7, Done: 7},
 	}
 	if len(got) != len(want) {
@@ -47,7 +47,7 @@ func TestIngestRunsPersist(t *testing.T) {
 	}
 	for o, w := range want {
 		g := got[o]
-		if g.Gen != w.Gen || g.Done != w.Done || g.RunGen != w.RunGen || g.RunID != w.RunID || g.Pending != w.Pending || !g.RunAt.Equal(w.RunAt) {
+		if g.Gen != w.Gen || g.Done != w.Done || g.RunGen != w.RunGen || g.RunID != w.RunID || g.Pending != w.Pending || !g.RunAt.Equal(w.RunAt) || !g.RunUntil.Equal(w.RunUntil) {
 			t.Fatalf("%s: got %+v, want %+v", o, g, w)
 		}
 	}

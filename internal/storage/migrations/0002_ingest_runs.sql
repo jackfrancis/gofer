@@ -9,5 +9,6 @@ CREATE TABLE ingest_runs (
     run_gen  INTEGER NOT NULL,          -- the current run's generation; 0 if none
     run_id   TEXT    NOT NULL,          -- its runtime id; '' while acceptance is unknown
     run_at   INTEGER NOT NULL,          -- reserved, or accepted once it was (Unix nanoseconds)
-    pending  INTEGER NOT NULL           -- 1: whether the runtime accepted it is not known
+    pending  INTEGER NOT NULL,          -- 1: whether the runtime accepted it is not known
+    run_until INTEGER NOT NULL          -- when it stops counting as in flight however it went (Unix nanoseconds)
 );
