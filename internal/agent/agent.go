@@ -321,10 +321,14 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 	if len(items) > limit {
 		// Spend the model budget on the items the cheap, deterministic scorer already
 		// rates highest rather than on an arbitrary slice. enrich has just run, so those
-		// baselines are computed from complete signals.
+		// baselines are computed from complete signals. The baseline ignores an item's
+		// previous model proposal: that proposal is what this pass replaces, and it may
+		// rest on a classification since changed (e.g. a requester removed from
+		// BOT_REVIEWERS), so it must not keep the item out of the pass.
 		now := time.Now().UTC()
 		baseline := make(map[string]float64, len(items))
 		for _, it := range items {
+			it.Signals.Proposed = nil // it is a copy
 			baseline[it.ID] = worklist.Score(it, now).Rank
 		}
 		slices.SortStableFunc(items, func(a, b worklist.WorkItem) int {

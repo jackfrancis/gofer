@@ -91,3 +91,41 @@ func TestRankClassifiesStoredItemsByCurrentPolicy(t *testing.T) {
 		t.Fatalf("stored after rank: %+v", items)
 	}
 }
+
+// When the worklist exceeds the rank limit, candidates are chosen by their current
+// baseline, not by a previous proposal: after a requester leaves BOT_REVIEWERS, a
+// now-human request whose stale proposal is low still takes the slot.
+func TestRankSelectionIgnoresStaleProposal(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	store := worklist.NewMemoryStore()
+	stale := worklist.AxisProposal{Relevance: 0.3, Impact: 0.3, Engagement: 0.3, Urgency: 0.3, Confidence: 1}
+	store.Seed("u1",
+		// Was a bot request, ranked low; alice is no longer a configured bot.
+		worklist.WorkItem{ID: "now-human", OwnerID: "u1", Signals: worklist.Signals{
+			Reasons: []worklist.Reason{worklist.ReasonReviewRequested}, ReviewRequestedBy: "alice",
+			ReviewRequestedByBot: true, AwaitingMeSince: now.Add(-5 * 24 * time.Hour), Proposed: &stale}},
+		// Baseline 0.465 (assignee, priority/p1), no proposal.
+		worklist.WorkItem{ID: "assigned", OwnerID: "u1", Signals: worklist.Signals{
+			Reasons: []worklist.Reason{worklist.ReasonAssignee}, Labels: []string{"priority/p1"}}},
+	)
+	sink := NewStoreSink(store, "u1").WithPolicy(worklist.NewRunPolicy(nil))
+
+	for pass := 1; pass <= 2; pass++ {
+		ranker := &recordingRanker{seen: map[string]worklist.WorkItem{}}
+		if err := runRank(ctx, Params{Ranker: ranker, RankLimit: 1}, sink); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := ranker.seen["now-human"]; !ok || len(ranker.seen) != 1 {
+			t.Fatalf("pass %d ranked %v, want only now-human", pass, keys(ranker.seen))
+		}
+	}
+}
+
+func keys(m map[string]worklist.WorkItem) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}

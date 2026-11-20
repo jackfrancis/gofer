@@ -1,6 +1,9 @@
 package worklist
 
-import "strings"
+import (
+	"context"
+	"strings"
+)
 
 // RunPolicy holds the web tier's rules for a run's write-back that the workload
 // does not decide: it reports facts, and gofer classifies them. Apply it to a run's
@@ -55,4 +58,26 @@ func (p RunPolicy) Classify(items []WorkItem) {
 	for i := range items {
 		items[i].Signals.ReviewRequestedByBot = p.IsBot(items[i].Signals.ReviewRequestedBy)
 	}
+}
+
+// ClassifyReads returns s with List classified by the policy (Classify), so the
+// user's own reads score an item by the same bot list as the agent plane's: the
+// radar's rank and the one Discuss explains agree even for an item stored before an
+// upgrade or a change to BOT_REVIEWERS. Writes pass through unchanged.
+func (p RunPolicy) ClassifyReads(s Store) Store {
+	return classifiedStore{Store: s, policy: p}
+}
+
+type classifiedStore struct {
+	Store
+	policy RunPolicy
+}
+
+func (c classifiedStore) List(ctx context.Context, ownerID string) ([]WorkItem, error) {
+	items, err := c.Store.List(ctx, ownerID)
+	if err != nil {
+		return nil, err
+	}
+	c.policy.Classify(items)
+	return items, nil
 }

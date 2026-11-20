@@ -138,3 +138,44 @@ func TestRunPolicyClassifyLeavesOrigin(t *testing.T) {
 		t.Fatalf("Classify: bot=%v origin=%q", items[0].Signals.ReviewRequestedByBot, items[0].Meta.Origin)
 	}
 }
+
+// The user's reads classify by the current bot list before Resolve rescores, so the
+// radar shows the rank Discuss explains (the agent plane classifies the same way)
+// for an item stored before the policy, with a stale flag and no proposal.
+func TestClassifyReadsRadarMatchesAgentPlane(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 3, 10, 0, 0, 0, 0, time.UTC)
+	store := NewMemoryStore()
+	store.Seed("u1", WorkItem{
+		ID: "github:o/r#1", OwnerID: "u1", GitHub: GitHubRef{Number: 1, Repo: "o/r", UpdatedAt: now},
+		Signals: Signals{
+			Reasons:           []Reason{ReasonReviewRequested},
+			ReviewRequestedBy: "k8s-ci-robot", // stored flag: false (predates the policy)
+			AwaitingMeSince:   now.Add(-5 * 24 * time.Hour),
+		},
+		Meta: Metadata{Origin: OriginAgent},
+	})
+	policy := NewRunPolicy([]string{"k8s-ci-robot"})
+
+	res, err := Resolve(ctx, policy.ClassifyReads(store), nil, now, "u1", SortRank, true)
+	if err != nil || len(res.Items) != 1 {
+		t.Fatalf("Resolve = (%+v, %v)", res, err)
+	}
+	radar := res.Items[0].Meta
+
+	agentView, _ := store.List(ctx, "u1")
+	policy.Classify(agentView) // what GET /agent/worklist serves Discuss
+	discuss := Score(agentView[0], now)
+	if radar.Rank != discuss.Rank || radar.Urgency != botReviewUrgency {
+		t.Fatalf("radar rank %v (urgency %v), Discuss rank %v; want equal and bot-discounted", radar.Rank, radar.Urgency, discuss.Rank)
+	}
+
+	// Reads are classified; the stored item is not rewritten.
+	stored, _ := store.List(ctx, "u1")
+	if stored[0].Signals.ReviewRequestedByBot {
+		t.Error("ClassifyReads wrote the store")
+	}
+	if err := policy.ClassifyReads(store).Update(ctx, "u1", func(cur []WorkItem) ([]WorkItem, error) { return nil, nil }); err != nil {
+		t.Errorf("Update through the wrapper: %v", err)
+	}
+}
