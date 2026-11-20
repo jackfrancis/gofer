@@ -87,6 +87,11 @@ type ResearchAdjustment struct {
 	// shown alongside (ResearchReflectsVisibleThread). Empty on research stored
 	// before it recorded them, and on research that read no turns.
 	Turns []string `json:"turns,omitempty"`
+	// GitHubUpdatedAt is the item's GitHub UpdatedAt as the research read it, so a
+	// GitHub update stored after the research read the item (a refresh landing while
+	// the model worked) still makes the research stale (ResearchStale), however late
+	// the research was applied. Zero on research stored before it recorded it.
+	GitHubUpdatedAt time.Time `json:"github_updated_at,omitzero"`
 }
 
 // Multipliers returns the per-axis factors Score actually applies: each bounded to

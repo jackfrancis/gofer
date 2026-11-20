@@ -74,6 +74,8 @@ type Refresher struct {
 	items    ItemLister
 	research ScheduledResearcher
 	passes   uint64
+	// ticks counts Ticks, to alternate which pass goes first (Tick).
+	ticks uint64
 
 	// served records, per owner, when a pass last settled its refresh (submitted, or
 	// shared with a run already in flight), as a sequence number. Each pass goes
@@ -130,10 +132,7 @@ func (r *Refresher) loop() {
 		case <-r.stop:
 			return
 		case <-t.C:
-			r.RefreshOnce(ctx)
-			if r.research != nil {
-				r.ResearchOnce(ctx)
-			}
+			r.Tick(ctx)
 		}
 	}
 }
@@ -143,6 +142,29 @@ func (r *Refresher) loop() {
 func (r *Refresher) Stop() {
 	r.stopOnce.Do(func() { close(r.stop) })
 	<-r.done
+}
+
+// Tick runs one scheduled pass: the refresh pass, and with WithResearch the research
+// pass. The two take turns going first, so when the runtime's capacity runs out
+// within a tick (AEI's queue full), neither kind of run is left waiting behind the
+// other tick after tick: whichever went second gets the first slots next time.
+// Exported for tests.
+func (r *Refresher) Tick(ctx context.Context) {
+	if r.research == nil {
+		r.RefreshOnce(ctx)
+		return
+	}
+	r.mu.Lock()
+	researchFirst := r.ticks%2 == 1
+	r.ticks++
+	r.mu.Unlock()
+	if researchFirst {
+		r.ResearchOnce(ctx)
+		r.RefreshOnce(ctx)
+		return
+	}
+	r.RefreshOnce(ctx)
+	r.ResearchOnce(ctx)
 }
 
 // RefreshOnce requests a refresh for every GitHub owner with stored work and reports
@@ -161,18 +183,8 @@ func (r *Refresher) RefreshOnce(ctx context.Context) int {
 		if ctx.Err() != nil {
 			break
 		}
-		if ownerProvider(owner) != refreshProvider {
+		if ownerProvider(owner) != refreshProvider || !r.allowed(ctx, owner, "scheduled refresh") {
 			continue
-		}
-		if r.eligible != nil {
-			ok, err := r.eligible.ScheduledRunAllowed(ctx, owner, refreshProvider)
-			if err != nil {
-				r.log.Warn("scheduled refresh: eligibility", "owner", owner, "err", err)
-				continue
-			}
-			if !ok {
-				continue
-			}
 		}
 		ok, err := r.ing.ScheduledRefresh(ctx, owner)
 		if err != nil {
@@ -217,18 +229,8 @@ func (r *Refresher) ResearchOnce(ctx context.Context) int {
 		if ctx.Err() != nil {
 			return 0
 		}
-		if ownerProvider(owner) != refreshProvider {
+		if ownerProvider(owner) != refreshProvider || !r.allowed(ctx, owner, "scheduled research") {
 			continue
-		}
-		if r.eligible != nil {
-			ok, err := r.eligible.ScheduledRunAllowed(ctx, owner, refreshProvider)
-			if err != nil {
-				r.log.Warn("scheduled research: eligibility", "owner", owner, "err", err)
-				continue
-			}
-			if !ok {
-				continue
-			}
 		}
 		items, err := r.items.List(ctx, owner)
 		if err != nil {
@@ -261,15 +263,24 @@ func (r *Refresher) ResearchOnce(ctx context.Context) int {
 	queues = append(queues[start:], queues[:start]...)
 
 	var submitted int
+	dropped := map[string]bool{}
 	for round := 0; ; round++ {
 		more := false
 		for _, q := range queues {
-			if round >= len(q.items) {
+			if round >= len(q.items) || dropped[q.owner] {
 				continue
 			}
 			more = true
 			if ctx.Err() != nil {
 				return submitted
+			}
+			// Confirm the owner again right before each run: the queues were built
+			// before any dispatch, and an owner who signed out since must get no more
+			// runs. Research vends no GitHub credential, so signing out would not stop
+			// it from sending the stored discussion to the model.
+			if !r.allowed(ctx, q.owner, "scheduled research") {
+				dropped[q.owner] = true
+				continue
 			}
 			ok, err := r.research.ScheduledResearch(ctx, q.owner, q.items[round])
 			if err != nil {
@@ -287,6 +298,20 @@ func (r *Refresher) ResearchOnce(ctx context.Context) int {
 	}
 	r.logResearch(submitted)
 	return submitted
+}
+
+// allowed reports whether the Eligibility confirms owner now; a read error is logged
+// (under pass) and refuses. Without an Eligibility (tests) every owner is allowed.
+func (r *Refresher) allowed(ctx context.Context, owner, pass string) bool {
+	if r.eligible == nil {
+		return true
+	}
+	ok, err := r.eligible.ScheduledRunAllowed(ctx, owner, refreshProvider)
+	if err != nil {
+		r.log.Warn(pass+": eligibility", "owner", owner, "err", err)
+		return false
+	}
+	return ok
 }
 
 func (r *Refresher) logResearch(submitted int) {

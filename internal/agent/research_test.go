@@ -126,15 +126,14 @@ func TestFailedPostReplyResearchIsRetriedWithoutASecondReply(t *testing.T) {
 		t.Fatal("an item whose post-reply research failed must be stale")
 	}
 
-	cr := &capturingResearcher{adj: worklist.ResearchAdjustment{Relevance: 1.4, Impact: 1, Engagement: 1, Urgency: 1, Turns: []string{"u1"}}}
-	if err := Run(context.Background(), Params{JobType: JobResearch, ItemID: "github:o/r#1", Researcher: cr}, fakeVendor{}, sink); err != nil {
+	if err := Run(context.Background(), Params{JobType: JobResearch, ItemID: "github:o/r#1", Researcher: turnsResearcher{}}, fakeVendor{}, sink); err != nil {
 		t.Fatal(err)
 	}
 	got := sink.items[0]
 	if sink.replies != 1 || len(got.Thread) != 2 {
 		t.Fatalf("the retry added a turn: %d replies, thread %+v", sink.replies, got.Thread)
 	}
-	if got.Signals.Research == nil || got.Signals.Research.Relevance != 1.4 {
+	if got.Signals.Research == nil || got.Signals.Research.Relevance != 1.5 {
 		t.Fatalf("research not set by the retry: %+v", got.Signals.Research)
 	}
 	if worklist.ResearchStale(got) {
@@ -162,5 +161,57 @@ func TestRunResearchWithholdsHiddenTurns(t *testing.T) {
 	}
 	if len(cr.got.Thread) != 1 {
 		t.Fatalf("want the one visible turn, got %+v", cr.got.Thread)
+	}
+}
+
+// Research run with a turn hidden is current; unhiding that turn makes it stale, so
+// the restored evidence is reconsidered without any other activity.
+func TestResearchIsStaleOnceAHiddenTurnIsUnhidden(t *testing.T) {
+	now := time.Now().UTC()
+	sink := &memSink{items: []worklist.WorkItem{{
+		ID:     "github:o/r#1",
+		GitHub: worklist.GitHubRef{UpdatedAt: now.Add(-time.Hour)},
+		Thread: []worklist.Message{
+			{ID: "u1", Role: worklist.RoleUser, Content: "q", At: now.Add(-3 * time.Minute)},
+			{ID: "u2", Role: worklist.RoleUser, Content: "withdrawn", At: now.Add(-2 * time.Minute), Hidden: true},
+			{ID: "a1", Role: worklist.RoleAgent, Content: "a", ReplyTo: "u1", At: now.Add(-time.Minute)},
+		},
+	}}}
+	if err := Run(context.Background(), Params{JobType: JobResearch, ItemID: "github:o/r#1", Researcher: turnsResearcher{}}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if worklist.ResearchStale(sink.items[0]) {
+		t.Fatalf("fresh research is stale: %+v", sink.items[0].Signals.Research)
+	}
+	sink.items[0].Thread[1].Hidden = false // the owner unhides u2
+	if !worklist.ResearchStale(sink.items[0]) {
+		t.Fatal("research that never read an unhidden turn must be stale")
+	}
+}
+
+// A research run records the GitHub version it read, so a refresh that lands while
+// the model works (an update older than the research's AppliedAt) still makes it
+// stale.
+func TestResearchIsStaleAfterARefreshLandsDuringIt(t *testing.T) {
+	read := time.Now().UTC().Add(-time.Hour)
+	githubChange := time.Now().UTC().Add(-time.Minute) // before the research is applied
+	sink := &memSink{items: []worklist.WorkItem{{
+		ID:     "github:o/r#1",
+		GitHub: worklist.GitHubRef{UpdatedAt: read},
+		Thread: []worklist.Message{{ID: "u1", Role: worklist.RoleUser, Content: "q", At: read}},
+	}}}
+	fr := &sideEffectResearcher{
+		adj:    worklist.ResearchAdjustment{Relevance: 1, Impact: 1, Engagement: 1, Urgency: 1, Turns: []string{"u1"}},
+		during: func() { sink.items[0].GitHub.UpdatedAt = githubChange },
+	}
+	if err := Run(context.Background(), Params{JobType: JobResearch, ItemID: "github:o/r#1", Researcher: fr}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	r := sink.items[0].Signals.Research
+	if r == nil || !r.GitHubUpdatedAt.Equal(read) || !r.AppliedAt.After(githubChange) {
+		t.Fatalf("want research applied after the change, recording the version it read; got %+v", r)
+	}
+	if !worklist.ResearchStale(sink.items[0]) {
+		t.Fatal("research that never saw the GitHub change must be stale")
 	}
 }

@@ -187,7 +187,7 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 			p.logger().Warn("converse: reply saved; research failed", "item", item.ID, "err", rerr)
 			return nil
 		}
-		if err := sink.Research(ctx, item.ID, stampResearch(adj)); err != nil {
+		if err := sink.Research(ctx, item.ID, stampResearch(adj, latest)); err != nil {
 			return fmt.Errorf("research: %w", err)
 		}
 	}

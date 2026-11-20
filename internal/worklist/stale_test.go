@@ -14,6 +14,10 @@ func TestResearchStale(t *testing.T) {
 	turn := func(id, role string, m int, hidden bool) Message {
 		return Message{ID: id, Role: role, Content: id, At: at(m), Hidden: hidden}
 	}
+	withRead := func(r *ResearchAdjustment, github time.Time) *ResearchAdjustment {
+		r.GitHubUpdatedAt = github
+		return r
+	}
 	answered := []Message{turn("u1", RoleUser, 1, false), turn("a1", RoleAgent, 2, false)}
 
 	cases := []struct {
@@ -37,6 +41,20 @@ func TestResearchStale(t *testing.T) {
 			Signals: Signals{Research: research(4, "u1", "a1", "u2")}}, true},
 		{"legacy research without turns is judged by time", WorkItem{Thread: answered,
 			Signals: Signals{Research: research(3)}}, false},
+		{"a GitHub update stored after the research read the item", WorkItem{GitHub: GitHubRef{UpdatedAt: at(3)}, Thread: answered,
+			Signals: Signals{Research: withRead(research(5, "u1", "a1"), at(0))}}, true},
+		{"the GitHub version the research read", WorkItem{GitHub: GitHubRef{UpdatedAt: at(3)}, Thread: answered,
+			Signals: Signals{Research: withRead(research(5, "u1", "a1"), at(3))}}, false},
+		{"a turn posted while the research ran", WorkItem{Thread: append(append([]Message{}, answered...), turn("u2", RoleUser, 4, false)),
+			Signals: Signals{Research: withRead(research(5, "u1", "a1"), at(0))}}, true},
+		{"a turn unhidden since the research", WorkItem{Thread: []Message{
+			turn("u1", RoleUser, 1, false), turn("u2", RoleUser, 2, false), turn("a1", RoleAgent, 3, false)},
+			Signals: Signals{Research: withRead(research(5, "u1", "a1"), at(0))}}, true},
+		{"older turns left out of a bounded read", WorkItem{Thread: []Message{
+			turn("old1", RoleUser, 0, false), turn("old2", RoleAgent, 0, false), turn("u1", RoleUser, 1, false), turn("a1", RoleAgent, 2, false)},
+			Signals: Signals{Research: withRead(research(5, "u1", "a1"), at(0))}}, false},
+		{"research that read no turn, now with one", WorkItem{Thread: answered,
+			Signals: Signals{Research: withRead(research(5), at(0))}}, true},
 		{"hidden item", WorkItem{Thread: answered, Meta: Metadata{HiddenAt: at(4)}}, false},
 		{"closed item", WorkItem{Thread: answered, Meta: Metadata{CompletedAt: at(4)}}, false},
 		{"human override", WorkItem{Thread: answered, Meta: Metadata{Origin: OriginUser}}, false},

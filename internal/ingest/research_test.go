@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -226,5 +227,168 @@ func TestResearchOnceOffWithoutResearch(t *testing.T) {
 	r := NewRefresher(store, New(d, "", "", nil, "e", "m"), nil, time.Hour, nil)
 	if n := r.ResearchOnce(context.Background()); n != 0 || d.count() != 0 {
 		t.Fatalf("research ran without WithResearch: %d", n)
+	}
+}
+
+// switchEligibility answers ScheduledRunAllowed from a set of refused owners that a
+// test may change mid-pass.
+type switchEligibility struct {
+	mu      sync.Mutex
+	refused map[string]bool
+}
+
+func (e *switchEligibility) ScheduledRunAllowed(_ context.Context, userID, _ string) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return !e.refused[userID], nil
+}
+
+func (e *switchEligibility) refuse(owner string) {
+	e.mu.Lock()
+	e.refused[owner] = true
+	e.mu.Unlock()
+}
+
+// logoutAfterFirst dispatches through ig, and signs owner out once its first
+// research run is submitted.
+type logoutAfterFirst struct {
+	ig    *Ingestor
+	elig  *switchEligibility
+	owner string
+}
+
+func (l logoutAfterFirst) ScheduledResearch(ctx context.Context, ownerID, itemID string) (bool, error) {
+	ok, err := l.ig.ScheduledResearch(ctx, ownerID, itemID)
+	if ownerID == l.owner && ok {
+		l.elig.refuse(ownerID)
+	}
+	return ok, err
+}
+
+// An owner who signs out during a pass gets no more research runs from it: the rest
+// of their queue is dropped, while other owners carry on.
+func TestResearchOnceRechecksEligibilityBeforeEachRun(t *testing.T) {
+	t0 := time.Now().UTC().Add(-time.Hour)
+	store := worklist.NewMemoryStore()
+	store.Seed("github:1", discussed("a1", t0, nil), discussed("a2", t0, nil), discussed("a3", t0, nil))
+	store.Seed("github:2", discussed("b1", t0, nil), discussed("b2", t0, nil))
+	d := &gateDispatcher{phase: "Running"}
+	ig := New(d, "", "", nil, "e", "m")
+	elig := &switchEligibility{refused: map[string]bool{}}
+	r := NewRefresher(store, ig, elig, time.Hour, nil).WithResearch(store, logoutAfterFirst{ig: ig, elig: elig, owner: "github:1"})
+	r.ResearchOnce(context.Background())
+
+	per := map[string]int{}
+	d.mu.Lock()
+	for _, s := range d.specs {
+		per[s.Subject]++
+	}
+	d.mu.Unlock()
+	if per["github:1"] != 1 || per["github:2"] != 2 {
+		t.Fatalf("runs per owner = %v, want github:1 once (then signed out) and github:2 twice", per)
+	}
+}
+
+// queueDispatcher admits up to cap runs, then refuses (ErrNotAccepted) until
+// drain empties the queue, as AEI's bounded queue does. Every run it reports has
+// ended, so nothing in the gate holds a key across ticks.
+type queueDispatcher struct {
+	mu    sync.Mutex
+	cap   int
+	used  int
+	tasks map[string]int
+}
+
+func (d *queueDispatcher) Submit(_ context.Context, spec RunSpec) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.used >= d.cap {
+		return "", ErrNotAccepted
+	}
+	d.used++
+	d.tasks[spec.TaskRef]++
+	return spec.TaskRef + "-" + spec.Subject + "-" + spec.Parameters["item"] + "-" + time.Now().String(), nil
+}
+
+func (d *queueDispatcher) Status(context.Context, string) (RunStatus, error) {
+	return RunStatus{Phase: "Succeeded"}, nil
+}
+
+func (d *queueDispatcher) drain() {
+	d.mu.Lock()
+	d.used = 0
+	d.mu.Unlock()
+}
+
+// When refreshes alone fill the runtime's capacity every tick, research still gets
+// its turn: the two passes alternate going first.
+func TestTickResearchIsNotStarvedByRefresh(t *testing.T) {
+	t0 := time.Now().UTC().Add(-time.Hour)
+	store := worklist.NewMemoryStore()
+	store.Seed("github:1", discussed("a", t0, nil))
+	store.Seed("github:2", discussed("b", t0, nil))
+	d := &queueDispatcher{cap: 2, tasks: map[string]int{}}
+	ig := New(d, "", "", nil, "e", "m")
+	r := NewRefresher(store, ig, nil, time.Hour, nil).WithResearch(store, ig)
+	for range 4 {
+		r.Tick(context.Background())
+		d.drain()
+	}
+	if d.tasks[taskResearch] == 0 || d.tasks[taskIngest] == 0 {
+		t.Fatalf("one kind of run was starved over four ticks: %v", d.tasks)
+	}
+}
+
+// ambiguousDispatcher fails every Submit without saying whether the backend
+// accepted the run, as a lost response does, and counts the attempts.
+type ambiguousDispatcher struct {
+	mu       sync.Mutex
+	attempts int
+	err      error
+}
+
+func (d *ambiguousDispatcher) Submit(context.Context, RunSpec) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.attempts++
+	return "", d.err
+}
+
+func (d *ambiguousDispatcher) Status(context.Context, string) (RunStatus, error) {
+	return RunStatus{Phase: "Running"}, nil
+}
+
+// A research dispatch whose acceptance is unknown keeps the item reserved until the
+// run could no longer be running, so the next tick does not start a second model
+// call for it. A definite refusal frees the item at once.
+func TestScheduledResearchHoldsAnUncertainDispatch(t *testing.T) {
+	ctx := context.Background()
+	d := &ambiguousDispatcher{err: errors.New("dispatch response lost")}
+	ig := New(d, "", "", nil, "e", "m")
+	if _, err := ig.ScheduledResearch(ctx, "github:1", "a"); err == nil {
+		t.Fatal("want the dispatch error")
+	}
+	if ok, err := ig.ScheduledResearch(ctx, "github:1", "a"); ok || err != nil || d.attempts != 1 {
+		t.Fatalf("an uncertain research dispatch was retried at once: ok=%v err=%v attempts=%d", ok, err, d.attempts)
+	}
+	key := runKey{owner: "github:1", task: taskResearch, item: "a"}
+	ig.mu.Lock()
+	held := ig.runs[key]
+	if held == nil || !held.uncertain || held.until.Sub(time.Now()) < researchDeadline {
+		ig.mu.Unlock()
+		t.Fatalf("want the item held past the research deadline, got %+v", held)
+	}
+	held.until = time.Now().Add(-time.Second) // the hold has run out
+	ig.mu.Unlock()
+	if _, err := ig.ScheduledResearch(ctx, "github:1", "a"); err == nil || d.attempts != 2 {
+		t.Fatalf("an expired hold must allow a new dispatch: attempts=%d", d.attempts)
+	}
+
+	refused := &ambiguousDispatcher{err: ErrNotAccepted}
+	ig2 := New(refused, "", "", nil, "e", "m")
+	_, _ = ig2.ScheduledResearch(ctx, "github:1", "a")
+	_, _ = ig2.ScheduledResearch(ctx, "github:1", "a")
+	if refused.attempts != 2 {
+		t.Fatalf("a definite refusal must free the item at once: attempts=%d", refused.attempts)
 	}
 }

@@ -259,7 +259,8 @@ func TestAgentResearch(t *testing.T) {
 		Thread:  []worklist.Message{{ID: "q1", Role: worklist.RoleUser, Content: "q"}},
 	})
 	full := f.mint("signals:read", "metadata:write")
-	adj := worklist.ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 0.5, Rationale: "discussed", AppliedAt: time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC), Turns: []string{"q1"}}
+	read := time.Date(2026, 11, 17, 8, 30, 0, 0, time.UTC)
+	adj := worklist.ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 0.5, Rationale: "discussed", AppliedAt: time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC), Turns: []string{"q1"}, GitHubUpdatedAt: read}
 
 	srv := httptest.NewServer(f.research)
 	defer srv.Close()
@@ -271,6 +272,9 @@ func TestAgentResearch(t *testing.T) {
 	it := got[0]
 	if r := it.Signals.Research; r == nil || !r.AppliedAt.Equal(adj.AppliedAt) || r.Relevance != 1.5 || r.Rationale != "discussed" || len(r.Turns) != 1 || r.Turns[0] != "q1" {
 		t.Fatalf("the adjustment must land, got %+v", it.Signals.Research)
+	}
+	if !it.Signals.Research.GitHubUpdatedAt.Equal(read) {
+		t.Fatalf("the GitHub version the research read must land, got %v", it.Signals.Research.GitHubUpdatedAt)
 	}
 	if it.GitHub.Title != "Refreshed title" || it.GitHub.State != "closed" || it.Signals.Comments != 9 || it.Signals.Proposed == nil || len(it.Thread) != 1 {
 		t.Fatalf("everything but the adjustment must stay as stored, got %+v", it)

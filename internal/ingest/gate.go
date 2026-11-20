@@ -39,9 +39,9 @@ type run struct {
 	g       gate      // the policy the run was reserved under
 	pending bool      // reserved; Submit has not returned yet
 	gen     uint64    // ingest only: the owner's refresh generation, taken when reserved
-	// uncertain (ingest only): Submit failed without saying the backend refused
-	// (ErrNotAccepted), so a run may exist that gofer cannot probe. It holds the key,
-	// and counts as in flight, until its deadline.
+	// uncertain (ingest and research): Submit failed without saying the backend
+	// refused (ErrNotAccepted), so a run may exist that gofer cannot probe. It holds
+	// the key, and counts as in flight, until its deadline (uncertainHold).
 	uncertain bool
 	// until, when set, is the run's deadline instead of at + the gate's ttl: for a
 	// run whose acceptance is unknown, the latest moment it could still be running
@@ -178,9 +178,9 @@ func (i *Ingestor) reserve(ctx context.Context, key runKey, g gate) (mine *run, 
 // key's current run (see reserve). When the backend did not accept the run
 // (ErrNotAccepted) the key goes back to the run mine replaced, so the read model
 // still knows how the previous run ended. Any other error leaves acceptance unknown:
-// for ingest the reservation stays, uncertain, until its deadline, because a second
-// ingest started now could land out of order with one the backend did accept. A
-// converse turn is rolled back either way; the store keeps one answer per turn.
+// for ingest and research the reservation stays, uncertain, for uncertainHold,
+// because the backend may be running it. A converse turn is rolled back either way;
+// the store keeps one answer per turn.
 func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -193,9 +193,9 @@ func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 		mine.prev = nil // never rolled back now
 		return
 	}
-	if key.task == taskIngest && !errors.Is(err, ErrNotAccepted) {
+	if hold := uncertainHold(key.task); hold > 0 && !errors.Is(err, ErrNotAccepted) {
 		mine.uncertain = true
-		mine.until = time.Now().Add(holdUncertain)
+		mine.until = time.Now().Add(hold)
 		mine.prev = nil
 		return
 	}
@@ -209,6 +209,22 @@ func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 	} else {
 		i.runs[key] = p
 	}
+}
+
+// uncertainHold is how long a reservation whose Submit failed without saying the
+// backend refused it is held: for ingest, holdUncertain (a second ingest could land
+// out of order); for research, until the run the backend may have accepted could
+// still be making its model call, so a later tick does not pay for a second one. A
+// converse turn is released at once (0): the user is waiting, and the store keeps one
+// answer per turn.
+func uncertainHold(task string) time.Duration {
+	switch task {
+	case taskIngest:
+		return holdUncertain
+	case taskResearch:
+		return acceptGrace + researchDeadline
+	}
+	return 0
 }
 
 // markDoneLocked records that r, an ingest run for key's owner, has ended (failed,
