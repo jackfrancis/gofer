@@ -294,6 +294,30 @@ Wired on the web-tier side; they define what a runtime must respect:
 - Each pass of the scheduled refresh goes least recently served first, so an owner
   whose submission failed (AEI's queue full) goes first on the next pass and owners
   share a capacity limit evenly.
+- With a default chat model configured, each scheduled tick also runs the research
+  pass (`Refresher.ResearchOnce`, on the same `REFRESH_INTERVAL`, for the same
+  confirmed owners): a github-research run (`Ingestor.ScheduledResearch`) for every
+  item `worklist.ResearchStale` reports: on the radar, no human override, at least
+  one visible turn, and research missing or no longer matching what it read. Judge
+  research by what it READ, never by when it was applied (a refresh or a new turn
+  can land while the model works): the GitHub version it read
+  (`ResearchAdjustment.GitHubUpdatedAt`, stamped by `agent.stampResearch`) against
+  the stored one, and its `Turns` against the thread (a read turn gone or hidden, or
+  a turn in the window a research run would read now, `ThreadWindow` with no turn as
+  `ReadItem` serves it, left unread: posted or unhidden since; a window holding fewer
+  turns than were read does not count). The refresh and research passes alternate
+  going first each tick (`Refresher.Tick`); within the research pass owners take
+  turns starting after the last owner actually served (`lastResearched`), and
+  eligibility is re-checked right before every research
+  dispatch, since research vends no GitHub credential that a logout would revoke. A
+  research run writes back only the adjustment and never adds a turn, so it is how a
+  failed post-reply adjustment is retried. The gate holds one research run per
+  (owner, item), holds it through a dispatch of unknown acceptance
+  (`uncertainHold`), and skips an item while a Discuss run for it is in flight.
+  Research, like Discuss,
+  never sends a hidden turn to the model: the research read window
+  (`worklist.ThreadWindow` with no turn) and the prompt (`internal/llm/research.go`)
+  both leave hidden turns out, and the adjustment's `Turns` list only what it read.
 - The radar watches a refresh version: the highest generation of an ingest run
   known to have ended (each accepted ingest run takes the owner's next generation).
   `signedInView` reads it BEFORE the items and from local state only

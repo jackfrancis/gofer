@@ -78,8 +78,10 @@ type Config struct {
 
 	// RefreshInterval is how often the web tier requests a GitHub refresh (a
 	// github-ingest run) for every owner with stored work (REFRESH_INTERVAL, a Go
-	// duration such as "15m"). Zero, the default, turns the schedule off: worklists
-	// then refresh only on the Refresh button. Turn it on only against an AEI
+	// duration such as "15m"). With a default chat model, each tick also re-ranks
+	// items whose discussion research is stale (ingest.Refresher.ResearchOnce). Zero,
+	// the default, turns the schedule off: worklists then refresh only on the Refresh
+	// button. Turn it on only against an AEI
 	// control plane that contains provider failures (AEI archive-plan item 11): the
 	// scheduled runs dispatch with nobody watching.
 	RefreshInterval time.Duration

@@ -130,6 +130,9 @@ type researchAdjustment struct {
 	Rationale  string    `json:"rationale"`
 	AppliedAt  time.Time `json:"applied_at"`
 	Turns      []string  `json:"turns"`
+	// GitHubUpdatedAt is the GitHub version the research read (see
+	// worklist.ResearchAdjustment); zero from a runtime that does not send it.
+	GitHubUpdatedAt time.Time `json:"github_updated_at"`
 }
 
 // complete reports whether every multiplier and the stamp are present.
@@ -141,6 +144,7 @@ func (a *researchAdjustment) value() worklist.ResearchAdjustment {
 	return worklist.ResearchAdjustment{
 		Relevance: *a.Relevance, Impact: *a.Impact, Engagement: *a.Engagement, Urgency: *a.Urgency,
 		Rationale: a.Rationale, AppliedAt: a.AppliedAt, Turns: a.Turns,
+		GitHubUpdatedAt: a.GitHubUpdatedAt,
 	}
 }
 

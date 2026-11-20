@@ -1,0 +1,430 @@
+package ingest
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackfrancis/gofer/internal/worklist"
+)
+
+// A research run is a github-research task for one item, carrying the default model,
+// with no turn: it re-weights the ranking and answers nothing.
+func TestScheduledResearchBuildsRunIntent(t *testing.T) {
+	d := &recordDispatcher{}
+	ig := New(d, "gofer-agent", "http://gofer", nil, "https://model", "m1")
+	if !ig.CanResearch() {
+		t.Fatal("CanResearch must be true with a default model")
+	}
+	ok, err := ig.ScheduledResearch(context.Background(), "github:1", "github:o/r#1")
+	if err != nil || !ok {
+		t.Fatalf("ScheduledResearch = %v, %v", ok, err)
+	}
+	if len(d.specs) != 1 {
+		t.Fatalf("want one run, got %d", len(d.specs))
+	}
+	s := d.specs[0]
+	if s.TaskRef != "github-research" || s.Subject != "github:1" || s.Audience != "gofer-agent" || s.Deadline != researchDeadline {
+		t.Fatalf("unexpected run spec %+v", s)
+	}
+	p := s.Parameters
+	if p["item"] != "github:o/r#1" || p["owner"] != "github:1" || p["ai_model"] != "m1" || p["gofer_url"] != "http://gofer" {
+		t.Fatalf("unexpected parameters %v", p)
+	}
+	if _, has := p["turn"]; has {
+		t.Fatalf("a research run must name no turn: %v", p)
+	}
+	if New(d, "", "", nil, "", "").CanResearch() {
+		t.Fatal("CanResearch must be false without a default model")
+	}
+}
+
+// One research run per item while it is in flight; another item runs concurrently;
+// once the run has ended the item may be researched again.
+func TestScheduledResearchGate(t *testing.T) {
+	d := &gateDispatcher{phase: "Running"}
+	ig := New(d, "", "", nil, "e", "m")
+	ctx := context.Background()
+	for range 3 {
+		if _, err := ig.ScheduledResearch(ctx, "github:1", "item-a"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := ig.ScheduledResearch(ctx, "github:1", "item-b"); err != nil {
+		t.Fatal(err)
+	}
+	if d.count() != 2 {
+		t.Fatalf("want one run per item (2), got %d", d.count())
+	}
+	d.set("Failed")
+	if ok, _ := ig.ScheduledResearch(ctx, "github:1", "item-a"); !ok || d.count() != 3 {
+		t.Fatalf("a failed research run must free the item: ok=%v runs=%d", ok, d.count())
+	}
+}
+
+// While a Discuss run for the item is in flight, the schedule leaves research to it:
+// that run researches the thread once its reply lands.
+func TestScheduledResearchWaitsForDiscuss(t *testing.T) {
+	d := &gateDispatcher{phase: "Running"}
+	ig := New(d, "", "", nil, "e", "m")
+	ctx := context.Background()
+	if err := ig.Converse(ctx, "github:1", worklist.TurnRef{Item: "item-a", Turn: "u1"}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := ig.ScheduledResearch(ctx, "github:1", "item-a"); ok || err != nil {
+		t.Fatalf("research dispatched during a Discuss run: ok=%v err=%v", ok, err)
+	}
+	if ok, _ := ig.ScheduledResearch(ctx, "github:1", "item-b"); !ok {
+		t.Fatal("a Discuss run on another item must not hold this one")
+	}
+}
+
+// researchStore returns a store holding items for one owner.
+func researchStore(owner string, items ...worklist.WorkItem) *worklist.MemoryStore {
+	s := worklist.NewMemoryStore()
+	s.Seed(owner, items...)
+	return s
+}
+
+func discussed(id string, at time.Time, research *worklist.ResearchAdjustment) worklist.WorkItem {
+	return worklist.WorkItem{
+		ID:     id,
+		GitHub: worklist.GitHubRef{UpdatedAt: at.Add(-time.Hour)},
+		Thread: []worklist.Message{
+			{ID: id + "/u1", Role: worklist.RoleUser, Content: "q", At: at},
+			{ID: id + "/a1", Role: worklist.RoleAgent, Content: "a", ReplyTo: id + "/u1", At: at.Add(time.Minute)},
+		},
+		Signals: worklist.Signals{Research: research},
+	}
+}
+
+func researchedAtTime(at time.Time, turns ...string) *worklist.ResearchAdjustment {
+	return &worklist.ResearchAdjustment{Relevance: 1, Impact: 1, Engagement: 1, Urgency: 1, AppliedAt: at, Turns: turns}
+}
+
+func researchItems(d *gateDispatcher) []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var out []string
+	for _, s := range d.specs {
+		if s.TaskRef == taskResearch {
+			out = append(out, s.Parameters["item"])
+		}
+	}
+	return out
+}
+
+// The pass dispatches only stale items: one with current research, one with no
+// discussion, and one whose only turns are hidden are left alone.
+func TestResearchOnceSkipsCurrentAndUndiscussed(t *testing.T) {
+	const owner = "github:1"
+	t0 := time.Now().UTC().Add(-time.Hour)
+	current := discussed("current", t0, researchedAtTime(t0.Add(5*time.Minute), "current/u1", "current/a1"))
+	stale := discussed("stale", t0, nil)
+	silent := worklist.WorkItem{ID: "silent", GitHub: worklist.GitHubRef{UpdatedAt: t0}}
+	hidden := worklist.WorkItem{ID: "hidden", Thread: []worklist.Message{{ID: "h1", Role: worklist.RoleUser, Content: "x", At: t0, Hidden: true}}}
+	store := researchStore(owner, current, stale, silent, hidden)
+
+	d := &gateDispatcher{phase: "Running"}
+	ig := New(d, "", "", nil, "e", "m")
+	r := NewRefresher(store, ig, nil, time.Hour, nil).WithResearch(store, ig)
+	if n := r.ResearchOnce(context.Background()); n != 1 {
+		t.Fatalf("ResearchOnce submitted %d runs, want 1", n)
+	}
+	if got := researchItems(d); len(got) != 1 || got[0] != "stale" {
+		t.Fatalf("researched %v, want [stale]", got)
+	}
+}
+
+// A GitHub update after an item's research triggers one re-rank, however many ticks
+// overlap it, and none once the research has caught up.
+func TestResearchOnceLaterGitHubUpdateReranksOnce(t *testing.T) {
+	const owner = "github:1"
+	t0 := time.Now().UTC().Add(-time.Hour)
+	item := discussed("pr", t0, researchedAtTime(t0.Add(5*time.Minute), "pr/u1", "pr/a1"))
+	store := researchStore(owner, item)
+	d := &gateDispatcher{phase: "Running"}
+	ig := New(d, "", "", nil, "e", "m")
+	r := NewRefresher(store, ig, nil, time.Hour, nil).WithResearch(store, ig)
+	ctx := context.Background()
+
+	if n := r.ResearchOnce(ctx); n != 0 {
+		t.Fatalf("current research re-ranked: %d runs", n)
+	}
+
+	// A refresh stores a newer GitHub update.
+	updated := t0.Add(30 * time.Minute)
+	if err := store.Update(ctx, owner, func(cur []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		cur[0].GitHub.UpdatedAt = updated
+		return cur, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() { defer wg.Done(); r.ResearchOnce(ctx) }()
+	}
+	wg.Wait()
+	r.ResearchOnce(ctx) // a later tick while the run is still going
+	if got := researchItems(d); len(got) != 1 || got[0] != "pr" {
+		t.Fatalf("researched %v, want one run for pr", got)
+	}
+
+	// The run writes back its adjustment and ends: nothing more to do.
+	if err := worklist.ApplyResearch(ctx, store, owner, "pr", *researchedAtTime(time.Now().UTC(), "pr/u1", "pr/a1")); err != nil {
+		t.Fatal(err)
+	}
+	d.set("Succeeded")
+	if n := r.ResearchOnce(ctx); n != 0 {
+		t.Fatalf("re-ranked again after the research caught up: %d runs", n)
+	}
+	if got := researchItems(d); len(got) != 1 {
+		t.Fatalf("want exactly one re-rank in all, got %v", got)
+	}
+}
+
+// The pass serves only owners the Eligibility confirms, and none but GitHub's.
+func TestResearchOnceHonoursEligibility(t *testing.T) {
+	t0 := time.Now().UTC().Add(-time.Hour)
+	store := worklist.NewMemoryStore()
+	store.Seed("github:1", discussed("a", t0, nil))
+	store.Seed("github:2", discussed("b", t0, nil))
+	store.Seed("gitlab:3", discussed("c", t0, nil))
+	d := &gateDispatcher{phase: "Running"}
+	ig := New(d, "", "", nil, "e", "m")
+	r := NewRefresher(store, ig, eligibility{"github:2": nil}, time.Hour, nil).WithResearch(store, ig)
+	r.ResearchOnce(context.Background())
+	if got := researchItems(d); len(got) != 1 || got[0] != "a" {
+		t.Fatalf("researched %v, want [a]", got)
+	}
+}
+
+// A dispatch error ends the pass; the next tick carries on with what is left.
+func TestResearchOnceStopsAtADispatchError(t *testing.T) {
+	const owner = "github:1"
+	t0 := time.Now().UTC().Add(-time.Hour)
+	store := researchStore(owner, discussed("a", t0, nil), discussed("b", t0, nil))
+	d := &gateDispatcher{phase: "Running", failNext: true}
+	ig := New(d, "", "", nil, "e", "m")
+	r := NewRefresher(store, ig, nil, time.Hour, nil).WithResearch(store, ig)
+	ctx := context.Background()
+	if n := r.ResearchOnce(ctx); n != 0 || d.count() != 0 {
+		t.Fatalf("pass went on after a dispatch error: %d submitted, %d runs", n, d.count())
+	}
+	if n := r.ResearchOnce(ctx); n != 2 {
+		t.Fatalf("next tick submitted %d, want 2", n)
+	}
+}
+
+// Without WithResearch the pass does nothing.
+func TestResearchOnceOffWithoutResearch(t *testing.T) {
+	t0 := time.Now().UTC().Add(-time.Hour)
+	store := researchStore("github:1", discussed("a", t0, nil))
+	d := &gateDispatcher{phase: "Running"}
+	r := NewRefresher(store, New(d, "", "", nil, "e", "m"), nil, time.Hour, nil)
+	if n := r.ResearchOnce(context.Background()); n != 0 || d.count() != 0 {
+		t.Fatalf("research ran without WithResearch: %d", n)
+	}
+}
+
+// switchEligibility answers ScheduledRunAllowed from a set of refused owners that a
+// test may change mid-pass.
+type switchEligibility struct {
+	mu      sync.Mutex
+	refused map[string]bool
+}
+
+func (e *switchEligibility) ScheduledRunAllowed(_ context.Context, userID, _ string) (bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return !e.refused[userID], nil
+}
+
+func (e *switchEligibility) refuse(owner string) {
+	e.mu.Lock()
+	e.refused[owner] = true
+	e.mu.Unlock()
+}
+
+// logoutAfterFirst dispatches through ig, and signs owner out once its first
+// research run is submitted.
+type logoutAfterFirst struct {
+	ig    *Ingestor
+	elig  *switchEligibility
+	owner string
+}
+
+func (l logoutAfterFirst) ScheduledResearch(ctx context.Context, ownerID, itemID string) (bool, error) {
+	ok, err := l.ig.ScheduledResearch(ctx, ownerID, itemID)
+	if ownerID == l.owner && ok {
+		l.elig.refuse(ownerID)
+	}
+	return ok, err
+}
+
+// An owner who signs out during a pass gets no more research runs from it: the rest
+// of their queue is dropped, while other owners carry on.
+func TestResearchOnceRechecksEligibilityBeforeEachRun(t *testing.T) {
+	t0 := time.Now().UTC().Add(-time.Hour)
+	store := worklist.NewMemoryStore()
+	store.Seed("github:1", discussed("a1", t0, nil), discussed("a2", t0, nil), discussed("a3", t0, nil))
+	store.Seed("github:2", discussed("b1", t0, nil), discussed("b2", t0, nil))
+	d := &gateDispatcher{phase: "Running"}
+	ig := New(d, "", "", nil, "e", "m")
+	elig := &switchEligibility{refused: map[string]bool{}}
+	r := NewRefresher(store, ig, elig, time.Hour, nil).WithResearch(store, logoutAfterFirst{ig: ig, elig: elig, owner: "github:1"})
+	r.ResearchOnce(context.Background())
+
+	per := map[string]int{}
+	d.mu.Lock()
+	for _, s := range d.specs {
+		per[s.Subject]++
+	}
+	d.mu.Unlock()
+	if per["github:1"] != 1 || per["github:2"] != 2 {
+		t.Fatalf("runs per owner = %v, want github:1 once (then signed out) and github:2 twice", per)
+	}
+}
+
+// queueDispatcher admits up to cap runs, then refuses (ErrNotAccepted) until
+// drain empties the queue, as AEI's bounded queue does. Every run it reports has
+// ended, so nothing in the gate holds a key across ticks.
+type queueDispatcher struct {
+	mu    sync.Mutex
+	cap   int
+	used  int
+	tasks map[string]int
+}
+
+func (d *queueDispatcher) Submit(_ context.Context, spec RunSpec) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.used >= d.cap {
+		return "", ErrNotAccepted
+	}
+	d.used++
+	d.tasks[spec.TaskRef]++
+	return spec.TaskRef + "-" + spec.Subject + "-" + spec.Parameters["item"] + "-" + time.Now().String(), nil
+}
+
+func (d *queueDispatcher) Status(context.Context, string) (RunStatus, error) {
+	return RunStatus{Phase: "Succeeded"}, nil
+}
+
+func (d *queueDispatcher) drain() {
+	d.mu.Lock()
+	d.used = 0
+	d.mu.Unlock()
+}
+
+// When refreshes alone fill the runtime's capacity every tick, research still gets
+// its turn: the two passes alternate going first.
+func TestTickResearchIsNotStarvedByRefresh(t *testing.T) {
+	t0 := time.Now().UTC().Add(-time.Hour)
+	store := worklist.NewMemoryStore()
+	store.Seed("github:1", discussed("a", t0, nil))
+	store.Seed("github:2", discussed("b", t0, nil))
+	d := &queueDispatcher{cap: 2, tasks: map[string]int{}}
+	ig := New(d, "", "", nil, "e", "m")
+	r := NewRefresher(store, ig, nil, time.Hour, nil).WithResearch(store, ig)
+	for range 4 {
+		r.Tick(context.Background())
+		d.drain()
+	}
+	if d.tasks[taskResearch] == 0 || d.tasks[taskIngest] == 0 {
+		t.Fatalf("one kind of run was starved over four ticks: %v", d.tasks)
+	}
+}
+
+// ambiguousDispatcher fails every Submit without saying whether the backend
+// accepted the run, as a lost response does, and counts the attempts.
+type ambiguousDispatcher struct {
+	mu       sync.Mutex
+	attempts int
+	err      error
+}
+
+func (d *ambiguousDispatcher) Submit(context.Context, RunSpec) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.attempts++
+	return "", d.err
+}
+
+func (d *ambiguousDispatcher) Status(context.Context, string) (RunStatus, error) {
+	return RunStatus{Phase: "Running"}, nil
+}
+
+// A research dispatch whose acceptance is unknown keeps the item reserved until the
+// run could no longer be running, so the next tick does not start a second model
+// call for it. A definite refusal frees the item at once.
+func TestScheduledResearchHoldsAnUncertainDispatch(t *testing.T) {
+	ctx := context.Background()
+	d := &ambiguousDispatcher{err: errors.New("dispatch response lost")}
+	ig := New(d, "", "", nil, "e", "m")
+	if _, err := ig.ScheduledResearch(ctx, "github:1", "a"); err == nil {
+		t.Fatal("want the dispatch error")
+	}
+	if ok, err := ig.ScheduledResearch(ctx, "github:1", "a"); ok || err != nil || d.attempts != 1 {
+		t.Fatalf("an uncertain research dispatch was retried at once: ok=%v err=%v attempts=%d", ok, err, d.attempts)
+	}
+	key := runKey{owner: "github:1", task: taskResearch, item: "a"}
+	ig.mu.Lock()
+	held := ig.runs[key]
+	if held == nil || !held.uncertain || held.until.Sub(time.Now()) < researchDeadline {
+		ig.mu.Unlock()
+		t.Fatalf("want the item held past the research deadline, got %+v", held)
+	}
+	held.until = time.Now().Add(-time.Second) // the hold has run out
+	ig.mu.Unlock()
+	if _, err := ig.ScheduledResearch(ctx, "github:1", "a"); err == nil || d.attempts != 2 {
+		t.Fatalf("an expired hold must allow a new dispatch: attempts=%d", d.attempts)
+	}
+
+	refused := &ambiguousDispatcher{err: ErrNotAccepted}
+	ig2 := New(refused, "", "", nil, "e", "m")
+	_, _ = ig2.ScheduledResearch(ctx, "github:1", "a")
+	_, _ = ig2.ScheduledResearch(ctx, "github:1", "a")
+	if refused.attempts != 2 {
+		t.Fatalf("a definite refusal must free the item at once: attempts=%d", refused.attempts)
+	}
+}
+
+// With one slot a tick, which refresh takes on refresh-first ticks, owners share
+// research evenly: the owner rotation advances only when an owner is served, not on
+// a pass that submitted nothing.
+func TestResearchOwnersTakeTurnsWhenCapacityIsScarce(t *testing.T) {
+	t0 := time.Now().UTC().Add(-time.Hour)
+	store := worklist.NewMemoryStore()
+	store.Seed("github:1", discussed("a", t0, nil))
+	store.Seed("github:2", discussed("b", t0, nil))
+	d := &queueDispatcher{cap: 1, tasks: map[string]int{}}
+	ig := New(d, "", "", nil, "e", "m")
+	served := map[string]int{}
+	r := NewRefresher(store, ig, nil, time.Hour, nil).WithResearch(store, researchCounter{ig, served})
+	for range 12 {
+		r.Tick(context.Background())
+		d.drain()
+	}
+	a, b := served["github:1"], served["github:2"]
+	if a == 0 || b == 0 || a-b > 1 || b-a > 1 {
+		t.Fatalf("research slots were not shared evenly between owners: %v", served)
+	}
+}
+
+// researchCounter dispatches through ig and counts submitted runs per owner.
+type researchCounter struct {
+	ig     *Ingestor
+	served map[string]int
+}
+
+func (c researchCounter) ScheduledResearch(ctx context.Context, ownerID, itemID string) (bool, error) {
+	ok, err := c.ig.ScheduledResearch(ctx, ownerID, itemID)
+	if ok {
+		c.served[ownerID]++
+	}
+	return ok, err
+}

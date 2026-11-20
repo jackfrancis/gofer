@@ -26,7 +26,9 @@ data:
   # together with the client secrets, then restart gofer-0 (ADR 0007, "Rollout").
   # REFRESH_INTERVAL (a Go duration, at least 1m, e.g. "15m") refreshes every
   # populated worklist from GitHub on that schedule; each refresh is a full ingest
-  # run (GitHub walk, enrich, rank). Absent or "0" turns the schedule off, so
+  # run (GitHub walk, enrich, rank). With a chat model configured, each tick also
+  # re-ranks discussions whose research is stale (one model call per such item).
+  # Absent or "0" turns the schedule off, so
   # worklists refresh only on the Refresh button. Deliberately absent here: set it
   # on the live ConfigMap and restart gofer-0, and only once the cluster's AEI
   # contains provider failures (AEI archive-plan item 11), since scheduled runs

@@ -214,10 +214,20 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// for owners the auth handler confirms (ScheduledRunAllowed: provider configured,
 	// a vendable credential readable, no logout pending, login still allowed). cleanup
 	// stops it before main closes the store.
+	//
+	// When a default chat model is configured, each tick also runs the research pass:
+	// a github-research run for every item whose discussion-derived ranking is stale
+	// (worklist.ResearchStale), for the same confirmed owners.
 	stopRefresh := func() {}
 	if cfg.RefreshInterval > 0 {
 		if owners, ok := store.(worklist.OwnerLister); ok {
 			r := ingest.NewRefresher(owners, ingestor, authH, cfg.RefreshInterval, log)
+			if ingestor.CanResearch() {
+				r.WithResearch(store, ingestor)
+				log.Info("scheduled research enabled", "interval", cfg.RefreshInterval)
+			} else {
+				log.Info("scheduled research disabled: no default chat model (AI_CONNECTIONS)")
+			}
 			r.Start()
 			stopRefresh = r.Stop
 			log.Info("scheduled refresh enabled", "interval", cfg.RefreshInterval)
