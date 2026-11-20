@@ -41,6 +41,12 @@ type Credential struct {
 	// row still holds the version it read, and a run names the version GitHub
 	// rejected. Not a secret. Empty on a row stored before gofer recorded it.
 	Version string
+	// Login is the provider handle of the account that granted the credential (the
+	// GitHub login), recorded at sign-in and kept across refreshes. A run nobody
+	// requested (the scheduled refresh) checks it against ALLOWED_GITHUB_LOGINS, so
+	// removing an account from the allow-list stops those runs too. Not a secret.
+	// Empty on a row stored before gofer recorded it.
+	Login string
 }
 
 // LogoutKey names one pending logout.

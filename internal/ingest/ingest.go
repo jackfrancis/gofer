@@ -90,6 +90,10 @@ type Ingestor struct {
 
 	mu   sync.Mutex
 	runs map[runKey]*run // the most recent run per key: the in-flight gate (gate.go)
+	// gens counts, per owner, the ingest runs the backend has accepted: the refresh
+	// generation a worklist page compares to notice a pass that started after it was
+	// rendered (RefreshState). In memory, like the gate: a restart starts it again.
+	gens map[string]uint64
 }
 
 var (
@@ -106,7 +110,7 @@ func New(d Dispatcher, audience, sinkURL string, log *slog.Logger, aiEndpoint, a
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log, runs: map[runKey]*run{}}
+	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log, runs: map[runKey]*run{}, gens: map[string]uint64{}}
 }
 
 // runParams builds the parameters shared by every dispatched run: the owner, the sink
@@ -155,11 +159,27 @@ func (i *Ingestor) ScheduledRefresh(ctx context.Context, ownerID string) (bool, 
 	return i.dispatchIngest(ctx, ownerID, refreshGate)
 }
 
+// RefreshState reports ownerID's refresh generation (how many ingest runs the
+// backend has accepted for the owner) and whether one is in flight (Active). The
+// worklist page renders both, read before it reads the items, and polls for them
+// (webui.RefreshStatus): a pass that started after the render shows up as a new
+// generation, even when it also ended between two polls. The generation is read
+// first, so a run accepted in between is reported active, never as ended. err is a
+// failed status read; active is then still true until the run's deadline.
+func (i *Ingestor) RefreshState(ctx context.Context, ownerID string) (gen uint64, active bool, err error) {
+	i.mu.Lock()
+	gen = i.gens[ownerID]
+	i.mu.Unlock()
+	active, err = i.Active(ctx, ownerID)
+	return gen, active, err
+}
+
 // Active reports whether a github-ingest run for ownerID is in flight: being
-// submitted, or submitted and not yet seen to end. The worklist page reloads itself
-// while it is, so a refresh lands without a click. It asks the backend about a run
+// submitted, or submitted and not yet seen to end. It asks the backend about a run
 // that still looks live (once per call, until the run is seen to end), and reports
-// false for a run older than its deadline or one the backend gave no id to probe.
+// false for a run older than its deadline or one the backend gave no id to probe. A
+// failed status read reports true, with the error: the run may still be going, and
+// the page should keep watching until it ends or its deadline passes.
 func (i *Ingestor) Active(ctx context.Context, ownerID string) (bool, error) {
 	key := ingestKey(ownerID)
 	now := time.Now()
@@ -182,7 +202,7 @@ func (i *Ingestor) Active(ctx context.Context, ownerID string) (bool, error) {
 	}
 	failed, succeeded, _, err := i.probeRun(ctx, key)
 	if err != nil {
-		return false, err
+		return true, err // unknown: keep watching, bounded by the deadline above
 	}
 	return !failed && !succeeded, nil
 }
@@ -206,6 +226,11 @@ func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, g gate) (
 		Deadline:   ingestDeadline,
 	})
 	i.settle(key, mine, id, err)
+	if err == nil {
+		i.mu.Lock()
+		i.gens[ownerID]++
+		i.mu.Unlock()
+	}
 	return err == nil, err
 }
 

@@ -298,7 +298,7 @@ func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 	// logout in another tab) stores nothing and asks the user to sign in again, so
 	// they consent again.
 	if h.vault != nil {
-		restart, err := h.storeSignIn(ctx, p, user.ID, token)
+		restart, err := h.storeSignIn(ctx, p, user.ID, user.Login, token)
 		if err != nil {
 			slog.Default().Warn("could not verify the new token", "provider", p.name, "user", user.ID, "err", err)
 			http.Error(w, "could not verify the sign-in with "+p.name, http.StatusBadGateway)

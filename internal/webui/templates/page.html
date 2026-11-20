@@ -7,7 +7,7 @@
   {{if .RefreshSecs}}<meta http-equiv="refresh" content="{{.RefreshSecs}}">{{end}}
   <link rel="stylesheet" href="/static/app.css">
   {{if eq .View "worklist"}}<script src="/static/projects.js" defer></script>{{end}}
-  {{if .ReloadSecs}}<noscript><meta http-equiv="refresh" content="{{.ReloadSecs}}"></noscript><script src="/static/reload.js" data-reload-secs="{{.ReloadSecs}}" defer></script>{{end}}
+  {{if .WatchRefresh}}{{if .Refreshing}}<noscript><meta http-equiv="refresh" content="{{.PollSecs}}"></noscript>{{end}}<script src="/static/reload.js" data-gen="{{.RefreshGen}}" data-active="{{if .Refreshing}}1{{else}}0{{end}}" data-poll-secs="{{.PollSecs}}" data-idle-poll-secs="{{.IdlePollSecs}}" defer></script>{{end}}
 </head>
 <body>
   <div class="zz-container">
@@ -174,7 +174,7 @@
             </form>
           </details>
           {{end}}
-          <p class="zz-count">{{if .ProjectsFiltered}}{{len .Items}} of {{.TotalItems}} items{{else}}{{len .Items}} item{{if ne (len .Items) 1}}s{{end}}{{end}} on your radar{{if .ReloadSecs}} · <span class="zz-refreshing" role="status">refreshing from GitHub…</span>{{end}}</p>
+          <p class="zz-count">{{if .ProjectsFiltered}}{{len .Items}} of {{.TotalItems}} items{{else}}{{len .Items}} item{{if ne (len .Items) 1}}s{{end}}{{end}} on your radar{{if .WatchRefresh}}<span data-refreshing role="status"{{if not .Refreshing}} hidden{{end}}> · refreshing from GitHub…</span>{{end}}</p>
         </div>
         <div class="zz-toolbar-actions">
           <form method="post" action="/items/refresh">

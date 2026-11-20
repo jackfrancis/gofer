@@ -125,6 +125,8 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	mux.Handle("POST /items/review-all", http.HandlerFunc(webHandler.ReviewAllPRs))
 	// Force a re-ingest to pull newly created or updated work onto the radar.
 	mux.Handle("POST /items/refresh", http.HandlerFunc(webHandler.Refresh))
+	// The radar polls this to notice a refresh that ran while it was open (reload.js).
+	mux.Handle("GET /items/refresh-status", http.HandlerFunc(webHandler.RefreshStatus))
 	// The radar's project filter: saves which repositories the radar shows.
 	mux.Handle("POST /items/projects", http.HandlerFunc(webHandler.FilterProjects))
 	// Clear every conversation thread, so the review workflows can be demoed or
@@ -194,8 +196,10 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 
 	// The scheduled refresh (REFRESH_INTERVAL, off by default): a github-ingest run per
 	// owner with stored work, every interval, so a populated worklist keeps up with
-	// GitHub without a click. It reads the raw store (owners only) and skips owners
-	// who must sign in again. cleanup stops it before main closes the store.
+	// GitHub without a click. It reads the raw store (owners only) and dispatches only
+	// for owners the auth handler confirms (ScheduledRunAllowed: provider configured,
+	// a vendable credential readable, no logout pending, login still allowed). cleanup
+	// stops it before main closes the store.
 	stopRefresh := func() {}
 	if cfg.RefreshInterval > 0 {
 		if owners, ok := store.(worklist.OwnerLister); ok {

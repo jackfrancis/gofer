@@ -48,6 +48,7 @@ type sealedCredential struct {
 	RefreshExpiry time.Time `json:"refresh_expiry,omitzero"`
 	ClientID      string    `json:"client_id,omitempty"`
 	Version       string    `json:"version,omitempty"`
+	Login         string    `json:"login,omitempty"`
 }
 
 // credentialAAD is the associated data bound to a sealed credential: a domain tag
@@ -94,6 +95,7 @@ func (v *VaultStore) putWith(ctx context.Context, ex execer, userID string, cred
 		RefreshExpiry: cred.RefreshExpiry,
 		ClientID:      cred.ClientID,
 		Version:       cred.Version,
+		Login:         cred.Login,
 	})
 	if err != nil {
 		return fmt.Errorf("storage: encode credential: %w", err)
@@ -140,6 +142,7 @@ func (v *VaultStore) Get(ctx context.Context, userID, provider string) (vault.Cr
 		RefreshExpiry: sc.RefreshExpiry,
 		ClientID:      sc.ClientID,
 		Version:       sc.Version,
+		Login:         sc.Login,
 	}, nil
 }
 

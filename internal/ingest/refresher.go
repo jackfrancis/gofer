@@ -11,9 +11,7 @@ import (
 )
 
 // refreshProvider is the provider a github-ingest run vends its token for. Only its
-// owners ("github:<id>") are refreshed, and one gofer could not vend a token for is
-// skipped, so a user who signed out (or whose grant died) does not cost a failed run
-// on every tick.
+// owners ("github:<id>") are refreshed, and only those the Eligibility confirms.
 const refreshProvider = "github"
 
 // ScheduledRefresher is the dispatch side of the Refresher: Ingestor.ScheduledRefresh.
@@ -23,10 +21,15 @@ type ScheduledRefresher interface {
 	ScheduledRefresh(ctx context.Context, ownerID string) (bool, error)
 }
 
-// SignInChecker reports whether gofer holds no credential it could vend for the user
-// and provider (auth.Handler.SignInRequired). It only reads.
-type SignInChecker interface {
-	SignInRequired(ctx context.Context, userID, provider string) bool
+// Eligibility confirms that gofer may start a run nobody requested on the user's
+// behalf (auth.Handler.ScheduledRunAllowed): the provider is configured, a credential
+// it could vend is stored and readable, no logout is pending, and the account is
+// still allowed to sign in. It only reads. An owner it does not confirm, including
+// on a read error, is skipped: a signed-out or removed user, or a vault gofer cannot
+// read, must not cost a run on every tick, nor act for an account gofer no longer
+// serves.
+type Eligibility interface {
+	ScheduledRunAllowed(ctx context.Context, userID, provider string) (bool, error)
 }
 
 // Refresher periodically requests a GitHub refresh (a github-ingest run) for every
@@ -41,7 +44,7 @@ type SignInChecker interface {
 type Refresher struct {
 	owners   worklist.OwnerLister
 	ing      ScheduledRefresher
-	signIn   SignInChecker // nil: every owner is refreshed
+	eligible Eligibility // nil: every GitHub owner is refreshed (tests)
 	interval time.Duration
 	log      *slog.Logger
 
@@ -50,13 +53,14 @@ type Refresher struct {
 	done     chan struct{}
 }
 
-// NewRefresher builds a Refresher that ticks every interval. signIn may be nil.
-func NewRefresher(owners worklist.OwnerLister, ing ScheduledRefresher, signIn SignInChecker, interval time.Duration, log *slog.Logger) *Refresher {
+// NewRefresher builds a Refresher that ticks every interval. eligible may be nil only
+// in tests.
+func NewRefresher(owners worklist.OwnerLister, ing ScheduledRefresher, eligible Eligibility, interval time.Duration, log *slog.Logger) *Refresher {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Refresher{
-		owners: owners, ing: ing, signIn: signIn, interval: interval, log: log,
+		owners: owners, ing: ing, eligible: eligible, interval: interval, log: log,
 		stop: make(chan struct{}), done: make(chan struct{}),
 	}
 }
@@ -96,8 +100,8 @@ func (r *Refresher) Stop() {
 }
 
 // RefreshOnce requests a refresh for every GitHub owner with stored work and reports
-// how many runs it submitted. An owner whose ingest run is still in flight, or who
-// must sign in again, is skipped. Exported for tests; safe to call concurrently.
+// how many runs it submitted. An owner whose ingest run is still in flight, or whom
+// the Eligibility does not confirm, is skipped. Exported for tests; safe to call concurrently.
 func (r *Refresher) RefreshOnce(ctx context.Context) int {
 	owners, err := r.owners.Owners(ctx)
 	if err != nil {
@@ -109,9 +113,18 @@ func (r *Refresher) RefreshOnce(ctx context.Context) int {
 		if ctx.Err() != nil {
 			break
 		}
-		if ownerProvider(owner) != refreshProvider ||
-			(r.signIn != nil && r.signIn.SignInRequired(ctx, owner, refreshProvider)) {
+		if ownerProvider(owner) != refreshProvider {
 			continue
+		}
+		if r.eligible != nil {
+			ok, err := r.eligible.ScheduledRunAllowed(ctx, owner, refreshProvider)
+			if err != nil {
+				r.log.Warn("scheduled refresh: eligibility", "owner", owner, "err", err)
+				continue
+			}
+			if !ok {
+				continue
+			}
 		}
 		ok, err := r.ing.ScheduledRefresh(ctx, owner)
 		if err != nil {

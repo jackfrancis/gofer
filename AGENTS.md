@@ -274,19 +274,31 @@ Wired on the web-tier side; they define what a runtime must respect:
   A second opinion posts its own user turn, so it is never a duplicate.
 - The scheduled refresh (`ingest.Refresher`, `REFRESH_INTERVAL`, off when unset or
   0, at least 1m otherwise) dispatches a github-ingest run per GitHub owner with
-  stored work (`worklist.OwnerLister`), skipping owners who must sign in again. A
-  tick and a Refresh click both go through the gate under `refreshGate`, which asks
-  the backend about a run that still looks live: neither starts anything while any
-  ingest run for the owner (a backfill, a Refresh, an earlier tick) is running, so
-  overlapping ticks give one run per owner and two ingest runs never write one
-  owner's worklist at once. Neither waits out a finished run's deadline; the
-  empty-worklist poll (`ingestGate`) still does. Nothing forces a run past the gate,
-  so a reservation is never replaced before its Submit returns. Turn the schedule on only against an AEI that
-  contains provider failures (archive-plan item 11, AEI PR #21): scheduled runs
-  dispatch with nobody watching. While an ingest run is in flight
-  (`Ingestor.Active`) the radar reloads itself through `static/reload.js`, which
-  waits while a `<details>` menu is open or a form control has focus, so a reload
-  never drops a half-made filter or model choice.
+  stored work (`worklist.OwnerLister`), and only for owners
+  `auth.Handler.ScheduledRunAllowed` confirms: GitHub configured, no logout pending,
+  a vendable credential stored and readable, and the login recorded on it
+  (`vault.Credential.Login`, set at sign-in and kept across refreshes) still in
+  `ALLOWED_GITHUB_LOGINS`. A read error skips the owner. With an allow-list set, a
+  credential stored before gofer recorded the login gets no scheduled runs until
+  that user signs in again. (`SignInRequired` is for the page and answers false on
+  a read error, so never use it to gate a run.) A tick and a Refresh click both go
+  through the gate under `refreshGate`, which asks the backend about a run that
+  still looks live: neither starts anything while any ingest run for the owner (a
+  backfill, a Refresh, an earlier tick) is running, so overlapping ticks give one
+  run per owner and two ingest runs never write one owner's worklist at once.
+  Neither waits out a finished run's deadline; the empty-worklist poll
+  (`ingestGate`) still does. Nothing forces a run past the gate, so a reservation is
+  never replaced before its Submit returns. Turn the schedule on only against an AEI
+  that contains provider failures (archive-plan item 11, AEI PR #21): scheduled
+  runs dispatch with nobody watching.
+- The radar watches the refresh state (`Ingestor.RefreshState`: a per-owner count
+  of accepted ingest runs, and whether one is in flight). `signedInView` reads it
+  BEFORE the items, since a run writes before it ends; the page carries it to
+  `static/reload.js`, which polls `GET /items/refresh-status` (every 3s while a run
+  is in flight, 30s otherwise) and reloads once a run the page does not show has
+  ended, even one that started and ended between polls. A failed status read counts
+  as still in flight until the run's deadline. The script never reloads while a
+  `<details>` menu is open or a form control has focus.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

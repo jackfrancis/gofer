@@ -32,10 +32,15 @@ func (d *gateDispatcher) subjects() []string {
 	return out
 }
 
-type signIn map[string]bool // owner -> sign-in required
+// eligibility answers ScheduledRunAllowed from a map: owners absent are allowed.
+type eligibility map[string]error // owner -> nil (refused) or an error; absent: allowed
 
-func (s signIn) SignInRequired(_ context.Context, userID, provider string) bool {
-	return provider == "github" && s[userID]
+func (e eligibility) ScheduledRunAllowed(_ context.Context, userID, provider string) (bool, error) {
+	if provider != "github" {
+		return false, nil
+	}
+	err, listed := e[userID]
+	return !listed, err
 }
 
 func equal(a, b []string) bool {
@@ -127,13 +132,14 @@ func TestRefresherDispatchesAnIngestRun(t *testing.T) {
 	}
 }
 
-// Only owners with stored work, who sign in with GitHub and hold a credential gofer
-// could vend, are refreshed.
+// Only owners with stored work, who sign in with GitHub and whom the eligibility check
+// confirms, are refreshed: a refusal or a failed check skips the owner.
 func TestRefresherSkipsOwnersItCannotRefresh(t *testing.T) {
-	store := seeded("github:1", "github:2", "google:3")
+	store := seeded("github:1", "github:2", "google:3", "github:5")
 	store.Seed("github:4") // an owner whose items are all gone
 	d := &gateDispatcher{phase: "Running"}
-	r := NewRefresher(store, New(d, "", "", nil, "", ""), signIn{"github:2": true}, time.Hour, nil)
+	e := eligibility{"github:2": nil, "github:5": errors.New("vault unreadable")}
+	r := NewRefresher(store, New(d, "", "", nil, "", ""), e, time.Hour, nil)
 	r.RefreshOnce(context.Background())
 	if got := d.subjects(); !equal(got, []string{"github:1"}) {
 		t.Fatalf("refreshed %v, want only github:1", got)
@@ -298,5 +304,69 @@ func TestRefreshClickDuringAScheduledRun(t *testing.T) {
 	}
 	if d.count() != 2 {
 		t.Fatalf("a click after the scheduled run ended dispatched %d runs in all, want 2", d.count())
+	}
+}
+
+// errStatusDispatcher accepts runs and fails every status read.
+type errStatusDispatcher struct{ gateDispatcher }
+
+func (d *errStatusDispatcher) Status(context.Context, string) (RunStatus, error) {
+	return RunStatus{}, errors.New("status unavailable")
+}
+
+// RefreshState counts the ingest runs the backend accepted, whoever started them,
+// and not a submission that failed or a request the gate collapsed.
+func TestRefreshStateCountsAcceptedIngestRuns(t *testing.T) {
+	ctx := context.Background()
+	d := &gateDispatcher{phase: "Running"}
+	ig := New(d, "", "", nil, "", "")
+	state := func() (uint64, bool) {
+		t.Helper()
+		g, a, err := ig.RefreshState(ctx, "github:1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return g, a
+	}
+	if g, a := state(); g != 0 || a {
+		t.Fatalf("before any run: gen %d active %v", g, a)
+	}
+	_ = ig.EnsureBackfill(ctx, "github:1")
+	_ = ig.Refresh(ctx, "github:1") // collapsed into the running backfill
+	if g, a := state(); g != 1 || !a {
+		t.Fatalf("one run in flight: gen %d active %v", g, a)
+	}
+	d.set("Succeeded")
+	d.mu.Lock()
+	d.failNext = true
+	d.mu.Unlock()
+	if err := ig.Refresh(ctx, "github:1"); err == nil {
+		t.Fatal("want the Submit error")
+	}
+	if g, a := state(); g != 1 || a {
+		t.Fatalf("after a failed submit: gen %d active %v", g, a)
+	}
+	_, _ = ig.ScheduledRefresh(ctx, "github:1")
+	if g, _ := state(); g != 2 {
+		t.Fatalf("after a scheduled run: gen %d, want 2", g)
+	}
+	if g, _, _ := ig.RefreshState(ctx, "github:2"); g != 0 {
+		t.Fatalf("another owner's generation: %d", g)
+	}
+}
+
+// A failed status read keeps the run active, with the error, until its deadline.
+func TestActiveThroughAStatusError(t *testing.T) {
+	ctx := context.Background()
+	ig := New(&errStatusDispatcher{}, "", "", nil, "", "")
+	_ = ig.Refresh(ctx, "github:1")
+	if a, err := ig.Active(ctx, "github:1"); !a || err == nil {
+		t.Fatalf("Active = %v, %v; want true with the error", a, err)
+	}
+	ig.mu.Lock()
+	ig.runs[ingestKey("github:1")].at = time.Now().Add(-retryAfter)
+	ig.mu.Unlock()
+	if a, err := ig.Active(ctx, "github:1"); a || err != nil {
+		t.Fatalf("past the deadline: Active = %v, %v; want false", a, err)
 	}
 }

@@ -173,6 +173,43 @@ func (h *Handler) SignInRequired(ctx context.Context, userID, providerName strin
 	return !fromConfiguredClient(p, cred)
 }
 
+// ScheduledRunAllowed reports whether gofer may start a run nobody requested (the
+// scheduled refresh) on the user's behalf for the provider. Every condition must be
+// confirmed: gofer signs in with the provider; no logout of the credential is
+// pending; a credential is stored, readable, and from the configured client (a legacy
+// row counts only where the broker would tag and vend it); and the account that
+// granted it is still allowed to sign in (ALLOWED_GITHUB_LOGINS, checked against the
+// login recorded at sign-in, so a row stored before gofer recorded one is refused
+// while an allow-list is set). A read error answers false with the error. It reads
+// only: it takes no credential lock and refreshes nothing; the run's own vend does.
+func (h *Handler) ScheduledRunAllowed(ctx context.Context, userID, providerName string) (bool, error) {
+	p, ok := h.providers[providerName]
+	if !ok || h.vault == nil {
+		return false, nil
+	}
+	pending, err := h.logoutPending(ctx, userID, providerName)
+	if err != nil {
+		return false, fmt.Errorf("read pending logout: %w", err)
+	}
+	if pending {
+		return false, nil
+	}
+	cred, err := h.vault.Get(ctx, userID, providerName)
+	if errors.Is(err, vault.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !fromConfiguredClient(p, cred) {
+		return false, nil
+	}
+	if h.cfg != nil && !h.cfg.SignInAllowed(providerName, cred.Login) {
+		return false, nil
+	}
+	return true, nil
+}
+
 // Credential returns a credential the broker may vend for the user and provider,
 // under the credential lock. A provider gofer does not sign in with is
 // vault.ErrNotFound. Otherwise:
@@ -396,6 +433,7 @@ func (h *Handler) storeRefreshed(ctx context.Context, userID string, p *provider
 		RefreshExpiry: refreshExpiry(tok, h.now()),
 		ClientID:      p.oauth.ClientID,
 		Version:       newVersion(),
+		Login:         old.Login,
 	}
 	if fresh.RefreshToken == "" {
 		fresh.RefreshToken = old.RefreshToken
@@ -433,6 +471,7 @@ func (h *Handler) storeRotated(ctx context.Context, userID string, p *provider, 
 		RefreshExpiry: refreshExpiry(tok, h.now()),
 		ClientID:      p.oauth.ClientID,
 		Version:       newVersion(),
+		Login:         old.Login,
 	}
 	if fresh.RefreshToken == "" {
 		fresh.RefreshToken, fresh.RefreshExpiry = old.RefreshToken, old.RefreshExpiry
@@ -582,7 +621,7 @@ func (h *Handler) applicationCall(ctx context.Context, p *provider, method, suff
 // between the token exchange and this lock would otherwise leave a revoked token
 // stored behind a fresh session. It reports restart when the token is no longer
 // valid, so the user consents again.
-func (h *Handler) storeSignIn(ctx context.Context, p *provider, userID string, tok *oauth2.Token) (restart bool, err error) {
+func (h *Handler) storeSignIn(ctx context.Context, p *provider, userID, login string, tok *oauth2.Token) (restart bool, err error) {
 	unlock, err := h.locks.lock(ctx, userID, p.name)
 	if err != nil {
 		return false, err
@@ -606,6 +645,7 @@ func (h *Handler) storeSignIn(ctx context.Context, p *provider, userID string, t
 		RefreshExpiry: refreshExpiry(tok, h.now()),
 		ClientID:      p.oauth.ClientID,
 		Version:       newVersion(),
+		Login:         login,
 	}
 	// Best-effort, as before: a vault failure must not block interactive login. The
 	// broker then answers "sign-in required", and the page says so.
