@@ -170,7 +170,10 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	if p.Researcher != nil {
 		latest, ok, err := sink.Item(ctx, item.ID, "")
 		if err != nil {
-			return fmt.Errorf("research: read item: %w", err)
+			// The answer is saved and a retry would skip the answered turn, so a
+			// failed read only costs this best-effort research, not the run.
+			p.logger().Warn("converse: reply saved; skipping research after a failed read", "item", item.ID, "err", err)
+			return nil
 		}
 		if _, kept := latest.TurnIndex(msg.ID); !ok || !kept {
 			// The item is gone, or the reply was dropped (the thread was cleared, or

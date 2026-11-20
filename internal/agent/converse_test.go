@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -380,5 +381,37 @@ func TestRunConverseResearchesTheLatestThread(t *testing.T) {
 	want := []string{"q1", "q2", "a2", it.Thread[3].ID}
 	if !slices.Equal(r.Turns, want) {
 		t.Fatalf("research read turns %v, want the whole thread %v", r.Turns, want)
+	}
+}
+
+// failingResearchRead fails every item read after the first, as a web tier that
+// answers 502 to the research pass's read once the reply is saved.
+type failingResearchRead struct {
+	*memSink
+	reads int
+}
+
+func (f *failingResearchRead) Item(ctx context.Context, id, turn string) (worklist.WorkItem, bool, error) {
+	if f.reads++; f.reads > 1 {
+		return worklist.WorkItem{}, false, errors.New("agent plane: 502 Bad Gateway")
+	}
+	return f.memSink.Item(ctx, id, turn)
+}
+
+// The reply is saved, then the research pass's read fails. Research is best-effort,
+// so the run succeeds with the answer stored and no adjustment written.
+func TestRunConverseSucceedsWhenTheResearchReadFails(t *testing.T) {
+	sink := &failingResearchRead{memSink: &memSink{items: []worklist.WorkItem{{
+		ID:     "github:o/r#1",
+		Thread: []worklist.Message{{ID: "q1", Role: worklist.RoleUser, Content: "question"}},
+	}}}}
+	err := Run(context.Background(),
+		Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Turn: "q1", Converser: &fakeConverser{reply: "answer"}, Researcher: turnsResearcher{rationale: "r"}},
+		fakeVendor{token: "t"}, sink)
+	if err != nil {
+		t.Fatalf("a failed research read failed the answered run: %v", err)
+	}
+	if it := sink.items[0]; !it.Answered("q1") || it.Signals.Research != nil || sink.researches != 0 {
+		t.Fatalf("want the answer stored and no research, got thread %+v research %+v", it.Thread, it.Signals.Research)
 	}
 }
