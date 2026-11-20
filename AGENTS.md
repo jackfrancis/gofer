@@ -272,6 +272,19 @@ Wired on the web-tier side; they define what a runtime must respect:
   gate (`internal/ingest/gate.go`) holds one run per (owner, task, item, turn) and
   only saves the cost of a duplicate run: it is in memory and guarantees nothing.
   A second opinion posts its own user turn, so it is never a duplicate.
+- The scheduled refresh (`ingest.Refresher`, `REFRESH_INTERVAL`, off when unset or
+  0, at least 1m otherwise) dispatches a github-ingest run per GitHub owner with
+  stored work (`worklist.OwnerLister`), skipping owners who must sign in again. It
+  goes through the same gate under `refreshGate`, which asks the backend about a run
+  that still looks live: a tick starts nothing while any ingest run for the owner (a
+  backfill, a Refresh, an earlier tick) is running, so overlapping ticks give one run
+  per owner, and it does not wait out a finished run's deadline. The empty-worklist
+  poll (`ingestGate`) still does. Turn the schedule on only against an AEI that
+  contains provider failures (archive-plan item 11, AEI PR #21): scheduled runs
+  dispatch with nobody watching. While an ingest run is in flight
+  (`Ingestor.Active`) the radar reloads itself through `static/reload.js`, which
+  waits while a `<details>` menu is open or a form control has focus, so a reload
+  never drops a half-made filter or model choice.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

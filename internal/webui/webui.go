@@ -49,6 +49,14 @@ type Reconnector interface {
 	SignInRequired(ctx context.Context, userID, provider string) bool
 }
 
+// RefreshProber optionally reports whether a GitHub refresh (an ingest run) is in
+// flight for the owner (ingest.Ingestor.Active). While one is, the worklist page
+// reloads itself so the refreshed work appears without a click. A Pipeline that does
+// not implement it leaves the page static.
+type RefreshProber interface {
+	Active(ctx context.Context, ownerID string) (bool, error)
+}
+
 // Pipeline triggers a user's backfill when the worklist is empty, schedules an
 // assistant turn for the Discuss action, and launches a concurrent batch of review
 // turns for the "Review all PRs" action. It is the same Ingestor the JSON API uses.
@@ -242,6 +250,7 @@ type pageData struct {
 	SecondOpinionMenuOptions []ModelOption      // menu-mode models (every model except the single first-review model)
 	ResetCount               int                // stored items carrying a conversation (hidden and closed too: Reset clears them all); gates/labels "Reset Conversations"
 	RefreshSecs              int                // when > 0, the page auto-refreshes after this many seconds
+	ReloadSecs               int                // worklist: when > 0, a GitHub refresh is running and the page reloads itself (reload.js) after this many seconds
 	ReplyStalled             bool               // a pending reply has not arrived within reviewStaleAfter (thread view)
 	Message                  string             // failure detail rendered on the error view
 	Failure                  string             // a failed user action, rendered on the error view in place of the discovery wording
@@ -572,6 +581,9 @@ const independentReviewPrompt = "Give an independent review of this PR. There ma
 // gets two replies, which is harmless).
 const reviewStaleAfter = 5 * time.Minute
 
+// reloadSecs is how often the worklist reloads itself while a GitHub refresh runs.
+const reloadSecs = 3
+
 // ReviewAllPRs handles POST /items/review-all. For every pull request the submitting
 // page showed (on the radar, in its projects: form "scope"), it appends the review prompt to the item's thread and, in one
 // concurrent batch, schedules an assistant review turn for each — then redirects
@@ -855,6 +867,14 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		}
 		if data.SecondOpinionEnabled && secondCount > 0 {
 			data.SecondOpinionMode, data.SecondOpinionMenuOptions = h.secondOpinionMenu(firstModels)
+		}
+		// While a refresh pass (scheduled, a Refresh click, a backfill) is running, keep
+		// the ranked list visible and reload it until the pass lands. A failed probe
+		// just leaves the page static.
+		if p, ok := h.pipeline.(RefreshProber); ok {
+			if active, err := p.Active(r.Context(), user.ID); err == nil && active {
+				data.ReloadSecs = reloadSecs
+			}
 		}
 		return data, http.StatusOK
 	}

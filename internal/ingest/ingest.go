@@ -132,23 +132,67 @@ func (i *Ingestor) runParams(ownerID string) map[string]string {
 // executes them. A failed or stale run (older than retryAfter) is re-dispatched, so a
 // reload retries after a failure or a lost run.
 func (i *Ingestor) EnsureBackfill(ctx context.Context, ownerID string) error {
-	return i.dispatchIngest(ctx, ownerID, false)
+	_, err := i.dispatchIngest(ctx, ownerID, ingestGate, false)
+	return err
 }
 
 // Refresh forces a github-ingest run for ownerID so a user who just created or updated
 // work can pull it onto the radar on demand.
 func (i *Ingestor) Refresh(ctx context.Context, ownerID string) error {
-	return i.dispatchIngest(ctx, ownerID, true)
+	_, err := i.dispatchIngest(ctx, ownerID, ingestGate, true)
+	return err
 }
 
-// dispatchIngest submits a github-ingest run for ownerID and tracks it, so
-// BackfillFailure can report its outcome and EnsureBackfill can gate on it. Unless
-// force is set it submits nothing while the owner's ingest run is in flight.
-func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, force bool) error {
+// ScheduledRefresh requests a github-ingest run for ownerID on behalf of the
+// periodic refresh (Refresher), and reports whether it submitted one. It submits
+// nothing while any ingest run for the owner is in flight, asking the backend about a
+// run that still looks live, so overlapping ticks (and a tick during a backfill or a
+// Refresh) share one run per owner.
+func (i *Ingestor) ScheduledRefresh(ctx context.Context, ownerID string) (bool, error) {
+	return i.dispatchIngest(ctx, ownerID, refreshGate, false)
+}
+
+// Active reports whether a github-ingest run for ownerID is in flight: being
+// submitted, or submitted and not yet seen to end. The worklist page reloads itself
+// while it is, so a refresh lands without a click. It asks the backend about a run
+// that still looks live (once per call, until the run is seen to end), and reports
+// false for a run older than its deadline or one the backend gave no id to probe.
+func (i *Ingestor) Active(ctx context.Context, ownerID string) (bool, error) {
 	key := ingestKey(ownerID)
-	mine, ok := i.reserve(ctx, key, ingestGate, force)
+	now := time.Now()
+	i.mu.Lock()
+	cur := i.runs[key]
+	var pending, stale, noID bool
+	if cur != nil {
+		pending = cur.pending
+		stale = now.Sub(cur.at) >= cur.g.ttl
+		noID = cur.id == ""
+	}
+	i.mu.Unlock()
+	switch {
+	case cur == nil || stale:
+		return false, nil
+	case pending:
+		return true, nil
+	case noID:
+		return false, nil // NoopDispatcher: nothing to wait for
+	}
+	failed, succeeded, _, err := i.probeRun(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	return !failed && !succeeded, nil
+}
+
+// dispatchIngest submits a github-ingest run for ownerID under gate g and tracks it,
+// so BackfillFailure can report its outcome and EnsureBackfill can gate on it, and
+// reports whether it submitted one. Unless force is set it submits nothing while the
+// owner's ingest run is in flight.
+func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, g gate, force bool) (bool, error) {
+	key := ingestKey(ownerID)
+	mine, ok := i.reserve(ctx, key, g, force)
 	if !ok {
-		return nil
+		return false, nil
 	}
 	id, err := i.d.Submit(ctx, RunSpec{
 		TaskRef:    taskIngest,
@@ -159,7 +203,7 @@ func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, force boo
 		Deadline:   ingestDeadline,
 	})
 	i.settle(key, mine, id, err)
-	return err
+	return err == nil, err
 }
 
 // probeRun reports the lifecycle of the run tracked for key, reading it from the

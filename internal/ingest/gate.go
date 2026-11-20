@@ -47,11 +47,14 @@ type run struct {
 	prev *run
 }
 
-// live reports whether r still counts as in flight at now, as far as gofer knows
-// without asking the backend. A failure always frees the key; a success frees it only
-// under a probing gate.
-func (r *run) live(now time.Time) bool {
-	if r.failed || (r.succeeded && r.g.probe) {
+// live reports whether r still counts as in flight at now for a caller reserving
+// under a gate with the given probe setting, as far as gofer knows without asking the
+// backend. A failure always frees the key; a success frees it only for a probing
+// caller. So the empty-worklist poll (ingestGate) still waits out a successful ingest
+// run, whoever started it, while a scheduled refresh (refreshGate) may follow one as
+// soon as it has ended. The ttl is the run's own.
+func (r *run) live(now time.Time, probe bool) bool {
+	if r.failed || (r.succeeded && probe) {
 		return false
 	}
 	return now.Sub(r.at) < r.g.ttl
@@ -74,6 +77,11 @@ type gate struct {
 var (
 	ingestGate   = gate{ttl: retryAfter}
 	converseGate = gate{ttl: converseDeadline, probe: true}
+	// refreshGate is the scheduled refresh's policy for the owner's ingest key: it
+	// starts nothing while any ingest run for the owner (a backfill, a Refresh, an
+	// earlier tick) is still running, and asks the backend rather than waiting out the
+	// ttl, so a tick after a finished run dispatches the next one.
+	refreshGate = gate{ttl: retryAfter, probe: true}
 )
 
 // reserve claims key for a new run under g and reports whether the caller should
@@ -86,7 +94,7 @@ func (i *Ingestor) reserve(ctx context.Context, key runKey, g gate, force bool) 
 		now := time.Now()
 		i.mu.Lock()
 		cur := i.runs[key]
-		if force || cur == nil || !cur.live(now) {
+		if force || cur == nil || !cur.live(now, g.probe) {
 			mine = &run{at: now, g: g, pending: true, prev: cur}
 			i.runs[key] = mine
 			i.pruneLocked(now)
@@ -145,7 +153,7 @@ func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 // owner, and the read model asks about the latest one. The caller holds i.mu.
 func (i *Ingestor) pruneLocked(now time.Time) {
 	for k, r := range i.runs {
-		if k.task != taskIngest && !r.pending && !r.live(now) {
+		if k.task != taskIngest && !r.pending && !r.live(now, r.g.probe) {
 			delete(i.runs, k)
 		}
 	}

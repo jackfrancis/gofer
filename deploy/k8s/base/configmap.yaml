@@ -24,6 +24,13 @@ data:
   # GitHub App used only for sign-in; expiring tokens refreshed by the web tier). Also
   # deliberately absent, so a deploy never flips it: set it on the live ConfigMap
   # together with the client secrets, then restart gofer-0 (ADR 0007, "Rollout").
+  # REFRESH_INTERVAL (a Go duration, at least 1m, e.g. "15m") refreshes every
+  # populated worklist from GitHub on that schedule; each refresh is a full ingest
+  # run (GitHub walk, enrich, rank). Absent or "0" turns the schedule off, so
+  # worklists refresh only on the Refresh button. Deliberately absent here: set it
+  # on the live ConfigMap and restart gofer-0, and only once the cluster's AEI
+  # contains provider failures (AEI archive-plan item 11), since scheduled runs
+  # dispatch with nobody watching.
   # false because the dev port-forward is plain http; set true behind TLS.
   COOKIE_SECURE: "false"
   # Binds a run credential to gofer's agent plane; a runtime's token must carry this

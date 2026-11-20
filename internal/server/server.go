@@ -29,8 +29,8 @@ import (
 // swapping backends (a no-op, AEI, agent-sandbox, …) never changes this package: the
 // web tier speaks only gofer's neutral dispatch seam. The vault holds delegated
 // provider tokens the auth handler writes at login. sessionStore holds authenticated
-// sessions; nil keeps them in memory. The returned cleanup is a no-op today (reserved
-// for the staleness reconciler).
+// sessions; nil keeps them in memory. The returned cleanup stops the scheduled refresh
+// (REFRESH_INTERVAL), if it runs; call it before closing the store.
 func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt vault.Vault, store worklist.Store, sessionStore session.Store) (http.Handler, func()) {
 	sessions := session.NewManager(cfg.SessionSecret, cfg.CookieSecure, session.WithStore(sessionStore),
 		session.WithAllow(func(u *session.User) bool { return cfg.SignInAllowed(u.Provider, u.Login) }))
@@ -192,7 +192,25 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	h = logRequests(log, h)
 	h = recoverer(log, h)
 
-	return h, func() {}
+	// The scheduled refresh (REFRESH_INTERVAL, off by default): a github-ingest run per
+	// owner with stored work, every interval, so a populated worklist keeps up with
+	// GitHub without a click. It reads the raw store (owners only) and skips owners
+	// who must sign in again. cleanup stops it before main closes the store.
+	stopRefresh := func() {}
+	if cfg.RefreshInterval > 0 {
+		if owners, ok := store.(worklist.OwnerLister); ok {
+			r := ingest.NewRefresher(owners, ingestor, authH, cfg.RefreshInterval, log)
+			r.Start()
+			stopRefresh = r.Stop
+			log.Info("scheduled refresh enabled", "interval", cfg.RefreshInterval)
+		} else {
+			log.Warn("scheduled refresh disabled: the worklist store cannot list owners", "interval", cfg.RefreshInterval)
+		}
+	} else {
+		log.Info("scheduled refresh disabled (set REFRESH_INTERVAL to turn it on)")
+	}
+
+	return h, stopRefresh
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

@@ -542,3 +542,34 @@ func TestWorklistGetAndBriefsParity(t *testing.T) {
 		})
 	}
 }
+
+// Owners names each owner with stored work once, in both implementations; the
+// scheduled refresh reads it on every tick.
+func TestWorklistOwners(t *testing.T) {
+	ctx := t.Context()
+	for name, s := range worklistImpls(t) {
+		t.Run(name, func(t *testing.T) {
+			ol, ok := s.(worklist.OwnerLister)
+			if !ok {
+				t.Fatal("store does not implement worklist.OwnerLister")
+			}
+			if got, err := ol.Owners(ctx); err != nil || len(got) != 0 {
+				t.Fatalf("empty store: Owners = %v, %v", got, err)
+			}
+			if err := s.Upsert(ctx, "github:2", item("a", "A"), item("b", "B")); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Upsert(ctx, "github:1", item("a", "A")); err != nil {
+				t.Fatal(err)
+			}
+			got, err := ol.Owners(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sort.Strings(got)
+			if fmt.Sprint(got) != "[github:1 github:2]" {
+				t.Fatalf("Owners = %v, want [github:1 github:2]", got)
+			}
+		})
+	}
+}
