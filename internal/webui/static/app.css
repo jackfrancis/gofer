@@ -188,3 +188,9 @@ body {
 }
 
 .zz-stalled { color: var(--attention); font-size: 13px; margin: 4px 0 12px; }
+.zz-stalled p { margin: 0 0 6px; }
+.zz-retry-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.zz-retry-form select {
+  padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px;
+  font-family: inherit; font-size: 13px; background: #fff;
+}

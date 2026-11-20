@@ -76,11 +76,11 @@ func TestThreadStalledHint(t *testing.T) {
 	pr := worklist.WorkItem{ID: "github:o/r#1", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Number: 1, Repo: "o/r", Title: "A PR"}}
 	pr.Thread = []worklist.Message{{Role: worklist.RoleUser, Content: "Can you review this PR?"}}
 
-	if out := renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true, ReplyStalled: true}); !strings.Contains(out, "Resend to try again") {
-		t.Fatalf("expected the stalled retry hint, got:\n%s", out)
+	if out := renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true, ReplyStalled: true, StalledTurn: "pos:0"}); !strings.Contains(out, "hasn&rsquo;t responded") || !strings.Contains(out, `action="/items/thread/retry"`) {
+		t.Fatalf("expected the stalled notice with Retry, got:\n%s", out)
 	}
-	if out := renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true, ReplyStalled: false}); strings.Contains(out, "Resend to try again") {
-		t.Fatal("hint should be hidden when a reply is not stalled")
+	if out := renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true, ReplyStalled: false}); strings.Contains(out, "hasn&rsquo;t responded") || strings.Contains(out, "/items/thread/retry") {
+		t.Fatal("the notice and Retry should be hidden when a reply is not stalled")
 	}
 }
 

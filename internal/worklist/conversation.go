@@ -371,6 +371,22 @@ func (w WorkItem) ReplyStalled(now time.Time, staleAfter time.Duration) bool {
 	return now.Sub(w.Thread[i].At) >= staleAfter && !w.Answered(key) && !w.noticed()[key]
 }
 
+// RetryStalled prepares the stalled most recent user turn (ReplyStalled) for a
+// retry under its existing key: it re-stamps the turn's time to now, so the turn is
+// pending again and a second retry within staleAfter finds nothing to do, and
+// returns the key a dispatch must name. It changes nothing and reports false when
+// the turn has not stalled. The caller persists the item in the same Store.Update
+// that read it. A retry never adds a turn, and the store keeps one answer per turn
+// (AppendReply), so a first run that answers late and its retry leave one reply.
+func (w *WorkItem) RetryStalled(now time.Time, staleAfter time.Duration) (string, bool) {
+	if !w.ReplyStalled(now, staleAfter) {
+		return "", false
+	}
+	i, _ := w.LastUserTurn()
+	w.Thread[i].At = now
+	return w.TurnKey(i), true
+}
+
 // NeedsReview reports whether the pull request still needs a first review dispatched
 // now: it is on the radar (OnRadar), has no completed review, and none is currently
 // in flight (a stale pending request is treated as failed, so it is eligible again).

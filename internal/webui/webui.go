@@ -263,6 +263,8 @@ type pageData struct {
 	PollSecs, IdlePollSecs   int                // worklist: how often reload.js polls while a refresh runs, and while none does
 	FallbackURL              string             // worklist, no script: where the <noscript> refresh goes while a refresh runs (refreshCheck)
 	ReplyStalled             bool               // a pending reply has not arrived within reviewStaleAfter (thread view)
+	StalledTurn              string             // the stalled turn's key, which the Retry form names (thread view)
+	StalledIndependent       bool               // the stalled turn is a review-panel request: Retry picks among the alternatives
 	Message                  string             // failure detail rendered on the error view
 	Failure                  string             // a failed user action, rendered on the error view in place of the discovery wording
 	JustHidden               *worklist.WorkItem // the item the user just hid, offered for Undo on the radar
@@ -309,7 +311,11 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 			if it.ReplyPending(now, reviewStaleAfter) {
 				data.RefreshSecs = 3 // a reply is plausibly in flight — poll for it
 			} else if it.ReplyStalled(now, reviewStaleAfter) {
-				data.ReplyStalled = true // no reply within the window — show a retry hint, stop spinning
+				// No reply within the window: stop spinning and offer to retry the turn.
+				data.ReplyStalled = true
+				i, _ := it.LastUserTurn()
+				data.StalledTurn = it.TurnKey(i)
+				data.StalledIndependent = isSecondOpinionRequest(it.Thread[i])
 			}
 			// Delivering the thread is the read receipt (the UI has no script to send
 			// one). The key is the newest reply on this page, taken from the snapshot
@@ -403,6 +409,80 @@ func (h *Handler) ThreadPost(w http.ResponseWriter, r *http.Request) {
 		_ = h.pipeline.Converse(r.Context(), user.ID, worklist.TurnRef{Item: id, Turn: msg.ID}, opt.Endpoint, opt.Model)
 	}
 	http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
+}
+
+// ThreadRetry handles POST /items/thread/retry, the thread view's Retry. It
+// re-dispatches the item's stalled turn under its existing key, as Review all does,
+// instead of starting a new turn and leaving the old one unanswered; then it
+// redirects back to the thread (Post/Redirect/Get). Form "turn" names the turn the
+// page offered to retry: if it is no longer the item's stalled turn (it was
+// answered, retried already, or the user has written since), nothing is
+// dispatched. Re-stamping and checking happen in one Store.Update, so a double
+// submit dispatches once; the in-flight gate and the store's one-answer rule cover a
+// run that is slow rather than lost.
+//
+// A review-panel request is retried as a blind review by a model other than the
+// item's first reviewer; any other turn as a Discuss turn by the chosen model.
+func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
+	user := h.sessions.CurrentUser(r)
+	if user == nil || !h.convEnabled {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	id := r.FormValue("id")
+	want := r.FormValue("turn")
+	back := "/items/thread?id=" + url.QueryEscape(id)
+	if id == "" || want == "" {
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	at := h.now().UTC()
+	choice := strings.TrimSpace(r.FormValue("choice"))
+	var (
+		turn        string
+		independent bool
+		opt         ModelOption
+	)
+	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		turn = ""
+		for _, it := range current {
+			if it.ID != id {
+				continue
+			}
+			i, ok := it.LastUserTurn()
+			if !ok || it.TurnKey(i) != want {
+				return nil, nil // the page is out of date: that is not the turn awaiting an answer
+			}
+			// Choose the model before re-stamping: never stamp a turn no run will answer.
+			independent = isSecondOpinionRequest(it.Thread[i])
+			if independent {
+				opt, ok = h.resolveSecondOpinionChoice(choice, map[string]struct{}{it.FirstReviewModel(): {}})
+				if !ok {
+					return nil, nil // no model other than the first reviewer's
+				}
+			} else {
+				opt, _ = h.resolveOption(choice) // none configured: the run's default, as ThreadPost
+			}
+			key, ok := it.RetryStalled(at, reviewStaleAfter)
+			if !ok {
+				return nil, nil // answered, or still plausibly in flight
+			}
+			turn = key
+			return []worklist.WorkItem{it}, nil
+		}
+		return nil, nil
+	})
+	if err != nil || turn == "" {
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	ref := worklist.TurnRef{Item: id, Turn: turn}
+	if independent {
+		_ = h.pipeline.SecondOpinion(r.Context(), user.ID, ref, opt.Endpoint, opt.Model)
+	} else {
+		_ = h.pipeline.Converse(r.Context(), user.ID, ref, opt.Endpoint, opt.Model)
+	}
+	http.Redirect(w, r, back, http.StatusSeeOther)
 }
 
 // Refresh handles POST /items/refresh. It forces a re-ingest of the signed-in
@@ -585,11 +665,12 @@ const independentReviewPrompt = "Give an independent review of this PR. There ma
 // reviewStaleAfter is how long a pending user turn (a review awaiting its reply) is
 // treated as plausibly in-flight. Past it, the converse run has almost certainly
 // finished or failed (a rate-limited converse dies fast), so the thread stops
-// spinning and shows a retry hint, and "Review all PRs" re-dispatches the item —
-// making the button self-healing. It is a heuristic, not run-status tracking: a
-// genuinely slow run re-dispatched here may still reply, and the retry run then finds
-// the turn answered and does nothing (or, if both were already under way, the turn
-// gets two replies, which is harmless).
+// spinning and offers Retry (ThreadRetry), and "Review all PRs" re-dispatches the
+// item — making the button self-healing. Both retry the turn under its existing key.
+// It is a heuristic, not run-status tracking: a genuinely slow run re-dispatched here
+// may still reply, and the retry run then finds the turn answered and does nothing;
+// if both were already under way, the store keeps the first answer and drops the
+// other (worklist.AppendReply).
 const reviewStaleAfter = 5 * time.Minute
 
 // pollSecs and idlePollSecs are how often the worklist asks whether a GitHub refresh
@@ -632,15 +713,11 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 			if it.ReplyPending(at, reviewStaleAfter) {
 				continue // a reply is plausibly in flight
 			}
-			var turn string
-			if it.ReplyStalled(at, reviewStaleAfter) {
-				// The last request's run has finished or failed, so retry it — reusing the
-				// prompt (refresh its timestamp) rather than stacking a second one. This is
-				// what makes the button self-healing after a rate-limited batch.
-				i, _ := it.LastUserTurn()
-				it.Thread[i].At = at
-				turn = it.TurnKey(i)
-			} else {
+			// If the last request's run has finished or failed, retry it — reusing the
+			// prompt (refresh its timestamp) rather than stacking a second one. This is
+			// what makes the button self-healing after a rate-limited batch.
+			turn, retry := it.RetryStalled(at, reviewStaleAfter)
+			if !retry {
 				msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, At: at}
 				it.Thread = append(it.Thread, msg)
 				turn = msg.ID
