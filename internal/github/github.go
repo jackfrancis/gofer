@@ -25,7 +25,6 @@ import (
 
 const (
 	defaultBaseURL = "https://api.github.com"
-	perPage        = 50      // timeline page size
 	searchPerPage  = 100     // the search API's maximum, so a full walk costs the fewest calls
 	maxBody        = 8 << 20 // 8 MiB
 	// searchResultCap is GitHub's hard ceiling on a single search query: it refuses
@@ -188,18 +187,20 @@ func appendReason(rs []worklist.Reason, r worklist.Reason) []worklist.Reason {
 // payload can prove — they authored it, they are assigned — are read from the item
 // itself and the generic reason is kept only when neither applies. enrich upgrades
 // that residue to ReasonCommented once the timeline shows the user actually spoke.
-// A targeted query (review-requested:) already knows its own answer.
+// A targeted query (review-requested:) already knows its own answer, and still
+// records what the payload proves: when the union search is partial, an item may
+// arrive only from the targeted one, and an assignment it carries must not be lost.
 func reasonsFor(from worklist.Reason, it searchItem, viewer string) []worklist.Reason {
-	if from != worklist.ReasonInvolved {
-		return []worklist.Reason{from}
-	}
 	var out []worklist.Reason
+	if from != worklist.ReasonInvolved {
+		out = append(out, from)
+	}
 	if it.User != nil && strings.EqualFold(it.User.Login, viewer) {
-		out = append(out, worklist.ReasonAuthor)
+		out = appendReason(out, worklist.ReasonAuthor)
 	}
 	for _, a := range it.Assignees {
 		if strings.EqualFold(a.Login, viewer) {
-			out = append(out, worklist.ReasonAssignee)
+			out = appendReason(out, worklist.ReasonAssignee)
 			break
 		}
 	}

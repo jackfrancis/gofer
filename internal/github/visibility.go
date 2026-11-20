@@ -500,32 +500,39 @@ func (b *cancelOnClose) Close() error {
 // redirect is followed only to a repository that passes the gate; a redirect off the
 // API host is refused (no JSON endpoint has one).
 func (c *Client) get(ctx context.Context, token, path string) ([]byte, error) {
+	body, _, err := c.getHeader(ctx, token, path)
+	return body, err
+}
+
+// getHeader is get, also returning the final response's headers (for a paged
+// endpoint's Link header).
+func (c *Client) getHeader(ctx context.Context, token, path string) ([]byte, http.Header, error) {
 	gated, err := c.gatePath(ctx, token, path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	repoScoped := strings.HasPrefix(path, "/repos/")
 	u := c.baseURL + gated
 	for hop := 0; ; hop++ {
 		resp, err := c.apiDo(ctx, token, u)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if isRedirect(resp.StatusCode) {
 			loc, lerr := resp.Location()
 			status := resp.StatusCode
 			drain(resp)
 			if lerr != nil {
-				return nil, fmt.Errorf("status %d: redirect without a usable location", status)
+				return nil, nil, fmt.Errorf("status %d: redirect without a usable location", status)
 			}
 			if hop >= maxAPIRedirects {
-				return nil, fmt.Errorf("status %d: too many redirects", status)
+				return nil, nil, fmt.Errorf("status %d: too many redirects", status)
 			}
 			if _, on := c.apiRelPath(loc); !on {
-				return nil, fmt.Errorf("status %d: refused a redirect off the API host", status)
+				return nil, nil, fmt.Errorf("status %d: refused a redirect off the API host", status)
 			}
 			if err := c.gateLocation(ctx, token, loc, repoScoped); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			u = loc.String()
 			continue
@@ -533,12 +540,12 @@ func (c *Client) get(ctx context.Context, token, path string) ([]byte, error) {
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 		resp.Body.Close()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("status %d", resp.StatusCode)
+			return nil, nil, fmt.Errorf("status %d", resp.StatusCode)
 		}
-		return body, nil
+		return body, resp.Header, nil
 	}
 }
 

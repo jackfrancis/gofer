@@ -16,6 +16,23 @@ type AxisProposal struct {
 	Urgency    float64 `json:"urgency"`
 	Confidence float64 `json:"confidence"`
 	Rationale  string  `json:"rationale,omitempty"`
+	// ReviewRequestedByBot is the item's Signals.ReviewRequestedByBot when the
+	// proposal was made. A proposal made under another classification (the requester
+	// was added to or removed from BOT_REVIEWERS since) is stale: CurrentProposal
+	// drops it, so the item falls back to its baseline until it is ranked again.
+	// Proposals from before this field were all made with the flag unset, which is
+	// what its zero value records.
+	ReviewRequestedByBot bool `json:"review_requested_by_bot,omitempty"`
+}
+
+// CurrentProposal returns the item's model proposal, or nil when there is none or it
+// was made under a different bot classification than the item has now. Everything
+// that uses a proposal reads it through here.
+func (s Signals) CurrentProposal() *AxisProposal {
+	if s.Proposed == nil || s.Proposed.ReviewRequestedByBot != s.ReviewRequestedByBot {
+		return nil
+	}
+	return s.Proposed
 }
 
 // AxisRanker proposes the four axes for an item. The real implementation calls an

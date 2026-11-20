@@ -160,7 +160,25 @@ Wired on the web-tier side; they define what a runtime must respect:
   (`WorkItem.OnRadar`), and no bulk action (Review all, the second-opinion batch)
   draws from them. A
   run adds a thread turn only through `POST /agent/worklist/reply`
-  (`worklist.AppendReply`). The web and runtime images must ship together: a runtime
+  (`worklist.AppendReply`). Before the merge, every write-back path applies
+  `worklist.RunPolicy` (the agent plane's ingest handler, and the in-process
+  `StoreSink`): workload metadata is stamped `OriginAgent`, so a run cannot claim the
+  `OriginUser` override that `Resolve` leaves unrescored, and
+  `Signals.ReviewRequestedByBot` is derived from `ReviewRequestedBy` against
+  `BOT_REVIEWERS` (case-insensitive), replacing whatever the run sent. The agent
+  plane's reads (`GET /agent/worklist`, `StoreSink.List`) re-derive the flag too
+  (`RunPolicy.Classify`), so a run ranks by the current bot list, and so do the user's
+  (the JSON worklist and the radar get `RunPolicy.ClassifyReads(store)`), so the rank
+  shown and the rank Discuss explains agree. The rank job picks candidates by their
+  baseline with the previous proposal cleared. A proposal records the bot
+  classification it was made under (`AxisProposal.ReviewRequestedByBot`); read it
+  through `Signals.CurrentProposal`, which drops it once the classification changes. The requester is
+  the actor of the user's pending review request on the timeline: the latest
+  `review_requested` for them, until a `review_request_removed` or their own submitted
+  review ends it (a comment does not). The timeline is paged by its `Link` header up
+  to a cap, inside enrich's reserve-adjusted deadline; a timeline longer than the cap
+  leaves the requester and both waiting timestamps unset. The deterministic scorer discounts a bot's request (no awaiting-me
+  pressure, low floors) unless the user is also an assignee. The web and runtime images must ship together: a runtime
   from before this rule posts its reply inside the item, where it is now ignored.
 - Replies can land out of order, so a turn's position does not say what it answers.
   Every new turn gets an ID; an agent turn's `ReplyTo` names the user turn it

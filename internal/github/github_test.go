@@ -81,7 +81,8 @@ func TestFetchWorklistDerivesReasons(t *testing.T) {
 				{"number":2,"repository_url":"https://api.github.com/repos/o/r","state":"open","user":{"login":"someone"},"assignees":[{"login":"me"}]},
 				{"number":3,"repository_url":"https://api.github.com/repos/o/r","state":"open","user":{"login":"someone"}}]}`))
 		case strings.Contains(q, "review-requested:@me"):
-			_, _ = w.Write([]byte(`{"items":[{"number":4,"repository_url":"https://api.github.com/repos/o/r","state":"open","user":{"login":"someone"},"pull_request":{"url":"x"}}]}`))
+			_, _ = w.Write([]byte(`{"items":[{"number":4,"repository_url":"https://api.github.com/repos/o/r","state":"open","user":{"login":"someone"},"pull_request":{"url":"x"}},
+				{"number":5,"repository_url":"https://api.github.com/repos/o/r","state":"open","user":{"login":"someone"},"assignees":[{"login":"Me"}],"pull_request":{"url":"x"}}]}`))
 		default:
 			t.Errorf("unexpected query %q", q)
 			_, _ = w.Write([]byte(`{"items":[]}`))
@@ -104,6 +105,12 @@ func TestFetchWorklistDerivesReasons(t *testing.T) {
 		3: worklist.ReasonInvolved,        // mentioned or commented — the union cannot say
 		4: worklist.ReasonReviewRequested, // its own query already knows
 	}
+	// #5 came only from the review search (the union search missed it, as when it is
+	// partial); the assignment its payload proves is kept beside the request.
+	if r := got[5]; len(r) != 2 || r[0] != worklist.ReasonReviewRequested || r[1] != worklist.ReasonAssignee {
+		t.Errorf("item #5 reasons = %v, want [review_requested assignee]", r)
+	}
+	delete(got, 5)
 	if len(got) != len(want) {
 		t.Fatalf("want %d items, got %v", len(want), got)
 	}
