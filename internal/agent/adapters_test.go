@@ -134,6 +134,9 @@ func TestPlaneClientSurfacesHTTPErrors(t *testing.T) {
 	if err := c.Ingest(context.Background(), []worklist.WorkItem{{ID: "i1"}}); err == nil {
 		t.Fatal("expected an error for a 401 ingest")
 	}
+	if err := c.Research(context.Background(), "i1", worklist.ResearchAdjustment{}); err == nil {
+		t.Fatal("expected an error for a 401 research write")
+	}
 }
 
 // Both shapes satisfy the workload's seams, so agent.Run is indifferent to which a

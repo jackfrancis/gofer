@@ -2,6 +2,7 @@ package worklist
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -278,5 +279,124 @@ func TestApplyReply(t *testing.T) {
 	other, _ := s.List(ctx, "u2")
 	if len(other) != 0 {
 		t.Fatalf("u2 must have nothing, got %+v", other)
+	}
+}
+
+// A refresh's write-back carries no model proposal or research adjustment (a GitHub
+// fetch derives neither): the stored ones survive it. A write-back that carries one
+// replaces the stored one.
+func TestMergeRunItemsKeepsModelSignals(t *testing.T) {
+	prop := &AxisProposal{Relevance: 0.8, Rationale: "model"}
+	adj := &ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "discussed"}
+	stored := WorkItem{ID: "a", GitHub: GitHubRef{Title: "old"}, Signals: Signals{Comments: 1, Proposed: prop, Research: adj}}
+
+	refresh := WorkItem{ID: "a", GitHub: GitHubRef{Title: "new"}, Signals: Signals{Comments: 7}}
+	m := MergeRunItems([]WorkItem{stored}, []WorkItem{refresh})[0]
+	if m.Signals.Proposed != prop || m.Signals.Research != adj {
+		t.Fatalf("a write-back without model signals must keep the stored ones, got %+v / %+v", m.Signals.Proposed, m.Signals.Research)
+	}
+	if m.Signals.Comments != 7 || m.GitHub.Title != "new" {
+		t.Fatalf("the refresh's own fields must land, got %+v", m)
+	}
+
+	newProp := &AxisProposal{Relevance: 0.2}
+	newAdj := &ResearchAdjustment{Relevance: 0.5, Impact: 1, Engagement: 1, Urgency: 1}
+	rerank := WorkItem{ID: "a", Signals: Signals{Proposed: newProp, Research: newAdj}}
+	m = MergeRunItems([]WorkItem{stored}, []WorkItem{rerank})[0]
+	if m.Signals.Proposed != newProp || m.Signals.Research != newAdj {
+		t.Fatalf("a write-back carrying model signals must replace the stored ones, got %+v / %+v", m.Signals.Proposed, m.Signals.Research)
+	}
+}
+
+// ApplyResearch sets the research adjustment alone: the item's GitHub fields, other
+// signals and thread stay as stored, so a pass that read the item before a refresh
+// cannot undo it.
+func TestApplyResearch(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore()
+	prop := &AxisProposal{Relevance: 0.8}
+	s.Seed("u1", WorkItem{
+		ID:      "a",
+		GitHub:  GitHubRef{Title: "refreshed", State: "closed"},
+		Signals: Signals{Comments: 4, Proposed: prop},
+		Thread:  []Message{{ID: "q1", Role: RoleUser, Content: "q", At: t0}},
+	})
+	adj := ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "r", AppliedAt: t1}
+	if err := ApplyResearch(ctx, s, "u1", "a", adj); err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyResearch(ctx, s, "u1", "gone", adj); err != nil {
+		t.Fatalf("an adjustment for a missing item is dropped without error, got %v", err)
+	}
+	if err := ApplyResearch(ctx, s, "u2", "a", adj); err != nil {
+		t.Fatalf("another owner's item is not found, got %v", err)
+	}
+	got, _ := s.List(ctx, "u1")
+	it := got[0]
+	if it.Signals.Research == nil || !reflect.DeepEqual(*it.Signals.Research, adj) {
+		t.Fatalf("the adjustment must land, got %+v", it.Signals.Research)
+	}
+	if it.GitHub.Title != "refreshed" || it.GitHub.State != "closed" || it.Signals.Comments != 4 || it.Signals.Proposed == nil || len(it.Thread) != 1 {
+		t.Fatalf("everything but the adjustment must stay as stored, got %+v", it)
+	}
+	if other, _ := s.List(ctx, "u2"); len(other) != 0 {
+		t.Fatalf("u2 must have nothing, got %+v", other)
+	}
+}
+
+// A resent adjustment cannot undo a later one: A lands, B lands for a later turn,
+// and A arrives again. An unstamped adjustment is refused.
+func TestApplyResearchDropsOlderAdjustment(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore()
+	s.Seed("u1", WorkItem{ID: "a"})
+	a := ResearchAdjustment{Relevance: 0.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "A", AppliedAt: t1}
+	b := ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "B", AppliedAt: t2}
+	for _, adj := range []ResearchAdjustment{a, b, a} {
+		if err := ApplyResearch(ctx, s, "u1", "a", adj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ := s.List(ctx, "u1")
+	if r := got[0].Signals.Research; r == nil || r.Rationale != "B" {
+		t.Fatalf("a replayed older adjustment must not replace a newer one, got %+v", r)
+	}
+	if err := ApplyResearch(ctx, s, "u1", "a", ResearchAdjustment{Relevance: 1, Impact: 1, Engagement: 1, Urgency: 1}); err != ErrUnstampedResearch {
+		t.Fatalf("want ErrUnstampedResearch, got %v", err)
+	}
+}
+
+// BaselineScore ignores the model-derived signals.
+func TestBaselineScoreIgnoresModelSignals(t *testing.T) {
+	plain := WorkItem{ID: "a", Signals: Signals{Reasons: []Reason{ReasonReviewRequested}}}
+	scored := plain
+	scored.Signals.Proposed = &AxisProposal{Relevance: 0.01, Impact: 0.01, Engagement: 0.01, Urgency: 0.01}
+	scored.Signals.Research = &ResearchAdjustment{Relevance: 0, Impact: 0, Engagement: 0, Urgency: 0}
+	if got, want := BaselineScore(scored, t0).Rank, Score(plain, t0).Rank; got != want {
+		t.Fatalf("BaselineScore = %v, want the plain score %v", got, want)
+	}
+	if scored.Signals.Proposed == nil || scored.Signals.Research == nil {
+		t.Fatal("BaselineScore must not change its argument")
+	}
+}
+
+// Research that read a turn no longer in the thread (the conversation was cleared)
+// is dropped whatever its stamp; research on turns still there, hidden or not, lands.
+func TestSetResearchRequiresItsTurns(t *testing.T) {
+	item := WorkItem{ID: "a", Thread: []Message{
+		{ID: "n1", Role: RoleUser, Content: "new", At: t2},
+		{ID: "n2", Role: RoleAgent, Content: "hidden later", At: t3, Hidden: true},
+		{Role: RoleUser, Content: "legacy turn without an id", At: t3},
+	}}
+	current := ResearchAdjustment{Relevance: 0.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "current", AppliedAt: t1, Turns: []string{"n1", "n2", "pos:2"}}
+	if ok, err := SetResearch(&item, current); err != nil || !ok {
+		t.Fatalf("research on turns still in the thread must land, got %v %v", ok, err)
+	}
+	cleared := ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 1, Rationale: "cleared", AppliedAt: t3, Turns: []string{"o1", "r1"}}
+	if ok, err := SetResearch(&item, cleared); err != nil || ok {
+		t.Fatalf("research on a cleared conversation must be dropped, got %v %v", ok, err)
+	}
+	if item.Signals.Research.Rationale != "current" {
+		t.Fatalf("want the current research kept, got %+v", item.Signals.Research)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackfrancis/gofer/internal/agent"
 	"github.com/jackfrancis/gofer/internal/authn"
 	"github.com/jackfrancis/gofer/internal/identity"
 	"github.com/jackfrancis/gofer/internal/principal"
@@ -74,10 +75,11 @@ func TestAgentIngestWithRunToken(t *testing.T) {
 
 // planeFixture is an agent plane with a memory store and a minter for run tokens.
 type planeFixture struct {
-	store  *worklist.MemoryStore
-	ingest http.Handler
-	reply  http.Handler
-	mint   func(scopes ...string) string
+	store    *worklist.MemoryStore
+	ingest   http.Handler
+	reply    http.Handler
+	research http.Handler
+	mint     func(scopes ...string) string
 }
 
 func newPlane(t *testing.T) planeFixture {
@@ -94,9 +96,10 @@ func newPlane(t *testing.T) planeFixture {
 	store := worklist.NewMemoryStore()
 	h := NewIngestHandler(store, nil, worklist.NewRunPolicy(nil))
 	return planeFixture{
-		store:  store,
-		ingest: auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Ingest)),
-		reply:  auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Reply)),
+		store:    store,
+		ingest:   auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Ingest)),
+		reply:    auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Reply)),
+		research: auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Research)),
 		mint: func(scopes ...string) string {
 			tok, err := authority.Mint(identity.Claims{RunID: "run", Subject: "u1", Scopes: scopes})
 			if err != nil {
@@ -193,6 +196,86 @@ func TestAgentReply(t *testing.T) {
 	}
 }
 
+// A research write-back sets the adjustment and nothing else: an item refreshed after
+// the run read it keeps its refreshed GitHub fields, signals and thread. The workload's
+// plane client and this handler agree on the request.
+func TestAgentResearch(t *testing.T) {
+	f := newPlane(t)
+	prop := &worklist.AxisProposal{Relevance: 0.8, Rationale: "model"}
+	f.store.Seed("u1", worklist.WorkItem{
+		ID:      "a",
+		GitHub:  worklist.GitHubRef{Repo: "o/r", Number: 1, Title: "Refreshed title", State: "closed"},
+		Signals: worklist.Signals{Comments: 9, Proposed: prop},
+		Thread:  []worklist.Message{{ID: "q1", Role: worklist.RoleUser, Content: "q"}},
+	})
+	full := f.mint("signals:read", "metadata:write")
+	adj := worklist.ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 0.5, Rationale: "discussed", AppliedAt: time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC), Turns: []string{"q1"}}
+
+	srv := httptest.NewServer(f.research)
+	defer srv.Close()
+	plane := agent.NewPlaneClient(srv.URL, full, srv.Client())
+	if err := plane.Research(context.Background(), "a", adj); err != nil {
+		t.Fatalf("Research: %v", err)
+	}
+	got, _ := f.store.List(context.Background(), "u1")
+	it := got[0]
+	if r := it.Signals.Research; r == nil || !r.AppliedAt.Equal(adj.AppliedAt) || r.Relevance != 1.5 || r.Rationale != "discussed" || len(r.Turns) != 1 || r.Turns[0] != "q1" {
+		t.Fatalf("the adjustment must land, got %+v", it.Signals.Research)
+	}
+	if it.GitHub.Title != "Refreshed title" || it.GitHub.State != "closed" || it.Signals.Comments != 9 || it.Signals.Proposed == nil || len(it.Thread) != 1 {
+		t.Fatalf("everything but the adjustment must stay as stored, got %+v", it)
+	}
+
+	// An adjustment for an item that is gone is accepted and dropped.
+	if code := f.post(t, f.research, "/agent/worklist/research", full, map[string]any{"item_id": "gone", "adjustment": adj}); code != http.StatusOK {
+		t.Fatalf("want 200 for a dropped adjustment, got %d", code)
+	}
+	// A resend of an older adjustment (A, then B, then A again) is accepted and dropped.
+	later := adj
+	later.AppliedAt = adj.AppliedAt.Add(time.Hour)
+	later.Rationale = "later"
+	for _, a := range []worklist.ResearchAdjustment{later, adj} {
+		if code := f.post(t, f.research, "/agent/worklist/research", full, map[string]any{"item_id": "a", "adjustment": a}); code != http.StatusOK {
+			t.Fatalf("want 200, got %d", code)
+		}
+	}
+	if got, _ := f.store.List(context.Background(), "u1"); got[0].Signals.Research.Rationale != "later" {
+		t.Fatalf("a resent older adjustment must not replace a newer one, got %+v", got[0].Signals.Research)
+	}
+
+	// An explicit zero multiplier is a valid adjustment.
+	zero := map[string]any{"relevance": 0, "impact": 1, "engagement": 1, "urgency": 1, "applied_at": later.AppliedAt.Add(time.Hour)}
+	if code := f.post(t, f.research, "/agent/worklist/research", full, map[string]any{"item_id": "a", "adjustment": zero}); code != http.StatusOK {
+		t.Fatalf("want 200 for an explicit zero multiplier, got %d", code)
+	}
+	if got, _ := f.store.List(context.Background(), "u1"); got[0].Signals.Research.Relevance != 0 || got[0].Signals.Research.Impact != 1 {
+		t.Fatalf("the explicit zero must land, got %+v", got[0].Signals.Research)
+	}
+
+	// Incomplete adjustments are rejected: a missing multiplier would decode as zero.
+	for name, partial := range map[string]map[string]any{
+		"empty":           {},
+		"missing urgency": {"relevance": 1, "impact": 1, "engagement": 1, "applied_at": later.AppliedAt},
+		"unstamped":       {"relevance": 1, "impact": 1, "engagement": 1, "urgency": 1},
+	} {
+		if code := f.post(t, f.research, "/agent/worklist/research", full, map[string]any{"item_id": "a", "adjustment": partial}); code != http.StatusBadRequest {
+			t.Fatalf("%s: want 400, got %d", name, code)
+		}
+	}
+
+	// Malformed requests are rejected.
+	if code := f.post(t, f.research, "/agent/worklist/research", full, map[string]any{"item_id": "a"}); code != http.StatusBadRequest {
+		t.Fatalf("want 400 without an adjustment, got %d", code)
+	}
+	if code := f.post(t, f.research, "/agent/worklist/research", full, map[string]any{"adjustment": adj}); code != http.StatusBadRequest {
+		t.Fatalf("want 400 without an item id, got %d", code)
+	}
+	// A token without metadata:write cannot write it.
+	if code := f.post(t, f.research, "/agent/worklist/research", f.mint("signals:read"), map[string]any{"item_id": "a", "adjustment": adj}); code != http.StatusForbidden {
+		t.Fatalf("want 403 without metadata:write, got %d", code)
+	}
+}
+
 // The agent-plane write-back applies the web tier's policy: a review requested by a
 // configured bot is stored as an automated assignment, a human's request is stored
 // as a human ask whatever the run claims, and a run's metadata is stored as
@@ -279,5 +362,25 @@ func TestAgentListClassifiesByCurrentPolicy(t *testing.T) {
 	}
 	if !got["stale-human"] || got["stale-bot"] {
 		t.Fatalf("served flags %v, want stale-human=true stale-bot=false", got)
+	}
+}
+
+// Research on a long conversation lists one key per turn; a valid adjustment must
+// fit the route's budget (the reply it follows has already landed).
+func TestAgentResearchLongThread(t *testing.T) {
+	f := newPlane(t)
+	thread := make([]worklist.Message, 2500)
+	turns := make([]string, len(thread))
+	for i := range thread {
+		thread[i] = worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: "q"}
+		turns[i] = thread[i].ID
+	}
+	f.store.Seed("u1", worklist.WorkItem{ID: "a", Thread: thread})
+	adj := worklist.ResearchAdjustment{Relevance: 1.5, Impact: 1, Engagement: 1, Urgency: 1, AppliedAt: time.Date(2026, 11, 17, 9, 0, 0, 0, time.UTC), Turns: turns}
+	if code := f.post(t, f.research, "/agent/worklist/research", f.mint("signals:read", "metadata:write"), map[string]any{"item_id": "a", "adjustment": adj}); code != http.StatusOK {
+		t.Fatalf("want 200 for research on a 2,500-turn thread, got %d", code)
+	}
+	if got, _ := f.store.List(context.Background(), "u1"); got[0].Signals.Research == nil || len(got[0].Signals.Research.Turns) != len(turns) {
+		t.Fatal("the long thread's research must land with all its turns")
 	}
 }

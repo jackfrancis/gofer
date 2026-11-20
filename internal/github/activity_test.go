@@ -147,6 +147,9 @@ func TestItemActivityRequestRemoved(t *testing.T) {
 	if a.RequestedByLogin != "" || !a.AwaitingMeSince.IsZero() {
 		t.Fatalf("withdrawn request still pending: requester %q since %v", a.RequestedByLogin, a.AwaitingMeSince)
 	}
+	if !a.TimelineComplete || !a.RequestEnded {
+		t.Fatalf("a whole timeline ending in a withdrawal: complete=%v ended=%v, want both", a.TimelineComplete, a.RequestEnded)
+	}
 
 	// Another reviewer's removal does not withdraw login's request.
 	srv2 := timelineServer(`[
@@ -161,6 +164,83 @@ func TestItemActivityRequestRemoved(t *testing.T) {
 	}
 	if a.RequestedByLogin != "alice" {
 		t.Fatalf("RequestedByLogin = %q, want alice", a.RequestedByLogin)
+	}
+	if a.RequestEnded {
+		t.Fatal("login's request is pending; RequestEnded must be false")
+	}
+}
+
+// RequestEnded is positive evidence only: login's own review fulfils the request,
+// while a timeline with no request event for login (a team request, say) proves
+// nothing.
+func TestItemActivityRequestEnded(t *testing.T) {
+	for name, tc := range map[string]struct {
+		timeline string
+		ended    bool
+	}{
+		"own review fulfils it": {`[
+			{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"bob"}},
+			{"event":"reviewed","submitted_at":"2026-01-02T00:00:00Z","state":"commented","user":{"login":"me"}}
+		]`, true},
+		"no request event for login": {`[
+			{"event":"commented","created_at":"2026-01-01T00:00:00Z","actor":{"login":"bob"}}
+		]`, false},
+		"re-requested after a review": {`[
+			{"event":"reviewed","submitted_at":"2026-01-01T00:00:00Z","state":"commented","user":{"login":"me"}},
+			{"event":"review_requested","created_at":"2026-01-02T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"bob"}}
+		]`, false},
+		// login may be on the team, which GitHub's review-requested search counts.
+		"team request after own review": {`[
+			{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"alice"}},
+			{"event":"reviewed","submitted_at":"2026-01-02T00:00:00Z","state":"approved","user":{"login":"me"}},
+			{"event":"review_requested","created_at":"2026-01-03T00:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"bob"}}
+		]`, false},
+		"team request withdrawn after own review": {`[
+			{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"alice"}},
+			{"event":"reviewed","submitted_at":"2026-01-02T00:00:00Z","state":"approved","user":{"login":"me"}},
+			{"event":"review_requested","created_at":"2026-01-03T00:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"bob"}},
+			{"event":"review_request_removed","created_at":"2026-01-04T00:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"bob"}}
+		]`, true},
+		"own review fulfils an earlier team request": {`[
+			{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"bob"}},
+			{"event":"review_requested","created_at":"2026-01-01T01:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"alice"}},
+			{"event":"reviewed","submitted_at":"2026-01-02T00:00:00Z","state":"approved","user":{"login":"me"}}
+		]`, true},
+		"team-only request withdrawn": {`[
+			{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"alice"}},
+			{"event":"review_request_removed","created_at":"2026-01-02T00:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"alice"}}
+		]`, true},
+		"team-only request pending": {`[
+			{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"alice"}}
+		]`, false},
+		"fulfilled team request, then personal withdrawal": {`[
+			{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"alice"}},
+			{"event":"reviewed","submitted_at":"2026-01-02T00:00:00Z","state":"approved","user":{"login":"me"}},
+			{"event":"review_requested","created_at":"2026-01-03T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"bob"}},
+			{"event":"review_request_removed","created_at":"2026-01-04T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"bob"}}
+		]`, true},
+		"one of two team requests withdrawn": {`[
+			{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_team":{"slug":"team-a"},"actor":{"login":"alice"}},
+			{"event":"review_requested","created_at":"2026-01-01T01:00:00Z","requested_team":{"slug":"team-b"},"actor":{"login":"alice"}},
+			{"event":"review_request_removed","created_at":"2026-01-02T00:00:00Z","requested_team":{"slug":"team-a"},"actor":{"login":"alice"}}
+		]`, false},
+		"personal withdrawal leaves a team request": {`[
+			{"event":"review_requested","created_at":"2026-01-01T00:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"bob"}},
+			{"event":"review_requested","created_at":"2026-01-01T01:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"alice"}},
+			{"event":"review_request_removed","created_at":"2026-01-02T00:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"alice"}}
+		]`, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := timelineServer(tc.timeline)
+			defer srv.Close()
+			a, err := NewClient(srv.Client(), srv.URL).ItemActivity(context.Background(), "tok", "o/r", 1, "me")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if a.RequestEnded != tc.ended || !a.TimelineComplete {
+				t.Fatalf("RequestEnded = %v (complete %v), want %v", a.RequestEnded, a.TimelineComplete, tc.ended)
+			}
+		})
 	}
 }
 
@@ -185,6 +265,9 @@ func TestItemActivityTruncatedTimelineWaitingUnknown(t *testing.T) {
 	}
 	if calls != timelineMaxPages {
 		t.Fatalf("timeline calls = %d, want the cap %d", calls, timelineMaxPages)
+	}
+	if a.TimelineComplete || a.RequestEnded {
+		t.Fatalf("truncated timeline: complete=%v ended=%v, want neither", a.TimelineComplete, a.RequestEnded)
 	}
 }
 

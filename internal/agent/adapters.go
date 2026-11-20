@@ -25,7 +25,7 @@ import (
 //     inside the web tier reads gofer's vault and worklist store directly.
 //   - OUT-OF-PROCESS (PlaneClient): a backend that executes the workload in another
 //     process or sandbox reaches gofer over its agent plane (GET /agent/credential,
-//     GET/POST /agent/worklist), authenticating every call with the run credential.
+//     GET/POST /agent/worklist and its reply/research routes), authenticating every call with the run credential.
 //
 // A backend picks the shape its substrate needs and writes no plumbing of its own.
 
@@ -144,6 +144,12 @@ func (s *StoreSink) Reply(ctx context.Context, itemID, replyTo string, reply wor
 	return worklist.ApplyReply(ctx, s.store, s.ownerID, itemID, replyTo, reply)
 }
 
+// Research sets the owner's item's research adjustment alone, atomically
+// (worklist.ApplyResearch).
+func (s *StoreSink) Research(ctx context.Context, itemID string, adj worklist.ResearchAdjustment) error {
+	return worklist.ApplyResearch(ctx, s.store, s.ownerID, itemID, adj)
+}
+
 // PlaneClient is the out-of-process Vendor and Sink: it reaches gofer's agent plane
 // over HTTP, authenticating every call with the run credential (the audience-bound
 // token the runtime carries). The owner is implied by that credential, so — unlike
@@ -260,6 +266,20 @@ type ReplyRequest struct {
 	ItemID    string           `json:"item_id"`
 	InReplyTo string           `json:"in_reply_to"` // the answered user turn's Key
 	Message   worklist.Message `json:"message"`
+}
+
+// Research writes an item's research adjustment, and nothing else, through the
+// agent plane (POST /agent/worklist/research). The plane drops an adjustment older
+// than the stored one (by AppliedAt), so resending after a lost response cannot
+// undo a later result.
+func (c *PlaneClient) Research(ctx context.Context, itemID string, adj worklist.ResearchAdjustment) error {
+	return c.post(ctx, "/agent/worklist/research", "research", ResearchRequest{ItemID: itemID, Adjustment: adj})
+}
+
+// ResearchRequest is the body of POST /agent/worklist/research.
+type ResearchRequest struct {
+	ItemID     string                      `json:"item_id"`
+	Adjustment worklist.ResearchAdjustment `json:"adjustment"`
 }
 
 // post sends one JSON body to the agent plane and expects 200.

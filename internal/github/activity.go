@@ -15,6 +15,9 @@ type timelineEvent struct {
 	RequestedReviewer *struct {
 		Login string `json:"login"`
 	} `json:"requested_reviewer"`
+	RequestedTeam *struct {
+		Slug string `json:"slug"`
+	} `json:"requested_team"`
 	User *struct {
 		Login string `json:"login"`
 	} `json:"user"`
@@ -32,6 +35,16 @@ type Activity struct {
 	AwaitingMeSince     time.Time // when login was asked to review with no engagement since; zero if none
 	AwaitingOthersSince time.Time // when the ball is in others' court; zero if none
 	RequestedByLogin    string    // who requested login's pending review (the actor); empty when none pending or unknown
+	// TimelineComplete reports that every timeline event was read, so
+	// RequestedByLogin is authoritative; when false it is unknown, not "none".
+	TimelineComplete bool
+	// RequestEnded reports that the whole timeline was read and no review request
+	// that may include login is outstanding. login's personal request ends with a
+	// review_request_removed or with login submitting a review. Team membership is
+	// unknown, so every team request may include login: each stands until it is
+	// withdrawn or login reviews after it. A timeline with no request event and no
+	// review by login is not evidence, so RequestEnded is false there.
+	RequestEnded bool
 }
 
 // The timeline is read oldest first, a page at a time, so the latest events, which
@@ -68,7 +81,12 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 	var inbound int
 	var requestedAt, requestChangedAt, myLastActivityAt, lastActivityAt time.Time
 	var lastActor, requestedByLogin string
-	var lastActivityDecisive bool
+	// The review requests outstanding as of each event: login's personal one, and
+	// each team's (membership is unknown, so any of them may include login), with
+	// when it was made. sawRequest records that the timeline holds any request
+	// evidence at all — a request event, or login's own review.
+	var lastActivityDecisive, personalPending, sawRequest bool
+	teamRequests := make(map[string]time.Time)
 	for _, e := range events {
 		switch e.Event {
 		case "commented":
@@ -93,9 +111,18 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 			if at.IsZero() {
 				at = e.CreatedAt
 			}
-			if l == login && !at.Before(requestChangedAt) {
-				// Submitting the review fulfils the pending request.
-				requestChangedAt, requestedAt, requestedByLogin = at, time.Time{}, ""
+			if l == login {
+				sawRequest = true
+				if !at.Before(requestChangedAt) {
+					// Submitting the review fulfils the pending request.
+					requestChangedAt, requestedAt, requestedByLogin, personalPending = at, time.Time{}, "", false
+				}
+				// It fulfils the team requests made before it too.
+				for team, requested := range teamRequests {
+					if !requested.After(at) {
+						delete(teamRequests, team)
+					}
+				}
 			}
 			if at.After(lastActivityAt) {
 				lastActivityAt, lastActor = at, l
@@ -111,14 +138,23 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 		case "cross-referenced":
 			inbound++
 		case "review_requested", "review_request_removed":
+			if e.RequestedTeam != nil {
+				sawRequest = true
+				if e.Event == "review_requested" {
+					teamRequests[e.RequestedTeam.Slug] = e.CreatedAt
+				} else {
+					delete(teamRequests, e.RequestedTeam.Slug)
+				}
+				break
+			}
 			if e.RequestedReviewer == nil || e.RequestedReviewer.Login != login || e.CreatedAt.Before(requestChangedAt) {
 				break
 			}
-			requestChangedAt = e.CreatedAt
+			requestChangedAt, sawRequest = e.CreatedAt, true
 			if e.Event == "review_requested" {
-				requestedAt, requestedByLogin = e.CreatedAt, eventLogin(e)
+				requestedAt, requestedByLogin, personalPending = e.CreatedAt, eventLogin(e), true
 			} else {
-				requestedAt, requestedByLogin = time.Time{}, ""
+				requestedAt, requestedByLogin, personalPending = time.Time{}, "", false
 			}
 		}
 	}
@@ -127,7 +163,9 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 	if !complete {
 		return a, nil // the latest events are unread: who is waiting is unknown
 	}
+	a.TimelineComplete = true
 	a.RequestedByLogin = requestedByLogin
+	a.RequestEnded = sawRequest && !personalPending && len(teamRequests) == 0
 
 	// Decide whose court the ball is in from the most recent court-changing event.
 	// Ball on login: a review was requested of them and they have not engaged
