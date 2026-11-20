@@ -176,8 +176,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   policy set aside stays set aside. Only a complete review-request search
   (`github.Fetch.ReviewRequestsComplete`) confirms a request was removed; after a
   partial one the stored request is kept, and the chained enrich drops that kept
-  request only if the whole timeline shows it ended (`Activity.RequestEnded`: a
-  withdrawal or the user's own review, with no team request still pending after it,
+  request only if the whole timeline shows no request that may include the user still
+  outstanding (`Activity.RequestEnded`: the personal request withdrawn or fulfilled by
+  the user's own review, and every team request withdrawn or made before that review,
   since team membership is unknown and the search counts team requests). A request
   the search showed is never dropped by the timeline, since a team request names the
   team, not the user. A retired item

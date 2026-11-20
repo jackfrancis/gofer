@@ -849,6 +849,33 @@ func TestRefreshReviewRequestEvidence(t *testing.T) {
 		}
 	})
 
+	// The search confirmed a request; the next, partial one misses it, and the whole
+	// timeline shows the last outstanding request ended — a team-only request
+	// withdrawn, or a personal one withdrawn after the user's review fulfilled the
+	// team's. The kept request goes.
+	for name, events := range map[string][]string{
+		"team-only request withdrawn": {
+			`{"event":"review_requested","created_at":"2026-01-01T09:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"alice"}}`,
+			`{"event":"review_request_removed","created_at":"2026-01-02T09:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"alice"}}`,
+		},
+		"personal withdrawal after a fulfilled team request": {
+			`{"event":"review_requested","created_at":"2026-01-01T09:00:00Z","requested_team":{"slug":"my-team"},"actor":{"login":"alice"}}`,
+			`{"event":"reviewed","submitted_at":"2026-01-02T09:00:00Z","state":"approved","user":{"login":"me"}}`,
+			`{"event":"review_requested","created_at":"2026-01-03T09:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"bob"}}`,
+			`{"event":"review_request_removed","created_at":"2026-01-04T09:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"bob"}}`,
+		},
+	} {
+		t.Run(name+" ends a carried request", func(t *testing.T) {
+			sink := newSink()
+			if first := reviewSnapshot(t, sink, true, "["+strings.Join(events[:len(events)-1], ",")+"]", false); !pending(first) {
+				t.Fatalf("setup: the confirmed request was not recorded: reasons %v", first.Signals.Reasons)
+			}
+			if item := reviewSnapshot(t, sink, false, "["+strings.Join(events, ",")+"]", false); pending(item) {
+				t.Fatalf("the last outstanding request ended, but reasons are %v", item.Signals.Reasons)
+			}
+		})
+	}
+
 	// The first refresh learns the bot requester from the timeline while its partial
 	// search misses the request; the next one confirms the request but cannot read the
 	// timeline. The known requester stays.

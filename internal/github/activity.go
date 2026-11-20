@@ -38,14 +38,12 @@ type Activity struct {
 	// TimelineComplete reports that every timeline event was read, so
 	// RequestedByLogin is authoritative; when false it is unknown, not "none".
 	TimelineComplete bool
-	// RequestEnded reports that the whole timeline was read and the latest change to
-	// login's own review request ended it: a review_request_removed, or login
-	// submitting a review. It is the timeline's positive evidence that no personal
-	// request is pending. A request made through a team appears as no event for
-	// login, so the absence of a request event is not evidence; and since membership
-	// is unknown, a team request still pending on the timeline may include login and
-	// leaves RequestEnded false — unless login's own review came after it, which
-	// fulfils it. A withdrawal of login's personal request does not end a team's.
+	// RequestEnded reports that the whole timeline was read and no review request
+	// that may include login is outstanding. login's personal request ends with a
+	// review_request_removed or with login submitting a review. Team membership is
+	// unknown, so every team request may include login: each stands until it is
+	// withdrawn or login reviews after it. A timeline with no request event and no
+	// review by login is not evidence, so RequestEnded is false there.
 	RequestEnded bool
 }
 
@@ -83,9 +81,11 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 	var inbound int
 	var requestedAt, requestChangedAt, myLastActivityAt, lastActivityAt time.Time
 	var lastActor, requestedByLogin string
-	var lastActivityDecisive, requestEnded, endedByReview bool
-	// Team review requests still pending on the timeline, by team, with when each
-	// was made. Membership is unknown, so any of them may include login.
+	// The review requests outstanding as of each event: login's personal one, and
+	// each team's (membership is unknown, so any of them may include login), with
+	// when it was made. sawRequest records that the timeline holds any request
+	// evidence at all — a request event, or login's own review.
+	var lastActivityDecisive, personalPending, sawRequest bool
 	teamRequests := make(map[string]time.Time)
 	for _, e := range events {
 		switch e.Event {
@@ -111,9 +111,18 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 			if at.IsZero() {
 				at = e.CreatedAt
 			}
-			if l == login && !at.Before(requestChangedAt) {
-				// Submitting the review fulfils the pending request.
-				requestChangedAt, requestedAt, requestedByLogin, requestEnded, endedByReview = at, time.Time{}, "", true, true
+			if l == login {
+				sawRequest = true
+				if !at.Before(requestChangedAt) {
+					// Submitting the review fulfils the pending request.
+					requestChangedAt, requestedAt, requestedByLogin, personalPending = at, time.Time{}, "", false
+				}
+				// It fulfils the team requests made before it too.
+				for team, requested := range teamRequests {
+					if !requested.After(at) {
+						delete(teamRequests, team)
+					}
+				}
 			}
 			if at.After(lastActivityAt) {
 				lastActivityAt, lastActor = at, l
@@ -130,6 +139,7 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 			inbound++
 		case "review_requested", "review_request_removed":
 			if e.RequestedTeam != nil {
+				sawRequest = true
 				if e.Event == "review_requested" {
 					teamRequests[e.RequestedTeam.Slug] = e.CreatedAt
 				} else {
@@ -140,11 +150,11 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 			if e.RequestedReviewer == nil || e.RequestedReviewer.Login != login || e.CreatedAt.Before(requestChangedAt) {
 				break
 			}
-			requestChangedAt = e.CreatedAt
+			requestChangedAt, sawRequest = e.CreatedAt, true
 			if e.Event == "review_requested" {
-				requestedAt, requestedByLogin, requestEnded = e.CreatedAt, eventLogin(e), false
+				requestedAt, requestedByLogin, personalPending = e.CreatedAt, eventLogin(e), true
 			} else {
-				requestedAt, requestedByLogin, requestEnded, endedByReview = time.Time{}, "", true, false
+				requestedAt, requestedByLogin, personalPending = time.Time{}, "", false
 			}
 		}
 	}
@@ -155,7 +165,7 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 	}
 	a.TimelineComplete = true
 	a.RequestedByLogin = requestedByLogin
-	a.RequestEnded = requestEnded && !teamRequestOpen(teamRequests, endedByReview, requestChangedAt)
+	a.RequestEnded = sawRequest && !personalPending && len(teamRequests) == 0
 
 	// Decide whose court the ball is in from the most recent court-changing event.
 	// Ball on login: a review was requested of them and they have not engaged
@@ -200,19 +210,6 @@ func (c *Client) fetchTimeline(ctx context.Context, token, repo string, number i
 		}
 	}
 	return events, false, nil
-}
-
-// teamRequestOpen reports whether a team review request still pending on the
-// timeline may stand after login's personal request ended at endedAt. login's own
-// review fulfils the team requests made before it; withdrawing login's personal
-// request leaves every team request standing.
-func teamRequestOpen(teams map[string]time.Time, endedByReview bool, endedAt time.Time) bool {
-	for _, at := range teams {
-		if !endedByReview || !at.Before(endedAt) {
-			return true
-		}
-	}
-	return false
 }
 
 func eventLogin(e timelineEvent) string {
