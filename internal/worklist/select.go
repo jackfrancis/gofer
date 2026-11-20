@@ -228,7 +228,8 @@ func ReadItem(ctx context.Context, store Store, ownerID, id, turn string) (WorkI
 // so the window is built for it as for a named turn. A window of the newest turns
 // could hold only later replies and lose the question.
 //
-// Without a turn (research), the window is the newest turns that fit, oldest first.
+// Without a turn (research), the window is the newest visible turns that fit, oldest
+// first: a hidden turn is withheld from the model, so it is not sent at all.
 //
 // A turn the window must keep that does not fit is cut (truncateMessage), with a
 // note saying so.
@@ -283,6 +284,9 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 		used := 0
 		for i := len(th) - 1; i >= 0; i-- {
 			m := th[i]
+			if m.Hidden {
+				continue // withheld from the model, as research never sends it
+			}
 			s := messageSize(m)
 			if used+s > left {
 				if len(window) > 0 {

@@ -180,10 +180,15 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 			// another run answered first): this run has nothing to research.
 			return nil
 		}
-		if adj, rerr := p.Researcher.Research(ctx, latest); rerr == nil {
-			if err := sink.Research(ctx, item.ID, stampResearch(adj)); err != nil {
-				return fmt.Errorf("research: %w", err)
-			}
+		adj, rerr := p.Researcher.Research(ctx, latest)
+		if rerr != nil {
+			// Best-effort: the reply is saved, and the scheduled research pass retries
+			// the adjustment (worklist.ResearchStale), without another reply.
+			p.logger().Warn("converse: reply saved; research failed", "item", item.ID, "err", rerr)
+			return nil
+		}
+		if err := sink.Research(ctx, item.ID, stampResearch(adj)); err != nil {
+			return fmt.Errorf("research: %w", err)
 		}
 	}
 	return nil

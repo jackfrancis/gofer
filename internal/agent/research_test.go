@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
@@ -82,5 +84,83 @@ func assertRefreshKept(t *testing.T, sink *memSink) {
 	}
 	if r := got.Signals.Research; r == nil || r.Relevance != 1.5 || r.AppliedAt.IsZero() {
 		t.Fatalf("the research adjustment must still land, stamped, got %+v", r)
+	}
+}
+
+// errResearcher fails every research call, as a model outage after a Discuss reply.
+type errResearcher struct{}
+
+func (errResearcher) Research(context.Context, worklist.WorkItem) (worklist.ResearchAdjustment, error) {
+	return worklist.ResearchAdjustment{}, errors.New("model unavailable")
+}
+
+// capturingResearcher records the item it was asked to research.
+type capturingResearcher struct {
+	got worklist.WorkItem
+	adj worklist.ResearchAdjustment
+}
+
+func (c *capturingResearcher) Research(_ context.Context, item worklist.WorkItem) (worklist.ResearchAdjustment, error) {
+	c.got = item
+	return c.adj, nil
+}
+
+// A post-reply adjustment that fails leaves the item stale, and the research run the
+// schedule then dispatches sets the adjustment without adding a reply: the thread
+// keeps exactly one answer.
+func TestFailedPostReplyResearchIsRetriedWithoutASecondReply(t *testing.T) {
+	sink := &memSink{items: []worklist.WorkItem{{
+		ID:     "github:o/r#1",
+		Thread: []worklist.Message{{ID: "u1", Role: worklist.RoleUser, Content: "why is this urgent?", At: time.Now().UTC()}},
+	}}}
+	fc := &fakeConverser{reply: "Because the release is blocked."}
+	if err := Run(context.Background(),
+		Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Turn: "u1", Converser: fc, Researcher: errResearcher{}},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatalf("a failed post-reply research must not fail the run: %v", err)
+	}
+	if sink.replies != 1 || sink.items[0].Signals.Research != nil {
+		t.Fatalf("want one reply and no research, got %d replies, research %+v", sink.replies, sink.items[0].Signals.Research)
+	}
+	if !worklist.ResearchStale(sink.items[0]) {
+		t.Fatal("an item whose post-reply research failed must be stale")
+	}
+
+	cr := &capturingResearcher{adj: worklist.ResearchAdjustment{Relevance: 1.4, Impact: 1, Engagement: 1, Urgency: 1, Turns: []string{"u1"}}}
+	if err := Run(context.Background(), Params{JobType: JobResearch, ItemID: "github:o/r#1", Researcher: cr}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := sink.items[0]
+	if sink.replies != 1 || len(got.Thread) != 2 {
+		t.Fatalf("the retry added a turn: %d replies, thread %+v", sink.replies, got.Thread)
+	}
+	if got.Signals.Research == nil || got.Signals.Research.Relevance != 1.4 {
+		t.Fatalf("research not set by the retry: %+v", got.Signals.Research)
+	}
+	if worklist.ResearchStale(got) {
+		t.Fatal("the item is still stale after a successful retry")
+	}
+}
+
+// A research run never hands the researcher a turn the owner hid.
+func TestRunResearchWithholdsHiddenTurns(t *testing.T) {
+	sink := &memSink{items: []worklist.WorkItem{{
+		ID: "github:o/r#1",
+		Thread: []worklist.Message{
+			{ID: "u1", Role: worklist.RoleUser, Content: "visible"},
+			{ID: "u2", Role: worklist.RoleUser, Content: "secret", Hidden: true},
+		},
+	}}}
+	cr := &capturingResearcher{adj: worklist.ResearchAdjustment{Relevance: 1, Impact: 1, Engagement: 1, Urgency: 1}}
+	if err := Run(context.Background(), Params{JobType: JobResearch, ItemID: "github:o/r#1", Researcher: cr}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range cr.got.Thread {
+		if m.Hidden || m.Content == "secret" {
+			t.Fatalf("hidden turn reached the researcher: %+v", cr.got.Thread)
+		}
+	}
+	if len(cr.got.Thread) != 1 {
+		t.Fatalf("want the one visible turn, got %+v", cr.got.Thread)
 	}
 }

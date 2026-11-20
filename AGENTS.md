@@ -294,6 +294,18 @@ Wired on the web-tier side; they define what a runtime must respect:
 - Each pass of the scheduled refresh goes least recently served first, so an owner
   whose submission failed (AEI's queue full) goes first on the next pass and owners
   share a capacity limit evenly.
+- With a default chat model configured, each scheduled tick also runs the research
+  pass (`Refresher.ResearchOnce`, on the same `REFRESH_INTERVAL`, for the same
+  confirmed owners): a github-research run (`Ingestor.ScheduledResearch`) for every
+  item `worklist.ResearchStale` reports: on the radar, no human override, at least
+  one visible turn, and research missing, older than the newest visible turn or the
+  GitHub update, or derived from a turn since hidden. A research run writes back
+  only the adjustment and never adds a turn, so it is how a failed post-reply
+  adjustment is retried. The gate holds one research run per (owner, item) and
+  skips an item while a Discuss run for it is in flight. Research, like Discuss,
+  never sends a hidden turn to the model: the research read window
+  (`worklist.ThreadWindow` with no turn) and the prompt (`internal/llm/research.go`)
+  both leave hidden turns out, and the adjustment's `Turns` list only what it read.
 - The radar watches a refresh version: the highest generation of an ingest run
   known to have ended (each accepted ingest run takes the owner's next generation).
   `signedInView` reads it BEFORE the items and from local state only

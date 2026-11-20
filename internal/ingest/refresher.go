@@ -22,6 +22,19 @@ type ScheduledRefresher interface {
 	ScheduledRefresh(ctx context.Context, ownerID string) (bool, error)
 }
 
+// ScheduledResearcher is the dispatch side of the Refresher's research pass:
+// Ingestor.ScheduledResearch. It must submit nothing while a research run for the
+// item is in flight, which is what makes overlapping ticks produce one run per item.
+type ScheduledResearcher interface {
+	ScheduledResearch(ctx context.Context, ownerID, itemID string) (bool, error)
+}
+
+// ItemLister reads one owner's stored items: the research pass's view of the
+// worklist (worklist.Store satisfies it).
+type ItemLister interface {
+	List(ctx context.Context, ownerID string) ([]worklist.WorkItem, error)
+}
+
 // Eligibility confirms that gofer may start a run nobody requested on the user's
 // behalf (auth.Handler.ScheduledRunAllowed): the provider is configured, a credential
 // it could vend is stored and readable, no logout is pending, and the account is
@@ -42,12 +55,25 @@ type Eligibility interface {
 // the owner is in flight, so a tick that overlaps a running refresh, a backfill or a
 // Refresh adds nothing. The web tier is a single replica, so one Refresher runs; a
 // second replica would need a leader.
+//
+// With WithResearch, each tick then runs the research pass (ResearchOnce): a
+// github-research run for every item whose discussion-derived ranking is stale
+// (worklist.ResearchStale), so a failed post-reply adjustment is retried and a later
+// GitHub update re-ranks the discussion once.
 type Refresher struct {
 	owners   worklist.OwnerLister
 	ing      ScheduledRefresher
 	eligible Eligibility // nil: every GitHub owner is refreshed (tests)
 	interval time.Duration
 	log      *slog.Logger
+
+	// The research pass, when set (WithResearch): items reads an owner's items, and
+	// research dispatches a run for one. passes rotates the owner the pass starts
+	// with, so when dispatch stops early (the runtime's queue full), the same owner
+	// does not take the first slot every time.
+	items    ItemLister
+	research ScheduledResearcher
+	passes   uint64
 
 	// served records, per owner, when a pass last settled its refresh (submitted, or
 	// shared with a run already in flight), as a sequence number. Each pass goes
@@ -75,6 +101,13 @@ func NewRefresher(owners worklist.OwnerLister, ing ScheduledRefresher, eligible 
 	}
 }
 
+// WithResearch adds the research pass to every tick (ResearchOnce). Call it before
+// Start. It returns r.
+func (r *Refresher) WithResearch(items ItemLister, research ScheduledResearcher) *Refresher {
+	r.items, r.research = items, research
+	return r
+}
+
 // Start launches the loop. The first pass runs one interval after Start, not at
 // once, so a restart does not refresh every owner together. Call Stop to end it.
 func (r *Refresher) Start() { go r.loop() }
@@ -98,6 +131,9 @@ func (r *Refresher) loop() {
 			return
 		case <-t.C:
 			r.RefreshOnce(ctx)
+			if r.research != nil {
+				r.ResearchOnce(ctx)
+			}
 		}
 	}
 }
@@ -152,6 +188,120 @@ func (r *Refresher) RefreshOnce(ctx context.Context) int {
 		r.log.Info("scheduled refresh: dispatched worklist refreshes", "runs", submitted, "owners", len(owners))
 	}
 	return submitted
+}
+
+// ResearchOnce requests a github-research run for every stale item
+// (worklist.ResearchStale) of every GitHub owner with stored work whom the Eligibility
+// confirms, and reports how many runs it submitted. Only items with a visible
+// discussion are eligible, so an item with current research or no discussion costs
+// nothing. Within an owner the item researched longest ago goes first, and owners
+// take turns, one item each, so a pass that stops early is shared out. A dispatch
+// error (the runtime's queue full, or unreachable) ends the pass; the next tick
+// carries on. It does nothing without WithResearch. Exported for tests; safe to call
+// concurrently (the Ingestor's gate holds one run per item).
+func (r *Refresher) ResearchOnce(ctx context.Context) int {
+	if r.research == nil || r.items == nil {
+		return 0
+	}
+	owners, err := r.owners.Owners(ctx)
+	if err != nil {
+		r.log.Warn("scheduled research: list owners", "err", err)
+		return 0
+	}
+	type ownerQueue struct {
+		owner string
+		items []string // stale item IDs, researched longest ago first
+	}
+	var queues []ownerQueue
+	for _, owner := range owners {
+		if ctx.Err() != nil {
+			return 0
+		}
+		if ownerProvider(owner) != refreshProvider {
+			continue
+		}
+		if r.eligible != nil {
+			ok, err := r.eligible.ScheduledRunAllowed(ctx, owner, refreshProvider)
+			if err != nil {
+				r.log.Warn("scheduled research: eligibility", "owner", owner, "err", err)
+				continue
+			}
+			if !ok {
+				continue
+			}
+		}
+		items, err := r.items.List(ctx, owner)
+		if err != nil {
+			r.log.Warn("scheduled research: list items", "owner", owner, "err", err)
+			continue
+		}
+		var stale []worklist.WorkItem
+		for _, it := range items {
+			if worklist.ResearchStale(it) {
+				stale = append(stale, it)
+			}
+		}
+		if len(stale) == 0 {
+			continue
+		}
+		sort.SliceStable(stale, func(a, b int) bool { return researchedAt(stale[a]).Before(researchedAt(stale[b])) })
+		ids := make([]string, len(stale))
+		for n := range stale {
+			ids[n] = stale[n].ID
+		}
+		queues = append(queues, ownerQueue{owner: owner, items: ids})
+	}
+	if len(queues) == 0 {
+		return 0
+	}
+	r.mu.Lock()
+	start := int(r.passes % uint64(len(queues)))
+	r.passes++
+	r.mu.Unlock()
+	queues = append(queues[start:], queues[:start]...)
+
+	var submitted int
+	for round := 0; ; round++ {
+		more := false
+		for _, q := range queues {
+			if round >= len(q.items) {
+				continue
+			}
+			more = true
+			if ctx.Err() != nil {
+				return submitted
+			}
+			ok, err := r.research.ScheduledResearch(ctx, q.owner, q.items[round])
+			if err != nil {
+				r.log.Warn("scheduled research: dispatch failed; the next tick carries on", "owner", q.owner, "item", q.items[round], "err", err)
+				r.logResearch(submitted)
+				return submitted
+			}
+			if ok {
+				submitted++
+			}
+		}
+		if !more {
+			break
+		}
+	}
+	r.logResearch(submitted)
+	return submitted
+}
+
+func (r *Refresher) logResearch(submitted int) {
+	if submitted > 0 {
+		r.log.Info("scheduled research: dispatched discussion re-ranks", "runs", submitted)
+	}
+}
+
+// researchedAt is when item's research was last applied; zero if never, so an item
+// never researched goes first.
+func researchedAt(item worklist.WorkItem) time.Time {
+	if r := item.Signals.Research; r != nil {
+		return r.AppliedAt
+	}
+	return time.Time{}
 }
 
 // leastRecentlyServed orders owners for a pass, least recently served first (never

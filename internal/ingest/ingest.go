@@ -26,7 +26,7 @@ import (
 // acting identity (Subject + Scopes + Audience), and a deadline. A concrete agent
 // runtime consumes this; NoopDispatcher discards it.
 type RunSpec struct {
-	TaskRef    string            // github-ingest | github-converse
+	TaskRef    string            // github-ingest | github-converse | github-research
 	Parameters map[string]string // owner, gofer_url, ai_endpoint, ai_model, item, independent
 	Subject    string            // the acting user id
 	Scopes     []string          // capability scopes the run is authorized for
@@ -77,9 +77,11 @@ func (NoopDispatcher) Status(context.Context, string) (RunStatus, error) {
 
 const (
 	// ingestDeadline bounds a github-ingest run (a paginated GitHub walk, then enrich
-	// and rank). converseDeadline bounds a slower model turn.
+	// and rank). converseDeadline bounds a slower model turn. researchDeadline bounds
+	// a github-research run: one item read, one model call, one write.
 	ingestDeadline   = 10 * time.Minute
 	converseDeadline = 15 * time.Minute
+	researchDeadline = 5 * time.Minute
 	// reviewConcurrency bounds how many review turns a bulk action dispatches at once.
 	reviewConcurrency = 8
 	// retryAfter bounds how long a tracked backfill run is treated as in-flight before
@@ -470,6 +472,65 @@ func (i *Ingestor) dispatchConverse(ctx context.Context, ownerID string, ref wor
 	})
 	i.settle(key, mine, id, err)
 	return err
+}
+
+// CanResearch reports whether a github-research run can do anything: the runtime
+// re-weights an item only with a chat model, and gofer carries the default model's
+// coordinates to every run it dispatches. Without them the scheduled research pass
+// stays off.
+func (i *Ingestor) CanResearch() bool { return i.aiEndpoint != "" && i.aiModel != "" }
+
+// ScheduledResearch requests a github-research run re-weighting itemID's ranking from
+// its discussion, on behalf of the scheduled research pass (Refresher), and reports
+// whether it submitted one. The run reads the item, asks the model for the research
+// multipliers, and writes back only the adjustment (POST /agent/worklist/research):
+// it never adds a turn, so retrying a failed post-reply adjustment cannot post a
+// second reply.
+//
+// It submits nothing while a research run for the same owner and item is in flight,
+// so overlapping ticks share one run per item, nor while a Discuss run for the item
+// is: that run researches the thread itself once its reply lands. The dispatch honours
+// ctx (the Refresher's, which Stop cancels) and is bounded by submitTimeout.
+func (i *Ingestor) ScheduledResearch(ctx context.Context, ownerID, itemID string) (bool, error) {
+	if itemID == "" {
+		return false, errors.New("ingest: research requires an item")
+	}
+	if i.converseInFlight(ownerID, itemID) {
+		return false, nil
+	}
+	key := runKey{owner: ownerID, task: taskResearch, item: itemID}
+	mine, ok := i.reserve(ctx, key, researchGate)
+	if !ok {
+		return false, nil // a research run for this item is already in flight
+	}
+	params := i.runParams(ownerID)
+	params["item"] = itemID
+	sctx, cancel := context.WithTimeout(ctx, submitTimeout)
+	defer cancel()
+	id, err := i.d.Submit(sctx, RunSpec{
+		TaskRef:    taskResearch,
+		Parameters: params,
+		Subject:    ownerID,
+		Scopes:     []string{"signals:read", "metadata:write"},
+		Audience:   i.audience,
+		Deadline:   researchDeadline,
+	})
+	i.settle(key, mine, id, err)
+	return err == nil, err
+}
+
+// converseInFlight reports whether a github-converse run for ownerID's item itemID
+// still counts as in flight, as far as gofer knows without asking the backend.
+func (i *Ingestor) converseInFlight(ownerID, itemID string) bool {
+	now := time.Now()
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	for k, r := range i.runs {
+		if k.task == taskConverse && k.owner == ownerID && k.item == itemID && r.live(now, false) {
+			return true
+		}
+	}
+	return false
 }
 
 // NoteWriteback records that a run wrote its result back to gofer's agent plane. The

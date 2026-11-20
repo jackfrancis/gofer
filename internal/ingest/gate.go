@@ -10,10 +10,11 @@ import (
 const (
 	taskIngest   = "github-ingest"
 	taskConverse = "github-converse"
+	taskResearch = "github-research"
 )
 
 // runKey names what a run does: the owner, the task, and for a converse run the item
-// and the turn it answers. The in-flight gate holds one run per key, so two identical
+// and the turn it answers (for a research run, the item alone). The in-flight gate holds one run per key, so two identical
 // requests share a run while requests for different items or turns run concurrently.
 // An ingest run is keyed by owner alone (item and turn empty).
 //
@@ -131,6 +132,10 @@ var (
 	// write one owner's worklist at once, and it asks the backend rather than waiting
 	// out the ttl, so a refresh after a finished run dispatches the next one.
 	refreshGate = gate{ttl: retryAfter, probe: true}
+	// researchGate is the policy of a scheduled research run for one item: one run
+	// per item at a time, and once the backend reports it ended, failed or not, the
+	// next tick may dispatch again if the item is still stale.
+	researchGate = gate{ttl: researchDeadline, probe: true}
 )
 
 // reserve claims key for a new run under g and reports whether the caller should
@@ -218,9 +223,10 @@ func (i *Ingestor) markDoneLocked(key runKey, r *run) (changed bool) {
 	return false
 }
 
-// pruneLocked drops converse runs that no longer gate anything, so the tracker does
-// not grow with every turn ever answered. Ingest runs are kept: there is one per
-// owner, and the read model asks about the latest one. The caller holds i.mu.
+// pruneLocked drops converse and research runs that no longer gate anything, so the
+// tracker does not grow with every turn ever answered or item ever researched. Ingest
+// runs are kept: there is one per owner, and the read model asks about the latest
+// one. The caller holds i.mu.
 func (i *Ingestor) pruneLocked(now time.Time) {
 	for k, r := range i.runs {
 		if k.task != taskIngest && !r.pending && !r.live(now, r.g.probe) {
