@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 // Config holds all runtime configuration for the web tier and the dispatch tier.
@@ -74,6 +75,39 @@ type Config struct {
 	// at rest in the database (VAULT_ENCRYPTION_KEY, base64). It is only loaded,
 	// and only required, when DataDir is set.
 	VaultKey []byte
+
+	// RefreshInterval is how often the web tier requests a GitHub refresh (a
+	// github-ingest run) for every owner with stored work (REFRESH_INTERVAL, a Go
+	// duration such as "15m"). Zero, the default, turns the schedule off: worklists
+	// then refresh only on the Refresh button. Turn it on only against an AEI
+	// control plane that contains provider failures (AEI archive-plan item 11): the
+	// scheduled runs dispatch with nobody watching.
+	RefreshInterval time.Duration
+}
+
+// MinRefreshInterval is the shortest REFRESH_INTERVAL gofer accepts. Each refresh is
+// a full ingest run (a GitHub walk, then enrich and rank, which calls the model), so
+// the interval trades freshness against GitHub and model cost.
+const MinRefreshInterval = time.Minute
+
+// parseRefreshInterval reads REFRESH_INTERVAL: empty or "0" is off; otherwise a Go
+// duration of at least MinRefreshInterval.
+func parseRefreshInterval(getenv func(string) string) (time.Duration, error) {
+	s := strings.TrimSpace(getenv("REFRESH_INTERVAL"))
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("REFRESH_INTERVAL must be a duration such as \"15m\" (or empty or 0 to turn the schedule off): %w", err)
+	}
+	if d == 0 {
+		return 0, nil
+	}
+	if d < MinRefreshInterval {
+		return 0, fmt.Errorf("REFRESH_INTERVAL must be at least %s (or empty or 0 to turn the schedule off), got %s", MinRefreshInterval, d)
+	}
+	return d, nil
 }
 
 // DefaultConnection returns the default chat-model connection: the first configured.
@@ -334,6 +368,11 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	refreshInterval, err := parseRefreshInterval(os.Getenv)
+	if err != nil {
+		return nil, err
+	}
+
 	dataDir := strings.TrimSpace(os.Getenv("DATA_DIR"))
 	vaultKey, err := loadVaultKey(dataDir, os.Getenv)
 	if err != nil {
@@ -371,8 +410,9 @@ func Load() (*Config, error) {
 		ConversationEnabled: len(conns) > 0,
 		// The ordered list of chat-model connections from AI_CONNECTIONS, each sharing
 		// AI_TOKEN; nil when AI is disabled. Callers read the default via DefaultConnection.
-		AIConnections: conns,
-		MintPublicKey: mintPub,
+		AIConnections:   conns,
+		MintPublicKey:   mintPub,
+		RefreshInterval: refreshInterval,
 	}, nil
 }
 

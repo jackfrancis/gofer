@@ -13,6 +13,7 @@ package ingest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -44,10 +45,19 @@ type RunStatus struct {
 // fetch GitHub work, enrich, rank, converse) under the run's scoped identity, and
 // reports the run's lifecycle back through Status. The default implementation is
 // NoopDispatcher; concrete backends live in internal/runtime/<name>.
+//
+// Submit's error says whether the run might exist: an error wrapping ErrNotAccepted
+// means the backend definitely did not accept it (it answered with a refusal, such as
+// an overload, or the request never left gofer); any other error leaves acceptance
+// unknown (a response lost after the request was sent), and gofer then treats an
+// ingest run as possibly running until its deadline.
 type Dispatcher interface {
 	Submit(ctx context.Context, spec RunSpec) (runID string, err error)
 	Status(ctx context.Context, runID string) (RunStatus, error)
 }
+
+// ErrNotAccepted marks a Submit error after which the backend certainly holds no run.
+var ErrNotAccepted = errors.New("the backend did not accept the run")
 
 // NoopDispatcher is the default backend: it accepts every run and does nothing (no-op,
 // always success). With it selected nothing executes, so no work is fetched and no
@@ -90,6 +100,13 @@ type Ingestor struct {
 
 	mu   sync.Mutex
 	runs map[runKey]*run // the most recent run per key: the in-flight gate (gate.go)
+	// gens counts, per owner, the ingest runs the backend has accepted; each accepted
+	// run takes the next generation (run.gen). dones is the highest generation known
+	// to have ended (failed, succeeded, or past its deadline): the refresh version a
+	// worklist page compares to notice results it does not show (RefreshState).
+	gens, dones map[string]uint64
+	ledger      RunLedger  // nil: all of this is lost on restart (ledger.go)
+	persistMu   sync.Mutex // serializes ledger writes (persist)
 }
 
 var (
@@ -106,7 +123,7 @@ func New(d Dispatcher, audience, sinkURL string, log *slog.Logger, aiEndpoint, a
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log, runs: map[runKey]*run{}}
+	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log, runs: map[runKey]*run{}, gens: map[string]uint64{}, dones: map[string]uint64{}}
 }
 
 // runParams builds the parameters shared by every dispatched run: the owner, the sink
@@ -132,25 +149,134 @@ func (i *Ingestor) runParams(ownerID string) map[string]string {
 // executes them. A failed or stale run (older than retryAfter) is re-dispatched, so a
 // reload retries after a failure or a lost run.
 func (i *Ingestor) EnsureBackfill(ctx context.Context, ownerID string) error {
-	return i.dispatchIngest(ctx, ownerID, false)
+	_, err := i.dispatchIngest(ctx, ownerID, ingestGate, true)
+	return err
 }
 
-// Refresh forces a github-ingest run for ownerID so a user who just created or updated
-// work can pull it onto the radar on demand.
+// Refresh requests a github-ingest run for ownerID so a user who just created or
+// updated work can pull it onto the radar on demand. Like a scheduled tick, it starts
+// nothing while an ingest run for the owner is still running: two runs at once could
+// leave the older one's GitHub fields stored. The radar reloads until the running
+// pass lands (Active), and a click after it has ended dispatches at once.
 func (i *Ingestor) Refresh(ctx context.Context, ownerID string) error {
-	return i.dispatchIngest(ctx, ownerID, true)
+	_, err := i.dispatchIngest(ctx, ownerID, refreshGate, true)
+	return err
 }
 
-// dispatchIngest submits a github-ingest run for ownerID and tracks it, so
-// BackfillFailure can report its outcome and EnsureBackfill can gate on it. Unless
-// force is set it submits nothing while the owner's ingest run is in flight.
-func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, force bool) error {
+// ScheduledRefresh requests a github-ingest run for ownerID on behalf of the
+// periodic refresh (Refresher), and reports whether it submitted one. It submits
+// nothing while any ingest run for the owner is in flight, asking the backend about a
+// run that still looks live, so overlapping ticks (and a tick during a backfill or a
+// Refresh) share one run per owner. Its dispatch honours ctx (the Refresher's, which
+// Stop cancels), so shutting down never waits out a stalled dispatch.
+func (i *Ingestor) ScheduledRefresh(ctx context.Context, ownerID string) (bool, error) {
+	return i.dispatchIngest(ctx, ownerID, refreshGate, false)
+}
+
+// RefreshState reports ownerID's refresh version — the highest generation of an
+// ingest run known to have ended — and whether an ingest run is in flight, asking the
+// backend about one that still looks live (Active). The worklist polls it
+// (webui.RefreshStatus) and reloads when the version passes the one it rendered: a
+// run that ended since, even one that started and ended between two polls, or one
+// that ended while the next run was already going. err is a failed status read;
+// active is then still true until the run's deadline.
+func (i *Ingestor) RefreshState(ctx context.Context, ownerID string) (done uint64, active bool, err error) {
+	active, err = i.Active(ctx, ownerID)
+	i.mu.Lock()
+	done = i.dones[ownerID]
+	i.mu.Unlock()
+	return done, active, err
+}
+
+// LocalRefreshState is RefreshState from what gofer already knows, without asking the
+// backend, so rendering the worklist never waits on it. A run gofer has not seen end
+// counts as in flight (the page's first poll asks the backend), until its deadline,
+// when it counts as ended. Every run up to done ended before this returned, so items
+// read after it hold everything those runs wrote.
+func (i *Ingestor) LocalRefreshState(ownerID string) (done uint64, active bool) {
 	key := ingestKey(ownerID)
-	mine, ok := i.reserve(ctx, key, ingestGate, force)
-	if !ok {
-		return nil
+	now := time.Now()
+	i.mu.Lock()
+	cur := i.runs[key]
+	expired := cur != nil && cur.expired(now)
+	changed := expired && i.markDoneLocked(key, cur)
+	active = cur != nil && !expired &&
+		(cur.pending || cur.uncertain || (cur.id != "" && !cur.failed && !cur.succeeded))
+	done = i.dones[ownerID]
+	i.mu.Unlock()
+	if changed {
+		_ = i.persist(ownerID)
 	}
-	id, err := i.d.Submit(ctx, RunSpec{
+	return done, active
+}
+
+// Active reports whether a github-ingest run for ownerID is in flight: being
+// submitted, submitted and not yet seen to end, or of unknown acceptance (uncertain).
+// It asks the backend about a run that still looks live (once per call, until the run
+// is seen to end). A run past its deadline counts as ended, and raises the refresh
+// version, so a page that slept through a run learns it ended. One the backend gave
+// no id to probe (NoopDispatcher) is not in flight. A failed status read reports
+// true, with the error: the run may still be going, and the page should keep
+// watching until it ends or its deadline passes.
+func (i *Ingestor) Active(ctx context.Context, ownerID string) (bool, error) {
+	key := ingestKey(ownerID)
+	now := time.Now()
+	i.mu.Lock()
+	cur := i.runs[key]
+	var pending, uncertain, stale, noID, changed bool
+	if cur != nil {
+		pending, uncertain = cur.pending, cur.uncertain
+		stale = cur.expired(now)
+		noID = cur.id == ""
+		if stale {
+			changed = i.markDoneLocked(key, cur)
+		}
+	}
+	i.mu.Unlock()
+	if changed {
+		_ = i.persist(ownerID)
+	}
+	switch {
+	case cur == nil || stale:
+		return false, nil
+	case pending || uncertain:
+		return true, nil
+	case noID:
+		return false, nil // NoopDispatcher: nothing to wait for
+	}
+	failed, succeeded, _, err := i.probeRun(ctx, key)
+	if err != nil {
+		return true, err // unknown: keep watching, bounded by the deadline above
+	}
+	return !failed && !succeeded, nil
+}
+
+// dispatchIngest submits a github-ingest run for ownerID under gate g and tracks it,
+// so BackfillFailure can report its outcome and EnsureBackfill can gate on it, and
+// reports whether it submitted one. It submits nothing while the owner's ingest run
+// is in flight. With a ledger, the reservation is recorded before the backend sees
+// the run, so a restart while the backend's answer is outstanding (or lost) still
+// holds the owner; if it cannot be recorded, nothing is submitted. The dispatch is
+// bounded by submitTimeout; with detach it also outlives ctx (a browser request that
+// goes away must not leave acceptance unknown), while without it ctx cancels it (the
+// Refresher's shutdown).
+func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, g gate, detach bool) (bool, error) {
+	key := ingestKey(ownerID)
+	mine, ok := i.reserve(ctx, key, g)
+	if !ok {
+		return false, nil
+	}
+	if err := i.persist(ownerID); err != nil {
+		i.settle(key, mine, "", ErrNotAccepted)
+		return false, fmt.Errorf("ingest: record the reservation before dispatch: %w", err)
+	}
+	parent := ctx
+	if detach {
+		parent = context.WithoutCancel(ctx)
+	}
+	sctx, cancel := context.WithTimeout(parent, submitTimeout)
+	defer cancel()
+	id, err := i.d.Submit(sctx, RunSpec{
 		TaskRef:    taskIngest,
 		Parameters: i.runParams(ownerID),
 		Subject:    ownerID,
@@ -159,7 +285,8 @@ func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, force boo
 		Deadline:   ingestDeadline,
 	})
 	i.settle(key, mine, id, err)
-	return err
+	_ = i.persist(ownerID) // accepted, rolled back, or uncertain: record what the gate now holds
+	return err == nil, err
 }
 
 // probeRun reports the lifecycle of the run tracked for key, reading it from the
@@ -197,6 +324,7 @@ func (i *Ingestor) probeRun(ctx context.Context, key runKey) (failed, succeeded 
 	case "Failed":
 		i.mu.Lock()
 		// Record on the run we probed; a concurrent dispatch may have moved on.
+		changed := i.markDoneLocked(key, cur)
 		if i.runs[key] == cur {
 			cur.failed = true
 			cur.message = res.Message
@@ -206,13 +334,20 @@ func (i *Ingestor) probeRun(ctx context.Context, key runKey) (failed, succeeded 
 			}
 		}
 		i.mu.Unlock()
+		if changed {
+			_ = i.persist(key.owner)
+		}
 		return true, false, res.Message, nil
 	case "Succeeded":
 		i.mu.Lock()
+		changed := i.markDoneLocked(key, cur)
 		if i.runs[key] == cur {
 			cur.succeeded = true
 		}
 		i.mu.Unlock()
+		if changed {
+			_ = i.persist(key.owner)
+		}
 		return false, true, "", nil
 	}
 	return false, false, "", nil // still running
@@ -321,7 +456,7 @@ func (i *Ingestor) dispatchConverse(ctx context.Context, ownerID string, ref wor
 		params["independent"] = "true"
 	}
 	key := runKey{owner: ownerID, task: taskConverse, item: ref.Item, turn: ref.Turn}
-	mine, ok := i.reserve(ctx, key, converseGate, false)
+	mine, ok := i.reserve(ctx, key, converseGate)
 	if !ok {
 		return nil // a run for this turn is already in flight
 	}

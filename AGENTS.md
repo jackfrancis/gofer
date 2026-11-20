@@ -272,6 +272,68 @@ Wired on the web-tier side; they define what a runtime must respect:
   gate (`internal/ingest/gate.go`) holds one run per (owner, task, item, turn) and
   only saves the cost of a duplicate run: it is in memory and guarantees nothing.
   A second opinion posts its own user turn, so it is never a duplicate.
+- The scheduled refresh (`ingest.Refresher`, `REFRESH_INTERVAL`, off when unset or
+  0, at least 1m otherwise) dispatches a github-ingest run per GitHub owner with
+  stored work (`worklist.OwnerLister`), and only for owners
+  `auth.Handler.ScheduledRunAllowed` confirms: GitHub configured, no logout pending,
+  a vendable credential stored and readable, and the login recorded on it
+  (`vault.Credential.Login`, set at sign-in and kept across refreshes) still in
+  `ALLOWED_GITHUB_LOGINS`. A read error skips the owner. With an allow-list set, a
+  credential stored before gofer recorded the login gets no scheduled runs until
+  that user signs in again. (`SignInRequired` is for the page and answers false on
+  a read error, so never use it to gate a run.) A tick and a Refresh click both go
+  through the gate under `refreshGate`, which asks the backend about a run that
+  still looks live: neither starts anything while any ingest run for the owner (a
+  backfill, a Refresh, an earlier tick) is running, so overlapping ticks give one
+  run per owner and two ingest runs never write one owner's worklist at once.
+  Neither waits out a finished run's deadline; the empty-worklist poll
+  (`ingestGate`) still does. Nothing forces a run past the gate, so a reservation is
+  never replaced before its Submit returns. Turn the schedule on only against an AEI
+  that contains provider failures (archive-plan item 11, AEI PR #21): scheduled
+  runs dispatch with nobody watching.
+- Each pass of the scheduled refresh goes least recently served first, so an owner
+  whose submission failed (AEI's queue full) goes first on the next pass and owners
+  share a capacity limit evenly.
+- The radar watches a refresh version: the highest generation of an ingest run
+  known to have ended (each accepted ingest run takes the owner's next generation).
+  `signedInView` reads it BEFORE the items and from local state only
+  (`Ingestor.LocalRefreshState`: no backend call, so a slow AEI never delays the
+  radar; a run gofer has not seen end counts as in flight). Since a run writes
+  before it ends, the items hold everything up to that version. `static/reload.js`
+  polls `GET /items/refresh-status?done=` (every 3s while a run is in flight, 30s
+  otherwise), which asks AEI within 5s (`Ingestor.RefreshState`), and reloads once
+  the version moves: a run that ended since the render, even one that started and
+  ended between polls, or one that ended while the next was already running. A
+  failed status read counts as still in flight until the run's deadline. The script
+  never reloads while a `<details>` menu is open or a form control has focus.
+- With persistent storage, each owner's ingest gate state (generation counter,
+  refresh version, and the current run's generation, id, time and whether its
+  acceptance is known) is kept in `ingest_runs` (`ingest.RunLedger`, implemented by
+  `storage.WorklistStore`, loaded by `Ingestor.UseLedger`; `server.New` fails, and
+  the pod exits, if it cannot be read). A reservation is recorded BEFORE Submit, and
+  not dispatched if it cannot be. Runs outlive a web-pod restart, so the new process
+  restores a run within its deadline into the gate and keeps counting the version an
+  open tab compares. A run past its deadline counts as ended when anything observes
+  it (a poll, a render, a reservation), which raises the version.
+- `Dispatcher.Submit` errors say whether a run might exist: one wrapping
+  `ingest.ErrNotAccepted` is a definite refusal, and releases the reservation. The
+  AEI backend judges the final attempt (after redirects) by watching its own
+  transport, since the app SDK types only 429: refused if it was never sent (ctx
+  already done, or no connection) or answered with a 3xx or 4xx. A 5xx (a gateway
+  can answer 502/503/504 after AEI accepted the POST), an answer lost after the
+  request went out, or an unreadable 202 leaves acceptance unknown, and the ingest
+  reservation is held, unprobeable, until the backend's own deadline could have
+  passed: AEI starts that clock at acceptance, so the hold runs from when Submit
+  returned plus a grace (`holdUncertain`), or, for a record written before Submit
+  returned, from that write (after any wait for earlier writes) through the whole
+  bounded dispatch window (`holdPending`). Each hold is recorded (`RunUntil`). In
+  process, a reservation whose Submit has not returned never expires. An ingest
+  Submit is bounded at 30s; a browser's is detached from its request, while a
+  scheduled one honours the Refresher's context, so `Stop` cancels it. A converse
+  turn is rolled back either way.
+- Without script, the radar's `<noscript>` refresh goes to `/?refresh=1`, whose
+  render asks AEI (within 5s) instead of reading local state, so it stops once the
+  run has ended.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

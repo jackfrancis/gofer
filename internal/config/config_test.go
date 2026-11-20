@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func env(m map[string]string) func(string) string {
@@ -244,5 +245,31 @@ func TestParseGitHubKind(t *testing.T) {
 	}
 	if (Providers{GitHubKind: GitHubApp}).IsGitHubApp() != true || (Providers{}).IsGitHubApp() {
 		t.Error("IsGitHubApp")
+	}
+}
+
+func TestParseRefreshInterval(t *testing.T) {
+	for _, tc := range []struct {
+		in      string
+		want    time.Duration
+		wantErr bool
+	}{
+		{in: "", want: 0},
+		{in: "0", want: 0},
+		{in: "0s", want: 0},
+		{in: " 15m ", want: 15 * time.Minute},
+		{in: "1m", want: time.Minute},
+		{in: "59s", wantErr: true},
+		{in: "-5m", wantErr: true},
+		{in: "soon", wantErr: true},
+		{in: "15", wantErr: true},
+	} {
+		got, err := parseRefreshInterval(env(map[string]string{"REFRESH_INTERVAL": tc.in}))
+		if (err != nil) != tc.wantErr || got != tc.want {
+			t.Errorf("REFRESH_INTERVAL=%q: got %v, %v; want %v (error %v)", tc.in, got, err, tc.want, tc.wantErr)
+		}
+	}
+	if got, err := parseRefreshInterval(env(nil)); err != nil || got != 0 {
+		t.Fatalf("unset REFRESH_INTERVAL must leave the schedule off: %v, %v", got, err)
 	}
 }

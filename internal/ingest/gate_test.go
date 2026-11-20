@@ -2,7 +2,6 @@ package ingest
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -36,7 +35,7 @@ func (d *gateDispatcher) Submit(_ context.Context, spec RunSpec) (string, error)
 	defer d.mu.Unlock()
 	if d.failNext {
 		d.failNext = false
-		return "", errors.New("backend unavailable")
+		return "", fmt.Errorf("backend unavailable: %w", ErrNotAccepted) // a definite refusal
 	}
 	d.specs = append(d.specs, spec)
 	return fmt.Sprintf("run-%d", len(d.specs)), nil
@@ -163,7 +162,7 @@ func TestConverseRedispatchesAfterTheDeadline(t *testing.T) {
 
 	noop := New(NoopDispatcher{}, "", "", nil, "", "")
 	_ = noop.Converse(context.Background(), "github:1", ref, "", "")
-	if _, ok := noop.reserve(context.Background(), key, converseGate, false); ok {
+	if _, ok := noop.reserve(context.Background(), key, converseGate); ok {
 		t.Fatal("a run with no id must gate the turn until its deadline")
 	}
 }
@@ -291,73 +290,68 @@ func (d *scriptedDispatcher) Status(context.Context, string) (RunStatus, error) 
 	return RunStatus{Phase: d.phase}, nil
 }
 
-// A Refresh forced while a backfill is still being submitted must not lose the
-// backfill's outcome: when the backfill's Submit succeeds and the Refresh's fails, the
-// backfill run is tracked again, with its id, so its result can be reported.
-func TestRefreshDuringBackfillSubmitKeepsTheBackfillOutcome(t *testing.T) {
+// A Refresh click shares an ingest run already in flight, as a scheduled tick does:
+// while a backfill is still being submitted, and while the backend reports it
+// running. Once the run has ended, a click dispatches at once.
+func TestRefreshSharesAnIngestRunInFlight(t *testing.T) {
 	ctx := context.Background()
-	for _, tc := range []struct {
-		name          string
-		backfillFirst bool
-	}{{"backfill returns first", true}, {"refresh returns first", false}} {
-		t.Run(tc.name, func(t *testing.T) {
-			d := &scriptedDispatcher{calls: make(chan chan step), phase: "Succeeded"}
-			ig := New(d, "", "", nil, "", "")
-			backfillDone, refreshDone := make(chan error, 1), make(chan error, 1)
-			go func() { backfillDone <- ig.EnsureBackfill(ctx, "github:1") }()
-			backfill := <-d.calls
-			go func() { refreshDone <- ig.Refresh(ctx, "github:1") }()
-			refresh := <-d.calls
-			if tc.backfillFirst {
-				backfill <- step{id: "run-backfill"}
-				<-backfillDone
-				refresh <- step{err: errors.New("backend unavailable")}
-				<-refreshDone
-			} else {
-				refresh <- step{err: errors.New("backend unavailable")}
-				<-refreshDone
-				backfill <- step{id: "run-backfill"}
-				<-backfillDone
-			}
-			ig.mu.Lock()
-			cur := ig.runs[ingestKey("github:1")]
-			id, pending := cur.id, cur.pending
-			ig.mu.Unlock()
-			if id != "run-backfill" || pending {
-				t.Fatalf("want the backfill run tracked with its id, got id=%q pending=%v", id, pending)
-			}
-			if done, _ := ig.BackfillSucceeded(ctx, "github:1"); !done {
-				t.Fatal("the backfill's outcome must be reportable")
-			}
-		})
+	d := &scriptedDispatcher{calls: make(chan chan step), phase: "Running"}
+	ig := New(d, "", "", nil, "", "")
+	backfillDone := make(chan error, 1)
+	go func() { backfillDone <- ig.EnsureBackfill(ctx, "github:1") }()
+	backfill := <-d.calls
+	if err := ig.Refresh(ctx, "github:1"); err != nil { // would block on d.calls if it submitted
+		t.Fatal(err)
+	}
+	backfill <- step{id: "run-backfill"}
+	if err := <-backfillDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := ig.Refresh(ctx, "github:1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := ig.tracked("github:1"); got != "run-backfill" {
+		t.Fatalf("a click during the running backfill replaced it: tracked %q", got)
+	}
+
+	d.phase = "Succeeded"
+	refreshDone := make(chan error, 1)
+	go func() { refreshDone <- ig.Refresh(ctx, "github:1") }()
+	select {
+	case refresh := <-d.calls:
+		refresh <- step{id: "run-refresh"}
+	case err := <-refreshDone:
+		t.Fatalf("a click after the run ended dispatched nothing (err %v)", err)
+	}
+	if err := <-refreshDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := ig.tracked("github:1"); got != "run-refresh" {
+		t.Fatalf("want the click's run tracked, got %q", got)
 	}
 }
 
-// When both a backfill and the Refresh that replaced it fail to submit, the key goes
-// back to the run before them.
-func TestRefreshRollbackSkipsFailedSubmissions(t *testing.T) {
+// A Refresh after a failed run whose own Submit fails leaves the failed run tracked,
+// so the read model still reports the failure.
+func TestRefreshSubmitErrorKeepsTheFailedRun(t *testing.T) {
 	ctx := context.Background()
-	d := &scriptedDispatcher{calls: make(chan chan step), phase: "Succeeded"}
+	d := &gateDispatcher{phase: "Failed"}
 	ig := New(d, "", "", nil, "", "")
-	go func() { _ = ig.EnsureBackfill(ctx, "github:1") }()
-	(<-d.calls) <- step{id: "run-first"}
-	for ig.tracked("github:1") != "run-first" {
-		time.Sleep(time.Millisecond)
+	_ = ig.EnsureBackfill(ctx, "github:1")
+	if failed, _, _ := ig.BackfillFailure(ctx, "github:1"); !failed {
+		t.Fatal("want the backfill reported failed")
 	}
-	ig.mu.Lock()
-	ig.runs[ingestKey("github:1")].failed = true // so the next poll may reserve
-	ig.mu.Unlock()
-	backfillDone, refreshDone := make(chan error, 1), make(chan error, 1)
-	go func() { backfillDone <- ig.EnsureBackfill(ctx, "github:1") }()
-	backfill := <-d.calls
-	go func() { refreshDone <- ig.Refresh(ctx, "github:1") }()
-	refresh := <-d.calls
-	backfill <- step{err: errors.New("down")}
-	<-backfillDone
-	refresh <- step{err: errors.New("down")}
-	<-refreshDone
-	if got := ig.tracked("github:1"); got != "run-first" {
-		t.Fatalf("want the first run tracked again, got %q", got)
+	d.mu.Lock()
+	d.failNext = true
+	d.mu.Unlock()
+	if err := ig.Refresh(ctx, "github:1"); err == nil {
+		t.Fatal("want the Submit error")
+	}
+	if got := ig.tracked("github:1"); got != "run-1" {
+		t.Fatalf("want the failed run tracked again, got %q", got)
+	}
+	if failed, _, _ := ig.BackfillFailure(ctx, "github:1"); !failed {
+		t.Fatal("the previous failure must still be reported")
 	}
 }
 

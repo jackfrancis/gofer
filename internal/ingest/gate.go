@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -32,30 +33,80 @@ func ingestKey(ownerID string) runKey { return runKey{owner: ownerID, task: task
 // outcome is cached here, so the backend is probed once per run rather than once per
 // page render. Every field is read and written under Ingestor.mu.
 type run struct {
-	id        string
-	at        time.Time // when it was reserved, then when Submit succeeded
-	g         gate      // the policy the run was reserved under
-	pending   bool      // reserved; Submit has not returned yet
-	noRun     bool      // Submit failed: there is no run behind this reservation
+	id      string
+	at      time.Time // when it was reserved, then when Submit succeeded
+	g       gate      // the policy the run was reserved under
+	pending bool      // reserved; Submit has not returned yet
+	gen     uint64    // ingest only: the owner's refresh generation, taken when reserved
+	// uncertain (ingest only): Submit failed without saying the backend refused
+	// (ErrNotAccepted), so a run may exist that gofer cannot probe. It holds the key,
+	// and counts as in flight, until its deadline.
+	uncertain bool
+	// until, when set, is the run's deadline instead of at + the gate's ttl: for a
+	// run whose acceptance is unknown, the latest moment it could still be running
+	// (see holdUncertain, holdPending).
+	until     time.Time
 	failed    bool
 	succeeded bool
 	message   string
 	logged    bool
 	// prev is the run this reservation replaced, restored if Submit fails. It is kept
-	// only while it may still be needed: until this reservation's Submit succeeds, or
-	// until it is rolled back.
+	// only until this reservation's Submit returns.
 	prev *run
 }
 
-// live reports whether r still counts as in flight at now, as far as gofer knows
-// without asking the backend. A failure always frees the key; a success frees it only
-// under a probing gate.
-func (r *run) live(now time.Time) bool {
-	if r.failed || (r.succeeded && r.g.probe) {
+// live reports whether r still counts as in flight at now for a caller reserving
+// under a gate with the given probe setting, as far as gofer knows without asking the
+// backend. A failure always frees the key; a success frees it only for a probing
+// caller. So the empty-worklist poll (ingestGate) still waits out a successful ingest
+// run, whoever started it, while a scheduled refresh (refreshGate) may follow one as
+// soon as it has ended. The ttl is the run's own.
+func (r *run) live(now time.Time, probe bool) bool {
+	if r.failed || (r.succeeded && probe) {
 		return false
 	}
-	return now.Sub(r.at) < r.g.ttl
+	return !r.expired(now)
 }
+
+// expired reports whether r is past its deadline: until when set, else at + ttl. A
+// reservation whose Submit has not returned never is: the backend may yet accept it,
+// and settle gives it its real deadline (Submit is bounded by submitTimeout).
+func (r *run) expired(now time.Time) bool {
+	if r.pending {
+		return false
+	}
+	return !now.Before(r.deadline())
+}
+
+// deadline is when r stops counting as in flight however it went.
+func (r *run) deadline() time.Time {
+	if !r.until.IsZero() {
+		return r.until
+	}
+	return r.at.Add(r.g.ttl)
+}
+
+// The backend starts a run's deadline when it accepts the run, which can be later
+// than gofer reserved it. An accepted run's deadline here runs from when Submit
+// returned, after any acceptance, so it already covers that. A run whose acceptance
+// is unknown must be held until the latest moment the backend could have accepted
+// it, plus the run's deadline:
+const (
+	// submitTimeout bounds one ingest Submit (dispatchIngest), so a dispatch window
+	// is bounded however the caller's request goes.
+	submitTimeout = 30 * time.Second
+	// acceptGrace covers a backend still finishing a dispatch request after gofer
+	// stopped waiting for its answer.
+	acceptGrace = time.Minute
+	// holdUncertain: a reservation whose Submit returned without saying whether
+	// the backend accepted it is held this long from when Submit returned.
+	holdUncertain = acceptGrace + ingestDeadline
+	// holdPending: a reservation whose Submit had not returned when gofer last
+	// recorded it (a restart mid-dispatch) is held this long from when that record
+	// was written (after any wait for earlier writes): the rest of the write, then
+	// the whole Submit, then holdUncertain.
+	holdPending = ledgerTimeout + submitTimeout + holdUncertain
+)
 
 // gate is the in-flight policy for one kind of run.
 type gate struct {
@@ -74,20 +125,32 @@ type gate struct {
 var (
 	ingestGate   = gate{ttl: retryAfter}
 	converseGate = gate{ttl: converseDeadline, probe: true}
+	// refreshGate is the policy of a Refresh click and a scheduled refresh tick for
+	// the owner's ingest key: it starts nothing while any ingest run for the owner (a
+	// backfill, a Refresh, an earlier tick) is still running, so two ingest runs never
+	// write one owner's worklist at once, and it asks the backend rather than waiting
+	// out the ttl, so a refresh after a finished run dispatches the next one.
+	refreshGate = gate{ttl: retryAfter, probe: true}
 )
 
 // reserve claims key for a new run under g and reports whether the caller should
-// submit it. It refuses while a run for key is in flight. A reservation is settled
-// with settle once Submit returns. With force set, a live run does not block (an
-// explicit Refresh); the reservation still replaces it, so a concurrent poll waits on
-// the forced run.
-func (i *Ingestor) reserve(ctx context.Context, key runKey, g gate, force bool) (mine *run, ok bool) {
+// submit it. It refuses while a run for key is in flight, which includes a
+// reservation whose Submit has not returned, so a reservation is never replaced
+// before it is settled. A reservation is settled with settle once Submit returns.
+func (i *Ingestor) reserve(ctx context.Context, key runKey, g gate) (mine *run, ok bool) {
 	for probed := false; ; probed = true {
 		now := time.Now()
 		i.mu.Lock()
 		cur := i.runs[key]
-		if force || cur == nil || !cur.live(now) {
+		if cur == nil || !cur.live(now, g.probe) {
+			if cur != nil {
+				i.markDoneLocked(key, cur) // failed, succeeded, or past its deadline
+			}
 			mine = &run{at: now, g: g, pending: true, prev: cur}
+			if key.task == taskIngest {
+				i.gens[key.owner]++
+				mine.gen = i.gens[key.owner]
+			}
 			i.runs[key] = mine
 			i.pruneLocked(now)
 			i.mu.Unlock()
@@ -106,10 +169,13 @@ func (i *Ingestor) reserve(ctx context.Context, key runKey, g gate, force bool) 
 	}
 }
 
-// settle records the outcome of Submit on the reservation mine, whether or not it is
-// still the key's current run, so a run restored by a later rollback is accurate. On
-// error, if mine is current, the key goes back to the run mine replaced, skipping any
-// reservation whose own Submit failed.
+// settle records the outcome of Submit on the reservation mine, which is still the
+// key's current run (see reserve). When the backend did not accept the run
+// (ErrNotAccepted) the key goes back to the run mine replaced, so the read model
+// still knows how the previous run ended. Any other error leaves acceptance unknown:
+// for ingest the reservation stays, uncertain, until its deadline, because a second
+// ingest started now could land out of order with one the backend did accept. A
+// converse turn is rolled back either way; the store keeps one answer per turn.
 func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -122,17 +188,17 @@ func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 		mine.prev = nil // never rolled back now
 		return
 	}
-	mine.noRun = true
-	if i.runs[key] != mine {
-		// Superseded: keep prev, so a rollback of the reservation that replaced mine
-		// can reach past it.
+	if key.task == taskIngest && !errors.Is(err, ErrNotAccepted) {
+		mine.uncertain = true
+		mine.until = time.Now().Add(holdUncertain)
+		mine.prev = nil
 		return
 	}
 	p := mine.prev
-	for p != nil && p.noRun {
-		p = p.prev
-	}
 	mine.prev = nil
+	if i.runs[key] != mine {
+		return // not reachable while reserve never replaces a pending reservation
+	}
 	if p == nil {
 		delete(i.runs, key)
 	} else {
@@ -140,12 +206,24 @@ func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 	}
 }
 
+// markDoneLocked records that r, an ingest run for key's owner, has ended (failed,
+// succeeded, or outlived its deadline), raising the owner's refresh version
+// (RefreshState). Reservations the backend never accepted carry no generation. The
+// caller holds i.mu.
+func (i *Ingestor) markDoneLocked(key runKey, r *run) (changed bool) {
+	if key.task == taskIngest && r.gen > i.dones[key.owner] {
+		i.dones[key.owner] = r.gen
+		return true
+	}
+	return false
+}
+
 // pruneLocked drops converse runs that no longer gate anything, so the tracker does
 // not grow with every turn ever answered. Ingest runs are kept: there is one per
 // owner, and the read model asks about the latest one. The caller holds i.mu.
 func (i *Ingestor) pruneLocked(now time.Time) {
 	for k, r := range i.runs {
-		if k.task != taskIngest && !r.pending && !r.live(now) {
+		if k.task != taskIngest && !r.pending && !r.live(now, r.g.probe) {
 			delete(i.runs, k)
 		}
 	}

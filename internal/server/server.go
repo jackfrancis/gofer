@@ -7,6 +7,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -29,9 +30,12 @@ import (
 // swapping backends (a no-op, AEI, agent-sandbox, …) never changes this package: the
 // web tier speaks only gofer's neutral dispatch seam. The vault holds delegated
 // provider tokens the auth handler writes at login. sessionStore holds authenticated
-// sessions; nil keeps them in memory. The returned cleanup is a no-op today (reserved
-// for the staleness reconciler).
-func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt vault.Vault, store worklist.Store, sessionStore session.Store) (http.Handler, func()) {
+// sessions; nil keeps them in memory. The returned cleanup stops the scheduled refresh
+// (REFRESH_INTERVAL), if it runs; call it before closing the store. It fails when the
+// store keeps ingest runs (ingest.RunLedger) and they cannot be read: serving with an
+// empty gate could start a second ingest while one is still writing, so the caller
+// should exit and let the pod restart.
+func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt vault.Vault, store worklist.Store, sessionStore session.Store) (http.Handler, func(), error) {
 	sessions := session.NewManager(cfg.SessionSecret, cfg.CookieSecure, session.WithStore(sessionStore),
 		session.WithAllow(func(u *session.User) bool { return cfg.SignInAllowed(u.Provider, u.Login) }))
 	authH := auth.NewHandler(cfg, sessions, vlt)
@@ -58,6 +62,14 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// that executes runs brings gofer to life without touching this package (see
 	// internal/runtime for the contract).
 	ingestor := ingest.New(dispatcher, cfg.Audience, cfg.SinkURL, log, aiEndpoint, aiModel)
+	// With persistent storage, each owner's last accepted ingest run survives a
+	// restart: the gate still holds a run the runtime is still executing, and the
+	// radar's refresh version keeps counting (ingest.RunLedger).
+	if ledger, ok := store.(ingest.RunLedger); ok {
+		if err := ingestor.UseLedger(context.Background(), ledger); err != nil {
+			return nil, nil, fmt.Errorf("load the last ingest runs: %w", err)
+		}
+	}
 	// The thread's model picker spans every configured connection's models (default
 	// first). A model id offered by more than one connection is disambiguated with the
 	// connection label; the selected option carries the connection endpoint the turn
@@ -125,6 +137,8 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	mux.Handle("POST /items/review-all", http.HandlerFunc(webHandler.ReviewAllPRs))
 	// Force a re-ingest to pull newly created or updated work onto the radar.
 	mux.Handle("POST /items/refresh", http.HandlerFunc(webHandler.Refresh))
+	// The radar polls this to notice a refresh that ran while it was open (reload.js).
+	mux.Handle("GET /items/refresh-status", http.HandlerFunc(webHandler.RefreshStatus))
 	// The radar's project filter: saves which repositories the radar shows.
 	mux.Handle("POST /items/projects", http.HandlerFunc(webHandler.FilterProjects))
 	// Clear every conversation thread, so the review workflows can be demoed or
@@ -192,7 +206,27 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	h = logRequests(log, h)
 	h = recoverer(log, h)
 
-	return h, func() {}
+	// The scheduled refresh (REFRESH_INTERVAL, off by default): a github-ingest run per
+	// owner with stored work, every interval, so a populated worklist keeps up with
+	// GitHub without a click. It reads the raw store (owners only) and dispatches only
+	// for owners the auth handler confirms (ScheduledRunAllowed: provider configured,
+	// a vendable credential readable, no logout pending, login still allowed). cleanup
+	// stops it before main closes the store.
+	stopRefresh := func() {}
+	if cfg.RefreshInterval > 0 {
+		if owners, ok := store.(worklist.OwnerLister); ok {
+			r := ingest.NewRefresher(owners, ingestor, authH, cfg.RefreshInterval, log)
+			r.Start()
+			stopRefresh = r.Stop
+			log.Info("scheduled refresh enabled", "interval", cfg.RefreshInterval)
+		} else {
+			log.Warn("scheduled refresh disabled: the worklist store cannot list owners", "interval", cfg.RefreshInterval)
+		}
+	} else {
+		log.Info("scheduled refresh disabled (set REFRESH_INTERVAL to turn it on)")
+	}
+
+	return h, stopRefresh, nil
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

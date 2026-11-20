@@ -21,8 +21,9 @@ func NewMemoryStore() *MemoryStore {
 }
 
 var (
-	_ Store  = (*MemoryStore)(nil)
-	_ Lister = (*MemoryStore)(nil)
+	_ Store       = (*MemoryStore)(nil)
+	_ Lister      = (*MemoryStore)(nil)
+	_ OwnerLister = (*MemoryStore)(nil)
 )
 
 // List returns a copy of the owner's work items.
@@ -66,6 +67,19 @@ func (s *MemoryStore) All(_ context.Context) (map[string][]WorkItem, error) {
 	out := make(map[string][]WorkItem, len(s.items))
 	for owner, src := range s.items {
 		out[owner] = cloneItems(src)
+	}
+	return out, nil
+}
+
+// Owners returns every owner with at least one stored item, in no particular order.
+func (s *MemoryStore) Owners(_ context.Context) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.items))
+	for owner, items := range s.items {
+		if len(items) > 0 {
+			out = append(out, owner)
+		}
 	}
 	return out, nil
 }

@@ -9,9 +9,11 @@ package webui
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"math"
 	"mime"
 	"net/http"
@@ -47,6 +49,19 @@ type Providers interface {
 // never shows the prompt.
 type Reconnector interface {
 	SignInRequired(ctx context.Context, userID, provider string) bool
+}
+
+// RefreshProber optionally reports the owner's GitHub refresh state
+// (ingest.Ingestor): a refresh version — the highest generation of an ingest run
+// known to have ended — and whether a run is in flight. The worklist renders the
+// version gofer already knows (LocalRefreshState, no backend call, so a slow backend
+// never delays the radar) and polls RefreshState (RefreshStatus, reload.js), so a
+// refresh that ends while the page is open lands without a click: one that started
+// and ended between two polls, or one that ended while the next was already running.
+// A Pipeline that does not implement it leaves the page static.
+type RefreshProber interface {
+	LocalRefreshState(ownerID string) (done uint64, active bool)
+	RefreshState(ctx context.Context, ownerID string) (done uint64, active bool, err error)
 }
 
 // Pipeline triggers a user's backfill when the worklist is empty, schedules an
@@ -242,6 +257,11 @@ type pageData struct {
 	SecondOpinionMenuOptions []ModelOption      // menu-mode models (every model except the single first-review model)
 	ResetCount               int                // stored items carrying a conversation (hidden and closed too: Reset clears them all); gates/labels "Reset Conversations"
 	RefreshSecs              int                // when > 0, the page auto-refreshes after this many seconds
+	WatchRefresh             bool               // worklist: watch the refresh state (reload.js) and reload once a pass that started after this render has ended
+	RefreshDone              uint64             // worklist: the refresh version read before the items were (every run up to it had ended)
+	Refreshing               bool               // worklist: a refresh was in flight before the items were read
+	PollSecs, IdlePollSecs   int                // worklist: how often reload.js polls while a refresh runs, and while none does
+	FallbackURL              string             // worklist, no script: where the <noscript> refresh goes while a refresh runs (refreshCheck)
 	ReplyStalled             bool               // a pending reply has not arrived within reviewStaleAfter (thread view)
 	Message                  string             // failure detail rendered on the error view
 	Failure                  string             // a failed user action, rendered on the error view in place of the discovery wording
@@ -572,6 +592,14 @@ const independentReviewPrompt = "Give an independent review of this PR. There ma
 // gets two replies, which is harmless).
 const reviewStaleAfter = 5 * time.Minute
 
+// pollSecs and idlePollSecs are how often the worklist asks whether a GitHub refresh
+// has ended (RefreshStatus): often while one runs, so its result lands quickly, and
+// rarely while none does, so an open tab still notices a scheduled pass.
+const (
+	pollSecs     = 3
+	idlePollSecs = 30
+)
+
 // ReviewAllPRs handles POST /items/review-all. For every pull request the submitting
 // page showed (on the radar, in its projects: form "scope"), it appends the review prompt to the item's thread and, in one
 // concurrent batch, schedules an assistant review turn for each — then redirects
@@ -781,7 +809,26 @@ func (h *Handler) view(r *http.Request) (pageData, int) {
 
 // signedInView renders the views for a signed-in user.
 func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, int) {
-
+	// The refresh state is read BEFORE the items, from what gofer already knows (no
+	// backend call): a run writes its results before it ends, so the read below holds
+	// everything every run up to done wrote, and the page reloads when a later one
+	// ends (RefreshStatus).
+	var (
+		done              uint64
+		refreshing, watch bool
+	)
+	if p, ok := h.pipeline.(RefreshProber); ok {
+		if r.URL.Query().Get(refreshCheck) != "" {
+			// The no-script fallback's reload: there is no status poll to find out
+			// the run ended, so ask the backend here, bounded like the poll.
+			ctx, cancel := context.WithTimeout(r.Context(), statusTimeout)
+			done, refreshing, _ = p.RefreshState(ctx, user.ID)
+			cancel()
+		} else {
+			done, refreshing = p.LocalRefreshState(user.ID)
+		}
+		watch = true
+	}
 	res, err := worklist.Resolve(r.Context(), h.store, h.pipeline, h.now(), user.ID, worklist.DefaultSort, true)
 	if err != nil {
 		return pageData{View: "error", User: user}, http.StatusBadGateway
@@ -856,8 +903,57 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		if data.SecondOpinionEnabled && secondCount > 0 {
 			data.SecondOpinionMode, data.SecondOpinionMenuOptions = h.secondOpinionMenu(firstModels)
 		}
+		if watch {
+			data.WatchRefresh, data.RefreshDone, data.Refreshing = true, done, refreshing
+			data.PollSecs, data.IdlePollSecs = pollSecs, idlePollSecs
+			q := r.URL.Query()
+			q.Set(refreshCheck, "1")
+			data.FallbackURL = "/?" + q.Encode()
+		}
 		return data, http.StatusOK
 	}
+}
+
+// refreshCheck is the query parameter of the no-script fallback's reload: that render
+// asks the backend whether the refresh ended (within statusTimeout) instead of using
+// only local state, so the fallback stops once the run has ended.
+const refreshCheck = "refresh"
+
+// statusTimeout bounds RefreshStatus's read of the run's status from the backend. A
+// read that does not finish in time counts as still in flight, so the page polls
+// again rather than waiting on it.
+const statusTimeout = 5 * time.Second
+
+// RefreshStatus handles GET /items/refresh-status, which the worklist polls
+// (reload.js). The query carries the refresh version the page was rendered with
+// (done). It answers {"active", "reload"}: active says whether a refresh is in flight
+// now (the page polls often while it is, and says so), and reload is true once a
+// refresh has ended since the render — the version moved — even while the next one
+// runs, so the page reloads exactly when a fresh read holds results it does not show.
+// A version that went backwards (an in-memory web tier restarted) also reloads.
+// Without a session it answers 401 with reload true, so the page reloads to sign in.
+func (h *Handler) RefreshStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	user := h.sessions.CurrentUser(r)
+	if user == nil {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"active":false,"reload":true}`)
+		return
+	}
+	var resp struct {
+		Active bool `json:"active"`
+		Reload bool `json:"reload"`
+	}
+	if p, ok := h.pipeline.(RefreshProber); ok {
+		ctx, cancel := context.WithTimeout(r.Context(), statusTimeout)
+		done, active, _ := p.RefreshState(ctx, user.ID)
+		cancel()
+		pageDone, perr := strconv.ParseUint(r.URL.Query().Get("done"), 10, 64)
+		resp.Active = active
+		resp.Reload = perr != nil || done != pageDone
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // render writes the page, returning the template's error, which includes a failed

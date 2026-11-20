@@ -21,8 +21,9 @@ type WorklistStore struct {
 func (db *DB) Worklist() *WorklistStore { return &WorklistStore{db: db} }
 
 var (
-	_ worklist.Store  = (*WorklistStore)(nil)
-	_ worklist.Lister = (*WorklistStore)(nil)
+	_ worklist.Store       = (*WorklistStore)(nil)
+	_ worklist.Lister      = (*WorklistStore)(nil)
+	_ worklist.OwnerLister = (*WorklistStore)(nil)
 )
 
 // List returns the owner's work items in first-insertion order. An owner with no
@@ -146,6 +147,30 @@ func (s *WorklistStore) All(ctx context.Context) (map[string][]worklist.WorkItem
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("storage: list all work items: %w", err)
+	}
+	return out, nil
+}
+
+// Owners returns every owner with at least one stored item, in owner order. It
+// reads no item documents: it is the cross-owner read behind worklist.OwnerLister,
+// run on every scheduled-refresh tick.
+func (s *WorklistStore) Owners(ctx context.Context) ([]string, error) {
+	rows, err := s.db.sql.QueryContext(ctx,
+		`SELECT DISTINCT owner_id FROM work_items ORDER BY owner_id`)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list owners: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var owner string
+		if err := rows.Scan(&owner); err != nil {
+			return nil, fmt.Errorf("storage: list owners: %w", err)
+		}
+		out = append(out, owner)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("storage: list owners: %w", err)
 	}
 	return out, nil
 }

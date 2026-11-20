@@ -78,12 +78,12 @@ func TestEnsureBackfillDoesNotPileOnRuns(t *testing.T) {
 	if len(d.specs) != 1 {
 		t.Fatalf("dispatched %d runs, want 1 (the in-flight run gates the rest)", len(d.specs))
 	}
-	// Refresh is the explicit user action, so it always dispatches.
+	// A Refresh click asks the backend: this run has ended, so it dispatches one.
 	if err := ig.Refresh(context.Background(), "github:1"); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
 	if len(d.specs) != 2 {
-		t.Fatalf("dispatched %d runs, want 2 (Refresh forces one)", len(d.specs))
+		t.Fatalf("dispatched %d runs, want 2 (the finished backfill does not block a Refresh)", len(d.specs))
 	}
 }
 

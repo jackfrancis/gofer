@@ -233,6 +233,13 @@ type Lister interface {
 	All(ctx context.Context) (map[string][]WorkItem, error)
 }
 
+// OwnerLister names every owner with at least one stored item. It is a cross-owner
+// CONTROL-PLANE read used by the scheduled refresh (ingest.Refresher), which needs
+// only the owners, not their items; the request path never uses it.
+type OwnerLister interface {
+	Owners(ctx context.Context) ([]string, error)
+}
+
 // Ingestor starts the serialized agentic flow that backfills a user's work
 // items. Implementations MUST be idempotent and MUST return promptly —
 // EnsureBackfill is invoked from the request path when a worklist is empty, so it

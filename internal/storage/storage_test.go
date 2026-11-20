@@ -77,7 +77,7 @@ func TestOpenMigratesAnEmptyFile(t *testing.T) {
 	if v != len(migrations) || v < 1 {
 		t.Fatalf("schema version = %d, want %d", v, len(migrations))
 	}
-	if got := strings.Join(tables(t, db), ","); got != "credentials,sessions,work_items" {
+	if got := strings.Join(tables(t, db), ","); got != "credentials,ingest_runs,sessions,work_items" {
 		t.Fatalf("tables = %s", got)
 	}
 }
