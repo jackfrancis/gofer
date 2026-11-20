@@ -179,3 +179,33 @@ func TestClassifyReadsRadarMatchesAgentPlane(t *testing.T) {
 		t.Errorf("Update through the wrapper: %v", err)
 	}
 }
+
+// A proposal counts only under the bot classification it was made with; one from
+// before the field (zero value) was made with the flag unset.
+func TestCurrentProposalMatchesClassification(t *testing.T) {
+	p := &AxisProposal{Relevance: 1}
+	if (Signals{Proposed: p}).CurrentProposal() != p {
+		t.Error("a proposal made with the flag unset is current while it stays unset")
+	}
+	if (Signals{Proposed: p, ReviewRequestedByBot: true}).CurrentProposal() != nil {
+		t.Error("a proposal made for a human request is current after it became a bot's")
+	}
+	bot := &AxisProposal{Relevance: 0.3, ReviewRequestedByBot: true}
+	if (Signals{Proposed: bot, ReviewRequestedByBot: true}).CurrentProposal() != bot {
+		t.Error("a bot-era proposal is current while the request stays a bot's")
+	}
+	if (Signals{Proposed: bot}).CurrentProposal() != nil {
+		t.Error("a bot-era proposal is current after the requester left the bot list")
+	}
+	if (Signals{}).CurrentProposal() != nil {
+		t.Error("no proposal")
+	}
+	// Score falls back to the baseline for a stale proposal.
+	now := time.Now().UTC()
+	it := WorkItem{Signals: Signals{Reasons: []Reason{ReasonReviewRequested}, ReviewRequestedByBot: true, Proposed: p}}
+	base := it
+	base.Signals.Proposed = nil
+	if Score(it, now).Rank != Score(base, now).Rank {
+		t.Error("Score used a stale proposal")
+	}
+}

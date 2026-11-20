@@ -359,6 +359,9 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 			if err != nil {
 				return // best-effort: leave the item unchanged
 			}
+			// Record the classification the ranker saw, so the proposal is dropped if
+			// it changes (worklist.Signals.CurrentProposal).
+			prop.ReviewRequestedByBot = items[i].Signals.ReviewRequestedByBot
 			items[i].Signals.Proposed = &prop
 			mu.Lock()
 			changed = append(changed, items[i])

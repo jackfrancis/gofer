@@ -129,3 +129,40 @@ func keys(m map[string]worklist.WorkItem) []string {
 	}
 	return out
 }
+
+// When a requester is added to BOT_REVIEWERS, the proposal made while their request
+// counted as human is stale. Even when the item misses the rerank cutoff, the radar
+// drops that proposal and shows the corrected baseline.
+func TestStaleProposalDroppedWhenRequesterBecomesBot(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	store := worklist.NewMemoryStore()
+	human := worklist.AxisProposal{Relevance: 1, Urgency: 1, Confidence: 1, Rationale: "a person is waiting"} // rank 0.65
+	store.Seed("u1",
+		worklist.WorkItem{ID: "now-bot", OwnerID: "u1", GitHub: worklist.GitHubRef{UpdatedAt: now}, Signals: worklist.Signals{
+			Reasons: []worklist.Reason{worklist.ReasonReviewRequested}, ReviewRequestedBy: "k8s-ci-robot",
+			AwaitingMeSince: now.Add(-5 * 24 * time.Hour), Proposed: &human}},
+		worklist.WorkItem{ID: "assigned", OwnerID: "u1", GitHub: worklist.GitHubRef{UpdatedAt: now}, Signals: worklist.Signals{
+			Reasons: []worklist.Reason{worklist.ReasonAssignee}, Labels: []string{"priority/p1"}}}, // baseline 0.465
+	)
+	policy := worklist.NewRunPolicy([]string{"k8s-ci-robot"})
+	sink := NewStoreSink(store, "u1").WithPolicy(policy)
+
+	for pass := 1; pass <= 2; pass++ {
+		if err := runRank(ctx, Params{RankLimit: 1}, sink); err != nil { // stub ranker
+			t.Fatal(err)
+		}
+	}
+	res, err := worklist.Resolve(ctx, policy.ClassifyReads(store), nil, now, "u1", worklist.SortRank, true)
+	if err != nil || len(res.Items) != 2 {
+		t.Fatalf("Resolve = (%+v, %v)", res, err)
+	}
+	if res.Items[0].ID != "assigned" {
+		t.Fatalf("radar order %s, %s: the stale human-era proposal still ranks the bot request first",
+			res.Items[0].ID, res.Items[1].ID)
+	}
+	bot := res.Items[1].Meta
+	if bot.Urgency > 0.3 || bot.Rationale == "a person is waiting" {
+		t.Fatalf("bot request: urgency %v, rationale %q; want the bot-discounted baseline", bot.Urgency, bot.Rationale)
+	}
+}

@@ -354,7 +354,7 @@ func rankingContext(item worklist.WorkItem, now time.Time) string {
 	fmt.Fprintf(&b, "axes: relevance %.2f, urgency %.2f, impact %.2f, engagement %.2f\n",
 		m.Relevance, m.Urgency, m.Impact, m.Engagement)
 
-	p, r := item.Signals.Proposed, item.Signals.Research
+	p, r := item.Signals.CurrentProposal(), item.Signals.Research
 	switch {
 	case m.Origin == worklist.OriginUser:
 		b.WriteString("source: the user set this ranking by hand\n")

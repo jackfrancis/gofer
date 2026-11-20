@@ -170,7 +170,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   (`RunPolicy.Classify`), so a run ranks by the current bot list, and so do the user's
   (the JSON worklist and the radar get `RunPolicy.ClassifyReads(store)`), so the rank
   shown and the rank Discuss explains agree. The rank job picks candidates by their
-  baseline with the previous proposal cleared. The requester is
+  baseline with the previous proposal cleared. A proposal records the bot
+  classification it was made under (`AxisProposal.ReviewRequestedByBot`); read it
+  through `Signals.CurrentProposal`, which drops it once the classification changes. The requester is
   the actor of the user's pending review request on the timeline: the latest
   `review_requested` for them, until a `review_request_removed` or their own submitted
   review ends it (a comment does not). The timeline is paged by its `Link` header up

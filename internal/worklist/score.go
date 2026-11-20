@@ -39,7 +39,7 @@ func Score(item WorkItem, now time.Time) Metadata {
 	// An LLM proposal is authoritative for the four axes it returns: gofer uses
 	// the proposed values directly, bounded only to [0,1]. The baseline above is
 	// the fallback when no proposal is present.
-	if p := item.Signals.Proposed; p != nil {
+	if p := item.Signals.CurrentProposal(); p != nil {
 		rel = clampUnit(p.Relevance)
 		imp = clampUnit(p.Impact)
 		eng = clampUnit(p.Engagement)
@@ -84,8 +84,8 @@ func Score(item WorkItem, now time.Time) Metadata {
 	switch {
 	case item.Signals.Research != nil && item.Signals.Research.Rationale != "":
 		m.Rationale = item.Signals.Research.Rationale
-	case item.Signals.Proposed != nil && item.Signals.Proposed.Rationale != "":
-		m.Rationale = item.Signals.Proposed.Rationale
+	case item.Signals.CurrentProposal() != nil && item.Signals.CurrentProposal().Rationale != "":
+		m.Rationale = item.Signals.CurrentProposal().Rationale
 	default:
 		m.Rationale = rationale(contribs)
 	}
