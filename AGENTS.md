@@ -78,7 +78,7 @@ backend fills each one:
 
 | Seam | gofer's side | The AEI backend |
 | --- | --- | --- |
-| `ingest.Dispatcher` (`Submit`/`Status`) | constructs each `RunSpec` | `aei.Dispatcher` POSTs it to the aei-controller (`AEI_DISPATCH_ENDPOINT`) as the `AgentApp` named by `AEI_APP`, on its dispatch listener (`:8081`), authenticating with a ServiceAccount token projected for the `aei-dispatch` audience (`AEI_DISPATCH_TOKEN_PATH`) |
+| `ingest.Dispatcher` (`Submit`/`Status`) | constructs each `RunSpec` | `aei.Dispatcher` POSTs it to the aei-controller (`AEI_DISPATCH_ENDPOINT`) as the `AgentApp` named by `AEI_APP`, on its dispatch listener (`:8081`), authenticating with a ServiceAccount token projected for the `aei-dispatch` audience (`AEI_DISPATCH_TOKEN_PATH`), from a web pod labelled `agents.x-k8s.io/dispatch-client: "true"` (AEI's NetworkPolicy admits only those to `:8081`) |
 | `agent.Vendor` / `agent.Sink` | `agent.NewPlaneClient`: one HTTP client to the `/agent/*` plane | the runtime uses it with its run credential (vend a credential, read/write the worklist) |
 | `agent.Run` (`internal/agent`) | the workload | `aei.RunWorkload` (`cmd/runtime`) executes it per run, out-of-process |
 | `identity.Authority` | verify-only (`internal/identity`, `MINT_PUBLIC_KEY`) | AEI's control plane owns the keypair and is the sole minter |
