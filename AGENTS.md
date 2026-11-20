@@ -282,16 +282,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   sandbox's temp directory for that run only, under gofer-side size caps (AEI's pod
   has no scratch volume or storage limit) — see `docs/adr/0003-repository-checkout-tools.md`.
 - The runtime reports a run's model time and model/tool call counts on completion
-  (`internal/runtime/aei/workload.go`). A one-shot run goes through gofer's `runOnce`,
-  not `aeiruntime.Main`, so it sends exactly one report, and `rt.Complete` applies
-  the SDK's deadline-aware retry budget (never wrap it in a timeout of gofer's own).
-  The durable serve loop still runs under `Main`, wrapped by `measured`, which
-  measures and logs but sends no report: the loop sends the run's one report and
-  holds the actor's slot until it is done, and it cannot yet carry an app's timing. The counts come
-  from an `llm.Collector` on the run's context: model time is elapsed time with any
-  call in flight (concurrent ranking calls count once), recorded in `llm.chat`, so
-  any new model transport must go through `chat`; tool calls are recorded in the
-  converse loop.
+  (`internal/runtime/aei/workload.go`): `measured` collects them and hands them to
+  `rt.SetModelTiming`, which the AEI SDK merges into the one terminal report it sends
+  from `aeiruntime.Main`. gofer never calls `rt.Complete`: the SDK owns delivery, its
+  retry budget, and freeing a durable actor's slot once the report is acknowledged.
+  The counts come from an `llm.Collector` on the run's context: model time is elapsed
+  time with any call in flight (concurrent ranking calls count once), recorded in
+  `llm.chat`, so any new model transport must go through `chat`; tool calls are
+  recorded in the converse loop.
 - The CI tools (`github_get_ci_status`, `ci_job_summary`/`ci_list`/`ci_search`/`ci_read`)
   are in `internal/agent/citools.go`. The `ci_*` tools open only Prow job URLs in
   allowlisted GCS buckets (`internal/prow/url.go`) and talk only to
