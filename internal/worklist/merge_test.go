@@ -152,6 +152,112 @@ func TestAppendReply(t *testing.T) {
 	})
 }
 
+// answers returns the substantive (non-notice) agent turns answering turn.
+func answers(it WorkItem, turn string) []Message {
+	var out []Message
+	for _, m := range it.Thread {
+		if m.Role == RoleAgent && m.Notice == "" && m.ReplyTo == turn {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// A user turn keeps one answer, whichever run stores it first; a notice is not an
+// answer.
+func TestAppendReplyOneAnswerPerTurn(t *testing.T) {
+	base := func() WorkItem {
+		return WorkItem{ID: "a", Thread: []Message{{ID: "q1", Role: RoleUser, Content: "q", At: t0}}}
+	}
+
+	t.Run("a second run answering the same turn is dropped", func(t *testing.T) {
+		it := base()
+		if changed, _ := AppendReply(&it, "q1", Message{ID: "r1", Content: "first", Model: "m", At: t1}); !changed {
+			t.Fatal("want the first answer stored")
+		}
+		changed, err := AppendReply(&it, "q1", Message{ID: "r2", Content: "second", Model: "m", At: t2})
+		if err != nil || changed {
+			t.Fatalf("a second answer must be dropped, got %v %v", changed, err)
+		}
+		if got := answers(it, "q1"); len(got) != 1 || got[0].Content != "first" {
+			t.Fatalf("want one answer, the first, got %+v", got)
+		}
+	})
+	t.Run("a first run finishing late loses to the retry that answered", func(t *testing.T) {
+		it := base()
+		// The retry (dispatched after the first run looked stalled) answers first...
+		if changed, _ := AppendReply(&it, "q1", Message{ID: "retry", Content: "retry", Model: "m", At: t2}); !changed {
+			t.Fatal("want the retry's answer stored")
+		}
+		// ...then the original run, which started earlier, finally writes back.
+		if changed, _ := AppendReply(&it, "q1", Message{ID: "late", Content: "late", Model: "m", At: t1}); changed {
+			t.Fatal("the late answer must be dropped")
+		}
+		if got := answers(it, "q1"); len(got) != 1 || got[0].ID != "retry" {
+			t.Fatalf("want only the retry's answer, got %+v", got)
+		}
+	})
+	t.Run("a turn answered only by a notice still takes its answer", func(t *testing.T) {
+		it := base()
+		notice := Message{ID: "n1", Content: ReconnectNotice, Notice: NoticeReconnect, At: t1}
+		if changed, _ := AppendReply(&it, "q1", notice); !changed {
+			t.Fatal("want the notice stored")
+		}
+		if it.Answered("q1") {
+			t.Fatal("a notice must not answer the turn")
+		}
+		if changed, _ := AppendReply(&it, "q1", Message{ID: "r1", Content: "answer", Model: "m", At: t2}); !changed {
+			t.Fatal("the real answer must be stored after a notice")
+		}
+		if !it.Answered("q1") || len(answers(it, "q1")) != 1 {
+			t.Fatalf("want q1 answered once, got %+v", it.Thread)
+		}
+	})
+	t.Run("a notice after the answer is dropped", func(t *testing.T) {
+		it := base()
+		_, _ = AppendReply(&it, "q1", Message{ID: "r1", Content: "answer", Model: "m", At: t1})
+		notice := Message{ID: "n1", Content: ReconnectNotice, Notice: NoticeReconnect, At: t2}
+		if changed, _ := AppendReply(&it, "q1", notice); changed {
+			t.Fatal("an answered turn takes nothing more, notices included")
+		}
+		if it.NeedsReconnect() {
+			t.Fatal("a dropped notice must not ask the user to reconnect")
+		}
+	})
+	t.Run("a hidden answer still answers the turn", func(t *testing.T) {
+		it := base()
+		_, _ = AppendReply(&it, "q1", Message{ID: "r1", Content: "answer", Model: "m", At: t1})
+		it.Thread[1].Hidden = true
+		if changed, _ := AppendReply(&it, "q1", Message{ID: "r2", Content: "again", Model: "m", At: t2}); changed {
+			t.Fatal("hiding the answer must not reopen the turn")
+		}
+	})
+	t.Run("a legacy positional answer counts", func(t *testing.T) {
+		// Stored before turns had IDs: the agent turn answers the user turn before it.
+		it := WorkItem{ID: "a", Thread: []Message{
+			{Role: RoleUser, Content: "old", At: t0},
+			{Role: RoleAgent, Content: "old answer", At: t1},
+		}}
+		if changed, _ := AppendReply(&it, "pos:0", Message{ID: "r2", Content: "new", Model: "m", At: t2}); changed {
+			t.Fatalf("the legacy turn already has its answer, got %+v", it.Thread)
+		}
+	})
+	t.Run("a second opinion is its own turn and takes its own answer", func(t *testing.T) {
+		// Review-all and the second-opinion action each post a new user turn, so the
+		// second model's review answers that turn, not the first review's.
+		it := base()
+		it.Thread[0].Kind = KindReviewRequest
+		_, _ = AppendReply(&it, "q1", Message{ID: "r1", Content: "first review", Model: "m1", At: t1})
+		it.Thread = append(it.Thread, Message{ID: "q2", Role: RoleUser, Content: "independent", Kind: KindReviewRequest, At: t2})
+		if changed, _ := AppendReply(&it, "q2", Message{ID: "r2", Content: "second review", Model: "m2", At: t3}); !changed {
+			t.Fatal("the second opinion must be stored")
+		}
+		if len(answers(it, "q1")) != 1 || len(answers(it, "q2")) != 1 {
+			t.Fatalf("want one answer per turn, got %+v", it.Thread)
+		}
+	})
+}
+
 func TestApplyReply(t *testing.T) {
 	ctx := context.Background()
 	s := NewMemoryStore()
