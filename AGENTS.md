@@ -39,6 +39,7 @@ cmd/server/          web tier entrypoint (HTTP, UI); selects the backend
 cmd/runtime/         agent runtime entrypoint (one-line shim over internal/runtime/aei)
 cmd/snapshot/        takes and prunes data-volume snapshots (the backup CronJob runs it from the web image)
 hack/restore/       guarded restore script + fake-kubectl regression tests (make restore)
+hack/aeicheck/      the deploy-time AEI dispatch-listener check + fake-kubectl tests (make aei-check)
 internal/runtime/    the backend contract (doc.go)
 internal/runtime/aei/  the AEI backend: dispatcher (aei.go) + workload entrypoint (workload.go)
 internal/config/     env configuration

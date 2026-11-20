@@ -349,18 +349,19 @@ deploy-target:
 		echo "ERROR: kubeconfig not found: $(abspath $(KUBECONFIG))"; exit 1; }
 	@echo "cluster: context '$$($(KUBECTL) config current-context 2>/dev/null)' at $$($(KUBECTL) config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
 
+# The TCP port gofer dials for dispatch: the one in the base gofer-config's
+# AEI_DISPATCH_ENDPOINT, which no deploy step overrides.
+AEI_DISPATCH_PORT := $(shell sed -n 's|^ *AEI_DISPATCH_ENDPOINT: *"[a-z]*://[^/:"]*:\([0-9][0-9]*\).*|\1|p' deploy/k8s/base/configmap.yaml)
+
 aei-check:
 	@$(KUBECTL) get crd agentapps.agents.x-k8s.io >/dev/null 2>&1 || { \
 		echo "ERROR: AEI is not installed (agents.x-k8s.io CRDs missing). This build dispatches to"; \
 		echo "       the aei-controller and cannot run without it. Install AEI, then re-run."; \
 		exit 1; }
 	@# gofer dispatches to the controller's own dispatch listener with a token projected
-	@# for the aei-dispatch audience. An AEI from before that listener has neither.
-	@$(KUBECTL) -n aei-system get service aei-controller -o jsonpath='{.spec.ports[*].name}' 2>/dev/null | tr ' ' '\n' | grep -qx dispatch || { \
-		echo "ERROR: the aei-controller Service in aei-system has no 'dispatch' port. This build"; \
-		echo "       dispatches to AEI's dispatch listener (8081) with an aei-dispatch token;"; \
-		echo "       upgrade AEI to a release that serves it, then re-run."; \
-		exit 1; }
+	@# for the aei-dispatch audience. An AEI from before that listener has neither. This
+	@# reads the aei-controller Service in aei-system (README, "Deploy permissions").
+	@AEI_DISPATCH_PORT="$(AEI_DISPATCH_PORT)" bash hack/aeicheck/dispatch.sh $(KUBECTL)
 
 # `deploy` does not create secrets: a real cluster's keys come from your secret manager,
 # not from a make target. It only checks that the ones the server refuses to start
@@ -373,7 +374,11 @@ secrets-check:
 			exit 1; }; \
 	done
 
-deploy: deploy-target aei-check secrets-check deploy-apply
+# The checks are prerequisites and the apply is a sub-make, so nothing is applied
+# until every check has passed, also under `make -j`, where sibling prerequisites run
+# at the same time.
+deploy: deploy-target aei-check secrets-check
+	@$(MAKE) --no-print-directory deploy-apply
 
 # The kind dev loop. SESSION_SECRET and VAULT_ENCRYPTION_KEY are generated;
 # MINT_PUBLIC_KEY is AEI's published verify key (read from
@@ -527,7 +532,10 @@ tls-status:
 	@$(KUBECTL) -n $(KUBE_NS) get certificate,certificaterequest,order,challenge 2>&1
 
 dev-up: DATA_RECLAIM_POLICY = Delete
-dev-up: cluster-up kind-load kind-load-runtime aei-check dev-secrets deploy-apply
+dev-up: cluster-up kind-load kind-load-runtime aei-check dev-secrets
+	@# A sub-make, as in deploy, so the apply waits for aei-check. A target-specific
+	@# variable does not reach a sub-make, so pass the reclaim policy on.
+	@$(MAKE) --no-print-directory deploy-apply DATA_RECLAIM_POLICY=$(DATA_RECLAIM_POLICY)
 	@# Durable pulls actor images from a registry BY DIGEST (a tag invalidates ate's golden
 	@# snapshot; kind-loaded images are not registry-pullable). So for the durable class,
 	@# push the runtime to the substrate registry and pin the AgentApp image to the pushed
