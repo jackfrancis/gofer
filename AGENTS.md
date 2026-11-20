@@ -160,7 +160,30 @@ Wired on the web-tier side; they define what a runtime must respect:
   (`WorkItem.OnRadar`), and no bulk action (Review all, the second-opinion batch)
   draws from them. A
   run adds a thread turn only through `POST /agent/worklist/reply`
-  (`worklist.AppendReply`). Before the merge, every write-back path applies
+  (`worklist.AppendReply`). A write-back that carries no model proposal or research
+  adjustment (`Signals.Proposed` / `Signals.Research`) keeps the stored one
+  (`worklist.KeepModelSignals`), and every workload pass sends only the model signal
+  it derived (ingest and enrich none, rank only the proposal), never the copy it
+  read, which a newer write may have replaced. A converse or research run writes its
+  research adjustment only through `POST /agent/worklist/research`
+  (`worklist.ApplyResearch`), never the whole item it read before the model call, so
+  a refresh that landed meanwhile stands. An adjustment is dropped if a turn it read
+  (`ResearchAdjustment.Turns`) is no longer in the stored thread (the conversation
+  was cleared); otherwise adjustments are ordered by `AppliedAt` (required), and an
+  older one is dropped, so a resend cannot undo a later result. A refresh keeps the
+  last known `ReviewRequestedBy` of a review that may still be pending (search does
+  not name the requester; enrich's timeline read replaces it), so a proposal the bot
+  policy set aside stays set aside. Only a complete review-request search
+  (`github.Fetch.ReviewRequestsComplete`) confirms a request was removed; after a
+  partial one the stored request is kept, and the chained enrich drops that kept
+  request only if the whole timeline shows no request that may include the user still
+  outstanding (`Activity.RequestEnded`: the personal request withdrawn or fulfilled by
+  the user's own review, and every team request withdrawn or made before that review,
+  since team membership is unknown and the search counts team requests). A request
+  the search showed is never dropped by the timeline, since a team request names the
+  team, not the user. A retired item
+  carries no request into its resurfacing.
+  Before the merge, every write-back path applies
   `worklist.RunPolicy` (the agent plane's ingest handler, and the in-process
   `StoreSink`): workload metadata is stamped `OriginAgent`, so a run cannot claim the
   `OriginUser` override that `Resolve` leaves unrescored, and
@@ -171,17 +194,20 @@ Wired on the web-tier side; they define what a runtime must respect:
   `List`, `Get` and `Briefs`) re-derive the flag too (`RunPolicy.Classify`), so a run
   ranks by the current bot list, and so do the user's
   (the JSON worklist and the radar get `RunPolicy.ClassifyReads(store)`), so the rank
-  shown and the rank Discuss explains agree. The rank job picks candidates by their
-  baseline with the previous proposal cleared (the top-N selection, `worklist.Select`). A proposal records the bot
+  shown and the rank Discuss explains agree. The rank job picks candidates by
+  `worklist.BaselineScore`, which clears the previous proposal and research (the
+  top-N selection, `worklist.Select`). A proposal records the bot
   classification it was made under (`AxisProposal.ReviewRequestedByBot`); read it
   through `Signals.CurrentProposal`, which drops it once the classification changes. The requester is
   the actor of the user's pending review request on the timeline: the latest
   `review_requested` for them, until a `review_request_removed` or their own submitted
   review ends it (a comment does not). The timeline is paged by its `Link` header up
   to a cap, inside enrich's reserve-adjusted deadline; a timeline longer than the cap
-  leaves the requester and both waiting timestamps unset. The deterministic scorer discounts a bot's request (no awaiting-me
+  leaves both waiting timestamps unset and the stored requester unchanged
+  (`Activity.TimelineComplete`). The deterministic scorer discounts a bot's request (no awaiting-me
   pressure, low floors) unless the user is also an assignee. The web and runtime images must ship together: a runtime
-  from before this rule posts its reply inside the item, where it is now ignored.
+  from before these rules posts its reply inside the item, where it is now ignored,
+  and a web tier from before them has no research route.
 - A run never reads the whole worklist: its threads grow without bound and the agent
   plane caps a response at 8 MiB. `agent.Sink` has only bounded reads, served by the
   same `internal/worklist/select.go` functions in process and on the plane:
@@ -199,14 +225,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   reads (the strongest labels, every distinct reason), so a projected item scores as
   the whole item does for the ranker and Discuss. Projection drops a research
   adjustment's source-turn list rather than shorten it, so the visibility check
-  withholds research it cannot check whole. Ranking reads the top N by baseline score
+  withholds research it cannot check whole. Ranking reads the top N by `worklist.BaselineScore`
   of the whole item, projected only after it is chosen (ties keep insertion order); ingest and enrichment page through
   every item with `readAll`, and ingest fails if it cannot read the stored items.
   Enrichment must keep reaching every open item; never cap it. The stores serve these
   reads directly (`Store.Get`, `Store.Briefs`), so a page never decodes every thread.
   Selections have their own route so a runtime facing an older web tier fails instead
   of getting the whole list. A write-back need not carry a thread (`MergeRunItems`
-  keeps the stored one). A user message is capped at 16 KiB (`webui.maxMessageBytes`).
+  keeps the stored one); research is written back alone (`Sink.Research`). A user message is capped at 16 KiB (`webui.maxMessageBytes`).
 - Replies can land out of order, so a turn's position does not say what it answers.
   Every new turn gets an ID; an agent turn's `ReplyTo` names the user turn it
   answers; dispatch carries the turn a run must answer (`worklist.TurnRef`, run

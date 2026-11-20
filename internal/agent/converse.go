@@ -162,14 +162,13 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	// A completed conversation turn is fresh evidence: re-weight the item's ranking
 	// from the thread (best-effort). The GitHub-metadata foundation stays
 	// authoritative — research only nuances it. The write-back carries only the
-	// signal; the plane keeps the stored thread.
+	// adjustment (Sink.Research): this copy of the item was read when the run
+	// started, and a refresh that landed since must keep its GitHub fields.
 	if p.Researcher != nil {
 		item.Thread = append(item.Thread, msg)
 		if adj, rerr := p.Researcher.Research(ctx, item); rerr == nil {
-			item.Signals.Research = &adj
-			item.Thread = nil // the plane keeps the stored thread; don't resend it
-			if err := sink.Ingest(ctx, []worklist.WorkItem{item}); err != nil {
-				return fmt.Errorf("ingest: %w", err)
+			if err := sink.Research(ctx, item.ID, stampResearch(adj)); err != nil {
+				return fmt.Errorf("research: %w", err)
 			}
 		}
 	}

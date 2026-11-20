@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -53,7 +54,8 @@ type Vendor interface {
 // A write-back is merged into the item as stored when it lands (see
 // worklist.MergeRunItems): Ingest updates what a run derives — GitHub fields,
 // signals, scoring — and never the conversation thread, so work the owner did
-// while the run was busy survives. Reply is the only way a run adds to a thread.
+// while the run was busy survives. Reply is the only way a run adds to a thread,
+// and Research writes a research adjustment without the rest of the item.
 type Sink interface {
 	// Item reads the acting user's item with id and a window of its thread that
 	// keeps the turn named by turn (worklist.ThreadWindow); ok is false if it is gone
@@ -68,6 +70,11 @@ type Sink interface {
 	// Key is replyTo (see worklist.AppendReply). It is dropped, without error, if
 	// that turn is gone or the item is.
 	Reply(ctx context.Context, itemID, replyTo string, reply worklist.Message) error
+	// Research sets itemID's research adjustment and nothing else (see
+	// worklist.ApplyResearch), so a pass that read the item before a refresh never
+	// writes back its older GitHub fields. It is dropped, without error, if the item
+	// is gone.
+	Research(ctx context.Context, itemID string, adj worklist.ResearchAdjustment) error
 }
 
 // Params configures a single runtime invocation.
@@ -200,7 +207,7 @@ func Run(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	case JobIngest:
 		return runIngest(ctx, p, vendor, sink)
 	case JobEnrich:
-		return runEnrich(ctx, p, vendor, sink)
+		return runEnrich(ctx, p, vendor, sink, nil)
 	case JobRank:
 		return runRank(ctx, p, sink)
 	case JobConverse:
@@ -227,7 +234,8 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 		return fmt.Errorf("vend credential: %w", err)
 	}
 	gh := github.NewClient(holder.client(p.Client), p.GitHubBaseURL)
-	items, complete, err := gh.FetchWorklist(ctx, holder.Token())
+	fetch, err := gh.FetchWorklistDetail(ctx, holder.Token())
+	items, complete := fetch.Items, fetch.Complete
 	if rerr := holder.Reconnect(); rerr != nil {
 		return fmt.Errorf("fetch github: %w", rerr)
 	}
@@ -249,7 +257,7 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	if lerr != nil {
 		return fmt.Errorf("ingest: read existing items: %w", lerr)
 	}
-	items = reconcileFetched(items, existing)
+	items, carried := reconcileFetched(items, existing, fetch.ReviewRequestsComplete)
 	// Retire what left the open set. Only a COMPLETE fetch proves an item is gone: a
 	// partial walk (time budget, rate limit, result ceiling) simply may not have
 	// reached it, and retiring it then would hide open work.
@@ -272,7 +280,7 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	// (the model proposal), so one pass yields a fully scored radar. Both are
 	// best-effort: a failure leaves the baseline-scored items in place. The
 	// separate JobEnrich / JobRank exist for an independent scheduled refresh.
-	if err := runEnrich(ctx, p, vendor, sink); err != nil {
+	if err := runEnrich(ctx, p, vendor, sink, carried); err != nil {
 		// The user's access is gone: stop here, and say so, rather than rank and
 		// report success. The items already written keep their baseline scores.
 		if isSignInRequired(err) {
@@ -292,10 +300,17 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 // completed), and the original creation time — from the persisted items onto the
 // freshly fetched ones, keyed by ID. Fetched items with no persisted counterpart (new
 // work) pass through unchanged. The agent plane also keeps the stored thread, read
-// cursor, hidden flag and creation time on every write-back (worklist.MergeRunItems),
+// cursor, hidden flag, creation time and, when a write-back carries none, the model
+// proposal and research adjustment on every write-back (worklist.MergeRunItems),
 // which is what protects a change made after this run read the items; carrying them
 // here keeps the run's own view of each item whole.
-func reconcileFetched(fetched, existing []worklist.WorkItem) []worklist.WorkItem {
+//
+// reviewsComplete reports whether the review-request search was walked whole
+// (github.Fetch.ReviewRequestsComplete); see carryPendingRequest. carried names the
+// items whose review request was kept from the store although this fetch did not
+// show it, so the chained enrich can drop it if the timeline shows it ended.
+func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete bool) (_ []worklist.WorkItem, carried map[string]bool) {
+	carried = make(map[string]bool)
 	prior := make(map[string]worklist.WorkItem, len(existing))
 	for _, it := range existing {
 		prior[it.ID] = it
@@ -311,13 +326,24 @@ func reconcileFetched(fetched, existing []worklist.WorkItem) []worklist.WorkItem
 		// A hidden item stays hidden until GitHub shows it changed after the hide; the
 		// plane's merge applies the same rule, so the run's view and the store agree.
 		fetched[i].Meta.HiddenAt = worklist.HiddenAfter(old.Meta.HiddenAt, fetched[i].GitHub.UpdatedAt)
+		// A fetch derives no model proposal or research adjustment, so it sends none:
+		// the plane's merge then keeps whatever is stored when this write lands, not
+		// the copy read above, which a discussion may have replaced since. The
+		// chained enrich and rank read the store again.
+		clearModelSignals(&fetched[i].Signals)
+		if old.Meta.CompletedAt.IsZero() {
+			// A retired item's request ended with it; a resurfaced item's request is new.
+			if carryPendingRequest(&fetched[i].Signals, old.Signals, reviewsComplete) {
+				carried[fetched[i].ID] = true
+			}
+		}
 		// CompletedAt is deliberately NOT carried over: the item was just fetched from
 		// the open set, so it is open, and a reopened item resurfaces (see Metadata).
 		if !old.CreatedAt.IsZero() {
 			fetched[i].CreatedAt = old.CreatedAt
 		}
 	}
-	return fetched
+	return fetched, carried
 }
 
 // retireMissing returns the persisted GitHub items that are absent from a complete
@@ -337,9 +363,50 @@ func retireMissing(fetched, existing []worklist.WorkItem, now time.Time) []workl
 			continue
 		}
 		it.Meta.CompletedAt = now
+		// Retiring derives no model signals; leave them to the store (see
+		// reconcileFetched).
+		clearModelSignals(&it.Signals)
 		retired = append(retired, it)
 	}
 	return retired
+}
+
+// carryPendingRequest keeps what a refresh cannot re-establish about a review the
+// user was asked for. GitHub's search says a review is requested but not by whom;
+// only enrich's timeline read names the requester. Without this a refresh would blank
+// the requester, the bot flag would read "human", and a stored proposal the bot
+// policy had set aside (Signals.CurrentProposal) would apply again until enrich ran.
+// So whenever the fetch shows a request, the stored requester is kept (whether the
+// store learned it with the request or from an earlier timeline read); enrich
+// replaces it whenever it reads the whole timeline.
+//
+// Only a complete review-request search confirms that a request was removed: when
+// that search was partial (reviewsComplete false), an item may arrive through
+// involves: alone, so a request the store recorded is kept, and carryPendingRequest
+// reports that it inferred it. The caller skips retired items, whose request ended
+// with them.
+func carryPendingRequest(fetched *worklist.Signals, stored worklist.Signals, reviewsComplete bool) (inferred bool) {
+	if !slices.Contains(fetched.Reasons, worklist.ReasonReviewRequested) {
+		if reviewsComplete || !slices.Contains(stored.Reasons, worklist.ReasonReviewRequested) {
+			return false // no request is shown, and none may be inferred
+		}
+		fetched.Reasons = append(slices.Clone(fetched.Reasons), worklist.ReasonReviewRequested)
+		inferred = true
+	}
+	if fetched.ReviewRequestedBy == "" && stored.ReviewRequestedBy != "" {
+		fetched.ReviewRequestedBy = stored.ReviewRequestedBy
+		fetched.ReviewRequestedByBot = stored.ReviewRequestedByBot
+	}
+	return inferred
+}
+
+// clearModelSignals drops the model proposal and research adjustment from a
+// write-back that did not derive them. A write-back that carries neither leaves the
+// stored values in place (worklist.MergeRunItems), so a pass never restores the
+// copy it read over a newer one written meanwhile.
+func clearModelSignals(s *worklist.Signals) {
+	s.Proposed = nil
+	s.Research = nil
 }
 
 // runRank reads the user's persisted work, asks the AxisRanker to propose the
@@ -362,10 +429,11 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 	// rates highest rather than on an arbitrary slice: the agent plane selects them
 	// (worklist.Select), so the read is the top N, not the worklist. Retired items are
 	// off the radar; a model proposal for one is wasted spend. enrich has just run, so
-	// those baselines are computed from complete signals. The baseline ignores an
-	// item's previous model proposal: that proposal is what this pass replaces, and it
-	// may rest on a classification since changed (e.g. a requester removed from
-	// BOT_REVIEWERS), so it must not keep the item out of the pass.
+	// those baselines are computed from complete signals. The baseline ignores the
+	// item's model signals (worklist.BaselineScore): the previous proposal is what this
+	// pass replaces, and it may rest on a classification since changed (e.g. a
+	// requester removed from BOT_REVIEWERS), so neither it nor an old research
+	// adjustment may keep the item out of the pass.
 	items, err := readAll(ctx, p, sink, worklist.Selection{Open: true, Top: limit})
 	if err != nil {
 		return fmt.Errorf("list worklist: %w", err)
@@ -397,6 +465,8 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 			// it changes (worklist.Signals.CurrentProposal).
 			prop.ReviewRequestedByBot = items[i].Signals.ReviewRequestedByBot
 			items[i].Signals.Proposed = &prop
+			// Rank derives only the proposal; the stored research adjustment stays.
+			items[i].Signals.Research = nil
 			mu.Lock()
 			changed = append(changed, items[i])
 			mu.Unlock()

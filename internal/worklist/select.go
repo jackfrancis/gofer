@@ -47,8 +47,8 @@ type Selection struct {
 	// Zero, or more than MaxSelectLimit, is MaxSelectLimit.
 	Limit int
 	// Top, when > 0, reads the Top items with the highest baseline score
-	// (Score(item, now).Rank, ignoring the item's previous model proposal, which is
-	// what a ranking pass replaces and may rest on a classification since changed),
+	// (BaselineScore(item, now).Rank, without the model signals a ranking pass
+	// replaces, which may rest on a classification since changed),
 	// highest first, instead of paging by ID; Limit is ignored. Equal scores keep the store's first-insertion order. It is clamped to
 	// MaxSelectLimit, and its pages are positions in that ranking, so a score that
 	// changes between pages can shift an item across a page boundary: a reader
@@ -86,8 +86,7 @@ func Select(items []WorkItem, sel Selection, now time.Time) (page []WorkItem, ne
 		// (a label past the cut), so it runs only on what is selected.
 		rank := make(map[string]float64, len(out))
 		for _, it := range out {
-			it.Signals.Proposed = nil // it is a copy
-			rank[it.ID] = Score(it, now).Rank
+			rank[it.ID] = BaselineScore(it, now).Rank
 		}
 		// Stable on ties: a fresh backfill stores the most recently active work
 		// first, so a tied cutoff favors fresh work.

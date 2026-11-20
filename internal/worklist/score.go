@@ -16,6 +16,15 @@ const (
 	wEngagement = 0.15
 )
 
+// BaselineScore is Score without the model-derived signals: the deterministic
+// metadata scorer alone, as computed from GitHub's signals. Choosing which items
+// to send to the model uses it, so a stored proposal cannot decide its own refresh.
+func BaselineScore(item WorkItem, now time.Time) Metadata {
+	item.Signals.Proposed = nil
+	item.Signals.Research = nil
+	return Score(item, now)
+}
+
 // Score computes an item's gofer Metadata from its Signals, as of now. It is a
 // pure function of the item, so a worklist can be re-scored when the weights
 // change without re-fetching from the provider. Origin is preserved; the caller

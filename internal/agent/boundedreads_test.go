@@ -63,6 +63,7 @@ func newBoundedPlane(t *testing.T) *boundedPlane {
 	mux.Handle("GET /agent/worklist/select", auth.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(h.Select)))
 	mux.Handle("GET /agent/worklist/item", auth.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(h.Item)))
 	mux.Handle("POST /agent/worklist/reply", auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Reply)))
+	mux.Handle("POST /agent/worklist/research", auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Research)))
 	mux.Handle("GET /agent/credential", auth.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"access_token":"gh-tok","credential_version":"v1"}`))
 	})))

@@ -113,6 +113,74 @@ func (h *IngestHandler) Reply(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// researchRequest is the body of POST /agent/worklist/research.
+type researchRequest struct {
+	ItemID     string              `json:"item_id"`
+	Adjustment *researchAdjustment `json:"adjustment"`
+}
+
+// researchAdjustment is worklist.ResearchAdjustment as posted, with each multiplier
+// a pointer so a missing one is told apart from an explicit zero: a missing
+// multiplier decoding as 0 would silently zero that ranking axis.
+type researchAdjustment struct {
+	Relevance  *float64  `json:"relevance"`
+	Impact     *float64  `json:"impact"`
+	Engagement *float64  `json:"engagement"`
+	Urgency    *float64  `json:"urgency"`
+	Rationale  string    `json:"rationale"`
+	AppliedAt  time.Time `json:"applied_at"`
+	Turns      []string  `json:"turns"`
+}
+
+// complete reports whether every multiplier and the stamp are present.
+func (a *researchAdjustment) complete() bool {
+	return a != nil && a.Relevance != nil && a.Impact != nil && a.Engagement != nil && a.Urgency != nil && !a.AppliedAt.IsZero()
+}
+
+func (a *researchAdjustment) value() worklist.ResearchAdjustment {
+	return worklist.ResearchAdjustment{
+		Relevance: *a.Relevance, Impact: *a.Impact, Engagement: *a.Engagement, Urgency: *a.Urgency,
+		Rationale: a.Rationale, AppliedAt: a.AppliedAt, Turns: a.Turns,
+	}
+}
+
+// maxResearchBody bounds a research request. Besides four multipliers and a
+// rationale it lists the key of every thread turn the research read, so it is sized
+// like a write-back (Ingest), which carries whole threads: a long conversation's
+// research must not be refused after its reply has landed.
+const maxResearchBody = 8 << 20
+
+// Research handles POST /agent/worklist/research. A converse or research run writes
+// the research adjustment it derived here (worklist.ApplyResearch), and only that:
+// the rest of the item stays as stored now, so a run that read the item before a
+// refresh cannot write back its older GitHub fields. An adjustment for an item that
+// is gone, or older than the stored one (a resend), is accepted and dropped.
+func (h *IngestHandler) Research(w http.ResponseWriter, r *http.Request) {
+	p, ok := principal.FromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var body researchRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxResearchBody)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if body.ItemID == "" || !body.Adjustment.complete() {
+		writeError(w, http.StatusBadRequest, "item_id and an adjustment with relevance, impact, engagement, urgency and applied_at are required")
+		return
+	}
+	if err := worklist.ApplyResearch(r.Context(), h.store, p.ActingUserID, body.ItemID, body.Adjustment.value()); err != nil {
+		writeError(w, http.StatusBadGateway, "could not persist research adjustment")
+		return
+	}
+	// The adjustment is the run's result landing (see Ingest).
+	if h.noter != nil && p.JobID != "" {
+		h.noter.NoteWriteback(p.JobID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // List handles GET /agent/worklist: the acting user's whole worklist, threads
 // included. No current run reads it (it outgrows the agent plane's response limit);
 // a run reads one item (Item) or a bounded selection (Select). It stays for a
