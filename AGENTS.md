@@ -175,8 +175,11 @@ Wired on the web-tier side; they define what a runtime must respect:
   not name the requester; enrich's timeline read replaces it), so a proposal the bot
   policy set aside stays set aside. Only a complete review-request search
   (`github.Fetch.ReviewRequestsComplete`) confirms a request was removed; after a
-  partial one the stored request is kept. A retired item carries no request into
-  its resurfacing.
+  partial one the stored request is kept, and the chained enrich drops that kept
+  request only if the whole timeline shows it ended (`Activity.RequestEnded`: a
+  withdrawal or the user's own review). A request the search showed is never dropped
+  by the timeline, since a team request leaves no event for the user. A retired item
+  carries no request into its resurfacing.
   Before the merge, every write-back path applies
   `worklist.RunPolicy` (the agent plane's ingest handler, and the in-process
   `StoreSink`): workload metadata is stamped `OriginAgent`, so a run cannot claim the
@@ -194,7 +197,8 @@ Wired on the web-tier side; they define what a runtime must respect:
   `review_requested` for them, until a `review_request_removed` or their own submitted
   review ends it (a comment does not). The timeline is paged by its `Link` header up
   to a cap, inside enrich's reserve-adjusted deadline; a timeline longer than the cap
-  leaves the requester and both waiting timestamps unset. The deterministic scorer discounts a bot's request (no awaiting-me
+  leaves both waiting timestamps unset and the stored requester unchanged
+  (`Activity.TimelineComplete`). The deterministic scorer discounts a bot's request (no awaiting-me
   pressure, low floors) unless the user is also an assignee. The web and runtime images must ship together: a runtime
   from before these rules posts its reply inside the item, where it is now ignored,
   and a web tier from before them has no research route.

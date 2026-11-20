@@ -158,7 +158,7 @@ func Run(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	case JobIngest:
 		return runIngest(ctx, p, vendor, sink)
 	case JobEnrich:
-		return runEnrich(ctx, p, vendor, sink)
+		return runEnrich(ctx, p, vendor, sink, nil)
 	case JobRank:
 		return runRank(ctx, p, sink)
 	case JobConverse:
@@ -205,7 +205,7 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 		log.Warn("ingest: could not read existing items to reconcile; threads may reset", "err", lerr)
 		existing = nil
 	}
-	items = reconcileFetched(items, existing, fetch.ReviewRequestsComplete)
+	items, carried := reconcileFetched(items, existing, fetch.ReviewRequestsComplete)
 	// Retire what left the open set. Only a COMPLETE fetch proves an item is gone: a
 	// partial walk (time budget, rate limit, result ceiling) simply may not have
 	// reached it, and retiring it then would hide open work.
@@ -228,7 +228,7 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	// (the model proposal), so one pass yields a fully scored radar. Both are
 	// best-effort: a failure leaves the baseline-scored items in place. The
 	// separate JobEnrich / JobRank exist for an independent scheduled refresh.
-	if err := runEnrich(ctx, p, vendor, sink); err != nil {
+	if err := runEnrich(ctx, p, vendor, sink, carried); err != nil {
 		// The user's access is gone: stop here, and say so, rather than rank and
 		// report success. The items already written keep their baseline scores.
 		if isSignInRequired(err) {
@@ -254,8 +254,11 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 // here keeps the run's own view of each item whole.
 //
 // reviewsComplete reports whether the review-request search was walked whole
-// (github.Fetch.ReviewRequestsComplete); see carryPendingRequest.
-func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete bool) []worklist.WorkItem {
+// (github.Fetch.ReviewRequestsComplete); see carryPendingRequest. carried names the
+// items whose review request was kept from the store although this fetch did not
+// show it, so the chained enrich can drop it if the timeline shows it ended.
+func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete bool) (_ []worklist.WorkItem, carried map[string]bool) {
+	carried = make(map[string]bool)
 	prior := make(map[string]worklist.WorkItem, len(existing))
 	for _, it := range existing {
 		prior[it.ID] = it
@@ -278,7 +281,9 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 		clearModelSignals(&fetched[i].Signals)
 		if old.Meta.CompletedAt.IsZero() {
 			// A retired item's request ended with it; a resurfaced item's request is new.
-			carryPendingRequest(&fetched[i].Signals, old.Signals, reviewsComplete)
+			if carryPendingRequest(&fetched[i].Signals, old.Signals, reviewsComplete) {
+				carried[fetched[i].ID] = true
+			}
 		}
 		// CompletedAt is deliberately NOT carried over: the item was just fetched from
 		// the open set, so it is open, and a reopened item resurfaces (see Metadata).
@@ -286,7 +291,7 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 			fetched[i].CreatedAt = old.CreatedAt
 		}
 	}
-	return fetched
+	return fetched, carried
 }
 
 // retireMissing returns the persisted GitHub items that are absent from a complete
@@ -315,31 +320,32 @@ func retireMissing(fetched, existing []worklist.WorkItem, now time.Time) []workl
 }
 
 // carryPendingRequest keeps what a refresh cannot re-establish about a review the
-// user was asked for and that may still be pending. GitHub's search says a review is
-// requested but not by whom; only enrich's timeline read names the requester.
-// Without this a refresh would blank the requester, the bot flag would read "human",
-// and a stored proposal the bot policy had set aside (Signals.CurrentProposal) would
-// apply again until enrich ran. Enrich replaces the carried requester whenever it
-// reads the timeline.
+// user was asked for. GitHub's search says a review is requested but not by whom;
+// only enrich's timeline read names the requester. Without this a refresh would blank
+// the requester, the bot flag would read "human", and a stored proposal the bot
+// policy had set aside (Signals.CurrentProposal) would apply again until enrich ran.
+// So whenever the fetch shows a request, the stored requester is kept (whether the
+// store learned it with the request or from an earlier timeline read); enrich
+// replaces it whenever it reads the whole timeline.
 //
 // Only a complete review-request search confirms that a request was removed: when
 // that search was partial (reviewsComplete false), an item may arrive through
-// involves: alone, so the stored request, reason and requester, is kept. The caller
-// skips retired items, whose request ended with them.
-func carryPendingRequest(fetched *worklist.Signals, stored worklist.Signals, reviewsComplete bool) {
-	if !slices.Contains(stored.Reasons, worklist.ReasonReviewRequested) {
-		return
-	}
+// involves: alone, so a request the store recorded is kept, and carryPendingRequest
+// reports that it inferred it. The caller skips retired items, whose request ended
+// with them.
+func carryPendingRequest(fetched *worklist.Signals, stored worklist.Signals, reviewsComplete bool) (inferred bool) {
 	if !slices.Contains(fetched.Reasons, worklist.ReasonReviewRequested) {
-		if reviewsComplete {
-			return // the request is gone
+		if reviewsComplete || !slices.Contains(stored.Reasons, worklist.ReasonReviewRequested) {
+			return false // no request is shown, and none may be inferred
 		}
 		fetched.Reasons = append(slices.Clone(fetched.Reasons), worklist.ReasonReviewRequested)
+		inferred = true
 	}
 	if fetched.ReviewRequestedBy == "" && stored.ReviewRequestedBy != "" {
 		fetched.ReviewRequestedBy = stored.ReviewRequestedBy
 		fetched.ReviewRequestedByBot = stored.ReviewRequestedByBot
 	}
+	return inferred
 }
 
 // clearModelSignals drops the model proposal and research adjustment from a

@@ -637,9 +637,27 @@ func TestCarryPendingRequest(t *testing.T) {
 	}
 
 	missed := worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonAuthor}}
-	carryPendingRequest(&missed, stored, false)
+	if !carryPendingRequest(&missed, stored, false) {
+		t.Fatal("a request kept after a partial search must be reported as inferred")
+	}
 	if missed.ReviewRequestedBy != "alice" || !slices.Contains(missed.Reasons, worklist.ReasonReviewRequested) || !slices.Contains(missed.Reasons, worklist.ReasonAuthor) {
 		t.Fatalf("a partial search proves nothing: want the request kept, got %+v", missed)
+	}
+
+	// The store learned the requester from a timeline before it saw the request; a
+	// search that now shows the request keeps it, and nothing was inferred.
+	timelineOnly := worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonAuthor}, ReviewRequestedBy: "bob"}
+	shown := worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonReviewRequested}}
+	if carryPendingRequest(&shown, timelineOnly, true) {
+		t.Fatal("a request the search showed is not inferred")
+	}
+	if shown.ReviewRequestedBy != "bob" {
+		t.Fatalf("want the timeline's requester kept, got %q", shown.ReviewRequestedBy)
+	}
+	// Without a stored request, a partial search infers none.
+	none := worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonAuthor}}
+	if carryPendingRequest(&none, timelineOnly, false) || slices.Contains(none.Reasons, worklist.ReasonReviewRequested) {
+		t.Fatalf("no request was stored; none may be inferred, got %+v", none)
 	}
 }
 
@@ -724,4 +742,109 @@ func TestRunIngestResurfacedItemDropsOldRequester(t *testing.T) {
 	if got.Signals.ReviewRequestedBy != "" || got.Signals.ReviewRequestedByBot {
 		t.Fatalf("the resurfaced request inherited the retired one's requester: %q bot=%v", got.Signals.ReviewRequestedBy, got.Signals.ReviewRequestedByBot)
 	}
+}
+
+// reviewSnapshot runs a full refresh in which the involvement search finds o/r#7.
+// reviewFound says whether the review-requested search shows it too (otherwise that
+// search reports incomplete results). timeline is the PR's timeline body; empty
+// makes the timeline unavailable (404), and longTimeline serves a timeline longer
+// than enrich reads. Ranking runs with the stub ranker.
+func reviewSnapshot(t *testing.T, sink Sink, reviewFound bool, timeline string, longTimeline bool) worklist.WorkItem {
+	t.Helper()
+	const hit = `{"number":7,"title":"PR","state":"open","repository_url":"https://api.github.com/repos/o/r","pull_request":{"url":"x"}}`
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		switch {
+		case r.URL.Path == "/user":
+			fmt.Fprint(w, `{"login":"me"}`)
+		case strings.Contains(q, "review-requested:@me"):
+			if reviewFound {
+				fmt.Fprintf(w, `{"total_count":1,"items":[%s]}`, hit)
+			} else {
+				fmt.Fprint(w, `{"incomplete_results":true,"items":[]}`)
+			}
+		case strings.Contains(q, "is:pr") && strings.Contains(q, "involves:@me"):
+			fmt.Fprintf(w, `{"total_count":1,"items":[%s]}`, hit)
+		case r.URL.Path == "/search/issues":
+			fmt.Fprint(w, `{"items":[]}`)
+		case strings.HasSuffix(r.URL.Path, "/timeline") && longTimeline:
+			w.Header().Set("Link", fmt.Sprintf(`<%s?page=next>; rel="next"`, r.URL.Path))
+			fmt.Fprint(w, `[{"event":"commented","created_at":"2026-01-03T09:00:00Z","actor":{"login":"bob"}}]`)
+		case strings.HasSuffix(r.URL.Path, "/timeline") && timeline != "":
+			fmt.Fprint(w, timeline)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	if err := Run(ctx, Params{JobType: JobIngest, GitHubBaseURL: srv.URL, Client: srv.Client()}, fakeVendor{token: "test"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	items, err := sink.List(ctx)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("list returned %d items, error %v", len(items), err)
+	}
+	return items[0]
+}
+
+// Refreshes against a review search and a timeline that disagree or fall short. Only
+// positive evidence changes what is known about the user's review request: a
+// complete search showing it, or a whole timeline showing who asked or that it ended.
+func TestRefreshReviewRequestEvidence(t *testing.T) {
+	const requested = `{"event":"review_requested","created_at":"2026-01-01T09:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"review-bot"}}`
+	const withdrawn = `{"event":"review_request_removed","created_at":"2026-01-02T09:00:00Z","requested_reviewer":{"login":"me"},"actor":{"login":"review-bot"}}`
+	const reviewed = `{"event":"reviewed","submitted_at":"2026-01-02T09:00:00Z","state":"commented","user":{"login":"me"}}`
+	newSink := func() Sink {
+		return NewStoreSink(worklist.NewMemoryStore(), "owner").WithPolicy(worklist.NewRunPolicy([]string{"review-bot"}))
+	}
+	pending := func(it worklist.WorkItem) bool {
+		return slices.Contains(it.Signals.Reasons, worklist.ReasonReviewRequested)
+	}
+
+	// A partial search kept the request; the whole timeline shows it withdrawn.
+	t.Run("withdrawal ends a carried request", func(t *testing.T) {
+		sink := newSink()
+		reviewSnapshot(t, sink, true, "["+requested+"]", false)
+		item := reviewSnapshot(t, sink, false, "["+requested+","+withdrawn+"]", false)
+		if pending(item) || item.Signals.ReviewRequestedBy != "" {
+			t.Fatalf("withdrawn request still counted: reasons %v, requester %q", item.Signals.Reasons, item.Signals.ReviewRequestedBy)
+		}
+	})
+
+	// A partial search kept the request; the timeline is longer than enrich reads,
+	// so it proves nothing: the request and its bot requester stay.
+	t.Run("partial timeline keeps a carried request", func(t *testing.T) {
+		sink := newSink()
+		reviewSnapshot(t, sink, true, "["+requested+"]", false)
+		item := reviewSnapshot(t, sink, false, "", true)
+		if !pending(item) || item.Signals.ReviewRequestedBy != "review-bot" || !item.Signals.ReviewRequestedByBot {
+			t.Fatalf("an inconclusive timeline changed the request: reasons %v, requester %q bot=%v", item.Signals.Reasons, item.Signals.ReviewRequestedBy, item.Signals.ReviewRequestedByBot)
+		}
+	})
+
+	// The search itself shows the request, though the user's own review ended their
+	// personal one (a team request leaves no event for them): the search wins.
+	t.Run("a search-confirmed request survives the timeline", func(t *testing.T) {
+		sink := newSink()
+		item := reviewSnapshot(t, sink, true, "["+requested+","+reviewed+"]", false)
+		if !pending(item) {
+			t.Fatalf("a request the search showed was dropped: reasons %v", item.Signals.Reasons)
+		}
+	})
+
+	// The first refresh learns the bot requester from the timeline while its partial
+	// search misses the request; the next one confirms the request but cannot read the
+	// timeline. The known requester stays.
+	t.Run("confirmed request keeps its timeline requester", func(t *testing.T) {
+		sink := newSink()
+		first := reviewSnapshot(t, sink, false, "["+requested+"]", false)
+		if first.Signals.ReviewRequestedBy != "review-bot" {
+			t.Fatalf("setup: want the timeline's requester, got %+v", first.Signals)
+		}
+		item := reviewSnapshot(t, sink, true, "", false)
+		if item.Signals.ReviewRequestedBy != "review-bot" || !item.Signals.ReviewRequestedByBot {
+			t.Fatalf("the confirmed review lost its requester: %q bot=%v", item.Signals.ReviewRequestedBy, item.Signals.ReviewRequestedByBot)
+		}
+	})
 }

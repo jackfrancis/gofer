@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -30,7 +31,13 @@ const (
 // cheap (one timeline read per item, a few percent of the hourly core budget even for
 // a large worklist); it is bounded by concurrency and by the run clock instead of by
 // an arbitrary count. Params.EnrichLimit still caps it when a caller wants that.
-func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
+//
+// carried (optional) names the items whose review request the refresh that chains
+// into this pass kept although its search did not show it (see carryPendingRequest):
+// for those, a timeline that shows the user's request ended removes the request.
+// A request the search itself showed is never removed here: one made through a team
+// leaves no event for the user on the timeline.
+func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried map[string]bool) error {
 	provider := p.Provider
 	if provider == "" {
 		provider = "github"
@@ -100,9 +107,21 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 					reasons, reasonChanged = upgraded, true
 				}
 			}
+			if carried[items[i].ID] && act.RequestEnded && slices.Contains(reasons, worklist.ReasonReviewRequested) {
+				// The refresh kept a request its partial search did not show; the whole
+				// timeline shows it withdrawn or fulfilled.
+				reasons = slices.DeleteFunc(slices.Clone(reasons), func(r worklist.Reason) bool { return r == worklist.ReasonReviewRequested })
+				reasonChanged = true
+			}
+			// Only a whole timeline says who requested the review; a partial one leaves
+			// what the store knows in place rather than reading as "nobody".
+			requester := act.RequestedByLogin
+			if !act.TimelineComplete {
+				requester = s.ReviewRequestedBy
+			}
 			if !reasonChanged &&
 				act.Participants == s.Participants && act.InboundRefs == s.InboundRefs &&
-				act.OtherReviewers == s.OtherReviewers && act.RequestedByLogin == s.ReviewRequestedBy &&
+				act.OtherReviewers == s.OtherReviewers && requester == s.ReviewRequestedBy &&
 				act.AwaitingMeSince.Equal(s.AwaitingMeSince) && act.AwaitingOthersSince.Equal(s.AwaitingOthersSince) {
 				return
 			}
@@ -110,7 +129,7 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 			s.Participants = act.Participants
 			s.InboundRefs = act.InboundRefs
 			s.OtherReviewers = act.OtherReviewers
-			s.ReviewRequestedBy = act.RequestedByLogin
+			s.ReviewRequestedBy = requester
 			s.AwaitingMeSince = act.AwaitingMeSince
 			s.AwaitingOthersSince = act.AwaitingOthersSince
 			// Enrich derives no model signals; leave them to the store.
