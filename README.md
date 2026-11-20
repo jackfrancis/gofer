@@ -157,8 +157,10 @@ same apply step after its kind-specific setup. The other kubectl targets
 Before it applies anything, `deploy` (and `dev-up`) checks that AEI serves its
 dispatch listener: the `aei-controller` Service in `aei-system` must expose a port
 named `dispatch` on TCP 8081, the port in `AEI_DISPATCH_ENDPOINT`. gofer dispatches
-there with a ServiceAccount token projected for the `aei-dispatch` audience, which an
-AEI from before agent-execution-interface 34d0951 does not accept. So besides its rights in the
+there with a ServiceAccount token projected for the `aei-dispatch` audience (which an
+AEI from before agent-execution-interface 34d0951 does not accept), from a web pod
+labelled `agents.x-k8s.io/dispatch-client: "true"`: AEI's NetworkPolicy admits only
+pods with that label to the dispatch port. So besides its rights in the
 `gofer` namespace and reading the `agentapps.agents.x-k8s.io` CRD, the identity that
 runs `deploy` needs `get` on that one Service:
 
