@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -93,37 +94,50 @@ func (v *VaultVendor) VendCredential(ctx context.Context, provider, _ string) (V
 
 // StoreSink is the in-process Sink: it reads and writes gofer's worklist store,
 // scoping every call to the run's owner — the same scoping the agent plane enforces
-// from the run credential.
+// from the run credential. Like the agent plane, it applies the web tier's
+// write-back policy (worklist.RunPolicy) before merging.
 type StoreSink struct {
 	store   worklist.Store
 	ownerID string
+	policy  worklist.RunPolicy
 }
 
 var _ Sink = (*StoreSink)(nil)
 
-// NewStoreSink binds a sink to one run's owner.
+// NewStoreSink binds a sink to one run's owner. It applies a policy with no bot
+// reviewers; use WithPolicy to set the configured one.
 func NewStoreSink(s worklist.Store, ownerID string) *StoreSink {
-	return &StoreSink{store: s, ownerID: ownerID}
+	return &StoreSink{store: s, ownerID: ownerID, policy: worklist.NewRunPolicy(nil)}
+}
+
+// WithPolicy sets the write-back policy the sink applies, and returns the sink.
+func (s *StoreSink) WithPolicy(p worklist.RunPolicy) *StoreSink {
+	s.policy = p
+	return s
 }
 
 // Item returns the owner's item with id and a window of its thread that keeps turn
-// (worklist.ReadItem); ok is false if it is gone.
+// (worklist.ReadItem), classified by the sink's policy as the agent plane serves
+// it; ok is false if it is gone.
 func (s *StoreSink) Item(ctx context.Context, id, turn string) (worklist.WorkItem, bool, error) {
-	return worklist.ReadItem(ctx, s.store, s.ownerID, id, turn)
+	return worklist.ReadItem(ctx, s.policy.ClassifyReads(s.store), s.ownerID, id, turn)
 }
 
-// Select returns the owner's items that sel names (worklist.SelectFrom), under the
-// same bounds the agent plane applies.
+// Select returns the owner's items that sel names (worklist.SelectFrom), classified
+// by the sink's policy and under the same bounds the agent plane applies.
 func (s *StoreSink) Select(ctx context.Context, sel worklist.Selection) ([]worklist.WorkItem, string, error) {
-	return worklist.SelectFrom(ctx, s.store, s.ownerID, sel, time.Now().UTC())
+	return worklist.SelectFrom(ctx, s.policy.ClassifyReads(s.store), s.ownerID, sel, time.Now().UTC())
 }
 
-// Ingest merges a run's items into the owner's stored items (worklist.MergeRunItems),
-// atomically. An empty batch is a no-op.
+// Ingest stamps a run's items with the sink's policy (on a copy; the caller's items
+// are untouched) and merges them into the owner's stored items
+// (worklist.MergeRunItems), atomically. An empty batch is a no-op.
 func (s *StoreSink) Ingest(ctx context.Context, items []worklist.WorkItem) error {
 	if len(items) == 0 {
 		return nil
 	}
+	items = slices.Clone(items)
+	s.policy.Apply(items)
 	return s.store.Update(ctx, s.ownerID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		return worklist.MergeRunItems(current, items), nil
 	})

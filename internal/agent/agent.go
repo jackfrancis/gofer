@@ -164,6 +164,17 @@ func readAll(ctx context.Context, p Params, sink Sink, sel worklist.Selection) (
 	}
 }
 
+// reserveContext returns a context that ends reserve before ctx's deadline, so work
+// started under it cannot eat the time kept for what follows (writing results back,
+// ranking). A context without a deadline is returned as is.
+func reserveContext(ctx context.Context, reserve time.Duration) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return context.WithCancel(ctx)
+	}
+	return context.WithDeadline(ctx, deadline.Add(-reserve))
+}
+
 // writeBack persists items through the sink in bounded batches (writeBackChunk).
 func writeBack(ctx context.Context, sink Sink, items []worklist.WorkItem) error {
 	for start := 0; start < len(items); start += writeBackChunk {
@@ -351,7 +362,10 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 	// rates highest rather than on an arbitrary slice: the agent plane selects them
 	// (worklist.Select), so the read is the top N, not the worklist. Retired items are
 	// off the radar; a model proposal for one is wasted spend. enrich has just run, so
-	// those baselines are computed from complete signals.
+	// those baselines are computed from complete signals. The baseline ignores an
+	// item's previous model proposal: that proposal is what this pass replaces, and it
+	// may rest on a classification since changed (e.g. a requester removed from
+	// BOT_REVIEWERS), so it must not keep the item out of the pass.
 	items, err := readAll(ctx, p, sink, worklist.Selection{Open: true, Top: limit})
 	if err != nil {
 		return fmt.Errorf("list worklist: %w", err)
@@ -379,6 +393,9 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 			if err != nil {
 				return // best-effort: leave the item unchanged
 			}
+			// Record the classification the ranker saw, so the proposal is dropped if
+			// it changes (worklist.Signals.CurrentProposal).
+			prop.ReviewRequestedByBot = items[i].Signals.ReviewRequestedByBot
 			items[i].Signals.Proposed = &prop
 			mu.Lock()
 			changed = append(changed, items[i])

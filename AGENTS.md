@@ -160,7 +160,27 @@ Wired on the web-tier side; they define what a runtime must respect:
   (`WorkItem.OnRadar`), and no bulk action (Review all, the second-opinion batch)
   draws from them. A
   run adds a thread turn only through `POST /agent/worklist/reply`
-  (`worklist.AppendReply`). The web and runtime images must ship together: a runtime
+  (`worklist.AppendReply`). Before the merge, every write-back path applies
+  `worklist.RunPolicy` (the agent plane's ingest handler, and the in-process
+  `StoreSink`): workload metadata is stamped `OriginAgent`, so a run cannot claim the
+  `OriginUser` override that `Resolve` leaves unrescored, and
+  `Signals.ReviewRequestedByBot` is derived from `ReviewRequestedBy` against
+  `BOT_REVIEWERS` (case-insensitive), replacing whatever the run sent. The agent
+  plane's reads (`GET /agent/worklist`, its `select` and `item` reads, and
+  `StoreSink.Item`/`Select`, all through `RunPolicy.ClassifyReads`, which classifies
+  `List`, `Get` and `Briefs`) re-derive the flag too (`RunPolicy.Classify`), so a run
+  ranks by the current bot list, and so do the user's
+  (the JSON worklist and the radar get `RunPolicy.ClassifyReads(store)`), so the rank
+  shown and the rank Discuss explains agree. The rank job picks candidates by their
+  baseline with the previous proposal cleared (the top-N selection, `worklist.Select`). A proposal records the bot
+  classification it was made under (`AxisProposal.ReviewRequestedByBot`); read it
+  through `Signals.CurrentProposal`, which drops it once the classification changes. The requester is
+  the actor of the user's pending review request on the timeline: the latest
+  `review_requested` for them, until a `review_request_removed` or their own submitted
+  review ends it (a comment does not). The timeline is paged by its `Link` header up
+  to a cap, inside enrich's reserve-adjusted deadline; a timeline longer than the cap
+  leaves the requester and both waiting timestamps unset. The deterministic scorer discounts a bot's request (no awaiting-me
+  pressure, low floors) unless the user is also an assignee. The web and runtime images must ship together: a runtime
   from before this rule posts its reply inside the item, where it is now ignored.
 - A run never reads the whole worklist: its threads grow without bound and the agent
   plane caps a response at 8 MiB. `agent.Sink` has only bounded reads, served by the
@@ -198,6 +218,19 @@ Wired on the web-tier side; they define what a runtime must respect:
   `http.ResponseWriter` must implement `Unwrap` (as `statusRecorder` does), or the
   flush fails and no thread is ever marked read. The
   cursor only moves forward; a re-render of an already-read thread skips the store.
+- The radar's project (repository) filter (`internal/webui/projects.go`) is a view
+  preference kept in the `gofer_projects` cookie, bound to the account that saved it
+  (none = all projects). It only drops items from the already-ranked list, never
+  re-sorts. The cookie never decides what a bulk action touches: each bulk form posts
+  the selection its page was rendered with (`scope`), narrowed to the projects the
+  checklist names, so neither a filter changed in another tab nor a saved repository
+  that left the radar can widen it; an unreadable form changes nothing, and only a
+  URL-encoded body is read (`ParseForm` leaves multipart unread, which would drop the
+  scope). Review all
+  PRs and Get 2nd Opinion act only on items the radar shows (`WorkItem.OnRadar`, the
+  rule `worklist.Resolve` applies); Reset Conversations also clears hidden and
+  completed items in scope, and its count includes them (`Resolution.OffRadar`, from
+  the same read).
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

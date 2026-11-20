@@ -127,7 +127,7 @@ func researchUserPrompt(item worklist.WorkItem) string {
 	}
 	fmt.Fprintf(&b, " — %s\n\n", item.GitHub.Title)
 
-	if p := item.Signals.Proposed; p != nil {
+	if p := item.Signals.CurrentProposal(); p != nil {
 		b.WriteString("Foundation axes (from GitHub metadata, authoritative):\n")
 		fmt.Fprintf(&b, "- relevance: %.2f\n- impact: %.2f\n- engagement: %.2f\n- urgency: %.2f\n",
 			p.Relevance, p.Impact, p.Engagement, p.Urgency)

@@ -248,6 +248,12 @@ type pageData struct {
 	JustHidden               *worklist.WorkItem // the item the user just hid, offered for Undo on the radar
 	RetryURL                 string             // where the error view's "Try again" goes; empty = the radar
 	SignInRequired           bool               // gofer holds no usable credential: prompt the user to sign in again
+	Projects                 []ProjectOption    // the project filter's checklist, by name (worklist view)
+	ProjectsFiltered         bool               // some project is deselected: Items is a subset of the radar
+	SelectedProjects         int                // projects shown, for the filter's label
+	TotalItems               int                // items on the whole radar, before the project filter
+	ProjectScope             string             // the shown selection, posted back by each bulk form ("" = every project)
+	ProjectsError            string             // why the last project selection was not saved
 }
 
 // Index handles GET /. It renders the sign-in view for anonymous visitors, the
@@ -394,14 +400,16 @@ func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 }
 
 // ResetConversations handles POST /items/reset-conversations. It clears the Discuss
-// thread and its read cursor on every one of the signed-in owner's items, leaving the
+// thread and its read cursor on the signed-in owner's items (which ones: below), leaving the
 // work itself — the GitHub fields, the signals, and the gofer metadata — untouched,
 // then redirects back to the radar (Post/Redirect/Get).
 //
 // This is a demo and development affordance: with the threads gone every PR is
 // unreviewed again, so "Review all PRs" and the review panel can be exercised end to
-// end without rebuilding the environment. It clears EVERY item the owner has, including
-// ones hidden or completed on the radar, and the conversations are not recoverable.
+// end without rebuilding the environment. It clears every item in the projects the
+// submitting page was filtered to (form "scope"; every project without one), including
+// items hidden or completed on the radar — the page's count and tooltip say so. The
+// conversations are not recoverable.
 // SameSite=Lax cookies give baseline CSRF protection.
 func (h *Handler) ResetConversations(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
@@ -411,11 +419,16 @@ func (h *Handler) ResetConversations(w http.ResponseWriter, r *http.Request) {
 	}
 	// One atomic update, so a run's write-back cannot restore a thread mid-clear. Only
 	// items that actually carry conversation state are written back.
+	selected, ok := formSelection(r)
+	if !ok {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
 	_ = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		var cleared []worklist.WorkItem
 		for _, it := range current {
-			if len(it.Thread) == 0 && it.ThreadReadAt.IsZero() && it.ThreadReadThrough == "" {
-				continue
+			if !inScope(selected, it) || !hasConversation(it) {
+				continue // outside the submitting page's projects, or nothing to clear
 			}
 			it.Thread = nil
 			it.ThreadReadAt = time.Time{}
@@ -559,8 +572,8 @@ const independentReviewPrompt = "Give an independent review of this PR. There ma
 // gets two replies, which is harmless).
 const reviewStaleAfter = 5 * time.Minute
 
-// ReviewAllPRs handles POST /items/review-all. For every pull request on the
-// user's radar it appends the review prompt to the item's thread and, in one
+// ReviewAllPRs handles POST /items/review-all. For every pull request the submitting
+// page showed (on the radar, in its projects: form "scope"), it appends the review prompt to the item's thread and, in one
 // concurrent batch, schedules an assistant review turn for each — then redirects
 // back to the radar (Post/Redirect/Get). A PR already awaiting a reply is skipped,
 // so a double submit does not stack duplicate reviews.
@@ -572,13 +585,18 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 	}
 	at := h.now().UTC()
 	var refs []worklist.TurnRef
+	selected, ok := formSelection(r)
+	if !ok {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
 	// Choose and stamp the PRs in one atomic update, against the threads as stored.
 	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		var changed []worklist.WorkItem
 		refs = refs[:0]
 		for _, it := range current {
-			if it.Type != worklist.TypePullRequest || !it.OnRadar() {
-				continue // a hidden or closed PR is off the radar: never review it in bulk
+			if it.Type != worklist.TypePullRequest || !it.OnRadar() || !inScope(selected, it) {
+				continue // off the radar (hidden or closed) or outside the page's projects: never review it in bulk
 			}
 			if it.HasReview() {
 				continue // already reviewed at least once — a first-review is no longer needed
@@ -643,7 +661,7 @@ func (h *Handler) SecondOpinion(w http.ResponseWriter, r *http.Request) {
 }
 
 // SecondOpinionAllPRs handles POST /items/second-opinion-all. For every pull request
-// reviewed once but without a consensus synthesis yet, it appends an independent-review
+// the submitting page showed (on the radar, in its projects: form "scope") reviewed once but without a consensus synthesis yet, it appends an independent-review
 // prompt and runs the review panel (blind review + chained synthesis) by a model that
 // differs from that PR's first review, then redirects back to the radar (Post/Redirect/
 // Get). When the eligible PRs' first reviews are homogeneous the user picks the model
@@ -652,6 +670,11 @@ func (h *Handler) SecondOpinion(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
 	if user == nil || !h.secondOpinionEnabled() {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	selected, ok := formSelection(r)
+	if !ok {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
@@ -673,7 +696,7 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 		var eligible []worklist.WorkItem
 		firstModels := map[string]struct{}{}
 		for _, it := range current {
-			if it.NeedsSecondOpinion(now, reviewStaleAfter) {
+			if it.OnRadar() && inScope(selected, it) && it.NeedsSecondOpinion(now, reviewStaleAfter) {
 				eligible = append(eligible, it)
 				firstModels[it.FirstReviewModel()] = struct{}{}
 			}
@@ -772,9 +795,22 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		return pageData{View: "error", User: user, Message: res.Message}, http.StatusOK
 	default:
 		now := h.now()
+		// The project filter narrows what is shown. The bulk actions' counts below, and
+		// the scope each bulk form posts back (ProjectScope), cover only the selected
+		// projects the checklist names, so an action acts on what this page shows.
+		selected := savedSelection(r, user.ID)
+		projects := projectOptions(res.Items, selected)
+		shown := filterProjects(res.Items, selected)
+		scope := shownSelection(selected, projects)
+		selectedCount := 0
+		for _, p := range projects {
+			if p.Selected {
+				selectedCount++
+			}
+		}
 		var reviewCount, secondCount, resetCount int
 		firstModels := map[string]struct{}{}
-		for _, it := range res.Items {
+		for _, it := range shown {
 			if it.NeedsReview(now, reviewStaleAfter) {
 				reviewCount++
 			}
@@ -782,18 +818,18 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 				secondCount++
 				firstModels[it.FirstReviewModel()] = struct{}{}
 			}
-			if len(it.Thread) > 0 {
+			if hasConversation(it) {
 				resetCount++
 			}
 		}
-		// The radar lists only items on it, but Reset clears every stored thread, hidden
-		// and closed items' included; and the item just hidden is off the radar, to be
-		// offered for Undo. Both come from Resolve's same read (res.OffRadar), so the
-		// page never offers Hide and Undo for one item.
+		// The radar lists only items on it, but Reset clears every stored thread in the
+		// selected projects the checklist names, hidden and closed items' included; and the item just hidden is
+		// off the radar, to be offered for Undo. Both come from Resolve's same read
+		// (res.OffRadar), so the page never offers Hide and Undo for one item.
 		var justHidden *worklist.WorkItem
 		hiddenID := r.URL.Query().Get("hidden")
 		for i, it := range res.OffRadar {
-			if len(it.Thread) > 0 {
+			if inScope(scope, it) && hasConversation(it) {
 				resetCount++
 			}
 			if hiddenID != "" && it.ID == hiddenID && !it.Meta.HiddenAt.IsZero() {
@@ -801,9 +837,16 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 			}
 		}
 		data := pageData{
-			View: "worklist", User: user, Items: res.Items, ConvEnabled: h.convEnabled,
+			View: "worklist", User: user, Items: shown, ConvEnabled: h.convEnabled,
 			ReviewCount: reviewCount, SecondOpinionEnabled: h.secondOpinionEnabled(), SecondOpinionCount: secondCount,
 			ResetCount: resetCount, JustHidden: justHidden,
+			Projects: projects, ProjectsFiltered: selected != nil, SelectedProjects: selectedCount, TotalItems: len(res.Items),
+		}
+		if scope != nil {
+			data.ProjectScope = encodeSelection(scope)
+		}
+		if r.URL.Query().Get("projects") == projectsTooMany {
+			data.ProjectsError = "Too many projects selected to save. Choose fewer, or Select all; your previous filter is unchanged."
 		}
 		// "Review all PRs" offers every model when more than one is configured; a
 		// single-model setup keeps the plain button.
@@ -837,6 +880,12 @@ var funcs = template.FuncMap{
 	"isSecondOpinionRequest": isSecondOpinionRequest,
 	"isSynthesisRequest":     isSynthesisRequest,
 	"userHandle":             userHandle,
+}
+
+// hasConversation reports whether the item carries conversation state that Reset
+// Conversations clears: a thread, or a read cursor.
+func hasConversation(it worklist.WorkItem) bool {
+	return len(it.Thread) > 0 || !it.ThreadReadAt.IsZero() || it.ThreadReadThrough != ""
 }
 
 // isSecondOpinionRequest reports whether a thread turn is the programmatic

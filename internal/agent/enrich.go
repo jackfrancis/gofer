@@ -83,7 +83,12 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			act, err := gh.ItemActivity(ctx, token, items[i].GitHub.Repo, items[i].GitHub.Number, login)
+			// The timeline can take several page reads; they must finish inside the
+			// reserve-adjusted deadline too, not just start before it, or one slow item
+			// holds the batch past the time kept for writing every result back.
+			actx, cancel := reserveContext(ctx, enrichReserve)
+			act, err := gh.ItemActivity(actx, token, items[i].GitHub.Repo, items[i].GitHub.Number, login)
+			cancel()
 			if err != nil {
 				return // best-effort: leave the item's signals unchanged
 			}

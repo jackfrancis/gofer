@@ -56,7 +56,7 @@ func newBoundedPlane(t *testing.T) *boundedPlane {
 		authn.NewIdentityValidator(identity.NewEd25519Verifier(pub, "gofer-agent")),
 	)
 	p := &boundedPlane{store: worklist.NewMemoryStore(), reads: map[string]int{}}
-	h := api.NewIngestHandler(p.store, nil)
+	h := api.NewIngestHandler(p.store, nil, worklist.NewRunPolicy(nil))
 	mux := http.NewServeMux()
 	mux.Handle("POST /agent/worklist", auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Ingest)))
 	mux.Handle("GET /agent/worklist", auth.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(h.List)))

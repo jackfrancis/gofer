@@ -77,10 +77,17 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// driven by run write-backs (NoteWriteback), so it is populated once a backend that
 	// writes results back is selected.
 	metric := metrics.New()
-	worklistHandler := api.NewWorklistHandler(store, ingestor)
+	// The user's reads (the JSON worklist and the radar) classify review requests by
+	// the current BOT_REVIEWERS, as the agent plane does, so the rank shown and the
+	// rank Discuss explains agree before the next refresh re-stamps stored items.
+	runPolicy := worklist.NewRunPolicy(cfg.BotReviewers)
+	readStore := runPolicy.ClassifyReads(store)
+	worklistHandler := api.NewWorklistHandler(readStore, ingestor)
 	// The runtime write-back sink also notifies the batch tracker (NoteWriteback), so
-	// a Review-all batch is timed to the instant its last review lands.
-	ingestHandler := api.NewIngestHandler(store, ingestor)
+	// a Review-all batch is timed to the instant its last review lands. It applies the
+	// write-back policy: workload metadata is agent-derived, and a review requested by
+	// one of BOT_REVIEWERS is flagged as an automated assignment for the ranker.
+	ingestHandler := api.NewIngestHandler(store, ingestor, runPolicy)
 	// The broker vends the single shared chat-model token as provider "ai", per run,
 	// so the sandbox never holds a standing model secret. Every model on this endpoint
 	// uses the same token; the model id travels as a run parameter. Per-user provider
@@ -90,7 +97,7 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// The assistive conversation is offered when the model is fully configured; the
 	// runtime (not the web tier) runs the model, vending the token from the broker.
 	convEnabled := cfg.ConversationEnabled
-	webHandler := webui.New(sessions, store, ingestor, authH, convEnabled, options)
+	webHandler := webui.New(sessions, readStore, ingestor, authH, convEnabled, options)
 
 	mux := http.NewServeMux()
 
@@ -118,6 +125,8 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	mux.Handle("POST /items/review-all", http.HandlerFunc(webHandler.ReviewAllPRs))
 	// Force a re-ingest to pull newly created or updated work onto the radar.
 	mux.Handle("POST /items/refresh", http.HandlerFunc(webHandler.Refresh))
+	// The radar's project filter: saves which repositories the radar shows.
+	mux.Handle("POST /items/projects", http.HandlerFunc(webHandler.FilterProjects))
 	// Clear every conversation thread, so the review workflows can be demoed or
 	// exercised again from scratch without rebuilding the environment.
 	mux.Handle("POST /items/reset-conversations", http.HandlerFunc(webHandler.ResetConversations))

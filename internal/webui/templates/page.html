@@ -6,6 +6,7 @@
   <title>gofer</title>
   {{if .RefreshSecs}}<meta http-equiv="refresh" content="{{.RefreshSecs}}">{{end}}
   <link rel="stylesheet" href="/static/app.css">
+  {{if eq .View "worklist"}}<script src="/static/projects.js" defer></script>{{end}}
 </head>
 <body>
   <div class="zz-container">
@@ -154,7 +155,26 @@
       </div>
       {{end}}
       <div class="zz-toolbar">
-        <p class="zz-count">{{len .Items}} item{{if ne (len .Items) 1}}s{{end}} on your radar</p>
+        <div class="zz-toolbar-lead">
+          {{if or (gt (len .Projects) 1) .ProjectsFiltered}}
+          <details class="zz-menu zz-filter">
+            <summary class="btn btn-sm" title="Choose which projects to show">Projects: {{if .ProjectsFiltered}}{{.SelectedProjects}} of {{len .Projects}}{{else}}All{{end}} &#9662;</summary>
+            <form class="zz-menu-list zz-filter-list" method="post" action="/items/projects">
+              <label class="zz-filter-opt zz-filter-all" hidden><input type="checkbox" name="all" value="1" data-filter-all disabled{{if not .ProjectsFiltered}} checked{{end}}> Select all</label>
+              <div class="zz-filter-options">
+                {{range .Projects}}
+                <label class="zz-filter-opt"><input type="checkbox" name="project" value="{{.Name}}" data-filter-project{{if .Selected}} checked{{end}}> <span class="zz-filter-name">{{.Name}}</span> <span class="zz-filter-count">{{.Count}}</span></label>
+                {{end}}
+              </div>
+              <div class="zz-filter-actions">
+                <button class="btn btn-primary btn-sm" type="submit">Apply</button>
+                {{if .ProjectsFiltered}}<button class="btn btn-sm" type="submit" name="all" value="1">Show all projects</button>{{end}}
+              </div>
+            </form>
+          </details>
+          {{end}}
+          <p class="zz-count">{{if .ProjectsFiltered}}{{len .Items}} of {{.TotalItems}} items{{else}}{{len .Items}} item{{if ne (len .Items) 1}}s{{end}}{{end}} on your radar</p>
+        </div>
         <div class="zz-toolbar-actions">
           <form method="post" action="/items/refresh">
             <button class="btn btn-sm" type="submit" title="Pull in newly created or updated work from GitHub">Refresh</button>
@@ -167,6 +187,7 @@
                 <div class="zz-menu-head">Review with&hellip;</div>
                 {{range .ReviewModelOptions}}
                 <form method="post" action="/items/review-all">
+                  {{template "projectScope" $}}
                   <input type="hidden" name="choice" value="{{.Value}}">
                   <button class="zz-menu-item" type="submit">{{.Label}}</button>
                 </form>
@@ -175,7 +196,8 @@
             </details>
             {{else}}
             <form method="post" action="/items/review-all">
-              <button class="btn btn-primary btn-sm" type="submit" title="Review every pull request that hasn't been reviewed yet">Review all PRs{{if gt .ReviewCount 1}} ({{.ReviewCount}}){{end}}</button>
+              {{template "projectScope" $}}
+              <button class="btn btn-primary btn-sm" type="submit" title="Review every pull request{{if .ProjectsFiltered}} in the selected projects{{end}} that hasn't been reviewed yet">Review all PRs{{if gt .ReviewCount 1}} ({{.ReviewCount}}){{end}}</button>
             </form>
             {{end}}
           {{end}}
@@ -186,6 +208,7 @@
               <div class="zz-menu-head">2nd opinion with&hellip;</div>
               {{range .SecondOpinionMenuOptions}}
               <form method="post" action="/items/second-opinion-all">
+                {{template "projectScope" $}}
                 <input type="hidden" name="choice" value="{{.Value}}">
                 <button class="zz-menu-item" type="submit">{{.Label}}</button>
               </form>
@@ -194,16 +217,19 @@
           </details>
           {{else if eq .SecondOpinionMode "auto"}}
           <form method="post" action="/items/second-opinion-all">
+            {{template "projectScope" $}}
             <button class="btn btn-sm" type="submit" title="The first reviews used different models — a different model is auto-picked per PR">Get 2nd Opinion ({{.SecondOpinionCount}})</button>
           </form>
           {{end}}
           {{if .ResetCount}}
           <form method="post" action="/items/reset-conversations">
-            <button class="btn btn-sm btn-danger" type="submit" title="Clear every Discuss thread so the review workflows can be run again from scratch. This cannot be undone; the work itself is untouched.">Reset Conversations ({{.ResetCount}})</button>
+            {{template "projectScope" $}}
+            <button class="btn btn-sm btn-danger" type="submit" title="Clear every Discuss thread{{if .ProjectsFiltered}} in the selected projects{{end}}, including on hidden and completed items, so the review workflows can be run again from scratch. This cannot be undone; the work itself is untouched.">Reset Conversations ({{.ResetCount}})</button>
           </form>
           {{end}}
         </div>
       </div>
+      {{with .ProjectsError}}<p class="zz-stalled" role="alert">{{.}}</p>{{end}}
       {{range .Items}}
         <div class="zz-item">
           <div class="zz-item-head">
@@ -233,9 +259,10 @@
           {{with .Meta.Rationale}}<div class="zz-rationale">{{.}}</div>{{end}}
         </div>
       {{else}}
-        <div class="zz-empty"><p>Nothing on your radar right now.</p></div>
+        <div class="zz-empty"><p>{{if .ProjectsFiltered}}No items in the selected projects.{{else}}Nothing on your radar right now.{{end}}</p></div>
       {{end}}
     {{end}}
   </div>
 </body>
 </html>
+{{define "projectScope"}}{{if .ProjectsFiltered}}<input type="hidden" name="scope" value="{{.ProjectScope}}">{{end}}{{end}}

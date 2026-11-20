@@ -39,7 +39,7 @@ func Score(item WorkItem, now time.Time) Metadata {
 	// An LLM proposal is authoritative for the four axes it returns: gofer uses
 	// the proposed values directly, bounded only to [0,1]. The baseline above is
 	// the fallback when no proposal is present.
-	if p := item.Signals.Proposed; p != nil {
+	if p := item.Signals.CurrentProposal(); p != nil {
 		rel = clampUnit(p.Relevance)
 		imp = clampUnit(p.Impact)
 		eng = clampUnit(p.Engagement)
@@ -84,8 +84,8 @@ func Score(item WorkItem, now time.Time) Metadata {
 	switch {
 	case item.Signals.Research != nil && item.Signals.Research.Rationale != "":
 		m.Rationale = item.Signals.Research.Rationale
-	case item.Signals.Proposed != nil && item.Signals.Proposed.Rationale != "":
-		m.Rationale = item.Signals.Proposed.Rationale
+	case item.Signals.CurrentProposal() != nil && item.Signals.CurrentProposal().Rationale != "":
+		m.Rationale = item.Signals.CurrentProposal().Rationale
 	default:
 		m.Rationale = rationale(contribs)
 	}
@@ -154,6 +154,13 @@ func clampUnit(f float64) float64 { return math.Max(0, math.Min(1, f)) }
 // clampMult bounds a research multiplier to [0,2]; 1.0 is neutral.
 func clampMult(f float64) float64 { return math.Max(0, math.Min(2, f)) }
 
+// A review a bot requested (Signals.ReviewRequestedByBot) is a bare assignment, not
+// a person asking, so it weighs less than a human request on both axes it drives.
+const (
+	botReviewRelevance = 0.6
+	botReviewUrgency   = 0.3
+)
+
 // relevanceScore: the strongest relationship reason wins, with a small bump for
 // corroborating reasons.
 func relevanceScore(s Signals, c *[]Contribution) float64 {
@@ -166,6 +173,11 @@ func relevanceScore(s Signals, c *[]Contribution) float64 {
 		ReasonMentioned:       0.5,
 		ReasonInvolved:        0.5,
 		ReasonTeamMentioned:   0.4,
+	}
+	if s.ReviewRequestedByBot {
+		// A bot's review request (e.g. CI assigning code owners) is not an explicit
+		// ask; an actual assignment still counts in full.
+		weights[ReasonReviewRequested] = botReviewRelevance
 	}
 	var best float64
 	var bestReason Reason
@@ -189,7 +201,11 @@ func relevanceScore(s Signals, c *[]Contribution) float64 {
 func urgencyScore(s Signals, now time.Time, c *[]Contribution) float64 {
 	var urg float64
 
-	if !s.AwaitingMeSince.IsZero() {
+	// AwaitingMeSince dates a pending review request. When a bot made that request
+	// no person is waiting on the user, so it adds no pressure, and the request
+	// itself sets only a low floor (unless the user is also an assignee). Other
+	// signals, such as a deadline, are unaffected.
+	if !s.AwaitingMeSince.IsZero() && !s.ReviewRequestedByBot {
 		days := now.Sub(s.AwaitingMeSince).Hours() / 24
 		u := math.Min(1, 0.6+0.1*days)
 		if u > urg {
@@ -198,9 +214,17 @@ func urgencyScore(s Signals, now time.Time, c *[]Contribution) float64 {
 		add(c, "urgency", "awaiting_me", u, "awaiting your response since "+s.AwaitingMeSince.Format("Jan 2"))
 	}
 
-	if containsReason(s.Reasons, ReasonReviewRequested) && urg < 0.6 {
-		urg = 0.6
-		add(c, "urgency", string(ReasonReviewRequested), 0.6, "review requested")
+	if containsReason(s.Reasons, ReasonReviewRequested) {
+		switch {
+		case !s.ReviewRequestedByBot || containsReason(s.Reasons, ReasonAssignee):
+			if urg < 0.6 {
+				urg = 0.6
+				add(c, "urgency", string(ReasonReviewRequested), 0.6, "review requested")
+			}
+		case urg < botReviewUrgency:
+			urg = botReviewUrgency
+			add(c, "urgency", string(ReasonReviewRequested), botReviewUrgency, "review auto-requested by a bot")
+		}
 	}
 
 	if !s.DeadlineAt.IsZero() {
