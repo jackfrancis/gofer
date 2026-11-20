@@ -71,6 +71,12 @@ var ErrEmptyReply = errors.New("worklist: reply has no content")
 //     conversation), the reply is dropped.
 //   - A reply already in the thread (same ID, or for a reply without one the same
 //     time and model — a resent request) is not added twice.
+//   - A user turn keeps at most one answer: once an answer to it is stored (see
+//     replies), any later reply to it is dropped, answer or notice. The first answer
+//     stored wins, so a retry is safe even when the first run finishes late or gofer
+//     restarts between them. A system notice is not an answer (see noticed), so a
+//     turn answered only by a notice still accepts its answer. A hidden answer still
+//     counts: hiding does not reopen the turn.
 //
 // The reply goes at the end of the thread, after any turns posted while the run
 // worked; ReplyTo, not position, says which turn it answers.
@@ -85,7 +91,7 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 		reply.Notice = "" // only notices gofer knows
 	}
 	reply.ReplyTo = replyTo
-	answered := false
+	found := false // the answered turn is still in the thread
 	for i, m := range item.Thread {
 		if reply.ID != "" && m.ID == reply.ID {
 			return false, nil // already recorded
@@ -94,11 +100,14 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 			return false, nil // already recorded
 		}
 		if m.Role == RoleUser && item.TurnKey(i) == replyTo {
-			answered = true
+			found = true
 		}
 	}
-	if !answered {
+	if !found {
 		return false, nil
+	}
+	if _, done := item.replies()[replyTo]; done {
+		return false, nil // the turn already has its answer
 	}
 	if reply.ID == "" {
 		reply.ID = NewMessageID()
