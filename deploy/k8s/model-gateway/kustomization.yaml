@@ -1,0 +1,15 @@
+# gofer's optional model gateway (docs/adr/0008-model-gateway.md): agentgateway holds
+# the upstream model key and applies one shared request budget to every run's model
+# calls. Per-run vending (AI_TOKEN in gofer-secrets) stays the default; this profile
+# replaces it. Applied by `make model-gateway-apply`, which fills in the upstream, the
+# budget and gofer's authorization address, and points gofer at the gateway; nothing
+# here names an environment. The upstream key lives in the gofer-model-gateway Secret.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: gofer
+resources:
+  - gateway.yaml
+configMapGenerator:
+  - name: gofer-model-gateway
+    files:
+      - config.yaml

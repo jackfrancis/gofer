@@ -68,4 +68,8 @@ data:
   # connection speaks: .../chat/completions or .../responses. A model listed under an
   # endpoint that does not serve it fails at call time, not at startup. Model ids go
   # stale; list the current ones with GET https://api.githubcopilot.com/models.
+  #
+  # Optional model gateway (docs/adr/0008-model-gateway.md): `make model-gateway-apply`
+  # moves the key to agentgateway, sets AI_GATEWAY_URL here and rewrites these
+  # endpoints to the gateway's. gofer then holds no model key.
   AI_CONNECTIONS: '[{"endpoint":"https://api.githubcopilot.com/chat/completions","models":["claude-opus-5.5","gemini-4-carbon"]},{"endpoint":"https://api.githubcopilot.com/responses","models":["gpt-6.2-astra"]}]'

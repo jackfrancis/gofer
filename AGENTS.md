@@ -68,6 +68,8 @@ Dockerfile.runtime   agent-runtime image (AEI launches it per run)
 deploy/k8s/base/     app manifests: namespace, SA, config, statefulset (+ data PVC), service
 deploy/k8s/overlays/dev/  base + agentapp.yaml (gofer's AEI dispatch registration)
 deploy/k8s/backup/   optional snapshot CronJob + RBAC (`make backup-apply`)
+deploy/k8s/model-gateway/  optional model gateway: agentgateway holds the model key + a shared budget (`make model-gateway-apply`)
+internal/modelgateway/  end-to-end check of that gateway against the real binary (`make model-gateway-test`)
 deploy/k8s/tls/      HTTPS: ACME Issuer, Traefik allow-list, Ingress (make deploy TLS_HOST=...)
 ```
 
@@ -118,6 +120,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   (GitHub App) tokens; the refresh token never leaves the web tier.
 - **The chat-model token is the same class.** The web tier holds only the non-secret
   coordinates (`AI_CONNECTIONS`) and brokers the token; the workload runs the model.
+  In the optional model-gateway profile (`AI_GATEWAY_URL`, ADR 0008) neither holds
+  it: agentgateway does, runs present their run credential (`ai_auth=gateway`), and
+  the gateway asks gofer (`/agent/model-access`) before attaching the key.
 - **Least privilege.** Source scopes are READ; only gofer metadata is WRITE.
 
 ## Conventions & gotchas
@@ -427,6 +432,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   holds them together. The workload's GitHub calls go through a `tokenHolder`, which
   re-vends once on 401 with `rejected=<version>`; a Discuss turn that finds sign-in
   required saves a reconnect notice (`worklist.NoticeReconnect`), never an answer.
+- The model gateway (ADR 0008) is optional; per-run vending is the default. With
+  `AI_GATEWAY_URL` set the web tier refuses `AI_TOKEN` and any `AI_CONNECTIONS`
+  endpoint off the gateway's origin, because a run sends its run credential to a
+  gateway connection. The gateway routes by model (no `params.model`; both
+  `completions` and `responses`), and its config is the plain file
+  `deploy/k8s/model-gateway/config.yaml`, which `internal/modelgateway`'s test runs
+  unchanged: edit that file, not a copy, and re-run `make model-gateway-test` when you
+  change it or bump the pinned release.
 - `go test` binds httptest sockets; run it outside a restrictive sandbox.
 
 ## Build / test / run
@@ -441,6 +454,8 @@ make kind-load-runtime  # rebuild + load only the runtime image
 make push IMAGE=... RUNTIME_IMAGE=... PLATFORM=linux/amd64  # build both images for a platform and push them
 make deploy KUBECONFIG=<file> IMAGE=... RUNTIME_IMAGE=...  # apply to any cluster (no kind, no secret creation); dev-up shares its apply step
 make backup-apply KUBECONFIG=<file> SNAPSHOT_CLASS=<class>  # scheduled data-volume snapshots (snapshot, snapshots, restore, backup-down)
+make model-gateway-apply KUBECONFIG=<file>  # optional: agentgateway holds the model key + a shared budget (model-gateway-check, model-gateway-down)
+make model-gateway-test  # the gateway's end-to-end check on this machine (fetches the pinned agentgateway release)
 make install-ingress KUBECONFIG=<file>  # once per cluster: Traefik + cert-manager (pinned charts) for HTTPS
 make deploy ... TLS_HOST=<dns name> ALLOWED_GITHUB_LOGINS=<logins> [ALLOWED_SOURCE_RANGES=...]  # HTTPS with a Let's Encrypt certificate, sign-in limited to those GitHub logins; make tls-status to watch it
 ```

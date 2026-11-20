@@ -2,6 +2,7 @@ package aei
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"github.com/jackfrancis/agent-execution-interface/aeiruntime"
 
 	"github.com/jackfrancis/gofer/internal/agent"
+	"github.com/jackfrancis/gofer/internal/ingest"
 	"github.com/jackfrancis/gofer/internal/llm"
 )
 
@@ -81,13 +83,14 @@ func work(ctx context.Context, rt *aeiruntime.Runtime) error {
 
 	// The chat model's coordinates travel as non-secret run parameters; its token is
 	// VENDED for this run (provider "ai"), so the sandbox never holds a standing model
-	// secret. Without both, ranking falls back to the deterministic stub and the
-	// converse and research jobs are disabled.
+	// secret — or, behind gofer's model gateway, the run never holds a model token at
+	// all (modelToken). Without both coordinates, ranking falls back to the
+	// deterministic stub and the converse and research jobs are disabled.
 	endpoint, model := strings.TrimSpace(spec.Parameters["ai_endpoint"]), strings.TrimSpace(spec.Parameters["ai_model"])
 	if endpoint != "" && model != "" {
-		token, err := plane.Vend(ctx, "ai")
+		token, err := modelToken(ctx, spec.Parameters["ai_auth"], rt.Credential(), plane)
 		if err != nil {
-			return fmt.Errorf("vend model credential: %w", err)
+			return err
 		}
 		cfg := llm.Config{Endpoint: endpoint, Model: model, Token: token, Logger: log}
 		params.Model = model
@@ -100,4 +103,28 @@ func work(ctx context.Context, rt *aeiruntime.Runtime) error {
 	}
 
 	return agent.Run(ctx, params, plane, plane)
+}
+
+// modelToken returns the bearer the run's model client sends. By default it vends the
+// chat-model token from gofer's broker (provider "ai"). With ai_auth=gateway the
+// model is behind gofer's model gateway, which holds the upstream key: the run
+// presents its own run credential, which the gateway verifies with gofer before it
+// attaches the key upstream, so the run never receives a model key. An unknown
+// ai_auth fails the run rather than guessing where a credential may be sent.
+func modelToken(ctx context.Context, aiAuth, runCredential string, v agent.Vendor) (string, error) {
+	switch strings.TrimSpace(aiAuth) {
+	case "":
+		token, err := v.Vend(ctx, "ai")
+		if err != nil {
+			return "", fmt.Errorf("vend model credential: %w", err)
+		}
+		return token, nil
+	case ingest.AIAuthGateway:
+		if runCredential == "" {
+			return "", errors.New("aei: the model gateway needs the run credential, and this run has none")
+		}
+		return runCredential, nil
+	default:
+		return "", fmt.Errorf("aei: unknown ai_auth %q", aiAuth)
+	}
 }

@@ -1,0 +1,58 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+#
+# gofer's model gateway (docs/adr/0008-model-gateway.md): agentgateway in front of the
+# chat-model provider. It alone holds the upstream key, and every run's model call
+# draws on one shared request budget. `make model-gateway-apply` fills in the @...@
+# values; internal/modelgateway's test runs the real gateway on this same file.
+config:
+  # The kubelet's readiness probe. The admin API stays on its loopback default.
+  readinessAddr: 0.0.0.0:15021
+  statsAddr: 0.0.0.0:15020
+
+llm:
+  port: 4000
+  policies:
+    # Who may call: the gateway forwards the caller's Authorization header (a run's
+    # run credential) to gofer, which answers 204 only for a run credential with the
+    # credential broker's scope (/agent/model-access). The same runs that could vend
+    # the model token without the gateway may use the model through it.
+    extAuthz:
+      host: "@AUTHZ_HOST@"
+      protocol:
+        http:
+          path: '"/agent/model-access"'
+      failureMode: deny
+    # The shared budget: one local token bucket with no key, so every request from
+    # every run draws on it. The gateway runs one replica, so the bucket is global.
+    # Over budget the gateway answers 429, which the workload's model client
+    # (internal/httpretry) backs off and retries. maxTokens is the burst;
+    # tokensPerFill per fillInterval is the sustained rate.
+    localRateLimit:
+      - type: requests
+        maxTokens: @BURST@
+        tokensPerFill: @REFILL@
+        fillInterval: "@INTERVAL@"
+  models:
+    # Route by model: the request's own model and API pass through unchanged. gofer
+    # sends each model to the endpoint AI_CONNECTIONS names for it, and the gateway
+    # forwards a chat-completions request to <baseUrl>/chat/completions and a
+    # Responses request to <baseUrl>/responses, so the model picker and second
+    # opinions reach the model they name. No model is pinned here.
+    - name: "*"
+      provider:
+        custom:
+          formats:
+            - type: completions
+            - type: responses
+      params:
+        baseUrl: "@UPSTREAM@"
+        # Replaces the caller's Authorization (the run credential) on the upstream
+        # request. Mounted from the gofer-model-gateway Secret, which nothing else in
+        # gofer mounts.
+        apiKey:
+          file: /var/run/secrets/model-gateway/AI_TOKEN
+      requestHeaders:
+        set:
+          # GitHub Copilot requires it; other providers ignore it. gofer sets it
+          # itself only when it calls Copilot directly (internal/llm).
+          Copilot-Integration-Id: copilot-developer-cli

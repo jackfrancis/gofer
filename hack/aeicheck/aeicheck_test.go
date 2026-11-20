@@ -34,6 +34,7 @@ case "$*" in
 *"get secret aei-signing"*) printf 'eA==' ;;
 *"config current-context"*) echo review-fake ;;
 *"get cronjob gofer-snapshot"*) exit 1 ;;
+*"get deployment gofer-model-gateway"*) exit 1 ;;
 esac
 exit 0
 `
