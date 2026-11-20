@@ -25,7 +25,7 @@ gofer's interfaces:
 
 | Concern | gofer (unchanged by the backend) | AEI backend |
 | --- | --- | --- |
-| Dispatch a run (`ingest.Dispatcher`) | constructs the `RunSpec` | `internal/runtime/aei` POSTs it to the aei-controller, authenticating with the web pod's ServiceAccount token |
+| Dispatch a run (`ingest.Dispatcher`) | constructs the `RunSpec` | `internal/runtime/aei` POSTs it to the aei-controller, authenticating with a ServiceAccount token projected into the web pod for AEI's `aei-dispatch` audience |
 | The agent WORKLOAD (`internal/agent`) | fetch GitHub, enrich, rank, converse | `cmd/runtime` runs it per run, out-of-process, in the runtime image |
 | Credential vend + write-back (`/agent/*`) | served by the web tier | the runtime calls them with its run credential |
 | Run-credential mint/verify (`internal/identity`) | verify-only (public key) | AEI's control plane is the sole minter |

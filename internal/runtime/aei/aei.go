@@ -6,9 +6,9 @@
 // its own: it is an AEI *app* that POSTs each run to the pre-installed AEI control
 // plane (the aei-controller dispatch API) through the app SDK and reads the run's
 // lifecycle back. It imports no provider and no client-go, and creates no per-run
-// Kubernetes object — the caller authenticates with the web pod's projected
-// ServiceAccount token, bounded by gofer's AgentApp policy (dispatchers, maxScopes,
-// audience).
+// Kubernetes object — the caller authenticates with a ServiceAccount token projected
+// into the web pod for AEI's dispatch audience ("aei-dispatch"), bounded by gofer's
+// AgentApp policy (dispatchers, maxScopes, audience).
 //
 // The substrate is OUT-OF-PROCESS: the control plane launches gofer's runtime image
 // (cmd/runtime, whose workload lives in this package — see workload.go) on whatever
@@ -41,18 +41,25 @@ import (
 // fallback so the backend owns its own configuration and gofer's wiring point names
 // none of it.
 type Config struct {
-	// Endpoint is the AEI dispatch API base URL (the aei-controller), e.g.
-	// "http://aei-controller.aei-system.svc:8080". Empty falls back to
+	// Endpoint is the AEI dispatch API base URL: the aei-controller's dispatch
+	// listener, e.g. "http://aei-controller.aei-system.svc:8081". Empty falls back to
 	// AEI_DISPATCH_ENDPOINT.
 	Endpoint string
 	// App is the AgentApp gofer dispatches as. The control plane bounds every run by
 	// that app's policy (permitted dispatchers, scope ceiling) and fixes the minted
 	// credential's audience. Empty falls back to AEI_APP.
 	App string
-	// Token overrides the dispatch bearer (tests, out-of-cluster runs); empty uses the
-	// pod's projected ServiceAccount token, which the controller TokenReviews — the
-	// production path, with no shared secret.
+	// Token overrides the dispatch bearer (tests, out-of-cluster runs) and wins over
+	// TokenPath.
 	Token string
+	// TokenPath is the file the dispatch bearer is read from: a ServiceAccount token
+	// projected for AEI's dispatch audience, which the controller TokenReviews — the
+	// production path, with no shared secret. The SDK re-reads it on every request,
+	// so the kubelet's in-place rotation is picked up. Empty falls back to
+	// AEI_DISPATCH_TOKEN_PATH; with neither, the SDK sends the pod's default
+	// ServiceAccount token, which AEI admits only while it still accepts legacy
+	// dispatch tokens.
+	TokenPath string
 	// HTTPClient overrides the transport (tests); nil uses a client bounded by
 	// dispatchTimeout.
 	HTTPClient *http.Client
@@ -101,12 +108,46 @@ func New(cfg Config) (*Dispatcher, error) {
 		client = &http.Client{Timeout: dispatchTimeout}
 	}
 	opts := []aeiapp.Option{aeiapp.WithHTTPClient(client)}
-	if cfg.Token != "" {
+	tokenSource := "default ServiceAccount token"
+	switch tokenPath := resolveTokenPath(cfg.TokenPath); {
+	case cfg.Token != "":
 		opts = append(opts, aeiapp.WithToken(cfg.Token))
+		tokenSource = "explicit token"
+	case tokenPath != "":
+		// A projected volume is mounted before the container starts, so a path that
+		// cannot be read now is a misconfiguration every dispatch would hit. Fail at
+		// startup rather than accept runs that can never be dispatched.
+		if err := checkTokenFile(tokenPath); err != nil {
+			return nil, err
+		}
+		opts = append(opts, aeiapp.WithTokenPath(tokenPath))
+		tokenSource = tokenPath
 	}
 
-	log.Info("agent runtime backend ready", "backend", "aei", "dispatch", endpoint, "app", app)
+	log.Info("agent runtime backend ready", "backend", "aei", "dispatch", endpoint, "app", app, "token", tokenSource)
 	return &Dispatcher{client: aeiapp.New(endpoint, app, opts...), app: app, log: log}, nil
+}
+
+// resolveTokenPath applies the AEI_DISPATCH_TOKEN_PATH fallback (the variable the app
+// SDK reads too) so the backend can check and log the path it will use.
+func resolveTokenPath(configured string) string {
+	if p := strings.TrimSpace(configured); p != "" {
+		return p
+	}
+	return strings.TrimSpace(os.Getenv(aeiapp.TokenPathEnv))
+}
+
+// checkTokenFile confirms the dispatch token file holds a token. It never logs or
+// returns the token itself.
+func checkTokenFile(path string) error {
+	b, err := os.ReadFile(path) // #nosec G304 -- operator-configured token path
+	if err != nil {
+		return fmt.Errorf("aei: dispatch token %s (%s): %w", aeiapp.TokenPathEnv, path, err)
+	}
+	if strings.TrimSpace(string(b)) == "" {
+		return fmt.Errorf("aei: dispatch token %s (%s) is empty", aeiapp.TokenPathEnv, path)
+	}
+	return nil
 }
 
 // Submit dispatches spec to the control plane and returns the run id. Dispatch is

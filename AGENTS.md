@@ -77,7 +77,7 @@ backend fills each one:
 
 | Seam | gofer's side | The AEI backend |
 | --- | --- | --- |
-| `ingest.Dispatcher` (`Submit`/`Status`) | constructs each `RunSpec` | `aei.Dispatcher` POSTs it to the aei-controller (`AEI_DISPATCH_ENDPOINT`) as the `AgentApp` named by `AEI_APP`, authenticating with the web pod's projected ServiceAccount token |
+| `ingest.Dispatcher` (`Submit`/`Status`) | constructs each `RunSpec` | `aei.Dispatcher` POSTs it to the aei-controller (`AEI_DISPATCH_ENDPOINT`) as the `AgentApp` named by `AEI_APP`, on its dispatch listener (`:8081`), authenticating with a ServiceAccount token projected for the `aei-dispatch` audience (`AEI_DISPATCH_TOKEN_PATH`) |
 | `agent.Vendor` / `agent.Sink` | `agent.NewPlaneClient`: one HTTP client to the `/agent/*` plane | the runtime uses it with its run credential (vend a credential, read/write the worklist) |
 | `agent.Run` (`internal/agent`) | the workload | `aei.RunWorkload` (`cmd/runtime`) executes it per run, out-of-process |
 | `identity.Authority` | verify-only (`internal/identity`, `MINT_PUBLIC_KEY`) | AEI's control plane owns the keypair and is the sole minter |
@@ -128,7 +128,8 @@ Wired on the web-tier side; they define what a runtime must respect:
 - Interfaces are the extension seams: `identity.Authority`, `worklist.Store` /
   `worklist.Ingestor`, `vault.Vault`, `session.Store`, `ingest.Dispatcher`, and the workload's `agent.Vendor` /
   `agent.Sink`.
-- The web tier fails fast at startup without `AEI_DISPATCH_ENDPOINT` and `AEI_APP`.
+- The web tier fails fast at startup without `AEI_DISPATCH_ENDPOINT` and `AEI_APP`,
+  or when `AEI_DISPATCH_TOKEN_PATH` is set but holds no readable token.
   With them set but no reachable aei-controller (e.g. `make run`), sign-in works but
   dispatch fails, so the worklist stays empty.
 - Web-tier state (sessions, delegated tokens in the vault, the worklist and its

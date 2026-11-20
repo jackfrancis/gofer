@@ -354,6 +354,13 @@ aei-check:
 		echo "ERROR: AEI is not installed (agents.x-k8s.io CRDs missing). This build dispatches to"; \
 		echo "       the aei-controller and cannot run without it. Install AEI, then re-run."; \
 		exit 1; }
+	@# gofer dispatches to the controller's own dispatch listener with a token projected
+	@# for the aei-dispatch audience. An AEI from before that listener has neither.
+	@$(KUBECTL) -n aei-system get service aei-controller -o jsonpath='{.spec.ports[*].name}' 2>/dev/null | tr ' ' '\n' | grep -qx dispatch || { \
+		echo "ERROR: the aei-controller Service in aei-system has no 'dispatch' port. This build"; \
+		echo "       dispatches to AEI's dispatch listener (8081) with an aei-dispatch token;"; \
+		echo "       upgrade AEI to a release that serves it, then re-run."; \
+		exit 1; }
 
 # `deploy` does not create secrets: a real cluster's keys come from your secret manager,
 # not from a make target. It only checks that the ones the server refuses to start

@@ -7,8 +7,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackfrancis/agent-execution-interface/sdks/go/aeiapp"
 
 	"github.com/jackfrancis/gofer/internal/ingest"
 )
@@ -155,6 +160,7 @@ func TestStatusReportsThePhase(t *testing.T) {
 // A backend that cannot reach a control plane is a configuration error, not a runtime
 // surprise: New fails fast rather than accepting runs it can never dispatch.
 func TestNewRequiresEndpointAndApp(t *testing.T) {
+	t.Setenv(aeiapp.TokenPathEnv, "")
 	t.Setenv("AEI_DISPATCH_ENDPOINT", "")
 	t.Setenv("AEI_APP", "")
 	if _, err := New(Config{App: "gofer"}); err == nil {
@@ -168,9 +174,107 @@ func TestNewRequiresEndpointAndApp(t *testing.T) {
 // The backend owns its own configuration, so it reads its environment itself and
 // gofer's wiring point names none of it.
 func TestNewReadsItsOwnEnvironment(t *testing.T) {
-	t.Setenv("AEI_DISPATCH_ENDPOINT", "http://aei-controller.aei-system.svc:8080")
+	t.Setenv(aeiapp.TokenPathEnv, "")
+	t.Setenv("AEI_DISPATCH_ENDPOINT", "http://aei-controller.aei-system.svc:8081")
 	t.Setenv("AEI_APP", "gofer")
 	if _, err := New(Config{}); err != nil {
 		t.Fatalf("New: %v", err)
 	}
+}
+
+// writeToken writes a token file the way the kubelet projects one.
+func writeToken(t *testing.T, path, token string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// dispatchOnce submits a run and returns the bearer the control plane saw.
+func dispatchOnce(t *testing.T, d *Dispatcher, c *controlPlane) string {
+	t.Helper()
+	if _, err := d.Submit(context.Background(), ingest.RunSpec{TaskRef: "github-ingest"}); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	return c.bearer
+}
+
+// gofer dispatches with the token projected for AEI's dispatch audience, read from the
+// configured path on every request: the kubelet rotates the projected token in place,
+// and a cached one would expire under a long-lived web pod.
+func TestDispatchUsesTheProjectedTokenAndItsRotation(t *testing.T) {
+	t.Setenv(aeiapp.TokenPathEnv, "")
+	c := newControlPlane(t)
+	path := filepath.Join(t.TempDir(), "token")
+	writeToken(t, path, "dispatch-token-1")
+	d, err := New(Config{Endpoint: c.srv.URL, App: "gofer", TokenPath: path})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := dispatchOnce(t, d, c); got != "Bearer dispatch-token-1" {
+		t.Errorf("bearer = %q, want the projected token", got)
+	}
+	writeToken(t, path, "dispatch-token-2")
+	if got := dispatchOnce(t, d, c); got != "Bearer dispatch-token-2" {
+		t.Errorf("bearer after rotation = %q, want the rotated token", got)
+	}
+}
+
+// The deployment configures the path through the environment (gofer-config), which the
+// backend reads itself.
+func TestTokenPathFromEnvironment(t *testing.T) {
+	c := newControlPlane(t)
+	path := filepath.Join(t.TempDir(), "token")
+	writeToken(t, path, "from-env")
+	t.Setenv(aeiapp.TokenPathEnv, path)
+	d, err := New(Config{Endpoint: c.srv.URL, App: "gofer"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := dispatchOnce(t, d, c); got != "Bearer from-env" {
+		t.Errorf("bearer = %q, want the token at %s", got, aeiapp.TokenPathEnv)
+	}
+}
+
+// An explicit token (tests, out-of-cluster runs) wins over any configured path.
+func TestExplicitTokenWinsOverTokenPath(t *testing.T) {
+	c := newControlPlane(t)
+	t.Setenv(aeiapp.TokenPathEnv, filepath.Join(t.TempDir(), "absent"))
+	d, err := New(Config{Endpoint: c.srv.URL, App: "gofer", Token: "explicit"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := dispatchOnce(t, d, c); got != "Bearer explicit" {
+		t.Errorf("bearer = %q, want the explicit token", got)
+	}
+}
+
+// A configured token path that holds no token (the volume is not mounted, or names the
+// wrong file) is a misconfiguration every dispatch would hit, so New refuses it, and
+// its error names the path without quoting any token.
+func TestNewRefusesAnUnusableTokenPath(t *testing.T) {
+	t.Setenv(aeiapp.TokenPathEnv, "")
+	dir := t.TempDir()
+	empty := filepath.Join(dir, "empty")
+	writeToken(t, empty, "  ")
+	for name, path := range map[string]string{
+		"missing": filepath.Join(dir, "missing"),
+		"empty":   empty,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := New(Config{Endpoint: "http://aei-controller:8081", App: "gofer", TokenPath: path})
+			if err == nil {
+				t.Fatal("New: want error")
+			}
+			if !strings.Contains(err.Error(), path) {
+				t.Errorf("error %q does not name the path", err)
+			}
+		})
+	}
+	t.Run("from environment", func(t *testing.T) {
+		t.Setenv(aeiapp.TokenPathEnv, filepath.Join(dir, "missing"))
+		if _, err := New(Config{Endpoint: "http://aei-controller:8081", App: "gofer"}); err == nil {
+			t.Fatal("New: want error")
+		}
+	})
 }
