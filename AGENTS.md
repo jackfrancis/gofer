@@ -195,7 +195,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   Stored data past the bounds still reads: an oversized message is cut with a note,
   and an item over `MaxBriefBytes` is projected (`worklist.Project`), which marks
   each cut field (`WorkItem.Projected`) so `MergeRunItems` restores it on write-back
-  unless the run rewrote it. Never store a projection. Projection drops a research
+  unless the run rewrote it. Never store a projection. A cut keeps what the score
+  reads (the strongest labels, every distinct reason), so a projected item scores as
+  the whole item does for the ranker and Discuss. Projection drops a research
   adjustment's source-turn list rather than shorten it, so the visibility check
   withholds research it cannot check whole. Ranking reads the top N by baseline score
   of the whole item, projected only after it is chosen (ties keep insertion order); ingest and enrichment page through

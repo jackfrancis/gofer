@@ -1,6 +1,7 @@
 package worklist
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -38,6 +39,9 @@ type projectable struct {
 
 // projectables are the item's free-form fields: everything whose size the data,
 // rather than the schema, decides. IDs, enums, numbers and times are left whole.
+// A cut keeps what the score reads (the strongest label, every distinct reason), so
+// a projected item scores as the whole item does: the ranker and Discuss see the
+// radar's ranking.
 var projectables = []projectable{
 	{"github.title", func(w *WorkItem) any { return w.GitHub.Title },
 		func(d, s *WorkItem) { d.GitHub.Title = s.GitHub.Title },
@@ -49,7 +53,16 @@ var projectables = []projectable{
 		func(d, s *WorkItem) { d.Signals.Reasons = slices.Clone(s.Signals.Reasons) },
 		func(w *WorkItem) {
 			if w.Signals.Reasons != nil {
-				r := slices.Clone(w.Signals.Reasons[:min(len(w.Signals.Reasons), projectedList)])
+				// Relevance reads the best reason and the count, which saturates long
+				// before the bound: keep every distinct reason, then fill the bound.
+				seen := map[Reason]bool{}
+				r := keepByPriority(w.Signals.Reasons, func(r Reason) float64 {
+					if seen[r] {
+						return 0
+					}
+					seen[r] = true
+					return 1
+				})
 				for i := range r {
 					r[i] = Reason(cutString(string(r[i])))
 				}
@@ -61,7 +74,16 @@ var projectables = []projectable{
 		func(w *WorkItem) { w.Signals.RelatedActive = cutStrings(w.Signals.RelatedActive) }},
 	{"signals.labels", func(w *WorkItem) any { return w.Signals.Labels },
 		func(d, s *WorkItem) { d.Signals.Labels = slices.Clone(s.Signals.Labels) },
-		func(w *WorkItem) { w.Signals.Labels = cutStrings(w.Signals.Labels) }},
+		func(w *WorkItem) {
+			// Impact reads the strongest label: keep the strongest labels. A label is
+			// cut only past projectedString bytes, far longer than GitHub allows.
+			if w.Signals.Labels != nil {
+				w.Signals.Labels = cutStrings(keepByPriority(w.Signals.Labels, func(l string) float64 {
+					weight, _ := labelImpact(l)
+					return weight
+				}))
+			}
+		}},
 	{"signals.roadmap_themes", func(w *WorkItem) any { return w.Signals.RoadmapThemes },
 		func(d, s *WorkItem) { d.Signals.RoadmapThemes = slices.Clone(s.Signals.RoadmapThemes) },
 		func(w *WorkItem) { w.Signals.RoadmapThemes = cutStrings(w.Signals.RoadmapThemes) }},
@@ -178,6 +200,28 @@ func cutStrings(list []string) []string {
 	out := slices.Clone(list[:min(len(list), projectedList)])
 	for i := range out {
 		out[i] = cutString(out[i])
+	}
+	return out
+}
+
+// keepByPriority returns at most projectedList entries of list, in their original
+// order: those with the highest priority, the earlier entry first on a tie. priority
+// is called once per entry, in order.
+func keepByPriority[T any](list []T, priority func(T) float64) []T {
+	if len(list) <= projectedList {
+		return slices.Clone(list)
+	}
+	weight := make([]float64, len(list))
+	idx := make([]int, len(list))
+	for i, v := range list {
+		weight[i], idx[i] = priority(v), i
+	}
+	slices.SortStableFunc(idx, func(a, b int) int { return cmp.Compare(weight[b], weight[a]) })
+	idx = idx[:projectedList]
+	slices.Sort(idx)
+	out := make([]T, len(idx))
+	for j, i := range idx {
+		out[j] = list[i]
 	}
 	return out
 }

@@ -652,3 +652,59 @@ func TestTurnlessDiscussAnswersTheLatestQuestion(t *testing.T) {
 		t.Fatalf("largest read %d bytes (%s)", n, key)
 	}
 }
+
+// A projected item keeps the label that sets its impact, so a ranking pass and
+// Discuss see the radar's ranking: the stub ranker's proposal (which echoes the
+// baseline) and the item Discuss explains score as the stored item does, and the
+// write-back keeps every stored label.
+func TestProjectedItemKeepsItsRanking(t *testing.T) {
+	plane := newBoundedPlane(t)
+	ctx := context.Background()
+	labels := make([]string, 0, 33)
+	for i := range 32 {
+		labels = append(labels, fmt.Sprintf("area/%d", i))
+	}
+	labels = append(labels, "security") // past the projection's cut
+	if err := plane.store.Upsert(ctx, "u1", worklist.WorkItem{ID: "github:o/r#1", Source: "github",
+		GitHub:  worklist.GitHubRef{Repo: "o/r", Number: 1},
+		Signals: worklist.Signals{Labels: labels},
+		Meta:    worklist.Metadata{Rationale: strings.Repeat("r", worklist.MaxBriefBytes)}, // forces projection
+		Thread:  []worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: "why is this ranked here?"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored := func() worklist.WorkItem {
+		t.Helper()
+		it, _, err := plane.store.Get(ctx, "u1", "github:o/r#1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return it
+	}
+	now := time.Now().UTC()
+	radar := worklist.Score(stored(), now)
+	if radar.Impact != 1 {
+		t.Fatalf("fixture: stored impact %.2f, want 1", radar.Impact)
+	}
+	sink := plane.client("u1")
+	if err := Run(ctx, Params{JobType: JobRank}, sink, sink); err != nil { // the stub ranker
+		t.Fatal(err)
+	}
+	ranked := stored()
+	if p := ranked.Signals.Proposed; p == nil || p.Impact != 1 {
+		t.Fatalf("the ranking pass proposed %+v, want impact 1", ranked.Signals.Proposed)
+	}
+	if got := worklist.Score(ranked, now); got.Rank != radar.Rank || len(ranked.Signals.Labels) != 33 {
+		t.Fatalf("after ranking: rank %.3f with %d labels, want %.3f with 33", got.Rank, len(ranked.Signals.Labels), radar.Rank)
+	}
+	fc := &fakeConverser{reply: "it is a security issue"}
+	if err := Run(ctx, Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Turn: "q", Converser: fc}, sink, sink); err != nil {
+		t.Fatal(err)
+	}
+	if fc.gotItem.Projected == nil {
+		t.Fatal("fixture: Discuss read the item whole, want it projected")
+	}
+	if got := worklist.Score(fc.gotItem, now); got.Rank != worklist.Score(stored(), now).Rank || got.Impact != 1 {
+		t.Fatalf("Discuss explains rank %.3f (impact %.2f), the radar shows %.3f", got.Rank, got.Impact, worklist.Score(stored(), now).Rank)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -380,24 +381,42 @@ func TestSelectFromStore(t *testing.T) {
 	}
 }
 
-// The top N is chosen by the whole item's score, before projection shortens the
-// signals it reads: a label past the projection's cut still counts.
-func TestSelectTopScoresTheWholeItem(t *testing.T) {
+// A projected item scores as the whole item does, so the top N, the ranker and
+// Discuss all see the radar's ranking: the cut keeps the strongest label and every
+// distinct reason, wherever they sit in the list.
+func TestProjectionKeepsTheScore(t *testing.T) {
 	labels := make([]string, 0, projectedList+1)
 	for i := range projectedList {
 		labels = append(labels, fmt.Sprintf("area/%d", i))
 	}
 	labels = append(labels, "security") // past the cut
-	big := WorkItem{ID: "big", Signals: Signals{Labels: labels}, Meta: Metadata{Rationale: strings.Repeat("r", MaxBriefBytes)}}
-	plain := WorkItem{ID: "plain", Signals: Signals{Labels: []string{"kind/bug"}}}
+	reasons := make([]Reason, 0, projectedList+2)
+	for range projectedList + 1 {
+		reasons = append(reasons, ReasonMentioned)
+	}
+	reasons = append(reasons, ReasonAssignee) // the best reason, past the cut
+	big := WorkItem{ID: "big", Signals: Signals{Labels: labels, Reasons: reasons},
+		Meta: Metadata{Rationale: strings.Repeat("r", MaxBriefBytes)}}
+	plain := WorkItem{ID: "plain", Signals: Signals{Labels: []string{"kind/bug"}, Reasons: []Reason{ReasonMentioned, ReasonAuthor}}}
 	now := time.Now().UTC()
-	full, cut, other := Score(big, now).Rank, Score(Project(big), now).Rank, Score(plain, now).Rank
-	if !(cut < other && other < full) {
-		t.Fatalf("fixture: want projected %.3f < plain %.3f < whole %.3f", cut, other, full)
+	proj := Project(big)
+	if proj.Projected == nil || len(proj.Signals.Labels) != projectedList || len(proj.Signals.Reasons) != projectedList {
+		t.Fatalf("fixture: want labels and reasons cut to %d, got %d and %d", projectedList, len(proj.Signals.Labels), len(proj.Signals.Reasons))
+	}
+	whole, cut := Score(big, now), Score(proj, now)
+	if whole.Rank != cut.Rank || whole.Relevance != cut.Relevance || whole.Impact != cut.Impact ||
+		whole.Engagement != cut.Engagement || whole.Urgency != cut.Urgency {
+		t.Fatalf("projected score %+v, want the whole item's %+v", cut, whole)
+	}
+	if whole.Impact != 1 || !slices.Contains(proj.Signals.Labels, "security") || !slices.Contains(proj.Signals.Reasons, ReasonAssignee) {
+		t.Fatalf("the cut dropped the label or reason the score reads: %v %v", proj.Signals.Labels, proj.Signals.Reasons)
+	}
+	if !(Score(plain, now).Rank < whole.Rank) {
+		t.Fatal("fixture: want plain below big")
 	}
 	page, _ := Select([]WorkItem{plain, big}, Selection{Top: 1}, now)
 	if len(page) != 1 || page[0].ID != "big" || page[0].Projected == nil {
-		t.Fatalf("top 1 = %v, want the (projected) item whose whole score is higher", ids(page))
+		t.Fatalf("top 1 = %v, want the (projected) item with the higher score", ids(page))
 	}
 }
 
