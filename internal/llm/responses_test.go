@@ -160,6 +160,20 @@ func openAIResponsesStub(t *testing.T, reply string, got chan<- responsesRequest
 	return srv
 }
 
+// captured returns the request the stub recorded, failing the test at once if none
+// reached it. Call it only after the call returned without error: the handler records
+// the request before it answers, so a successful call never has to wait for it.
+func captured(t *testing.T, got <-chan responsesRequest) responsesRequest {
+	t.Helper()
+	select {
+	case req := <-got:
+		return req
+	default:
+		t.Fatal("no request reached the stub")
+		return responsesRequest{}
+	}
+}
+
 // wantJSONMode fails the test unless req asked for json_object output.
 func wantJSONMode(t *testing.T, req responsesRequest) {
 	t.Helper()
@@ -187,7 +201,7 @@ func TestResponsesJSONModeInputMentionsJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := <-got
+	req := captured(t, got)
 	wantJSONMode(t, req)
 	if req.Instructions != "Respond with ONLY a JSON object." {
 		t.Errorf("instructions = %q", req.Instructions)
@@ -227,7 +241,7 @@ func TestResponsesJSONReminderAfterNonUserTurn(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			req := <-got
+			req := captured(t, got)
 			if len(req.Input) != tc.want {
 				t.Fatalf("input = %+v, want %d item(s)", req.Input, tc.want)
 			}
@@ -262,7 +276,7 @@ func TestResponsesJSONReminderOnlyWhenNeeded(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if req := <-got; len(req.Input) != 1 || req.Input[0].Content != tc.user {
+			if req := captured(t, got); len(req.Input) != 1 || req.Input[0].Content != tc.user {
 				t.Errorf("input = %+v, want the user message unchanged", req.Input)
 			}
 		})
@@ -278,10 +292,10 @@ func TestResearchOverResponses(t *testing.T) {
 	adj, err := r.Research(context.Background(), worklist.WorkItem{
 		Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "hi"}},
 	})
-	wantJSONMode(t, <-got)
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantJSONMode(t, captured(t, got))
 	if adj.Relevance != 1.5 || adj.Urgency != 0.5 || adj.Impact != 1 || adj.Engagement != 1 || adj.Rationale != "x" {
 		t.Fatalf("adjustment = %+v", adj)
 	}
@@ -294,10 +308,10 @@ func TestRankerOverResponses(t *testing.T) {
 	srv := openAIResponsesStub(t, `{"relevance":0.9,"impact":0.4,"engagement":0.2,"urgency":0.7,"confidence":0.8,"rationale":"y"}`, got)
 	r := NewRanker(Config{Endpoint: srv.URL + "/v1/responses", Model: "m", Token: "t", Client: srv.Client()})
 	p, err := r.Propose(context.Background(), worklist.WorkItem{})
-	wantJSONMode(t, <-got)
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantJSONMode(t, captured(t, got))
 	if p.Relevance != 0.9 || p.Urgency != 0.7 || p.Confidence != 0.8 || p.Rationale != "y" {
 		t.Fatalf("proposal = %+v", p)
 	}
