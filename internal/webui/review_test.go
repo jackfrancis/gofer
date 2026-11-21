@@ -662,3 +662,35 @@ func TestThreadPostAcceptsMultipart(t *testing.T) {
 		t.Fatal("an oversized multipart message was stored")
 	}
 }
+
+// Each assistant reply carries a Copy button whose payload is the reply's raw Markdown
+// (escaped into the attribute, never rendered as markup); user turns get none. The
+// button ships hidden and copy.js, served from /static and loaded only on the
+// thread view, reveals and wires it.
+func TestThreadAgentReplyCopyButton(t *testing.T) {
+	pr := worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Number: 1, Repo: "o/r", Title: "A PR"}}
+	pr.Thread = []worklist.Message{
+		{Role: worklist.RoleUser, Content: "Draft a review request"},
+		{Role: worklist.RoleAgent, Content: "**Hi** <script>x</script> \"q\"", Model: "m"},
+	}
+	out := renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true})
+
+	if n := strings.Count(out, `class="zz-linkbtn zz-copy"`); n != 1 {
+		t.Fatalf("want exactly one Copy button (agent turn only), got %d:\n%s", n, out)
+	}
+	if !strings.Contains(out, `data-copy="**Hi** &lt;script&gt;x&lt;/script&gt; &#34;q&#34;"`) {
+		t.Fatalf("Copy payload should be the escaped Markdown source, got:\n%s", out)
+	}
+	if !strings.Contains(out, `<script src="/static/copy.js" defer></script>`) {
+		t.Fatal("the thread view should load copy.js from /static")
+	}
+	if strings.Contains(renderPage(t, pageData{View: "worklist"}), "copy.js") {
+		t.Fatal("copy.js belongs to the thread view only")
+	}
+
+	rec := httptest.NewRecorder()
+	(&Handler{}).Static().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/static/copy.js", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "wireCopyButtons") {
+		t.Fatalf("GET /static/copy.js = %d", rec.Code)
+	}
+}

@@ -157,6 +157,8 @@ body {
 .zz-model { font-size: 12px; color: var(--muted); }
 .zz-msg .zz-msgfoot { display: flex; gap: 12px; align-items: center; margin-top: 8px; }
 .zz-msgfoot form { margin: 0; }
+/* The Copy button is hidden until copy.js wires it, so a no-JS page shows no dead control. */
+.zz-copy[hidden] { display: none; }
 .zz-linkbtn { background: none; border: 0; padding: 0; font-family: inherit; font-size: 12px; text-decoration: underline; cursor: pointer; color: var(--muted); }
 .zz-linkbtn:hover { color: var(--accent); }
 .zz-msg--user .zz-linkbtn { color: rgba(255, 255, 255, 0.85); }
