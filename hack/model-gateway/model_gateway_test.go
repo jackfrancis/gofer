@@ -508,6 +508,19 @@ func TestDownStopsWhenAWriteFails(t *testing.T) {
 			}
 		})
 	}
+	t.Run("restore connections gofer would refuse", func(t *testing.T) {
+		c, _ := install(t)
+		bad := `[{"endpoint":"https://models.example/v1/responses","models":[]}]`
+		if err, out := c.run("down", "MODEL_GATEWAY_RESTORE_CONNECTIONS="+bad); err == nil {
+			t.Fatalf("down restored connections gofer would refuse:\n%s", out)
+		}
+		if calls := c.calls(); has(calls, "patch") || has(calls, "statefulset/gofer") {
+			t.Fatalf("down wrote before refusing:\n%s", strings.Join(calls, "\n"))
+		}
+		if _, ok := c.web()["AI_TOKEN"]; ok {
+			t.Fatal("down gave gofer its key back")
+		}
+	})
 	t.Run("nothing saved", func(t *testing.T) {
 		c, _ := install(t)
 		cfg := c.config()
@@ -593,6 +606,25 @@ func TestDeployWithAnOverrideBehindTheGateway(t *testing.T) {
 	}
 }
 
+// With the model off (no gateway, no AI_TOKEN) gofer ignores AI_CONNECTIONS, so a
+// deploy accepts any override, [] included, as it always has.
+func TestDeployWithTheModelOff(t *testing.T) {
+	base := shippedBases(t)["configmap.yaml"]
+	for _, override := range []string{`[]`, `[{"endpoint":"https://x/responses","models":[]}]`} {
+		c := newCluster(t, customConns, "")
+		if err, out := c.deploy(base, "AI_CONNECTIONS="+override); err != nil {
+			t.Fatalf("deploy with the model off and AI_CONNECTIONS=%s: %v\n%s", override, err, out)
+		}
+		if got := c.config()["AI_CONNECTIONS"]; got != override {
+			t.Fatalf("AI_CONNECTIONS = %s, want %s", got, override)
+		}
+		env := c.config()
+		if _, err := config.LoadConnections(func(k string) string { return env[k] }); err != nil {
+			t.Fatalf("gofer would refuse it: %v", err)
+		}
+	}
+}
+
 // A deploy that cannot build a valid routed config applies nothing.
 func TestDeployRefusesBeforeApplying(t *testing.T) {
 	base := shippedBases(t)["configmap.yaml"]
@@ -608,13 +640,14 @@ func TestDeployRefusesBeforeApplying(t *testing.T) {
 	})
 	for name, override := range map[string]string{
 		// gofer refuses a connection with no model at startup; so does the render.
-		"an empty model list":       `[{"endpoint":"https://models.example/v1/responses","models":[]}]`,
-		"only blank models":         `[{"endpoint":"https://models.example/v1/responses","models":[" "]}]`,
-		"no endpoint":               `[{"models":["a"]}]`,
-		"another path on the host":  `[{"endpoint":"https://models.example/deployment-b/responses","models":["a"]}]`,
-		"a deeper path on the base": `[{"endpoint":"https://models.example/v1/b/responses","models":["a"]}]`,
-		"an API the gateway lacks":  `[{"endpoint":"https://models.example/v1/embeddings","models":["a"]}]`,
-		"a query string":            `[{"endpoint":"https://models.example/v1/responses?x=1","models":["a"]}]`,
+		"an empty model list":          `[{"endpoint":"https://models.example/v1/responses","models":[]}]`,
+		"a model that is not a string": `[{"endpoint":"https://models.example/v1/responses","models":["a",42]}]`,
+		"only blank models":            `[{"endpoint":"https://models.example/v1/responses","models":[" "]}]`,
+		"no endpoint":                  `[{"models":["a"]}]`,
+		"another path on the host":     `[{"endpoint":"https://models.example/deployment-b/responses","models":["a"]}]`,
+		"a deeper path on the base":    `[{"endpoint":"https://models.example/v1/b/responses","models":["a"]}]`,
+		"an API the gateway lacks":     `[{"endpoint":"https://models.example/v1/embeddings","models":["a"]}]`,
+		"a query string":               `[{"endpoint":"https://models.example/v1/responses?x=1","models":["a"]}]`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			c, _ := install(t)
@@ -627,7 +660,7 @@ func TestDeployRefusesBeforeApplying(t *testing.T) {
 			}
 		})
 	}
-	t.Run("an empty model list without the gateway", func(t *testing.T) {
+	t.Run("an empty model list without the gateway, model on", func(t *testing.T) {
 		c := newCluster(t, customConns, webKey)
 		if err, out := c.deploy(base, "AI_CONNECTIONS="+`[{"endpoint":"https://x/responses","models":[]}]`); err == nil {
 			t.Fatalf("deploy accepted a connection gofer would refuse:\n%s", out)
@@ -894,6 +927,23 @@ func TestDevSecretsUsesCheckedGatewayDiscovery(t *testing.T) {
 			t.Fatalf("gofer-secrets got AI_TOKEN %q beside the gateway", k)
 		}
 	})
+	for name, fail := range map[string]string{
+		"verify-key patch refused": `MOCK_FAIL={"stringData":{"MINT_PUBLIC_KEY"`,
+		"Secret creation refused":  "MOCK_FAIL=create secret",
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newCluster(t, customConns, "")
+			if strings.Contains(fail, "create") {
+				_ = os.Remove(filepath.Join(c.state, "secret.gofer-secrets.json"))
+			}
+			if err, out := devSecrets(c, fail); err == nil {
+				t.Fatalf("dev-secrets succeeded after a refused write:\n%s", out)
+			}
+			if !injected(c.calls(), fail) {
+				t.Fatalf("the injected failure (%s) never fired", fail)
+			}
+		})
+	}
 	t.Run("no gateway", func(t *testing.T) {
 		c := newCluster(t, customConns, "")
 		if err, out := devSecrets(c); err != nil {
@@ -903,4 +953,59 @@ func TestDevSecretsUsesCheckedGatewayDiscovery(t *testing.T) {
 			t.Fatalf("gofer-secrets AI_TOKEN = %q, want the shell's", k)
 		}
 	})
+}
+
+// The script's validator agrees with gofer's own loader (config.LoadConnections, with
+// the model enabled) on what AI_CONNECTIONS gofer starts with.
+func TestValidatorMatchesLoadConnections(t *testing.T) {
+	c := newCluster(t, customConns, webKey)
+	for _, conns := range []string{
+		`[{"endpoint":"https://x/responses","models":["a"]}]`,
+		`[{"endpoint":"https://x/responses","models":["a","b"]},{"endpoint":"https://y/chat/completions","models":["c"]}]`,
+		`[{"endpoint":"  https://x/responses  ","models":[" a "]}]`,
+		`[{"endpoint":"https://x/responses","models":["a","a"]}]`,
+		`[{"endpoint":"https://x/responses","models":["a",null]}]`,
+		`[{"endpoint":"https://x/responses","models":["a"],"extra":1,"token":"t"}]`,
+		`[{"Endpoint":"https://x/responses","MODELS":["a"]}]`,
+		`[{"endpoint":"https://x/responses","Endpoint":"","models":["a"]}]`,
+		`[{"Endpoint":"","endpoint":"https://x/responses","models":["a"]}]`,
+		`[{"endpoint":"https://x/responses","models":["a",42]}]`,
+		`[{"endpoint":"https://x/responses","models":["a",true]}]`,
+		`[{"endpoint":"https://x/responses","models":["a",["b"]]}]`,
+		`[{"endpoint":"https://x/responses","models":[]}]`,
+		`[{"endpoint":"https://x/responses","models":[" ",""]}]`,
+		`[{"endpoint":"https://x/responses","models":[null]}]`,
+		`[{"endpoint":"https://x/responses","models":null}]`,
+		`[{"endpoint":"https://x/responses"}]`,
+		`[{"endpoint":"https://x/responses","models":"a"}]`,
+		`[{"endpoint":"https://x/responses","models":{"a":1}}]`,
+		`[{"models":["a"]}]`,
+		`[{"endpoint":null,"models":["a"]}]`,
+		`[{"endpoint":" ","models":["a"]}]`,
+		`[{"endpoint":5,"models":["a"]}]`,
+		`[{"endpoint":true,"models":["a"]}]`,
+		`[null]`,
+		`[null,{"endpoint":"https://x/responses","models":["a"]}]`,
+		`["https://x/responses"]`,
+		`[[]]`,
+		`[1]`,
+		`[]`,
+		`{}`,
+		`{"endpoint":"https://x/responses","models":["a"]}`,
+		`"x"`,
+		`null`,
+		`42`,
+		`[] []`,
+		`[{"endpoint":"https://x/responses","models":["a"]}] x`,
+		`[{"endpoint":"https://x/responses","models":["a"]`,
+		`  `,
+	} {
+		_, goErr := config.LoadConnections(func(k string) string {
+			return map[string]string{"AI_TOKEN": "t", "AI_CONNECTIONS": conns}[k]
+		})
+		err, out := c.run("validate", "AI_CONNECTIONS="+conns)
+		if (goErr == nil) != (err == nil) {
+			t.Errorf("AI_CONNECTIONS=%s: gofer error %v, script accepted=%v\n%s", conns, goErr, err == nil, out)
+		}
+	}
 }

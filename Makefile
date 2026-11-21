@@ -412,9 +412,10 @@ dev-secrets:
 				--from-literal=MINT_PUBLIC_KEY="$$mpk" \
 				--from-literal=GITHUB_CLIENT_ID="$${GITHUB_CLIENT_ID:-}" \
 				--from-literal=GITHUB_CLIENT_SECRET="$${GITHUB_CLIENT_SECRET:-}" \
-				--from-literal=AI_TOKEN="$$token"; \
+				--from-literal=AI_TOKEN="$$token" || { echo "ERROR: could not create gofer-secrets."; exit 1; }; \
 		$(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge \
-			-p "{\"stringData\":{\"MINT_PUBLIC_KEY\":\"$$mpk\"}}"; \
+			-p "{\"stringData\":{\"MINT_PUBLIC_KEY\":\"$$mpk\"}}" || { \
+			echo "ERROR: could not update MINT_PUBLIC_KEY in gofer-secrets; gofer would reject run credentials signed with AEI's current key."; exit 1; }; \
 		if [ -n "$$AI_TOKEN" ] && [ "$$gateway" != no ]; then \
 			echo "AI_TOKEN not written to gofer-secrets: the model gateway holds the key (make model-gateway-apply AI_TOKEN=... rotates it)."; \
 		elif [ -n "$$token" ]; then \

@@ -115,8 +115,16 @@ key or of the provider endpoints:
   when the gateway is confirmed absent, whether it is creating the Secret or updating
   one. The key reaches jq on stdin and kubectl in a file, never a command line.
 - **What may be written:** no AI_CONNECTIONS is written that gofer would refuse at
-  startup. Every connection needs a non-blank endpoint and at least one non-blank
-  model, the same rules as `config.LoadConnections`. Behind the gateway, each endpoint
+  startup. The script's validator mirrors how `config.LoadConnections` decodes and
+  checks the value:
+  - every element type is checked;
+  - field names match case-insensitively;
+  - there must be a non-blank endpoint and at least one non-blank model.
+
+  A differential test checks the two agree on a corpus of cases. It applies wherever
+  gofer will have the model on: behind the gateway, on rollback, and on a deploy with
+  `AI_TOKEN` set. With the model off, gofer ignores `AI_CONNECTIONS`, so a deploy
+  accepts any value, `[]` included. Behind the gateway, each endpoint
   must be exactly the upstream URL, origin and base path, followed by
   `/chat/completions` or `/responses`. Those are the only places the gateway forwards
   to, so another path on the same host would silently reach a different backend.

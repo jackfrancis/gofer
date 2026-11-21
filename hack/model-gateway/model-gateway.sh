@@ -33,6 +33,7 @@
 #                the gateway, before gofer restarts.
 #   check:   read-only check of a deployed profile.
 #   gateway-installed:  prints yes or no (a failed read stops it); dev-secrets uses it.
+#   validate:  exits 0 when gofer, with the model enabled, would accept $AI_CONNECTIONS.
 set -euo pipefail
 
 cmd=${1:?usage: model-gateway.sh apply|down|preflight|render|apply-base|sync|check|gateway-installed kubectl [flags...]}
@@ -104,23 +105,35 @@ form() {
         else "provider" end' <<<"$1" 2>/dev/null || fail "AI_CONNECTIONS is not usable here: $1"
 }
 
-# jq_valid checks an AI_CONNECTIONS list by gofer's own startup rules
-# (config.LoadConnections): a non-empty array, each connection with a non-blank
-# endpoint and at least one non-blank model. A config gofer would refuse is never
-# written.
-jq_valid='def valid:
-    if type != "array" or length == 0 then error("AI_CONNECTIONS must be a non-empty list of {endpoint, models}")
-    else . end |
-    to_entries | map(.key as $i | .value |
-        if type != "object" then error("AI_CONNECTIONS[\($i)] is not an object")
-        elif ((.endpoint | type) != "string") or (.endpoint | gsub("^\\s+|\\s+$"; "") | length) == 0 then error("AI_CONNECTIONS[\($i)]: endpoint is required")
-        elif ((.models | type) != "array") or ([.models[] | select(type == "string" and (gsub("^\\s+|\\s+$"; "") | length) > 0)] | length) == 0
-            then error("AI_CONNECTIONS[\($i)] (\(.endpoint)): at least one model is required")
-        else . end) ;'
+# jq_valid mirrors how gofer reads AI_CONNECTIONS at startup with the model enabled
+# (config.LoadConnections: encoding/json into []AIConnection, then its checks), so a
+# config gofer would refuse is never written. hack/model-gateway's tests hold the two
+# together on a corpus of cases. In order:
+#   - exactly one JSON value; null or [] means no connections (refused);
+#   - each element an object, or null (a zero connection);
+#   - field names match case-insensitively, the last match winning, as encoding/json;
+#   - endpoint a string or null; models a list or null of strings or nulls;
+#   - endpoint non-blank, and at least one non-blank model.
+jq_valid='def trim: gsub("^\\s+|\\s+$"; "");
+def field($n): [to_entries[] | select(.key | ascii_downcase == $n) | .value] | last;
+def valid:
+    if length != 1 then error("AI_CONNECTIONS is not one JSON value") else .[0] end |
+    if type == "null" then [] elif type != "array" then error("AI_CONNECTIONS is not a list of {endpoint, models}") else . end |
+    if length == 0 then error("AI_CONNECTIONS has no connections") else . end |
+    to_entries[] | .key as $i | .value |
+    (if . == null then {} elif type != "object" then error("AI_CONNECTIONS[\($i)] is not an object") else . end) |
+    field("endpoint") as $e | field("models") as $m |
+    if ($e | type | . != "string" and . != "null") then error("AI_CONNECTIONS[\($i)]: endpoint is not a string")
+    elif ($m | type | . != "array" and . != "null") then error("AI_CONNECTIONS[\($i)]: models is not a list")
+    elif any($m[]?; type != "string" and type != "null") then error("AI_CONNECTIONS[\($i)]: every model must be a string")
+    elif (($e // "") | trim) == "" then error("AI_CONNECTIONS[\($i)]: endpoint is required")
+    elif ([$m[]? | strings | trim | select(length > 0)] | length) == 0 then error("AI_CONNECTIONS[\($i)] (\($e)): at least one model is required")
+    else empty end;'
 
-# validate CONNS fails unless gofer would accept CONNS at startup.
+# validate CONNS fails unless gofer, with the model enabled, would accept CONNS at
+# startup.
 validate() {
-    jq -e "$jq_valid"' valid | true' <<<"$1" >/dev/null ||
+    jq -se "$jq_valid"' [valid] | true' <<<"$1" >/dev/null ||
         fail "AI_CONNECTIONS would not start gofer (above); nothing was changed: $1"
 }
 
@@ -279,6 +292,8 @@ do_down() {
         fi
         fail "gofer-config has no saved $saved_key, so the provider endpoints are unknown. Pass them as MODEL_GATEWAY_RESTORE_CONNECTIONS and re-run."
     fi
+    # gofer gets its key back with these connections, so they must start it.
+    validate "$before"
     shape=$(form "$before")
     [[ $shape == provider ]] || fail "the AI_CONNECTIONS to restore points at the gateway, not a provider: $before"
 
@@ -381,7 +396,11 @@ do_render() {
     dep=$(gateway_deployment)
     if [[ -z $dep ]]; then
         if [[ -n ${AI_CONNECTIONS:-} ]]; then
-            validate "$AI_CONNECTIONS"
+            # gofer reads AI_CONNECTIONS only with the model enabled (AI_TOKEN set);
+            # with it off, any value (even []) is accepted and ignored.
+            local web
+            web=$(secret_get gofer-secrets AI_TOKEN)
+            [[ -z $web ]] || validate "$AI_CONNECTIONS"
             yaml_set "$tmp/base.yaml" "AI_CONNECTIONS=$AI_CONNECTIONS"
         else
             cat "$tmp/base.yaml"
@@ -457,6 +476,7 @@ case $cmd in
     render) do_render ;;
     apply-base) do_apply_base ;;
     gateway-installed) dep=$(gateway_deployment); [[ -n $dep ]] && echo yes || echo no ;;
+    validate) validate "${AI_CONNECTIONS:-}" ;;
     sync) do_sync ;;
     check) do_check ;;
     *) fail "unknown command: $cmd" ;;

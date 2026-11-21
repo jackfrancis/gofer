@@ -450,8 +450,10 @@ Wired on the web-tier side; they define what a runtime must respect:
   saved provider connections, in the script's own temp directory (`apply-base`). A
   failed read is never "absent" (dev-secrets included), the key never appears in a
   process's arguments, gofer-secrets' key is removed by a test-and-remove JSON Patch,
-  and no AI_CONNECTIONS is written that gofer's `LoadConnections` would refuse or
-  whose endpoint is not exactly the upstream plus `/chat/completions` or `/responses`. `/agent/*` gets no CORS handling: a 204 from
+  and no AI_CONNECTIONS is written that gofer's `LoadConnections` would refuse with
+  the model on (the script's jq validator mirrors it; `TestValidatorMatchesLoadConnections`
+  holds them together, so extend its corpus when either changes) or whose endpoint is
+  not exactly the upstream plus `/chat/completions` or `/responses`. `/agent/*` gets no CORS handling: a 204 from
   `/agent/model-access` authorizes a model call.
 - `go test` binds httptest sockets; run it outside a restrictive sandbox.
 
