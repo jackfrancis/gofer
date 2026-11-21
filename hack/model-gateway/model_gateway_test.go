@@ -12,8 +12,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/jackfrancis/gofer/internal/config"
 )
@@ -119,6 +122,7 @@ case "$1 $2" in
 	mv "$S/cm.new" "$S/configmap.json" ;;
 "delete --ignore-not-found") rm -f "$S/deployment" ;;
 "kustomize deploy/k8s/base") cat "$MOCK_BASE" ;;
+"port-forward svc/gofer-model-gateway") echo $$ >"$S/port-forward.pid"; exec sleep 60 ;;
 "kustomize deploy/k8s/model-gateway")
 	printf 'kind: Deployment\nmetadata:\n  annotations:\n    gofer/model-gateway-upstream: "@UPSTREAM@"\n' ;;
 esac
@@ -1159,4 +1163,38 @@ func TestApplyRemovesTheKeyFromTheLastAppliedConfiguration(t *testing.T) {
 			t.Fatalf("check = %v, %s; want a refusal naming the last-applied configuration", err, out)
 		}
 	})
+}
+
+// A check that passes exits 0. Its EXIT trap stops the port-forward after do_check has
+// returned, so the pid it reads must not be a local (set -u would fail on it, turning
+// a pass into exit 1 and leaving the port-forward running).
+func TestCheckExitsZeroWhenItPasses(t *testing.T) {
+	c, _ := install(t)
+	bin := t.TempDir()
+	// The gateway answers callers without a run credential with 401.
+	curl := "#!/usr/bin/env bash\ncase \"$*\" in *http_code*) printf 401 ;; esac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(bin, "curl"), []byte(curl), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err, out := c.run("check", "PATH="+bin+":"+c.shims+":"+os.Getenv("PATH"))
+	if err != nil || !strings.Contains(out, "OK:") {
+		t.Fatalf("check = %v, want exit 0 after OK:\n%s", err, out)
+	}
+	if strings.Contains(out, "unbound variable") || strings.Contains(out, "Terminated") {
+		t.Fatalf("the EXIT trap failed or was noisy:\n%s", out)
+	}
+	// The port-forward the check started is stopped, not just the shell around it.
+	b, err := os.ReadFile(filepath.Join(c.state, "port-forward.pid"))
+	if err != nil {
+		t.Fatalf("the check started no port-forward: %v", err)
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	deadline := time.Now().Add(3 * time.Second)
+	for syscall.Kill(pid, 0) == nil {
+		if time.Now().After(deadline) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			t.Fatalf("the port-forward (pid %d) was still running after the check exited", pid)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
