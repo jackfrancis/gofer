@@ -99,6 +99,22 @@ type responsesOutput struct {
 	Arguments string `json:"arguments"`
 }
 
+// jsonModeReminder is the input message responsesChat adds to a json_object request
+// whose input messages never mention JSON.
+const jsonModeReminder = "Respond with a JSON object only."
+
+// inputMentionsJSON reports whether any input message (not a tool call or tool
+// output) contains the word "json" in any case, which the Responses API requires of
+// a json_object request.
+func inputMentionsJSON(items []responsesItem) bool {
+	for _, it := range items {
+		if it.Role != "" && strings.Contains(strings.ToLower(it.Content), "json") {
+			return true
+		}
+	}
+	return false
+}
+
 // responsesChat translates gofer's neutral chatRequest into an OpenAI Responses
 // request, posts it, and parses the reply back into the same chatMessage the
 // chat-completions path returns — so the ranker and the converser's tool loop are
@@ -135,6 +151,13 @@ func responsesChat(ctx context.Context, httpClient *http.Client, endpoint, token
 	}
 	if body.ResponseFormat != nil && body.ResponseFormat.Type != "" {
 		rr.Text = &responsesText{Format: responsesFormat{Type: body.ResponseFormat.Type}}
+		// The Responses API refuses json_object mode (HTTP 400) unless an INPUT message
+		// mentions JSON; the instructions do not count. Callers say "JSON" in their
+		// system prompt, which this translation moved into instructions, so add the
+		// word back as a closing input message when no input message carries it.
+		if body.ResponseFormat.Type == "json_object" && !inputMentionsJSON(rr.Input) {
+			rr.Input = append(rr.Input, responsesItem{Role: "user", Content: jsonModeReminder})
+		}
 	}
 
 	reqBody, err := json.Marshal(rr)

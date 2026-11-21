@@ -6,7 +6,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
 func TestIsResponsesEndpoint(t *testing.T) {
@@ -109,5 +112,137 @@ func TestResponsesChatError(t *testing.T) {
 	_, err := responsesChat(context.Background(), srv.Client(), srv.URL+"/v1/responses", "tok", chatRequest{Model: "x", Messages: []chatMessage{{Role: "user", Content: "hi"}}})
 	if err == nil {
 		t.Fatal("expected an error on a 400 response")
+	}
+}
+
+// openAIResponsesStub mimics the OpenAI Responses API's json_object rule: a request
+// whose text.format is json_object is refused with 400 unless an input message (the
+// instructions do not count) contains "json". Otherwise it answers with reply as the
+// output text. Each decoded request is sent on got, when non-nil.
+func openAIResponsesStub(t *testing.T, reply string, got chan<- responsesRequest) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req responsesRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if got != nil {
+			got <- req
+		}
+		if req.Text != nil && req.Text.Format.Type == "json_object" {
+			mentioned := false
+			for _, it := range req.Input {
+				if it.Role != "" && strings.Contains(strings.ToLower(it.Content), "json") {
+					mentioned = true
+				}
+			}
+			if !mentioned {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `{"error":{"message":"Response input messages must contain the word 'json' in some form to use 'text.format' of type 'json_object'."}}`)
+				return
+			}
+		}
+		out, _ := json.Marshal(map[string]any{"output": []any{map[string]any{
+			"type": "message", "role": "assistant",
+			"content": []any{map[string]any{"type": "output_text", "text": reply}},
+		}}})
+		_, _ = w.Write(out)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A json_object request whose only mention of JSON is in the system prompt (moved to
+// instructions) gets an input message that says JSON; the instructions and the
+// caller's own messages are unchanged.
+func TestResponsesJSONModeInputMentionsJSON(t *testing.T) {
+	got := make(chan responsesRequest, 1)
+	srv := openAIResponsesStub(t, `{}`, got)
+
+	_, err := responsesChat(context.Background(), srv.Client(), srv.URL+"/v1/responses", "tok", chatRequest{
+		Model: "m",
+		Messages: []chatMessage{
+			{Role: "system", Content: "Respond with ONLY a JSON object."},
+			{Role: "user", Content: "Return the four multipliers."},
+		},
+		ResponseFormat: &responseFormat{Type: "json_object"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := <-got
+	if req.Text == nil || req.Text.Format.Type != "json_object" {
+		t.Fatalf("text.format = %+v, want json_object", req.Text)
+	}
+	if req.Instructions != "Respond with ONLY a JSON object." {
+		t.Errorf("instructions = %q", req.Instructions)
+	}
+	if !inputMentionsJSON(req.Input) {
+		t.Fatalf("no input message mentions json: %+v", req.Input)
+	}
+	if len(req.Input) != 2 || req.Input[0].Content != "Return the four multipliers." || req.Input[1].Role != "user" {
+		t.Errorf("input = %+v, want the user message then the JSON reminder", req.Input)
+	}
+}
+
+// The reminder is added only when needed: not when an input message already says
+// JSON, and never outside json_object mode.
+func TestResponsesJSONReminderOnlyWhenNeeded(t *testing.T) {
+	cases := []struct {
+		name   string
+		user   string
+		format *responseFormat
+		want   int // input items
+	}{
+		{"input already says json", "Reply in Json, please.", &responseFormat{Type: "json_object"}, 1},
+		{"text format", "hello", &responseFormat{Type: "text"}, 1},
+		{"no format", "hello", nil, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make(chan responsesRequest, 1)
+			srv := openAIResponsesStub(t, `{}`, got)
+			_, err := responsesChat(context.Background(), srv.Client(), srv.URL+"/v1/responses", "tok", chatRequest{
+				Model:          "m",
+				Messages:       []chatMessage{{Role: "system", Content: "JSON only"}, {Role: "user", Content: tc.user}},
+				ResponseFormat: tc.format,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if req := <-got; len(req.Input) != tc.want {
+				t.Errorf("input = %+v, want %d item(s)", req.Input, tc.want)
+			}
+		})
+	}
+}
+
+// Research over a Responses endpoint: the request passes the API's json_object rule
+// and the reply parses into the adjustment.
+func TestResearchOverResponses(t *testing.T) {
+	srv := openAIResponsesStub(t, `{"relevance":1.5,"urgency":0.5,"rationale":"x"}`, nil)
+	r := NewResearchRanker(Config{Endpoint: srv.URL + "/v1/responses", Model: "m", Token: "t", Client: srv.Client()})
+	adj, err := r.Research(context.Background(), worklist.WorkItem{
+		Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adj.Relevance != 1.5 || adj.Urgency != 0.5 || adj.Impact != 1 || adj.Engagement != 1 || adj.Rationale != "x" {
+		t.Fatalf("adjustment = %+v", adj)
+	}
+}
+
+// Ranking over a Responses endpoint has the same exposure (its JSON instruction is
+// in the system prompt too) and the same fix.
+func TestRankerOverResponses(t *testing.T) {
+	srv := openAIResponsesStub(t, `{"relevance":0.9,"impact":0.4,"engagement":0.2,"urgency":0.7,"confidence":0.8,"rationale":"y"}`, nil)
+	r := NewRanker(Config{Endpoint: srv.URL + "/v1/responses", Model: "m", Token: "t", Client: srv.Client()})
+	p, err := r.Propose(context.Background(), worklist.WorkItem{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Relevance != 0.9 || p.Urgency != 0.7 || p.Confidence != 0.8 || p.Rationale != "y" {
+		t.Fatalf("proposal = %+v", p)
 	}
 }
