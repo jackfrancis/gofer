@@ -443,8 +443,13 @@ Wired on the web-tier side; they define what a runtime must respect:
   `hack/model-gateway/model-gateway.sh` (fake-kubectl tests beside it): check and read
   back every write, remove gofer's `AI_TOKEN` only after the gateway holds the key and
   gofer's config points at it, restore the saved `AI_CONNECTIONS_BEFORE_GATEWAY`
-  verbatim on rollback, and never write a key from `make deploy`. `/agent/*` gets no
-  CORS handling: a 204 from `/agent/model-access` authorizes a model call.
+  verbatim on rollback (and keep it until the rollback finishes, so a partial down can
+  be re-run), and never write a key from `make deploy`. `make deploy` sets
+  gofer-config's `AI_CONNECTIONS` in the rendered base (`model-gateway.sh render`)
+  rather than patching after the apply; behind the gateway that value comes from the
+  saved provider connections. A failed read is never "absent", and the key never
+  appears in a process's arguments. `/agent/*` gets no CORS handling: a 204 from
+  `/agent/model-access` authorizes a model call.
 - `go test` binds httptest sockets; run it outside a restrictive sandbox.
 
 ## Build / test / run

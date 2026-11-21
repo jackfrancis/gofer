@@ -437,14 +437,20 @@ deploy-apply:
 	@# With the model gateway installed, refuse before applying anything if gofer would
 	@# get AI_TOKEN beside it.
 	@$(MODEL_GATEWAY_SH) preflight $(KUBECTL)
-	$(KUBECTL) kustomize deploy/k8s/base | sed 's|image: localhost/gofer:dev$$|image: $(IMAGE)|' | $(KUBECTL) apply -f -
-	@[ -z "$$AI_CONNECTIONS" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$$AI_CONNECTIONS" '{data:{AI_CONNECTIONS:$$v}}')"
+	@# gofer-config's AI_CONNECTIONS is set in the rendered base, so one apply writes the
+	@# final config: the AI_CONNECTIONS override if given, and with the model gateway
+	@# installed, the gateway endpoints built from the saved provider connections
+	@# (hack/model-gateway/model-gateway.sh render). A failed render applies nothing.
+	@mkdir -p build
+	$(KUBECTL) kustomize deploy/k8s/base >build/base.yaml
+	sed 's|image: localhost/gofer:dev$$|image: $(IMAGE)|' build/base.yaml | $(MODEL_GATEWAY_SH) render $(KUBECTL) >build/base.rendered.yaml
+	$(KUBECTL) apply -f build/base.rendered.yaml
 	@[ -z "$(BASE_URL)" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$(BASE_URL)" '{data:{BASE_URL:$$v}}')"
 	@[ -z "$(ALLOWED_GITHUB_LOGINS)" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$(ALLOWED_GITHUB_LOGINS)" '{data:{ALLOWED_GITHUB_LOGINS:$$v}}')"
 	@[ "$(PUBLIC_SERVICE)" != true ] || $(MAKE) --no-print-directory deploy-public
 	@[ -z "$(TLS_HOST)" ] || $(MAKE) --no-print-directory deploy-tls
-	@# The base config just re-applied names the provider again. If the model gateway is
-	@# installed, point gofer back at it (routing only: a deploy never writes a key).
+	@# With the model gateway installed, confirm gofer-config routes every connection
+	@# through it before gofer restarts (a deploy never writes a key).
 	@$(MODEL_GATEWAY_SH) sync $(KUBECTL)
 	sed 's|image: localhost/gofer-runtime:dev$$|image: $(RUNTIME_IMAGE)|' deploy/k8s/overlays/dev/agentapp.yaml | $(KUBECTL) apply -f -
 	@# Point the AgentApp at the well-known class name the admin published on the AEI side

@@ -91,12 +91,24 @@ key or of the provider endpoints:
   2. In one patch, restore the saved `AI_CONNECTIONS` *verbatim* and drop
      `AI_GATEWAY_URL`. The provider is never rebuilt from the current invocation's
      settings.
-  3. Restart gofer, and only then delete the gateway.
-- **`make deploy`:** it re-applies the base config. When the gateway is installed, it
-  points that config back at the gateway, and it never writes a key, even with
-  `AI_TOKEN` in the shell. It refuses up front if `gofer-secrets` holds `AI_TOKEN`
-  beside the gateway, and `dev-up` stops writing `AI_TOKEN` there once the gateway is
-  installed. Rotating the key is `make model-gateway-apply AI_TOKEN=...`.
+  3. Restart gofer, then delete the gateway.
+  4. Only then forget the saved copy.
+
+  Each step is skipped when it is already done. A down that stops part-way can simply
+  be re-run, and a deploy in that state says so.
+- **`make deploy`:** the shipped base names GitHub Copilot, so re-applying it as-is
+  would break a custom-provider gateway. Instead, the script sets gofer-config's
+  `AI_CONNECTIONS` in the rendered base before the one apply. It builds the gateway
+  endpoints from the saved provider connections, or from an `AI_CONNECTIONS` override,
+  which then becomes the saved copy. It sets `AI_GATEWAY_URL` the same way. A render
+  that cannot do this applies nothing. After the apply, gofer restarts only once the
+  live endpoints, the saved copy and the gateway URL all match what was intended.
+  - A deploy never writes a key, even with `AI_TOKEN` in the shell.
+  - It refuses up front if `gofer-secrets` holds `AI_TOKEN` beside the gateway.
+  - `dev-up` stops writing `AI_TOKEN` there once the gateway is installed.
+  - Rotating the key is `make model-gateway-apply AI_TOKEN=...`.
+- **Reads and the key:** a failed read stops the script; it is never taken to mean
+  "absent". The key reaches jq on stdin and kubectl in a file, never a command line.
 
 `hack/model-gateway`'s tests drive the script against a stateful fake kubectl. They
 cover every refused or silently ignored write on both paths, and the order of the
