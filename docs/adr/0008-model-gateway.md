@@ -124,7 +124,11 @@ key or of the provider endpoints:
   A differential test checks the two agree on a corpus of cases. It applies wherever
   gofer will have the model on: behind the gateway, on rollback, and on a deploy with
   `AI_TOKEN` set. With the model off, gofer ignores `AI_CONNECTIONS`, so a deploy
-  accepts any value, `[]` included. Behind the gateway, each endpoint
+  accepts any value, `[]` included. Routing reads each connection's endpoint the same
+  way gofer does: the last case-insensitive match, trimmed. It writes connections with
+  exactly one `endpoint` and one `models`, so no other spelling can leave a provider
+  URL for gofer to read. Each routed config is checked by gofer's own gateway rule
+  before it is written. Behind the gateway, each endpoint
   must be exactly the upstream URL, origin and base path, followed by
   `/chat/completions` or `/responses`. Those are the only places the gateway forwards
   to, so another path on the same host would silently reach a different backend.

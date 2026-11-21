@@ -1009,3 +1009,56 @@ func TestValidatorMatchesLoadConnections(t *testing.T) {
 		}
 	}
 }
+
+// Routing reads each connection's endpoint the way gofer does (case-insensitive field
+// names, the last match winning, trimmed) and writes connections with exactly one
+// endpoint field, so gofer reads the gateway URL the script wrote. The original JSON is
+// what rollback restores.
+func TestRoutingUsesTheEndpointGoferReads(t *testing.T) {
+	base := shippedBases(t)["configmap.yaml"]
+	for name, tc := range map[string]struct{ conns, want string }{
+		"capitalized field names": {
+			`[{"Endpoint":"https://models.example/v1/chat/completions","MODELS":["a"]}]`, gw + "/v1/chat/completions"},
+		"endpoint then Endpoint, same URL": {
+			`[{"endpoint":"https://models.example/v1/responses","Endpoint":"https://models.example/v1/responses","models":["a"]}]`, gw + "/v1/responses"},
+		"endpoint then Endpoint, the later wins": {
+			`[{"endpoint":"https://models.example/v1/responses","Endpoint":"https://models.example/v1/chat/completions","models":["a"]}]`, gw + "/v1/chat/completions"},
+		"padded endpoint": {
+			`[{"endpoint":"  https://models.example/v1/responses  ","models":["a"]}]`, gw + "/v1/responses"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			check := func(c *cluster, what string) {
+				t.Helper()
+				conns := c.goferStarts()
+				if len(conns) != 1 || !conns[0].Gateway || conns[0].Endpoint != tc.want {
+					t.Fatalf("after %s gofer reads %+v, want endpoint %s", what, conns, tc.want)
+				}
+				if got := c.config()["AI_CONNECTIONS_BEFORE_GATEWAY"]; got != tc.conns {
+					t.Fatalf("after %s the saved connections are %s, want the original verbatim", what, got)
+				}
+			}
+			c := newCluster(t, tc.conns, webKey)
+			if err, out := c.run("apply", "MODEL_GATEWAY_UPSTREAM="+customUp); err != nil {
+				t.Fatalf("apply: %v\n%s", err, out)
+			}
+			check(c, "apply")
+			if err, out := c.deploy(base); err != nil {
+				t.Fatalf("deploy: %v\n%s", err, out)
+			}
+			check(c, "deploy")
+			if err, out := c.run("down"); err != nil {
+				t.Fatalf("down: %v\n%s", err, out)
+			}
+			if got := c.config()["AI_CONNECTIONS"]; got != tc.conns {
+				t.Fatalf("down restored %s, want the original %s", got, tc.conns)
+			}
+
+			// The same connections given as a deploy override behind the gateway.
+			d, _ := install(t)
+			if err, out := d.deploy(base, "AI_CONNECTIONS="+tc.conns); err != nil {
+				t.Fatalf("deploy with override: %v\n%s", err, out)
+			}
+			check(d, "a deploy with them as the override")
+		})
+	}
+}

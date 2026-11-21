@@ -92,14 +92,24 @@ patch_config() {
         fail "ConfigMap $ns/gofer-config does not hold what was just written ($2); nothing after this step ran."
 }
 
-# origin of a URL, lowercased: scheme://host[:port].
-jq_origin='def origin: (capture("^(?<o>[A-Za-z][A-Za-z0-9+.-]*://[^/]+)").o // "") | ascii_downcase;'
+# jq_lib: definitions shared by every jq program here.
+#   field(n)   a connection's value for field n as gofer reads it: names match
+#              case-insensitively and the last match wins, as encoding/json does.
+#   endpoint   a connection's effective endpoint (field "endpoint", trimmed, as gofer
+#              trims it). Every check and rewrite reads the endpoint through this, so
+#              the script routes exactly the endpoint gofer will use.
+#   origin     a URL's scheme://host[:port], lowercased.
+jq_lib='def trim: gsub("^\\s+|\\s+$"; "");
+def field($n): [to_entries[] | select(.key | ascii_downcase == $n) | .value] | last;
+def endpoint: ((if type == "object" then field("endpoint") else null end) // "") | if type == "string" then trim else "" end;
+def origin: (capture("^(?<o>[A-Za-z][A-Za-z0-9+.-]*://[^/]+)").o // "") | ascii_downcase;
+'
 
 # form JSON prints "gateway" when every endpoint is on the gateway, "provider" when
 # none is, and fails on a mix or a malformed list.
 form() {
-    jq -re --arg gw "$gw_url" "$jq_origin"'
-        ($gw | origin) as $g | [.[].endpoint | origin == $g] as $on |
+    jq -re --arg gw "$gw_url" "$jq_lib"'
+        ($gw | origin) as $g | [.[] | endpoint | origin == $g] as $on |
         if type != "array" or length == 0 then error("not a non-empty list of connections")
         elif ($on | all) then "gateway" elif ($on | any) then error("it mixes gateway and provider endpoints")
         else "provider" end' <<<"$1" 2>/dev/null || fail "AI_CONNECTIONS is not usable here: $1"
@@ -114,9 +124,7 @@ form() {
 #   - field names match case-insensitively, the last match winning, as encoding/json;
 #   - endpoint a string or null; models a list or null of strings or nulls;
 #   - endpoint non-blank, and at least one non-blank model.
-jq_valid='def trim: gsub("^\\s+|\\s+$"; "");
-def field($n): [to_entries[] | select(.key | ascii_downcase == $n) | .value] | last;
-def valid:
+jq_valid=$jq_lib'def valid:
     if length != 1 then error("AI_CONNECTIONS is not one JSON value") else .[0] end |
     if type == "null" then [] elif type != "array" then error("AI_CONNECTIONS is not a list of {endpoint, models}") else . end |
     if length == 0 then error("AI_CONNECTIONS has no connections") else . end |
@@ -138,23 +146,43 @@ validate() {
 }
 
 # rewrite PROVIDER prints the gateway form of a provider AI_CONNECTIONS (compact
-# JSON), or fails. Each endpoint must be exactly the upstream (origin and base path)
-# plus an API the gateway serves, /chat/completions or /responses: that is the only
-# place the gateway forwards to, so anything else would silently reach a different
-# backend.
+# JSON), or fails. Each connection is first normalized to exactly the two fields gofer
+# reads, {endpoint, models}, with their effective values, so no other spelling of
+# "endpoint" can survive to name the provider. Each endpoint must be exactly the
+# upstream (origin and base path) plus an API the gateway serves, /chat/completions or
+# /responses: that is the only place the gateway forwards to, so anything else would
+# silently reach a different backend. The result is checked by gofer's gateway rule
+# before it is printed.
 rewrite() {
+    local new
     validate "$1"
-    jq -ce --arg gw "$gw_url" --arg up "$upstream" '
+    new=$(jq -ce --arg gw "$gw_url" --arg up "$upstream" "$jq_lib"'
         def split_url: capture("^(?<o>[A-Za-z][A-Za-z0-9+.-]*://[^/?#]+)(?<p>[^?#]*)$") // error("\(.) is not a URL with no query") |
             {o: (.o | ascii_downcase), p: (.p | sub("/+$"; ""))};
         ($up | split_url) as $u |
+        map({endpoint: endpoint, models: field("models")}) |
         map(.endpoint |= (
             (split_url) as $e |
             if $e.o != $u.o then error("AI_CONNECTIONS endpoint \(.) is not on the gateway upstream \($up)")
             elif $e.p == $u.p + "/chat/completions" then $gw + "/v1/chat/completions"
             elif $e.p == $u.p + "/responses" then $gw + "/v1/responses"
             else error("AI_CONNECTIONS endpoint \(.) is not \($up)/chat/completions or \($up)/responses, the only places the gateway forwards to") end))' \
-        <<<"$1" || fail "could not route AI_CONNECTIONS through the gateway (above); nothing was changed."
+        <<<"$1") || fail "could not route AI_CONNECTIONS through the gateway (above); nothing was changed."
+    check_routed "$new"
+    printf '%s' "$new"
+}
+
+# check_routed CONNS fails unless gofer, with AI_GATEWAY_URL set to the gateway, would
+# start with CONNS (config.LoadConnections): valid, and every effective endpoint an
+# http(s) URL without userinfo on the gateway's origin. It runs on every routed config
+# before it is written, and on the live config before gofer restarts.
+check_routed() {
+    validate "$1"
+    jq -e --arg gw "$gw_url" "$jq_lib"'
+        def gorigin: (capture("^(?<s>[Hh][Tt][Tt][Pp][Ss]?)://(?<h>[^/?#]+)") // null) |
+            if . == null or (.h | contains("@")) then null else (.s + "://" + .h | ascii_downcase) end;
+        ($gw | gorigin) as $g | $g != null and all(.[]; (endpoint | gorigin) == $g)' <<<"$1" >/dev/null ||
+        fail "AI_CONNECTIONS does not route every connection through the gateway ($gw_url), so gofer would refuse to start; nothing was changed: $1"
 }
 
 # resolve_upstream sets upstream: the provider the installed gateway fronts, else
@@ -450,8 +478,7 @@ do_check() {
         fail "the gateway is not running (make model-gateway-apply)."
     cfg=$(config_get)
     [[ $(config_value "$cfg" AI_GATEWAY_URL) == "$gw_url" ]] || fail "gofer-config AI_GATEWAY_URL is not $gw_url."
-    jq -e --arg gw "$gw_url" '.data.AI_CONNECTIONS | fromjson | length > 0 and all(.[]; .endpoint | startswith($gw + "/"))' <<<"$cfg" >/dev/null ||
-        fail "an AI_CONNECTIONS endpoint is not on the gateway."
+    check_routed "$(config_value "$cfg" AI_CONNECTIONS)"
     [[ -n $(config_value "$cfg" "$saved_key") ]] || fail "gofer-config has no saved $saved_key, so model-gateway-down could not restore the provider endpoints."
     v=$(secret_get gofer-secrets AI_TOKEN)
     [[ -z $v ]] || fail "gofer-secrets still holds AI_TOKEN."
