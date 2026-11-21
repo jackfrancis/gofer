@@ -502,7 +502,9 @@ do_sync() {
 }
 
 do_check() {
-    local port=${MODEL_GATEWAY_LOCAL_PORT:-18480} cfg pf code auth v
+    # The port-forward's pid is global: the EXIT trap that stops it runs after this
+    # function has returned, when a local would be gone (and set -u would fail on it).
+    local port=${MODEL_GATEWAY_LOCAL_PORT:-18480} cfg code auth v
     kube -n "$ns" rollout status deployment/gofer-model-gateway --timeout=10s >/dev/null ||
         fail "the gateway is not running (make model-gateway-apply)."
     cfg=$(config_get)
@@ -516,10 +518,26 @@ do_check() {
         fail "gofer-secrets' last-applied configuration (kubectl.kubernetes.io/last-applied-configuration) still holds AI_TOKEN; re-run make model-gateway-apply, and remove it from the manifest you apply gofer-secrets from."
     v=$(secret_get gofer-model-gateway AI_TOKEN)
     [[ -n $v ]] || fail "the gateway has no upstream key."
-    kube -n "$ns" port-forward svc/gofer-model-gateway "$port:80" >/dev/null 2>&1 &
-    pf=$!
-    trap 'kill $pf 2>/dev/null; rm -rf "$tmp"' EXIT
-    for _ in 1 2 3 4 5 6 7 8 9 10; do curl -s -o /dev/null "http://127.0.0.1:$port/" && break; sleep 1; done
+    # kubectl itself, not the kube function: backgrounding a function forks a subshell,
+    # and $! would be the subshell's pid, so the trap would leave kubectl running.
+    "${kubectl[@]}" -n "$ns" port-forward svc/gofer-model-gateway "$port:80" >"$tmp/port-forward.log" 2>&1 &
+    port_forward_pid=$!
+    disown "$port_forward_pid" # no "Terminated" notice when the trap stops it
+    # Stopping it must not fail the check: under set -e a failed kill (the
+    # port-forward already gone) would end the script with 1 after it passed.
+    trap 'if [[ -n ${port_forward_pid:-} ]]; then kill "$port_forward_pid" 2>/dev/null || true; fi; rm -rf "$tmp"' EXIT
+    # Probe only once THIS kubectl says it is listening on 127.0.0.1:$port. If it cannot
+    # bind (a stale forward, maybe to another cluster, already holds the port), the
+    # probes would reach whatever holds it and could pass against the wrong gateway.
+    local tries=0
+    until grep -q "^Forwarding from 127\.0\.0\.1:$port " "$tmp/port-forward.log" 2>/dev/null; do
+        if ! kill -0 "$port_forward_pid" 2>/dev/null; then
+            fail "kubectl port-forward exited before listening on 127.0.0.1:$port (is the port in use?): $(cat "$tmp/port-forward.log" 2>/dev/null)"
+        fi
+        tries=$((tries + 1))
+        [[ $tries -lt 100 ]] || fail "kubectl port-forward was not listening on 127.0.0.1:$port after 10s: $(cat "$tmp/port-forward.log" 2>/dev/null)"
+        sleep 0.1
+    done
     for auth in "" "Authorization: Bearer forged.credential"; do
         code=$(curl -s -o /dev/null -w '%{http_code}' -H "Content-Type: application/json" ${auth:+-H "$auth"} \
             -d '{"model":"any","messages":[{"role":"user","content":"hi"}]}' "http://127.0.0.1:$port/v1/chat/completions")

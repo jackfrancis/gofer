@@ -119,6 +119,23 @@ case "$1 $2" in
 	mv "$S/cm.new" "$S/configmap.json" ;;
 "delete --ignore-not-found") rm -f "$S/deployment" ;;
 "kustomize deploy/k8s/base") cat "$MOCK_BASE" ;;
+"port-forward svc/gofer-model-gateway")
+	# MOCK_PF=fail: cannot bind (another process holds the port), as kubectl reports it.
+	# MOCK_PF=exit-after-probes: exits once the check's last probe has been answered,
+	# so the check's cleanup finds it gone.
+	port=${3%%:*}
+	if [ "${MOCK_PF:-}" = fail ]; then
+		echo "error: unable to listen on any of the requested ports: [{$port 4000}]" >&2
+		exit 1
+	fi
+	echo $$ >"$S/port-forward.pid.new" && mv "$S/port-forward.pid.new" "$S/port-forward.pid"
+	echo "Forwarding from 127.0.0.1:$port -> 4000"
+	echo "Forwarding from [::1]:$port -> 4000"
+	if [ "${MOCK_PF:-}" = exit-after-probes ]; then
+		while [ ! -f "$S/probes-done" ]; do sleep 0.02; done
+		exit 0
+	fi
+	exec sleep 60 ;;
 "kustomize deploy/k8s/model-gateway")
 	printf 'kind: Deployment\nmetadata:\n  annotations:\n    gofer/model-gateway-upstream: "@UPSTREAM@"\n' ;;
 esac
