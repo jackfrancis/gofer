@@ -394,12 +394,17 @@ dev-secrets:
 	@# VERIFIES, with AEI's PUBLIC key. Provide it via MINT_PUBLIC_KEY, or let dev-up read
 	@# AEI's published key from the cluster (both share one kind cluster in dev). gofer
 	@# feeds AEI nothing secret.
+	@# With the model gateway installed the key is the gateway's alone, so AI_TOKEN from
+	@# the shell goes into gofer-secrets only once the gateway is confirmed absent. One
+	@# checked lookup, before any write: a failed read stops here, never reads as absent.
 	@mpk="$${MINT_PUBLIC_KEY:-$$($(KUBECTL) -n aei-system get secret aei-signing -o jsonpath='{.data.AEI_ED25519_PUBLIC_KEY}' 2>/dev/null | base64 -d)}"; \
 		test -n "$$mpk" || { \
 			echo "ERROR: no AEI run-credential verify key found. On the AEI side run 'make authority'"; \
 			echo "       (provisions the platform keypair), then 'make public-key', and re-run this with"; \
 			echo "       MINT_PUBLIC_KEY=<that key>."; \
 			exit 1; }; \
+		gateway=$$($(MODEL_GATEWAY_SH) gateway-installed $(KUBECTL)) || exit 1; \
+		token=; [ "$$gateway" != no ] || token="$${AI_TOKEN:-}"; \
 		$(KUBECTL) -n $(KUBE_NS) get secret gofer-secrets >/dev/null 2>&1 || \
 			$(KUBECTL) -n $(KUBE_NS) create secret generic gofer-secrets \
 				--from-literal=SESSION_SECRET="$$(openssl rand -base64 48)" \
@@ -407,18 +412,16 @@ dev-secrets:
 				--from-literal=MINT_PUBLIC_KEY="$$mpk" \
 				--from-literal=GITHUB_CLIENT_ID="$${GITHUB_CLIENT_ID:-}" \
 				--from-literal=GITHUB_CLIENT_SECRET="$${GITHUB_CLIENT_SECRET:-}" \
-				--from-literal=AI_TOKEN="$${AI_TOKEN:-}"; \
+				--from-literal=AI_TOKEN="$$token"; \
 		$(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge \
-			-p "{\"stringData\":{\"MINT_PUBLIC_KEY\":\"$$mpk\"}}"
+			-p "{\"stringData\":{\"MINT_PUBLIC_KEY\":\"$$mpk\"}}"; \
+		if [ -n "$$AI_TOKEN" ] && [ "$$gateway" != no ]; then \
+			echo "AI_TOKEN not written to gofer-secrets: the model gateway holds the key (make model-gateway-apply AI_TOKEN=... rotates it)."; \
+		elif [ -n "$$token" ]; then \
+			$(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"AI_TOKEN\":\"$$token\"}}"; \
+		fi
 	@[ -z "$$GITHUB_CLIENT_ID" ] || $(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"GITHUB_CLIENT_ID\":\"$$GITHUB_CLIENT_ID\"}}"
 	@[ -z "$$GITHUB_CLIENT_SECRET" ] || $(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"GITHUB_CLIENT_SECRET\":\"$$GITHUB_CLIENT_SECRET\"}}"
-	@# With the model gateway installed the key is the gateway's alone: AI_TOKEN in the
-	@# shell is not written to gofer-secrets (rotate it with make model-gateway-apply).
-	@if [ -n "$$AI_TOKEN" ]; then \
-		if $(KUBECTL) -n $(KUBE_NS) get deployment gofer-model-gateway >/dev/null 2>&1; then \
-			echo "AI_TOKEN not written to gofer-secrets: the model gateway holds the key (make model-gateway-apply AI_TOKEN=... rotates it)."; \
-		else $(KUBECTL) -n $(KUBE_NS) patch secret gofer-secrets --type=merge -p "{\"stringData\":{\"AI_TOKEN\":\"$$AI_TOKEN\"}}"; fi; \
-	fi
 	@# A gofer-secrets created before persistent storage has no token-encryption key.
 	@# Add one if it is missing; never replace an existing key (it seals stored tokens).
 	@$(KUBECTL) -n $(KUBE_NS) get secret gofer-secrets -o jsonpath='{.data.VAULT_ENCRYPTION_KEY}' | grep -q . || \
@@ -439,12 +442,10 @@ deploy-apply:
 	@$(MODEL_GATEWAY_SH) preflight $(KUBECTL)
 	@# gofer-config's AI_CONNECTIONS is set in the rendered base, so one apply writes the
 	@# final config: the AI_CONNECTIONS override if given, and with the model gateway
-	@# installed, the gateway endpoints built from the saved provider connections
-	@# (hack/model-gateway/model-gateway.sh render). A failed render applies nothing.
-	@mkdir -p build
-	$(KUBECTL) kustomize deploy/k8s/base >build/base.yaml
-	sed 's|image: localhost/gofer:dev$$|image: $(IMAGE)|' build/base.yaml | $(MODEL_GATEWAY_SH) render $(KUBECTL) >build/base.rendered.yaml
-	$(KUBECTL) apply -f build/base.rendered.yaml
+	@# installed, the gateway endpoints built from the saved provider connections. The
+	@# script renders and applies from its own temporary directory, so concurrent
+	@# deploys never share files, and a failed render applies nothing.
+	IMAGE="$(IMAGE)" $(MODEL_GATEWAY_SH) apply-base $(KUBECTL)
 	@[ -z "$(BASE_URL)" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$(BASE_URL)" '{data:{BASE_URL:$$v}}')"
 	@[ -z "$(ALLOWED_GITHUB_LOGINS)" ] || $(KUBECTL) -n $(KUBE_NS) patch configmap gofer-config --type=merge -p "$$(jq -nc --arg v "$(ALLOWED_GITHUB_LOGINS)" '{data:{ALLOWED_GITHUB_LOGINS:$$v}}')"
 	@[ "$(PUBLIC_SERVICE)" != true ] || $(MAKE) --no-print-directory deploy-public

@@ -447,8 +447,11 @@ Wired on the web-tier side; they define what a runtime must respect:
   be re-run), and never write a key from `make deploy`. `make deploy` sets
   gofer-config's `AI_CONNECTIONS` in the rendered base (`model-gateway.sh render`)
   rather than patching after the apply; behind the gateway that value comes from the
-  saved provider connections. A failed read is never "absent", and the key never
-  appears in a process's arguments. `/agent/*` gets no CORS handling: a 204 from
+  saved provider connections, in the script's own temp directory (`apply-base`). A
+  failed read is never "absent" (dev-secrets included), the key never appears in a
+  process's arguments, gofer-secrets' key is removed by a test-and-remove JSON Patch,
+  and no AI_CONNECTIONS is written that gofer's `LoadConnections` would refuse or
+  whose endpoint is not exactly the upstream plus `/chat/completions` or `/responses`. `/agent/*` gets no CORS handling: a 204 from
   `/agent/model-access` authorizes a model call.
 - `go test` binds httptest sockets; run it outside a restrictive sandbox.
 

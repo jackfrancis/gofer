@@ -80,7 +80,9 @@ key or of the provider endpoints:
   3. Point gofer at it: rewrite `AI_CONNECTIONS` to the gateway's paths, set
      `AI_GATEWAY_URL`, and save the original `AI_CONNECTIONS` once, as
      `AI_CONNECTIONS_BEFORE_GATEWAY`.
-  4. Only then remove `AI_TOKEN` from `gofer-secrets`, and restart gofer.
+  4. Only then remove `AI_TOKEN` from `gofer-secrets`, and restart gofer. The removal
+     is one JSON Patch that tests the value read at the start and removes it. If
+     someone rotated the key meanwhile, the patch is refused and the new key stays.
 
   A failure at any step leaves gofer's key and pod as they were. The upstream is
   recorded on the gateway Deployment, and later runs reuse it. Asking an installed
@@ -108,7 +110,19 @@ key or of the provider endpoints:
   - `dev-up` stops writing `AI_TOKEN` there once the gateway is installed.
   - Rotating the key is `make model-gateway-apply AI_TOKEN=...`.
 - **Reads and the key:** a failed read stops the script; it is never taken to mean
-  "absent". The key reaches jq on stdin and kubectl in a file, never a command line.
+  "absent". That includes `dev-secrets`, which looks the gateway up once, checked,
+  before it writes anything. It adds the shell's `AI_TOKEN` to `gofer-secrets` only
+  when the gateway is confirmed absent, whether it is creating the Secret or updating
+  one. The key reaches jq on stdin and kubectl in a file, never a command line.
+- **What may be written:** no AI_CONNECTIONS is written that gofer would refuse at
+  startup. Every connection needs a non-blank endpoint and at least one non-blank
+  model, the same rules as `config.LoadConnections`. Behind the gateway, each endpoint
+  must be exactly the upstream URL, origin and base path, followed by
+  `/chat/completions` or `/responses`. Those are the only places the gateway forwards
+  to, so another path on the same host would silently reach a different backend.
+- **Per-invocation files:** the deploy renders and applies the base from the script's
+  own temporary directory, so concurrent deploys from one checkout never apply each
+  other's files.
 
 `hack/model-gateway`'s tests drive the script against a stateful fake kubectl. They
 cover every refused or silently ignored write on both paths, and the order of the
@@ -118,9 +132,10 @@ writes.
 
 - Per-run vending stays the default, and nothing changes for a deployment that does
   not apply the profile.
-- One upstream origin per gateway. All connections must share the origin given as
-  `MODEL_GATEWAY_UPSTREAM`; the rewrite refuses others. A second upstream would need
-  a model entry per origin, matched by model name.
+- One upstream per gateway. Every connection must sit directly under
+  `MODEL_GATEWAY_UPSTREAM` (its origin and base path); the rewrite refuses others. A
+  second upstream, or a second deployment path on one host, would need a model entry
+  per backend, matched by model name.
 - The wildcard serves any model the upstream serves, not only those gofer lists. Only
   gofer's runs can call it, and the shared budget bounds them.
 - Every model call costs gofer one signature check (`/agent/model-access`). That is

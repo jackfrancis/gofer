@@ -23,6 +23,8 @@
 #            is already done, so a down that stopped part-way can simply be re-run.
 #   make deploy (never touches a key):
 #     preflight  refuse a deploy that would hand gofer AI_TOKEN beside the gateway.
+#     apply-base render deploy/k8s/base with IMAGE, then render and apply it from this
+#                invocation's own temporary directory.
 #     render     stdin -> stdout: the rendered base with gofer-config's AI_CONNECTIONS
 #                set to its final value (the AI_CONNECTIONS override, if given; and
 #                behind the gateway, the gateway endpoints built from the saved provider
@@ -30,9 +32,10 @@
 #     sync       after the apply: confirm gofer-config routes every connection through
 #                the gateway, before gofer restarts.
 #   check:   read-only check of a deployed profile.
+#   gateway-installed:  prints yes or no (a failed read stops it); dev-secrets uses it.
 set -euo pipefail
 
-cmd=${1:?usage: model-gateway.sh apply|down|preflight|render|sync|check kubectl [flags...]}
+cmd=${1:?usage: model-gateway.sh apply|down|preflight|render|apply-base|sync|check|gateway-installed kubectl [flags...]}
 shift
 [[ $# -gt 0 ]] || { echo "ERROR: pass kubectl and its cluster-selection flags." >&2; exit 1; }
 kubectl=("$@")
@@ -101,18 +104,43 @@ form() {
         else "provider" end' <<<"$1" 2>/dev/null || fail "AI_CONNECTIONS is not usable here: $1"
 }
 
+# jq_valid checks an AI_CONNECTIONS list by gofer's own startup rules
+# (config.LoadConnections): a non-empty array, each connection with a non-blank
+# endpoint and at least one non-blank model. A config gofer would refuse is never
+# written.
+jq_valid='def valid:
+    if type != "array" or length == 0 then error("AI_CONNECTIONS must be a non-empty list of {endpoint, models}")
+    else . end |
+    to_entries | map(.key as $i | .value |
+        if type != "object" then error("AI_CONNECTIONS[\($i)] is not an object")
+        elif ((.endpoint | type) != "string") or (.endpoint | gsub("^\\s+|\\s+$"; "") | length) == 0 then error("AI_CONNECTIONS[\($i)]: endpoint is required")
+        elif ((.models | type) != "array") or ([.models[] | select(type == "string" and (gsub("^\\s+|\\s+$"; "") | length) > 0)] | length) == 0
+            then error("AI_CONNECTIONS[\($i)] (\(.endpoint)): at least one model is required")
+        else . end) ;'
+
+# validate CONNS fails unless gofer would accept CONNS at startup.
+validate() {
+    jq -e "$jq_valid"' valid | true' <<<"$1" >/dev/null ||
+        fail "AI_CONNECTIONS would not start gofer (above); nothing was changed: $1"
+}
+
 # rewrite PROVIDER prints the gateway form of a provider AI_CONNECTIONS (compact
-# JSON), or fails: every endpoint must be on the upstream and name an API the gateway
-# serves.
+# JSON), or fails. Each endpoint must be exactly the upstream (origin and base path)
+# plus an API the gateway serves, /chat/completions or /responses: that is the only
+# place the gateway forwards to, so anything else would silently reach a different
+# backend.
 rewrite() {
-    jq -ce --arg gw "$gw_url" --arg up "$upstream" "$jq_origin"'
-        ($up | origin) as $u |
-        if type != "array" or length == 0 then error("AI_CONNECTIONS is empty") else . end |
+    validate "$1"
+    jq -ce --arg gw "$gw_url" --arg up "$upstream" '
+        def split_url: capture("^(?<o>[A-Za-z][A-Za-z0-9+.-]*://[^/?#]+)(?<p>[^?#]*)$") // error("\(.) is not a URL with no query") |
+            {o: (.o | ascii_downcase), p: (.p | sub("/+$"; ""))};
+        ($up | split_url) as $u |
         map(.endpoint |= (
-            if origin != $u then error("AI_CONNECTIONS endpoint \(.) is not on the gateway upstream \($up)")
-            elif test("/chat/completions/?$") then $gw + "/v1/chat/completions"
-            elif test("/responses/?$") then $gw + "/v1/responses"
-            else error("AI_CONNECTIONS endpoint \(.) is neither .../chat/completions nor .../responses") end))' \
+            (split_url) as $e |
+            if $e.o != $u.o then error("AI_CONNECTIONS endpoint \(.) is not on the gateway upstream \($up)")
+            elif $e.p == $u.p + "/chat/completions" then $gw + "/v1/chat/completions"
+            elif $e.p == $u.p + "/responses" then $gw + "/v1/responses"
+            else error("AI_CONNECTIONS endpoint \(.) is not \($up)/chat/completions or \($up)/responses, the only places the gateway forwards to") end))' \
         <<<"$1" || fail "could not route AI_CONNECTIONS through the gateway (above); nothing was changed."
 }
 
@@ -222,10 +250,13 @@ do_apply() {
 
     # Only now, with the key safe in the gateway and gofer's config pointing at it,
     # remove gofer's copy. The running web pod keeps its environment until restarted.
+    # The JSON Patch tests the value read at the start and removes it in one request,
+    # so a key rotated into gofer-secrets meanwhile is refused, never deleted.
     if [[ -n $web ]]; then
-        printf '%s' '[{"op":"remove","path":"/data/AI_TOKEN"}]' >"$tmp/remove-key.json"
+        printf '%s' "$web" | jq -R '[{op: "test", path: "/data/AI_TOKEN", value: .}, {op: "remove", path: "/data/AI_TOKEN"}]' \
+            >"$tmp/remove-key.json"
         kube -n "$ns" patch secret gofer-secrets --type=json --patch-file "$tmp/remove-key.json" >/dev/null ||
-            fail "could not remove AI_TOKEN from gofer-secrets; gofer was not restarted. Remove it and restart gofer."
+            fail "could not remove AI_TOKEN from gofer-secrets: it is no longer the key read at the start (rotated meanwhile?), or the write was refused. gofer was not restarted. Re-run make model-gateway-apply (with AI_TOKEN=... to install the new key)."
         web=$(secret_get gofer-secrets AI_TOKEN)
         [[ -z $web ]] || fail "gofer-secrets still holds AI_TOKEN; gofer was not restarted. Remove it and restart gofer."
         echo "model gateway: removed AI_TOKEN from gofer-secrets (the gateway holds it)"
@@ -350,6 +381,7 @@ do_render() {
     dep=$(gateway_deployment)
     if [[ -z $dep ]]; then
         if [[ -n ${AI_CONNECTIONS:-} ]]; then
+            validate "$AI_CONNECTIONS"
             yaml_set "$tmp/base.yaml" "AI_CONNECTIONS=$AI_CONNECTIONS"
         else
             cat "$tmp/base.yaml"
@@ -360,6 +392,22 @@ do_render() {
     provider=$(deploy_provider)
     new=$(rewrite "$provider")
     yaml_set "$tmp/base.yaml" "AI_CONNECTIONS=$new" "AI_GATEWAY_URL=$gw_url" "$saved_key=$provider"
+}
+
+# apply-base: make deploy's base apply. It renders deploy/k8s/base with IMAGE, sets
+# gofer-config's AI_CONNECTIONS (render), and applies the result, all in this
+# invocation's own temporary directory, so concurrent deploys never read each other's
+# files. A failed render applies nothing.
+do_apply_base() {
+    : "${IMAGE:?IMAGE must be set}"
+    kube kustomize deploy/k8s/base >"$tmp/kustomized.yaml" || fail "could not render deploy/k8s/base."
+    IMAGE=$IMAGE awk '{
+        s = "image: localhost/gofer:dev"; n = length($0) - length(s) + 1
+        if (n > 0 && substr($0, n) == s) $0 = substr($0, 1, n - 1) "image: " ENVIRON["IMAGE"]
+        print
+    }' "$tmp/kustomized.yaml" >"$tmp/imaged.yaml"
+    (do_render <"$tmp/imaged.yaml") >"$tmp/base.rendered.yaml"
+    kube apply -f "$tmp/base.rendered.yaml"
 }
 
 do_sync() {
@@ -407,6 +455,8 @@ case $cmd in
     down) do_down ;;
     preflight) do_preflight ;;
     render) do_render ;;
+    apply-base) do_apply_base ;;
+    gateway-installed) dep=$(gateway_deployment); [[ -n $dep ]] && echo yes || echo no ;;
     sync) do_sync ;;
     check) do_check ;;
     *) fail "unknown command: $cmd" ;;

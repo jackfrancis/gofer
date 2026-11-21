@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,9 +38,24 @@ matches() {
 }
 matches "${MOCK_FAIL:-}" && { echo "FAIL $call" >>"$S/calls"; echo "fake: refused" >&2; exit 1; }
 matches "${MOCK_DROP:-}" && { echo "DROP $call" >>"$S/calls"; exit 0; }
+# MOCK_ROTATE=PATTERN=B64: when a call matches PATTERN, someone rotates gofer-secrets'
+# AI_TOKEN to B64 first (a concurrent operator).
+if [ -n "${MOCK_ROTATE:-}" ] && matches "${MOCK_ROTATE%%=*}"; then
+	jq --arg v "${MOCK_ROTATE#*=}" '.AI_TOKEN = $v' "$S/secret.gofer-secrets.json" >"$S/rot.new" && mv "$S/rot.new" "$S/secret.gofer-secrets.json"
+fi
+[ "$1" = --context ] && shift 2
 [ "$1" = -n ] && shift 2
 arg_after() { local want=$1; shift; while [ $# -gt 0 ]; do [ "$1" = "$want" ] && { echo "$2"; return; }; shift; done; }
+# patch_file writes the patch from --patch-file or inline -p to $S/patch.json (by file,
+# so the fake's own jq calls never carry a key in their arguments either).
+patch_file() { local f; f=$(arg_after --patch-file "$@"); if [ -n "$f" ]; then cat "$f"; else arg_after -p "$@"; fi >"$S/patch.json"; }
+if [ "$1 $2 ${3:-}" = "apply -f -" ]; then cat >/dev/null; exit 0; fi
 case "$1 $2" in
+"create namespace") ;;
+"create secret")
+	name=$4; d='{}'; shift 4
+	for a in "$@"; do case $a in --from-literal=*) kv=${a#--from-literal=}; d=$(jq --arg k "${kv%%=*}" --arg v "${kv#*=}" '.[$k] = ($v | @base64)' <<<"$d");; esac; done
+	printf '%s' "$d" >"$S/secret.$name.json" ;;
 "get secret")
 	f="$S/secret.$3.json"
 	if [ -f "$f" ]; then jq '{data: .}' "$f"; else case "$*" in *--ignore-not-found*) ;; *) exit 1;; esac; fi ;;
@@ -53,6 +69,7 @@ case "$1 $2" in
 	if jq -e '.kind == "Secret"' "$3" >/dev/null 2>&1; then
 		jq '.data' "$3" >"$S/secret.$(jq -r .metadata.name "$3").json"
 	elif grep -q '^  name: gofer-config$' "$3"; then
+		grep -o 'image: .*' "$3" | head -1 >"$S/image" || true
 		cm=$(cat "$S/configmap.json")
 		while IFS= read -r line; do
 			k=${line%%: *}; k=${k#  }; v=${line#*: }
@@ -68,10 +85,14 @@ case "$1 $2" in
 	fi ;;
 "patch secret")
 	f="$S/secret.$3.json"; [ -f "$f" ] || exit 1
-	p=$(arg_after --patch-file "$@")
+	patch_file "$@"
 	case "$*" in
-	*--type=json*) jq 'del(.AI_TOKEN)' "$f" >"$f.new" ;;
-	*) jq --slurpfile p "$p" '. * $p[0].data | with_entries(select(.value != null))' "$f" >"$f.new" ;;
+	*--type=json*)
+		# JSON Patch on /data/<key>: every "test" must hold, or nothing changes.
+		jq -e --slurpfile p "$S/patch.json" '. as $d | all($p[0][] | select(.op == "test"); $d[.path | ltrimstr("/data/")] == .value)' "$f" >/dev/null ||
+			{ echo "fake: test failed" >&2; exit 1; }
+		jq --slurpfile p "$S/patch.json" 'reduce ($p[0][] | select(.op == "remove") | .path | ltrimstr("/data/")) as $k (.; del(.[$k]))' "$f" >"$f.new" ;;
+	*) jq --slurpfile p "$S/patch.json" '$p[0] as $p | . * (($p.data // {}) + (($p.stringData // {}) | map_values(@base64))) | with_entries(select(.value != null))' "$f" >"$f.new" ;;
 	esac
 	mv "$f.new" "$f" ;;
 "patch configmap")
@@ -80,6 +101,7 @@ case "$1 $2" in
 	jq --slurpfile p "$p" '. * $p[0].data | with_entries(select(.value != null))' "$S/configmap.json" >"$S/cm.new"
 	mv "$S/cm.new" "$S/configmap.json" ;;
 "delete --ignore-not-found") rm -f "$S/deployment" ;;
+"kustomize deploy/k8s/base") cat "$MOCK_BASE" ;;
 "kustomize deploy/k8s/model-gateway")
 	printf 'kind: Deployment\nmetadata:\n  annotations:\n    gofer/model-gateway-upstream: "@UPSTREAM@"\n' ;;
 esac
@@ -202,25 +224,20 @@ func (c *cluster) runIn(cmd string, stdin []byte, env ...string) (error, string,
 	return err, stderr.String() + stdout.String(), stdout.Bytes()
 }
 
-// deploy runs make deploy's gateway steps around the base apply, in the Makefile's
-// order: preflight, render the base, apply the rendered manifests, sync.
+// deploy runs make deploy's gateway steps in the Makefile's order: preflight, the
+// base apply (apply-base, with base as kustomize's output), sync.
 func (c *cluster) deploy(base []byte, env ...string) (error, string) {
 	c.t.Helper()
+	f := filepath.Join(c.t.TempDir(), "base.yaml")
+	if err := os.WriteFile(f, base, 0o600); err != nil {
+		c.t.Fatal(err)
+	}
+	env = append([]string{"MOCK_BASE=" + f, "IMAGE=registry.example/gofer:test"}, env...)
 	if err, out := c.run("preflight", env...); err != nil {
 		return err, "preflight: " + out
 	}
-	err, out, rendered := c.runIn("render", base, env...)
-	if err != nil {
-		return err, "render: " + out
-	}
-	f := filepath.Join(c.t.TempDir(), "base.rendered.yaml")
-	if err := os.WriteFile(f, rendered, 0o600); err != nil {
-		c.t.Fatal(err)
-	}
-	x := exec.Command(c.fake, "apply", "-f", f)
-	x.Env = c.env(env...)
-	if b, err := x.CombinedOutput(); err != nil {
-		return err, "apply: " + string(b)
+	if err, out := c.run("apply-base", env...); err != nil {
+		return err, "apply-base: " + out
 	}
 	if err, out := c.run("sync", env...); err != nil {
 		return err, "sync: " + out
@@ -582,11 +599,38 @@ func TestDeployRefusesBeforeApplying(t *testing.T) {
 	t.Run("an override on another provider", func(t *testing.T) {
 		c, _ := install(t)
 		err, out := c.deploy(base, "AI_CONNECTIONS="+`[{"endpoint":"https://api.githubcopilot.com/responses","models":["x"]}]`)
-		if err == nil || !strings.HasPrefix(out, "render:") {
-			t.Fatalf("deploy = %v, %s; want render to refuse", err, out)
+		if err == nil || !strings.HasPrefix(out, "apply-base:") {
+			t.Fatalf("deploy = %v, %s; want the render to refuse", err, out)
 		}
 		if has(c.calls(), "apply -f") {
 			t.Fatal("applied after a refused render")
+		}
+	})
+	for name, override := range map[string]string{
+		// gofer refuses a connection with no model at startup; so does the render.
+		"an empty model list":       `[{"endpoint":"https://models.example/v1/responses","models":[]}]`,
+		"only blank models":         `[{"endpoint":"https://models.example/v1/responses","models":[" "]}]`,
+		"no endpoint":               `[{"models":["a"]}]`,
+		"another path on the host":  `[{"endpoint":"https://models.example/deployment-b/responses","models":["a"]}]`,
+		"a deeper path on the base": `[{"endpoint":"https://models.example/v1/b/responses","models":["a"]}]`,
+		"an API the gateway lacks":  `[{"endpoint":"https://models.example/v1/embeddings","models":["a"]}]`,
+		"a query string":            `[{"endpoint":"https://models.example/v1/responses?x=1","models":["a"]}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, _ := install(t)
+			err, out := c.deploy(base, "AI_CONNECTIONS="+override)
+			if err == nil || !strings.HasPrefix(out, "apply-base:") {
+				t.Fatalf("deploy = %v, %s; want the render to refuse", err, out)
+			}
+			if has(c.calls(), "base.rendered.yaml") {
+				t.Fatal("applied after a refused render")
+			}
+		})
+	}
+	t.Run("an empty model list without the gateway", func(t *testing.T) {
+		c := newCluster(t, customConns, webKey)
+		if err, out := c.deploy(base, "AI_CONNECTIONS="+`[{"endpoint":"https://x/responses","models":[]}]`); err == nil {
+			t.Fatalf("deploy accepted a connection gofer would refuse:\n%s", out)
 		}
 	})
 	t.Run("nothing saved", func(t *testing.T) {
@@ -594,8 +638,8 @@ func TestDeployRefusesBeforeApplying(t *testing.T) {
 		cfg := c.config()
 		delete(cfg, "AI_CONNECTIONS_BEFORE_GATEWAY")
 		c.writeJSON("configmap.json", cfg)
-		if err, out := c.deploy(base); err == nil || !strings.HasPrefix(out, "render:") {
-			t.Fatalf("deploy = %v, %s; want render to refuse", err, out)
+		if err, out := c.deploy(base); err == nil || !strings.HasPrefix(out, "apply-base:") {
+			t.Fatalf("deploy = %v, %s; want the render to refuse", err, out)
 		}
 	})
 }
@@ -699,6 +743,20 @@ func TestApplyRefusesBeforeWritingAnything(t *testing.T) {
 			t.Fatalf("wrote before refusing:\n%s", strings.Join(calls, "\n"))
 		}
 	})
+	for name, conns := range map[string]string{
+		"another path on the upstream host": `[{"endpoint":"https://models.example/deployment-b/responses","models":["a"]}]`,
+		"an empty model list":               `[{"endpoint":"https://models.example/v1/responses","models":[]}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newCluster(t, conns, webKey)
+			if err, _ := c.run("apply", "MODEL_GATEWAY_UPSTREAM="+customUp); err == nil {
+				t.Fatal("apply accepted connections the gateway cannot serve as given")
+			}
+			if calls := c.calls(); has(calls, "apply -f") || has(calls, "patch") {
+				t.Fatalf("wrote before refusing:\n%s", strings.Join(calls, "\n"))
+			}
+		})
+	}
 	t.Run("an endpoint off the provider", func(t *testing.T) {
 		c := newCluster(t, customConns, webKey)
 		if err, _ := c.run("apply"); err == nil { // default upstream is Copilot
@@ -733,4 +791,116 @@ func TestApplyRotatesTheKey(t *testing.T) {
 	if c.gatewayKey() != "bmV3LWtleQ==" {
 		t.Fatalf("gateway key = %q, want the new key", c.gatewayKey())
 	}
+}
+
+// The web key is removed only if it is still the value read at the start: a key
+// rotated into gofer-secrets while the gateway rolls out is kept, and gofer is not
+// restarted.
+func TestApplyNeverDeletesARotatedKey(t *testing.T) {
+	const rotated = "cm90YXRlZC1rZXk=" // "rotated-key"
+	c := newCluster(t, customConns, webKey)
+	err, out := c.run("apply", "MODEL_GATEWAY_UPSTREAM="+customUp, "MOCK_ROTATE=rollout status deployment/gofer-model-gateway="+rotated)
+	if err == nil {
+		t.Fatalf("apply succeeded after the web key was rotated under it:\n%s", out)
+	}
+	if got := c.web()["AI_TOKEN"]; got != rotated {
+		t.Fatalf("gofer-secrets AI_TOKEN = %q, want the rotated key kept", got)
+	}
+	if has(c.calls(), "rollout restart statefulset/gofer") {
+		t.Fatal("gofer restarted")
+	}
+}
+
+// Concurrent deploys from one checkout render and apply their own files: each
+// cluster receives the image it was deployed with.
+func TestConcurrentDeploysUseTheirOwnFiles(t *testing.T) {
+	base := append(shippedBases(t)["configmap.yaml"], []byte("---\nkind: StatefulSet\nspec:\n  template:\n    spec:\n      containers:\n        - image: localhost/gofer:dev\n")...)
+	f := filepath.Join(t.TempDir(), "base.yaml")
+	if err := os.WriteFile(f, base, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a, b := newCluster(t, customConns, webKey), newCluster(t, customConns, webKey)
+	errs := make(chan error, 2)
+	for _, x := range []struct {
+		c     *cluster
+		image string
+	}{{a, "registry.example/gofer:a"}, {b, "registry.example/gofer:b"}} {
+		go func() {
+			for range 5 {
+				if err, out := x.c.run("apply-base", "MOCK_BASE="+f, "IMAGE="+x.image); err != nil {
+					errs <- fmt.Errorf("%s: %v\n%s", x.image, err, out)
+					return
+				}
+				got, _ := os.ReadFile(filepath.Join(x.c.state, "image"))
+				if strings.TrimSpace(string(got)) != "image: "+x.image {
+					errs <- fmt.Errorf("cluster deployed with %s received %q", x.image, got)
+					return
+				}
+			}
+			errs <- nil
+		}()
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// make dev-secrets looks the gateway up once, checked, before any write: a failed
+// read writes nothing, and the shell's AI_TOKEN reaches gofer-secrets only when the
+// gateway is confirmed absent, at creation as well as on an existing Secret.
+func TestDevSecretsUsesCheckedGatewayDiscovery(t *testing.T) {
+	devSecrets := func(c *cluster, env ...string) (error, string) {
+		bin := t.TempDir()
+		if err := os.Symlink(c.fake, filepath.Join(bin, "kubectl")); err != nil {
+			t.Fatal(err)
+		}
+		x := exec.Command("make", "-s", "dev-secrets")
+		x.Dir = filepath.Join("..", "..")
+		x.Env = append(c.env("PATH="+bin+":"+c.shims+":"+os.Getenv("PATH"), "MINT_PUBLIC_KEY=pub", "AI_TOKEN=shell-key"), env...)
+		out, err := x.CombinedOutput()
+		return err, string(out)
+	}
+	shellKey := base64.StdEncoding.EncodeToString([]byte("shell-key"))
+	t.Run("unreadable gateway", func(t *testing.T) {
+		c := newCluster(t, customConns, "")
+		_ = os.Remove(filepath.Join(c.state, "secret.gofer-secrets.json"))
+		if err, out := devSecrets(c, "MOCK_FAIL=get deployment gofer-model-gateway"); err == nil {
+			t.Fatalf("dev-secrets succeeded with the gateway unreadable:\n%s", out)
+		}
+		for _, call := range c.calls() {
+			if strings.Contains(call, "create secret") || strings.Contains(call, "patch secret") {
+				t.Fatalf("wrote before a checked lookup: %s", call)
+			}
+		}
+	})
+	t.Run("gateway installed, new Secret", func(t *testing.T) {
+		c, _ := install(t)
+		_ = os.Remove(filepath.Join(c.state, "secret.gofer-secrets.json"))
+		if err, out := devSecrets(c); err != nil {
+			t.Fatalf("dev-secrets: %v\n%s", err, out)
+		}
+		if k := c.web()["AI_TOKEN"]; k != "" {
+			t.Fatalf("gofer-secrets was created with AI_TOKEN %q beside the gateway", k)
+		}
+	})
+	t.Run("gateway installed, existing Secret", func(t *testing.T) {
+		c, _ := install(t)
+		if err, out := devSecrets(c); err != nil {
+			t.Fatalf("dev-secrets: %v\n%s", err, out)
+		}
+		if k := c.web()["AI_TOKEN"]; k != "" {
+			t.Fatalf("gofer-secrets got AI_TOKEN %q beside the gateway", k)
+		}
+	})
+	t.Run("no gateway", func(t *testing.T) {
+		c := newCluster(t, customConns, "")
+		if err, out := devSecrets(c); err != nil {
+			t.Fatalf("dev-secrets: %v\n%s", err, out)
+		}
+		if k := c.web()["AI_TOKEN"]; k != shellKey {
+			t.Fatalf("gofer-secrets AI_TOKEN = %q, want the shell's", k)
+		}
+	})
 }
