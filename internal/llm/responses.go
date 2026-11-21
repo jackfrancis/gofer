@@ -99,9 +99,24 @@ type responsesOutput struct {
 	Arguments string `json:"arguments"`
 }
 
-// jsonModeReminder is the input message responsesChat adds to a json_object request
-// whose input messages never mention JSON.
+// jsonModeReminder is what responsesChat adds to a json_object request whose input
+// messages never mention JSON.
 const jsonModeReminder = "Respond with a JSON object only."
+
+// withJSONReminder adds jsonModeReminder to the input. When the input ends with a
+// user message the reminder is appended to that message's text, so the request never
+// carries two user turns in a row: some self-hosted Responses servers keep message
+// boundaries and serve models whose chat templates require alternating roles.
+// Otherwise (the input ends with an assistant turn or a tool output, or is empty) it
+// becomes a new closing user message. The items are this translation's own copies,
+// so the caller's messages are unchanged.
+func withJSONReminder(items []responsesItem) []responsesItem {
+	if n := len(items); n > 0 && items[n-1].Type == "" && items[n-1].Role == "user" {
+		items[n-1].Content += "\n\n" + jsonModeReminder
+		return items
+	}
+	return append(items, responsesItem{Role: "user", Content: jsonModeReminder})
+}
 
 // inputMentionsJSON reports whether any input message (not a tool call or tool
 // output) contains the word "json" in any case, which the Responses API requires of
@@ -154,9 +169,9 @@ func responsesChat(ctx context.Context, httpClient *http.Client, endpoint, token
 		// The Responses API refuses json_object mode (HTTP 400) unless an INPUT message
 		// mentions JSON; the instructions do not count. Callers say "JSON" in their
 		// system prompt, which this translation moved into instructions, so add the
-		// word back as a closing input message when no input message carries it.
+		// word back when no input message carries it.
 		if body.ResponseFormat.Type == "json_object" && !inputMentionsJSON(rr.Input) {
-			rr.Input = append(rr.Input, responsesItem{Role: "user", Content: jsonModeReminder})
+			rr.Input = withJSONReminder(rr.Input)
 		}
 	}
 
