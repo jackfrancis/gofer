@@ -70,6 +70,12 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 			return nil, nil, fmt.Errorf("load the last ingest runs: %w", err)
 		}
 	}
+	// The model-gateway profile (AI_GATEWAY_URL): a gateway holds the upstream model
+	// key and the shared request budget, so runs present their run credential to it
+	// and gofer brokers no model token (conn.Token is empty).
+	if conn.Gateway {
+		ingestor.UseModelGateway()
+	}
 	// The thread's model picker spans every configured connection's models (default
 	// first). A model id offered by more than one connection is disambiguated with the
 	// connection label; the selected option carries the connection endpoint the turn
@@ -200,6 +206,12 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// The credential broker: a runtime vends the acting user's delegated provider
 	// token here, so it never holds a standing secret.
 	mux.Handle("GET /agent/credential", authenticator.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(credentialHandler.Vend)))
+	// The model gateway's authorization check: it forwards a run's bearer here before
+	// attaching the upstream key. Same scope as the broker; served only in the gateway
+	// profile. Any method, since the gateway calls with the model request's.
+	if conn.Gateway {
+		mux.Handle("/agent/model-access", authenticator.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(api.ModelAccess)))
+	}
 
 	// Global middleware chain (outermost first).
 	var h http.Handler = mux

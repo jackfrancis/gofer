@@ -101,6 +101,12 @@ app whose callback is `http://localhost:8080/auth/github/callback`.
    `gofer-secrets` Secret, and applies the web app and its `AgentApp`. Override the
    chat models with `AI_CONNECTIONS` (see `deploy/k8s/base/configmap.yaml`).
 
+   Optional: `make model-gateway-apply KUBE_CONTEXT=kind-gofer` puts agentgateway in
+   front of the model. The gateway then holds the key and applies one request budget
+   to every run (for example, a Review-all burst), and gofer holds no model key. Check
+   it with `make model-gateway-check`, and undo it with `make model-gateway-down`.
+   See [ADR 0008](docs/adr/0008-model-gateway.md).
+
 After a code change to the workload only (`internal/agent`, `internal/llm`,
 `internal/github`), `make kind-load-runtime` reloads the runtime image without
 restarting the web pod.

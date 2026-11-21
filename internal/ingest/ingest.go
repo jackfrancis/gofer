@@ -27,7 +27,7 @@ import (
 // runtime consumes this; NoopDispatcher discards it.
 type RunSpec struct {
 	TaskRef    string            // github-ingest | github-converse | github-research
-	Parameters map[string]string // owner, gofer_url, ai_endpoint, ai_model, item, independent
+	Parameters map[string]string // owner, gofer_url, ai_endpoint, ai_model, ai_auth, item, independent
 	Subject    string            // the acting user id
 	Scopes     []string          // capability scopes the run is authorized for
 	Audience   string            // binds the run credential to gofer's agent plane
@@ -98,6 +98,7 @@ type Ingestor struct {
 	sinkURL    string
 	aiEndpoint string
 	aiModel    string
+	aiGateway  bool // the model is reached through gofer's model gateway (run parameter ai_auth)
 	log        *slog.Logger
 
 	mu   sync.Mutex
@@ -128,6 +129,13 @@ func New(d Dispatcher, audience, sinkURL string, log *slog.Logger, aiEndpoint, a
 	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log, runs: map[runKey]*run{}, gens: map[string]uint64{}, dones: map[string]uint64{}}
 }
 
+// UseModelGateway marks every run this Ingestor dispatches as reaching the chat model
+// through gofer's model gateway (the AI_GATEWAY_URL profile): the run parameter
+// ai_auth=gateway tells the runtime to present its run credential to the gateway
+// instead of vending a model token, which the web tier does not hold in that profile.
+// Call it once, before the first dispatch.
+func (i *Ingestor) UseModelGateway() { i.aiGateway = true }
+
 // runParams builds the parameters shared by every dispatched run: the owner, the sink
 // URL a runtime calls back on (gofer_url), and — when configured — the non-secret
 // chat-model coordinates. The model token is never a parameter; a runtime would vend
@@ -141,8 +149,15 @@ func (i *Ingestor) runParams(ownerID string) map[string]string {
 		p["ai_endpoint"] = i.aiEndpoint
 		p["ai_model"] = i.aiModel
 	}
+	if i.aiGateway {
+		p["ai_auth"] = AIAuthGateway
+	}
 	return p
 }
+
+// AIAuthGateway is the value of run parameter ai_auth for a run whose chat model is
+// behind gofer's model gateway. A run without ai_auth vends the model token.
+const AIAuthGateway = "gateway"
 
 // EnsureBackfill requests a github-ingest run for ownerID so an empty worklist gets
 // populated. It dispatches at most one run at a time per owner: while a recent,

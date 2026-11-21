@@ -81,8 +81,11 @@ func main() {
 
 	if cfg.ConversationEnabled {
 		log.Info("assistive conversation enabled (the agent-runtime backend runs the model)")
+		if cfg.DefaultConnection().Gateway {
+			log.Info("chat model reached through the model gateway; gofer holds no model key", "gateway", os.Getenv("AI_GATEWAY_URL"))
+		}
 	} else {
-		log.Info("assistive conversation disabled (set AI_CONNECTIONS and AI_TOKEN to offer Discuss)")
+		log.Info("assistive conversation disabled (set AI_CONNECTIONS and AI_TOKEN, or AI_GATEWAY_URL, to offer Discuss)")
 	}
 
 	// Select the agent-runtime backend. This is the ONE wiring point that changes to

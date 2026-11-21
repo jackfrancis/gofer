@@ -173,6 +173,10 @@ type AIConnection struct {
 	Models   []string `json:"models"`   // model ids in order; Models[0] is the default
 	Token    string   `json:"-"`        // shared AI_TOKEN, fanned out at load; not wire data
 	ID       string   `json:"-"`        // stable, non-positional id (hash of Endpoint); set at load
+	// Gateway marks a connection served by gofer's model gateway (AI_GATEWAY_URL):
+	// the gateway holds the upstream key, so Token is empty and a runtime presents
+	// its run credential instead of vending a model token. Set at load.
+	Gateway bool `json:"-"`
 }
 
 // Enabled reports whether any chat model is configured.
@@ -239,13 +243,29 @@ func (c AIConnection) Label() string {
 //
 // AI_CONNECTIONS (with at least one valid {endpoint, models}) is required whenever
 // AI_TOKEN is set, so a half-configured deployment fails fast.
+//
+// The model-gateway profile (AI_GATEWAY_URL, docs/adr/0008-model-gateway.md) enables
+// the model WITHOUT AI_TOKEN: a gateway holds the upstream key, and every connection
+// must be served by it (same scheme and host), because a runtime presents its run
+// credential to a gateway connection and that credential must never reach a model
+// provider. AI_TOKEN must then be unset — the web tier holds no model key at all.
 func LoadConnections(getenv func(string) string) ([]AIConnection, error) {
 	token := strings.TrimSpace(getenv("AI_TOKEN"))
-	if token == "" {
+	gateway, err := gatewayOrigin(getenv("AI_GATEWAY_URL"))
+	if err != nil {
+		return nil, err
+	}
+	if gateway != "" && token != "" {
+		return nil, fmt.Errorf("AI_GATEWAY_URL and AI_TOKEN are both set: with the model gateway, the gateway alone holds the upstream key (remove AI_TOKEN from the web tier's environment)")
+	}
+	if token == "" && gateway == "" {
 		return nil, nil // AI disabled → stub ranker
 	}
 	raw := strings.TrimSpace(getenv("AI_CONNECTIONS"))
 	if raw == "" {
+		if gateway != "" {
+			return nil, fmt.Errorf("AI_GATEWAY_URL is set but AI_CONNECTIONS is empty (provide a JSON array of {endpoint, models} served by the gateway)")
+		}
 		return nil, fmt.Errorf("AI_TOKEN is set but AI_CONNECTIONS is empty (provide a JSON array of {endpoint, models}, or unset AI_TOKEN to disable the chat model)")
 	}
 	var conns []AIConnection
@@ -264,10 +284,31 @@ func LoadConnections(getenv func(string) string) ([]AIConnection, error) {
 		if len(conns[i].Models) == 0 {
 			return nil, fmt.Errorf("AI_CONNECTIONS[%d] (%s): at least one model is required", i, conns[i].Endpoint)
 		}
-		conns[i].Token = token                  // fan out the shared token across every connection
+		if gateway != "" {
+			if o, err := gatewayOrigin(conns[i].Endpoint); err != nil || o != gateway {
+				return nil, fmt.Errorf("AI_CONNECTIONS[%d] (%s): with AI_GATEWAY_URL set, every endpoint must be served by the gateway (%s)", i, conns[i].Endpoint, gateway)
+			}
+			conns[i].Gateway = true
+		}
+		conns[i].Token = token                  // fan out the shared token (empty behind the gateway)
 		conns[i].ID = connID(conns[i].Endpoint) // stable, non-positional id for UI selection
 	}
 	return conns, nil
+}
+
+// gatewayOrigin returns raw's scheme://host, lowercased, or "" when raw is blank. It
+// is how a gateway connection is matched to AI_GATEWAY_URL: only the origin counts,
+// since the gateway serves each API at its own path.
+func gatewayOrigin(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+		return "", fmt.Errorf("AI_GATEWAY_URL: %q is not an http(s) URL with a host", raw)
+	}
+	return strings.ToLower(u.Scheme + "://" + u.Host), nil
 }
 
 // cleanModels trims each model id, drops empties, and removes later duplicates while

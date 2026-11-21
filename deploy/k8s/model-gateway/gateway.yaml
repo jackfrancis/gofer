@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gofer-model-gateway
+  labels:
+    app.kubernetes.io/name: gofer-model-gateway
+    app.kubernetes.io/part-of: gofer
+  annotations:
+    # The provider this gateway fronts, recorded at install. Later applies and make
+    # deploy reuse it, so the provider never changes without an explicit
+    # model-gateway-down and re-apply (hack/model-gateway/model-gateway.sh).
+    gofer/model-gateway-upstream: "@UPSTREAM@"
+spec:
+  # Exactly one: the shared budget is a local token bucket, so a second replica would
+  # double it.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gofer-model-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gofer-model-gateway
+        app.kubernetes.io/part-of: gofer
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agentgateway
+          # Release images are on agentgateway's own registry. Pinned; bump
+          # deliberately, and re-run internal/modelgateway's test against the new
+          # release (AGENTGATEWAY_BIN) before you do.
+          image: cr.agentgateway.dev/agentgateway:v1.7.0
+          args: ["-f", "/etc/model-gateway/config.yaml"]
+          ports:
+            - name: http
+              containerPort: 4000
+            - name: metrics
+              containerPort: 15020
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: 15021
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/model-gateway
+              readOnly: true
+            # The upstream key, as a file (config.yaml: params.apiKey.file). Only this
+            # pod mounts it.
+            - name: upstream-key
+              mountPath: /var/run/secrets/model-gateway
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: gofer-model-gateway
+        - name: upstream-key
+          secret:
+            secretName: gofer-model-gateway
+            items:
+              - key: AI_TOKEN
+                path: AI_TOKEN
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gofer-model-gateway
+  labels:
+    app.kubernetes.io/name: gofer-model-gateway
+    app.kubernetes.io/part-of: gofer
+spec:
+  selector:
+    app.kubernetes.io/name: gofer-model-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
