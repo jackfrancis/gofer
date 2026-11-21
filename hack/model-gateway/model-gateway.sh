@@ -66,6 +66,12 @@ secret_get() {
     jq -r --arg k "$2" '.data[$k] // empty' <<<"$out"
 }
 
+# web_secret_get prints gofer-secrets as JSON, or nothing when it is absent. A failed
+# read stops the script.
+web_secret_get() {
+    kube -n "$ns" get secret gofer-secrets --ignore-not-found -o json || fail "could not read Secret $ns/gofer-secrets."
+}
+
 config_get() {
     kube -n "$ns" get configmap gofer-config -o json || fail "could not read ConfigMap $ns/gofer-config."
 }
@@ -99,10 +105,17 @@ patch_config() {
 #              trims it). Every check and rewrite reads the endpoint through this, so
 #              the script routes exactly the endpoint gofer will use.
 #   origin     a URL's scheme://host[:port], lowercased.
+#   la, la_path, la_has_token   a Secret's kubectl.kubernetes.io/last-applied-configuration
+#              annotation (client-side kubectl apply keeps the applied manifest there),
+#              its JSON Patch path, and whether it still names a non-empty AI_TOKEN.
 jq_lib='def trim: gsub("^\\s+|\\s+$"; "");
 def field($n): [to_entries[] | select(.key | ascii_downcase == $n) | .value] | last;
 def endpoint: ((if type == "object" then field("endpoint") else null end) // "") | if type == "string" then trim else "" end;
 def origin: (capture("^(?<o>[A-Za-z][A-Za-z0-9+.-]*://[^/]+)").o // "") | ascii_downcase;
+def la: .metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"]? // null;
+def la_path: "/metadata/annotations/kubectl.kubernetes.io~1last-applied-configuration";
+def la_has_token: la as $la | $la != null and ((($la | fromjson?) // {}) |
+    type == "object" and (((.data | objects | .AI_TOKEN) // "") != "" or ((.stringData | objects | .AI_TOKEN) // "") != ""));
 '
 
 # form JSON prints "gateway" when every endpoint is on the gateway, "provider" when
@@ -248,14 +261,17 @@ restart_gofer() {
 
 do_apply() {
     : "${MODEL_GATEWAY_BURST:?}" "${MODEL_GATEWAY_REFILL:?}" "${MODEL_GATEWAY_INTERVAL:?}"
-    local sts web gw want
+    local sts websecret web gw want ops after
     sts=$(kube -n "$ns" get statefulset gofer --ignore-not-found -o name) || fail "could not read StatefulSet $ns/gofer."
     [[ -n $sts ]] || fail "gofer is not deployed here; deploy it first."
     resolve_upstream
     # Fail on a bad AI_CONNECTIONS before anything is written.
     plan_apply "$tmp/routing.json"
 
-    web=$(secret_get gofer-secrets AI_TOKEN)
+    # gofer-secrets as read now: the removal at the end tests against this.
+    websecret=$(web_secret_get)
+    web=
+    [[ -z $websecret ]] || web=$(jq -r '.data.AI_TOKEN // empty' <<<"$websecret")
     gw=$(secret_get gofer-model-gateway AI_TOKEN)
     if [[ -n ${AI_TOKEN:-} ]]; then
         # An explicit key: install or rotate it.
@@ -290,17 +306,30 @@ do_apply() {
     echo "model gateway: AI_CONNECTIONS = $(jq -r '.data.AI_CONNECTIONS' "$tmp/routing.json")"
 
     # Only now, with the key safe in the gateway and gofer's config pointing at it,
-    # remove gofer's copy. The running web pod keeps its environment until restarted.
-    # The JSON Patch tests the value read at the start and removes it in one request,
-    # so a key rotated into gofer-secrets meanwhile is refused, never deleted.
-    if [[ -n $web ]]; then
-        printf '%s' "$web" | jq -R '[{op: "test", path: "/data/AI_TOKEN", value: .}, {op: "remove", path: "/data/AI_TOKEN"}]' \
-            >"$tmp/remove-key.json"
-        kube -n "$ns" patch secret gofer-secrets --type=json --patch-file "$tmp/remove-key.json" >/dev/null ||
-            fail "could not remove AI_TOKEN from gofer-secrets: it is no longer the key read at the start (rotated meanwhile?), or the write was refused. gofer was not restarted. Re-run make model-gateway-apply (with AI_TOKEN=... to install the new key)."
-        web=$(secret_get gofer-secrets AI_TOKEN)
-        [[ -z $web ]] || fail "gofer-secrets still holds AI_TOKEN; gofer was not restarted. Remove it and restart gofer."
-        echo "model gateway: removed AI_TOKEN from gofer-secrets (the gateway holds it)"
+    # remove gofer's copies: the data field, and the copy client-side kubectl apply
+    # keeps in the last-applied-configuration annotation (readable by anyone who can
+    # read the Secret). The running web pod keeps its environment until restarted.
+    # One JSON Patch tests each value read at the start and removes or rewrites it, so
+    # a key rotated in, or a manifest re-applied, meanwhile is refused, never lost.
+    if [[ -n $websecret ]]; then
+        jq -c "$jq_lib"'
+            (.data.AI_TOKEN? // null) as $tok | la as $la |
+            (if $tok != null then [{op: "test", path: "/data/AI_TOKEN", value: $tok}, {op: "remove", path: "/data/AI_TOKEN"}] else [] end) +
+            (if la_has_token then [{op: "test", path: la_path, value: $la},
+                {op: "replace", path: la_path, value: ($la | fromjson | del(.data.AI_TOKEN, .stringData.AI_TOKEN) | tojson)}] else [] end)' \
+            <<<"$websecret" >"$tmp/remove-key.json"
+        ops=$(jq -r '[.[] | select(.op != "test") | .path] | join(" ")' "$tmp/remove-key.json")
+        if [[ -n $ops ]]; then
+            kube -n "$ns" patch secret gofer-secrets --type=json --patch-file "$tmp/remove-key.json" >/dev/null ||
+                fail "could not remove AI_TOKEN from gofer-secrets: it changed since it was read at the start (key rotated, or the manifest re-applied, meanwhile?), or the write was refused. gofer was not restarted. Re-run make model-gateway-apply (with AI_TOKEN=... to install a new key)."
+            after=$(web_secret_get)
+            jq -e "$jq_lib"'(.data.AI_TOKEN // "") == "" and (la_has_token | not)' <<<"$after" >/dev/null ||
+                fail "gofer-secrets still holds AI_TOKEN; gofer was not restarted. Remove it and restart gofer."
+            echo "model gateway: removed AI_TOKEN from gofer-secrets (the gateway holds it)"
+            if [[ $ops == *last-applied* ]]; then
+                echo "model gateway: also removed it from gofer-secrets' last-applied configuration. Remove AI_TOKEN from the manifest you apply gofer-secrets from, too, or the next apply puts it back."
+            fi
+        fi
     fi
     restart_gofer
 }
@@ -482,6 +511,9 @@ do_check() {
     [[ -n $(config_value "$cfg" "$saved_key") ]] || fail "gofer-config has no saved $saved_key, so model-gateway-down could not restore the provider endpoints."
     v=$(secret_get gofer-secrets AI_TOKEN)
     [[ -z $v ]] || fail "gofer-secrets still holds AI_TOKEN."
+    v=$(web_secret_get)
+    [[ -z $v ]] || jq -e "$jq_lib"'la_has_token | not' <<<"$v" >/dev/null ||
+        fail "gofer-secrets' last-applied configuration (kubectl.kubernetes.io/last-applied-configuration) still holds AI_TOKEN; re-run make model-gateway-apply, and remove it from the manifest you apply gofer-secrets from."
     v=$(secret_get gofer-model-gateway AI_TOKEN)
     [[ -n $v ]] || fail "the gateway has no upstream key."
     kube -n "$ns" port-forward svc/gofer-model-gateway "$port:80" >/dev/null 2>&1 &

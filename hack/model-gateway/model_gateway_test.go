@@ -43,6 +43,12 @@ matches "${MOCK_DROP:-}" && { echo "DROP $call" >>"$S/calls"; exit 0; }
 if [ -n "${MOCK_ROTATE:-}" ] && matches "${MOCK_ROTATE%%=*}"; then
 	jq --arg v "${MOCK_ROTATE#*=}" '.AI_TOKEN = $v' "$S/secret.gofer-secrets.json" >"$S/rot.new" && mv "$S/rot.new" "$S/secret.gofer-secrets.json"
 fi
+# MOCK_REAPPLY=PATTERN: when a call matches PATTERN, someone re-applies gofer-secrets'
+# manifest first, changing its last-applied-configuration annotation.
+if [ -n "${MOCK_REAPPLY:-}" ] && matches "$MOCK_REAPPLY" && [ -f "$S/secret.gofer-secrets.ann.json" ]; then
+	jq '.["kubectl.kubernetes.io/last-applied-configuration"] |= (fromjson | .metadata.labels = {reapplied: "yes"} | tojson)' \
+		"$S/secret.gofer-secrets.ann.json" >"$S/ann.new" && mv "$S/ann.new" "$S/secret.gofer-secrets.ann.json"
+fi
 [ "$1" = --context ] && shift 2
 [ "$1" = -n ] && shift 2
 arg_after() { local want=$1; shift; while [ $# -gt 0 ]; do [ "$1" = "$want" ] && { echo "$2"; return; }; shift; done; }
@@ -57,8 +63,9 @@ case "$1 $2" in
 	for a in "$@"; do case $a in --from-literal=*) kv=${a#--from-literal=}; d=$(jq --arg k "${kv%%=*}" --arg v "${kv#*=}" '.[$k] = ($v | @base64)' <<<"$d");; esac; done
 	printf '%s' "$d" >"$S/secret.$name.json" ;;
 "get secret")
-	f="$S/secret.$3.json"
-	if [ -f "$f" ]; then jq '{data: .}' "$f"; else case "$*" in *--ignore-not-found*) ;; *) exit 1;; esac; fi ;;
+	f="$S/secret.$3.json"; a="$S/secret.$3.ann.json"
+	[ -f "$a" ] || a=/dev/null
+	if [ -f "$f" ]; then jq --slurpfile a "$a" '{metadata: {annotations: ($a[0] // {})}, data: .}' "$f"; else case "$*" in *--ignore-not-found*) ;; *) exit 1;; esac; fi ;;
 "get configmap") jq '{data: .}' "$S/configmap.json" ;;
 "get deployment")
 	if [ -f "$S/deployment" ]; then
@@ -88,10 +95,20 @@ case "$1 $2" in
 	patch_file "$@"
 	case "$*" in
 	*--type=json*)
-		# JSON Patch on /data/<key>: every "test" must hold, or nothing changes.
-		jq -e --slurpfile p "$S/patch.json" '. as $d | all($p[0][] | select(.op == "test"); $d[.path | ltrimstr("/data/")] == .value)' "$f" >/dev/null ||
-			{ echo "fake: test failed" >&2; exit 1; }
-		jq --slurpfile p "$S/patch.json" 'reduce ($p[0][] | select(.op == "remove") | .path | ltrimstr("/data/")) as $k (.; del(.[$k]))' "$f" >"$f.new" ;;
+		# A JSON Patch (test, remove, replace) on the whole Secret: any failed op and
+		# nothing changes.
+		a="$S/secret.$3.ann.json"; [ -f "$a" ] || echo '{}' >"$a"
+		jq -n --slurpfile d "$f" --slurpfile a "$a" --slurpfile p "$S/patch.json" '
+			def ptr: ltrimstr("/") | split("/") | map(gsub("~1"; "/") | gsub("~0"; "~"));
+			reduce $p[0][] as $op ({metadata: {annotations: $a[0]}, data: $d[0]};
+				($op.path | ptr) as $k |
+				if $op.op == "test" then (if getpath($k) == $op.value then . else error("test failed: \($op.path)") end)
+				elif getpath($k) == null then error("\($op.op) of a missing \($op.path)")
+				elif $op.op == "remove" then delpaths([$k])
+				elif $op.op == "replace" then setpath($k; $op.value)
+				else error("unsupported op \($op.op)") end)' >"$S/obj.new" || { echo "fake: patch refused" >&2; exit 1; }
+		jq '.metadata.annotations' "$S/obj.new" >"$a"
+		jq '.data' "$S/obj.new" >"$f.new" ;;
 	*) jq --slurpfile p "$S/patch.json" '$p[0] as $p | . * (($p.data // {}) + (($p.stringData // {}) | map_values(@base64))) | with_entries(select(.value != null))' "$f" >"$f.new" ;;
 	esac
 	mv "$f.new" "$f" ;;
@@ -173,6 +190,16 @@ func (c *cluster) readJSON(name string) map[string]string {
 		c.t.Fatal(err)
 	}
 	return m
+}
+
+// annotateWebSecret gives gofer-secrets the last-applied-configuration annotation a
+// client-side kubectl apply of manifest leaves.
+func (c *cluster) annotateWebSecret(manifest string) {
+	c.writeJSON("secret.gofer-secrets.ann.json", map[string]string{"kubectl.kubernetes.io/last-applied-configuration": manifest + "\n"})
+}
+
+func (c *cluster) webAnnotation() string {
+	return c.readJSON("secret.gofer-secrets.ann.json")["kubectl.kubernetes.io/last-applied-configuration"]
 }
 
 func (c *cluster) config() map[string]string { return c.readJSON("configmap.json") }
@@ -1061,4 +1088,75 @@ func TestRoutingUsesTheEndpointGoferReads(t *testing.T) {
 			check(d, "a deploy with them as the override")
 		})
 	}
+}
+
+// A gofer-secrets managed with client-side kubectl apply keeps the applied manifest,
+// key included, in its last-applied-configuration annotation. Install removes the key
+// from there too (and only the key), in the same tested JSON Patch, and the deployed
+// check refuses a Secret that still has it.
+func TestApplyRemovesTheKeyFromTheLastAppliedConfiguration(t *testing.T) {
+	manifests := map[string]string{
+		"stringData": `{"apiVersion":"v1","kind":"Secret","metadata":{"name":"gofer-secrets","namespace":"gofer"},"stringData":{"AI_TOKEN":"custom-key","SESSION_SECRET":"s"}}`,
+		"data":       `{"apiVersion":"v1","kind":"Secret","metadata":{"name":"gofer-secrets","namespace":"gofer"},"data":{"AI_TOKEN":"` + webKey + `","SESSION_SECRET":"cw=="}}`,
+	}
+	for name, manifest := range manifests {
+		t.Run(name, func(t *testing.T) {
+			c := newCluster(t, customConns, webKey)
+			c.annotateWebSecret(manifest)
+			err, out := c.run("apply", "MODEL_GATEWAY_UPSTREAM="+customUp)
+			if err != nil {
+				t.Fatalf("apply: %v\n%s", err, out)
+			}
+			if !strings.Contains(out, "last-applied") {
+				t.Errorf("apply did not tell the operator to fix the source manifest:\n%s", out)
+			}
+			var saved map[string]any
+			if err := json.Unmarshal([]byte(c.webAnnotation()), &saved); err != nil {
+				t.Fatalf("annotation is not JSON: %v: %q", err, c.webAnnotation())
+			}
+			field := saved[name].(map[string]any)
+			if _, ok := field["AI_TOKEN"]; ok || strings.Contains(c.webAnnotation(), "custom-key") || strings.Contains(c.webAnnotation(), webKey) {
+				t.Fatalf("the annotation still holds the key: %s", c.webAnnotation())
+			}
+			if field["SESSION_SECRET"] == nil || saved["kind"] != "Secret" {
+				t.Fatalf("the annotation lost more than the key: %s", c.webAnnotation())
+			}
+			if _, ok := c.web()["AI_TOKEN"]; ok {
+				t.Fatal("gofer-secrets still holds AI_TOKEN")
+			}
+		})
+	}
+	t.Run("re-applied meanwhile", func(t *testing.T) {
+		c := newCluster(t, customConns, webKey)
+		c.annotateWebSecret(manifests["stringData"])
+		err, out := c.run("apply", "MODEL_GATEWAY_UPSTREAM="+customUp, "MOCK_REAPPLY=rollout status deployment/gofer-model-gateway")
+		if err == nil {
+			t.Fatalf("apply succeeded although gofer-secrets changed under it:\n%s", out)
+		}
+		if c.web()["AI_TOKEN"] != webKey || !strings.Contains(c.webAnnotation(), "reapplied") {
+			t.Fatal("the refused patch changed gofer-secrets")
+		}
+		if has(c.calls(), "rollout restart statefulset/gofer") {
+			t.Fatal("gofer restarted")
+		}
+	})
+	t.Run("an annotation without the key is left alone", func(t *testing.T) {
+		c := newCluster(t, customConns, webKey)
+		clean := `{"apiVersion":"v1","kind":"Secret","stringData":{"SESSION_SECRET":"s"}}`
+		c.annotateWebSecret(clean)
+		if err, out := c.run("apply", "MODEL_GATEWAY_UPSTREAM="+customUp); err != nil {
+			t.Fatalf("apply: %v\n%s", err, out)
+		}
+		if c.webAnnotation() != clean+"\n" {
+			t.Fatalf("annotation changed: %q", c.webAnnotation())
+		}
+	})
+	t.Run("check refuses a Secret that still has it", func(t *testing.T) {
+		c, _ := install(t)
+		c.annotateWebSecret(manifests["stringData"])
+		err, out := c.run("check")
+		if err == nil || !strings.Contains(out, "last-applied") {
+			t.Fatalf("check = %v, %s; want a refusal naming the last-applied configuration", err, out)
+		}
+	})
 }

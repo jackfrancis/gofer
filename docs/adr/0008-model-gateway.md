@@ -83,6 +83,13 @@ key or of the provider endpoints:
   4. Only then remove `AI_TOKEN` from `gofer-secrets`, and restart gofer. The removal
      is one JSON Patch that tests the value read at the start and removes it. If
      someone rotated the key meanwhile, the patch is refused and the new key stays.
+     The same patch removes the key from the Secret's
+     `kubectl.kubernetes.io/last-applied-configuration` annotation, and nothing else
+     from it. A client-side `kubectl apply` keeps the applied manifest there,
+     readable by anyone who can read the Secret. The patch tests the annotation too,
+     so a manifest re-applied meanwhile is refused. Apply then reminds the operator
+     to drop `AI_TOKEN` from the source manifest, and `make model-gateway-check`
+     fails while the annotation still holds it.
 
   A failure at any step leaves gofer's key and pod as they were. The upstream is
   recorded on the gateway Deployment, and later runs reuse it. Asking an installed
