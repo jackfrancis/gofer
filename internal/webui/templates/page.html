@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/static/app.css">
   {{if eq .View "worklist"}}<script src="/static/projects.js" defer></script>{{end}}
   {{if .WatchRefresh}}{{if .Refreshing}}<noscript><meta http-equiv="refresh" content="{{.PollSecs}}; url={{.FallbackURL}}"></noscript>{{end}}<script src="/static/reload.js" data-done="{{.RefreshDone}}" data-active="{{if .Refreshing}}1{{else}}0{{end}}" data-poll-secs="{{.PollSecs}}" data-idle-poll-secs="{{.IdlePollSecs}}" defer></script>{{end}}
+  {{if eq .View "thread"}}<script src="/static/copy.js" defer></script>{{end}}
 </head>
 <body>
   <div class="zz-container">
@@ -98,6 +99,7 @@
             {{if eq $m.Role "agent"}}{{markdown $m.Content}}{{else}}{{$m.Content}}{{end}}
             <div class="zz-msgfoot">
               {{if $m.Model}}<span class="zz-model">via {{$m.Model}}</span>{{end}}
+              {{if eq $m.Role "agent"}}<button class="zz-linkbtn zz-copy" type="button" data-copy="{{$m.Content}}" title="Copy this reply to the clipboard" hidden>Copy</button>{{end}}
               <form method="post" action="/items/thread/hide">
                 <input type="hidden" name="id" value="{{$.Item.ID}}">
                 <input type="hidden" name="msg" value="{{$.Item.TurnKey $i}}">
