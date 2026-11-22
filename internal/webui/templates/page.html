@@ -96,7 +96,7 @@
           </div>
           {{else}}
           <div class="zz-msg zz-msg--{{$m.Role}}">
-            {{if eq $m.Role "agent"}}<div class="zz-msgbody">{{markdown $m.Content}}</div>{{else}}{{$m.Content}}{{end}}
+            {{if eq $m.Role "agent"}}{{markdown $m.Content}}{{else}}{{$m.Content}}{{end}}
             <div class="zz-msgfoot">
               {{if $m.Model}}<span class="zz-model">via {{$m.Model}}</span>{{end}}
               {{if eq $m.Role "agent"}}<button class="zz-linkbtn zz-copy" type="button" data-copy="{{$m.Content}}" title="Copy this reply to the clipboard" hidden>Copy</button>{{end}}

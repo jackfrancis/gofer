@@ -6,9 +6,13 @@
 
   var FEEDBACK_MS = 1500;
 
-  // Last-resort copy for contexts without the async Clipboard API (plain-HTTP
-  // origins other than localhost): a transient off-screen textarea + execCommand.
+  // Last-resort copy for contexts where the async Clipboard API is missing or
+  // rejected (plain-HTTP origins other than localhost, denied permission, embedded
+  // webviews): a transient off-screen textarea + execCommand. Selecting the textarea
+  // moves focus to it, and removing it would drop focus to <body>, so the element
+  // that had focus (normally the Copy button) gets it back either way.
   function legacyCopy(text) {
+    var prev = document.activeElement;
     var ta = document.createElement("textarea");
     ta.value = text;
     ta.setAttribute("readonly", "");
@@ -16,34 +20,31 @@
     ta.style.top = "-1000px";
     ta.style.opacity = "0";
     document.body.appendChild(ta);
-    ta.select();
     var ok = false;
-    try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
-    document.body.removeChild(ta);
+    try {
+      ta.select();
+      ok = document.execCommand("copy");
+    } catch (e) {
+      ok = false;
+    } finally {
+      document.body.removeChild(ta);
+      if (prev && typeof prev.focus === "function") {
+        prev.focus({ preventScroll: true });
+      }
+    }
     return ok ? Promise.resolve() : Promise.reject(new Error("copy failed"));
   }
 
-  // Copy an assistant reply. text/plain carries the reply's Markdown source (what
-  // pastes into a GitHub comment box); where supported, text/html carries the
-  // rendered, already-sanitized bubble so rich editors keep the formatting. Each
-  // path that the browser rejects (unsupported type, denied permission, embedded
-  // webview) falls through to the next, ending at the textarea copy.
-  function copyReply(markdown, bodyEl) {
+  // Copy an assistant reply's Markdown source as text/plain only. Never add a
+  // text/html flavor of the rendered reply: GitHub's comment box converts pasted
+  // HTML links back to Markdown, so a reply's [label](url) would paste as
+  // [[label](url)](url).
+  function copyReply(markdown) {
     var clip = navigator.clipboard;
-    if (!clip || !window.isSecureContext) {
+    if (!clip || !clip.writeText || !window.isSecureContext) {
       return legacyCopy(markdown);
     }
-    var attempt;
-    if (bodyEl && typeof ClipboardItem !== "undefined" && clip.write) {
-      var item = new ClipboardItem({
-        "text/plain": new Blob([markdown], { type: "text/plain" }),
-        "text/html": new Blob([bodyEl.innerHTML], { type: "text/html" })
-      });
-      attempt = clip.write([item]).catch(function () { return clip.writeText(markdown); });
-    } else {
-      attempt = clip.writeText(markdown);
-    }
-    return attempt.catch(function () { return legacyCopy(markdown); });
+    return clip.writeText(markdown).catch(function () { return legacyCopy(markdown); });
   }
 
   function wireCopyButtons() {
@@ -52,9 +53,7 @@
       var label = btn.textContent;
       var timer = 0;
       btn.addEventListener("click", function () {
-        var msg = btn.closest(".zz-msg");
-        var body = msg ? msg.querySelector(".zz-msgbody") : null;
-        copyReply(btn.getAttribute("data-copy"), body).then(
+        copyReply(btn.getAttribute("data-copy")).then(
           function () { btn.textContent = "Copied"; },
           function () { btn.textContent = "Copy failed"; }
         ).then(function () {
