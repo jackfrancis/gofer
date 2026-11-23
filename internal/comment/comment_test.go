@@ -3,7 +3,9 @@ package comment
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -103,7 +105,7 @@ func targets(repos ...string) []Target {
 // stop the others.
 func TestPostPostsEachTarget(t *testing.T) {
 	gh := &fakeGH{fail: map[string]error{"b/locked": &ghcomment.StatusError{Status: http.StatusForbidden, Message: "issue is locked"}}}
-	s := New(&fakeCreds{}, gh)
+	s := newTestService(&fakeCreds{}, gh)
 	res, err := s.Post(context.Background(), "u", targets("a/one", "b/locked", "c/three"), "/lgtm")
 	if err != nil {
 		t.Fatal(err)
@@ -123,7 +125,7 @@ func TestPostPostsEachTarget(t *testing.T) {
 func TestPostStopsOnUnauthorized(t *testing.T) {
 	creds := &fakeCreds{}
 	gh := &fakeGH{fail: map[string]error{"b/two": ghcomment.ErrUnauthorized}}
-	s := New(creds, gh)
+	s := newTestService(creds, gh)
 	res, err := s.Post(context.Background(), "u", targets("a/one", "b/two", "c/three"), "hi")
 	if err != nil {
 		t.Fatal(err)
@@ -142,7 +144,7 @@ func TestPostStopsOnUnauthorized(t *testing.T) {
 // Without a usable write grant nothing is attempted.
 func TestPostNotConnected(t *testing.T) {
 	gh := &fakeGH{}
-	s := New(&fakeCreds{writeErr: vault.ErrSignInRequired}, gh)
+	s := newTestService(&fakeCreds{writeErr: vault.ErrSignInRequired}, gh)
 	if _, err := s.Post(context.Background(), "u", targets("a/one"), "hi"); !errors.Is(err, ErrNotConnected) {
 		t.Fatalf("err = %v", err)
 	}
@@ -161,15 +163,17 @@ func TestMentionsRankAcrossRepos(t *testing.T) {
 		},
 		fail: map[string]error{"c/down": errors.New("boom")},
 	}
-	s := New(&fakeCreds{}, gh)
+	s := newTestService(&fakeCreds{}, gh)
 	m, err := s.Mentions(context.Background(), "u", []string{"a/one", "b/two", "c/down", "A/One"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Repos != 2 || len(m.Failed) != 1 || m.Failed[0] != "c/down" {
-		t.Errorf("repos=%d failed=%v", m.Repos, m.Failed)
+	if m.Selected != 3 || m.Checked != 2 || len(m.Failed) != 1 || m.Failed[0] != "c/down" {
+		t.Errorf("selected=%d checked=%d failed=%v", m.Selected, m.Checked, m.Failed)
 	}
-	want := []Mention{{"Bob", 2}, {"carol", 2}, {"alice", 1}}
+	// Every count is against the three selected repositories; the one that failed
+	// is unknown for everyone, never counted as assignable.
+	want := []Mention{{"Bob", 2, 1}, {"carol", 2, 1}, {"alice", 1, 1}}
 	if len(m.Users) != len(want) {
 		t.Fatalf("users = %+v", m.Users)
 	}
@@ -191,7 +195,7 @@ func TestMentionsRankAcrossRepos(t *testing.T) {
 func TestMentionsCache(t *testing.T) {
 	gh := &fakeGH{assignees: map[string][]string{"a/one": {"alice"}}, fail: map[string]error{}}
 	creds := &fakeCreds{}
-	s := New(creds, gh)
+	s := newTestService(creds, gh)
 	now := time.Now()
 	s.now = func() time.Time { return now }
 	ctx := context.Background()
@@ -218,8 +222,106 @@ func TestMentionsCache(t *testing.T) {
 
 // With no usable read credential, suggestions say sign-in is required.
 func TestMentionsSignInRequired(t *testing.T) {
-	s := New(&fakeCreds{readErr: vault.ErrSignInRequired}, &fakeGH{})
+	s := newTestService(&fakeCreds{readErr: vault.ErrSignInRequired}, &fakeGH{})
 	if _, err := s.Mentions(context.Background(), "u", []string{"a/one"}); !errors.Is(err, vault.ErrSignInRequired) {
 		t.Errorf("err = %v", err)
 	}
+}
+
+func newTestService(creds Credentials, gh GitHub) *Service {
+	s := New(creds, gh)
+	s.spacing = 0
+	return s
+}
+
+// Review P2: a rate limit stops the batch; the rest are left unattempted.
+func TestPostStopsOnRateLimit(t *testing.T) {
+	gh := &fakeGH{fail: map[string]error{"a/one": &ghcomment.RateLimitError{RetryAfter: 10 * time.Minute}}}
+	s := newTestService(&fakeCreds{}, gh)
+	res, err := s.Post(context.Background(), "u", targets("a/one", "b/two", "c/three"), "hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.posts) != 0 {
+		t.Errorf("posted after a rate limit: %v", gh.posts)
+	}
+	for i, r := range res {
+		if r.Posted || r.Error == "" {
+			t.Errorf("result %d = %+v", i, r)
+		}
+	}
+	if res[1].Error[:len("Not attempted")] != "Not attempted" || !strings.Contains(res[0].Error, "10m") {
+		t.Errorf("errors = %q / %q", res[0].Error, res[1].Error)
+	}
+}
+
+// Review P2: a post whose answer was lost is unknown, not "not posted", and the
+// batch carries on.
+func TestPostUnknownOutcome(t *testing.T) {
+	gh := &fakeGH{fail: map[string]error{"a/one": ghcomment.ErrOutcomeUnknown}}
+	s := newTestService(&fakeCreds{}, gh)
+	res, err := s.Post(context.Background(), "u", targets("a/one", "b/two"), "hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res[0].Unknown || res[0].Posted || !strings.HasPrefix(res[0].Error, "Unknown") {
+		t.Errorf("lost answer = %+v", res[0])
+	}
+	if !res[1].Posted {
+		t.Errorf("the next target = %+v", res[1])
+	}
+}
+
+// Posts are spaced apart, and a cancelled batch stops waiting.
+func TestPostSpacing(t *testing.T) {
+	gh := &fakeGH{}
+	s := New(&fakeCreds{}, gh)
+	s.spacing = 30 * time.Millisecond
+	start := time.Now()
+	if _, err := s.Post(context.Background(), "u", targets("a/one", "b/two", "c/three"), "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d < 60*time.Millisecond {
+		t.Errorf("three posts took %s; want at least two spacings", d)
+	}
+	s.spacing = time.Hour
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	res, _ := s.Post(ctx, "u", targets("a/one", "b/two"), "hi")
+	if !res[0].Posted || res[1].Posted || res[1].Error == "" {
+		t.Errorf("results after the deadline = %+v", res)
+	}
+}
+
+// Review P2: a cut list or a repository past the cap is unknown, not "cannot assign".
+func TestMentionsCoverage(t *testing.T) {
+	gh := &fakeGH{assignees: map[string][]string{}}
+	var repos []string
+	for i := 0; i < MaxMentionRepos+2; i++ {
+		r := fmt.Sprintf("o/r%d", i)
+		repos = append(repos, r)
+		gh.assignees[r] = []string{"alice"}
+	}
+	s := newTestService(&fakeCreds{}, &truncating{fakeGH: gh, cut: "o/r0"})
+	m, err := s.Mentions(context.Background(), "u", append(repos, "o/r1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Selected != MaxMentionRepos+2 || m.Unchecked != 2 || len(m.Truncated) != 1 || m.Checked != MaxMentionRepos-1 {
+		t.Fatalf("coverage = %+v", m)
+	}
+	if len(m.Users) != 1 || m.Users[0].Repos != MaxMentionRepos || m.Users[0].Unknown != 2 {
+		t.Errorf("alice = %+v; want found in every checked repo, unknown in the two unchecked", m.Users)
+	}
+}
+
+// truncating reports one repository's list as cut.
+type truncating struct {
+	*fakeGH
+	cut string
+}
+
+func (g *truncating) Assignees(ctx context.Context, token, repo string) ([]string, bool, error) {
+	l, _, err := g.fakeGH.Assignees(ctx, token, repo)
+	return l, repo != g.cut, err
 }

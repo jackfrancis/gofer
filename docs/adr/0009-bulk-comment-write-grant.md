@@ -45,9 +45,23 @@ classic scope that can comment on a public repository.
   an account `ALLOWED_GITHUB_LOGINS` no longer admits. The generic `/auth/{provider}`
   routes and the sign-in page never offer it.
 - **Logout revokes it too.** The grant is revoked at GitHub and deleted when the user
-  logs out, or when they choose "Disconnect commenting". If GitHub does not confirm
-  revocation, logout's existing "unconfirmed" answer links GitHub's OAuth-app settings
-  page.
+  logs out, or when they choose "Disconnect commenting". Logout records the write
+  grant's pending revocation in the **same commit** as the session's end and the
+  sign-in credential's marker (`MarkLogoutEndingSession` with both providers), so a
+  restart right after logout still revokes it. A grant that cannot be read at that
+  point is recorded anyway (fail closed), and a commit failure changes nothing for
+  either credential (503). If GitHub does not confirm revocation, logout's existing
+  "unconfirmed" answer links GitHub's OAuth-app settings page.
+- **A connection in flight cannot undo a logout.** The callback stores the grant only
+  after re-checking the initiating session, under the write grant's marker lock.
+  Logout holds the same lock while it decides what to revoke and commits the
+  session's end. Either the grant is stored first, and logout sees and revokes it, or
+  the session has ended first, and the callback revokes the token it was issued and
+  stores nothing.
+- **Storing it is strict.** Unlike sign-in, where a vault failure is logged and login
+  continues, a write grant gofer could not save is revoked, and the user is told,
+  including when GitHub did not confirm the revocation. A grant gofer has not saved is
+  one it could not revoke at logout.
 
 ### Posting happens in the web tier, never in a run
 
@@ -75,16 +89,30 @@ The client keeps the workload's guard rules (ADR 0007, "public-only guard"):
    (at most 16 KiB) for up to 50 selected items.
 2. Submitting renders a **preview**: the exact comment and every target, with any
    items it will skip (gone, hidden or closed since the page rendered, since bulk
-   actions never act on items off the radar). Nothing is posted yet.
-3. **Confirm** posts the comment to each target in order, one at a time. GitHub asks
-   for serial content creation. The confirm request must be same-origin (`Origin` /
-   `Sec-Fetch-Site`) in addition to SameSite=Lax.
-4. The preview carries a one-time nonce. A confirm whose nonce was already used
-   (double click, back button, refresh) shows the first submission's results again
-   instead of posting a second time.
-5. The results page shows each target as posted (with a link to the comment) or
-   failed (with the reason). A 401 confirmed by GitHub's check-token deletes the
-   stored grant, stops the batch, and asks the user to reconnect.
+   actions never act on items off the radar). Nothing is posted yet. The preview
+   registers the comment and its items, for its owner, under a one-time nonce (in
+   memory, bounded per owner and in all, for 30 minutes).
+3. **Confirm** sends only that nonce. It atomically consumes the registered preview
+   and posts its comment to each of its items still on the radar, in order, one at a
+   time, at least a second apart: GitHub asks for serial content creation, spaced
+   out. A nonce gofer does not hold (never issued, expired, or from before a web-pod
+   restart) is refused, never posted, so no resubmit can post a second time. A nonce
+   already confirmed shows that batch's results again (kept for an hour). A batch
+   that attempted nothing (no grant, the worklist unreadable) reopens its preview.
+4. The confirm request must be same-origin, in addition to SameSite=Lax. A browser
+   that sends fetch metadata decides (`Sec-Fetch-Site: same-origin`): gofer's
+   `Referrer-Policy: no-referrer` makes a form POST send `Origin: null`. Without
+   fetch metadata, an `Origin` must name gofer's host; `null` is refused. The preview
+   response itself sets `Referrer-Policy: same-origin`, so its Confirm button sends a
+   real origin.
+5. The results page shows each target as posted (with a link to the comment, when
+   GitHub's answer arrived whole), unknown, or not posted (with the reason). A 201 is
+   posted even if its body was lost. A POST whose answer was lost after the request
+   was written, or that got a gateway error (502/503/504), is **unknown**: it may
+   have been posted, and the page says to check before posting again. A 401 confirmed
+   by GitHub's check-token deletes the stored grant. A rate limit (429, or 403 with
+   GitHub's rate-limit signals) stops the batch, says when to try again, and leaves
+   the rest unattempted.
 
 Posting is detached from the browser request, under an overall deadline, so a closed
 tab does not leave a batch half-reported.
@@ -97,9 +125,13 @@ suggestions come from `GET /repos/{repo}/assignees`. The list is read with the u
 few hours. The browser asks `GET /items/mentions?repo=…` for the repositories of the
 checked items.
 
-Each suggestion is ranked by how many of those repositories can assign it. One that
-cannot be assigned everywhere says so ("assignable in 2 of 3"), so a `/assign` that
-will fail in some repositories is visible before posting. The typeahead
+Each suggestion is ranked by how many of those repositories can assign it, and every
+count is against **all** the selected repositories, not only those that answered.
+One that cannot be assigned everywhere says so ("assignable in 2 of 3"), so a
+`/assign` that will fail in some repositories is visible before posting. Repositories
+gofer could not check (a list that failed, a list cut at its bound that does not name
+the login, or past the 20-repository lookup cap) are shown as unknown ("assignable in
+1 of 3; 2 not checked"), never as assignable. The typeahead
 (`static/comment.js`) is progressive enhancement: without script the box is a plain
 textarea and the flow is unchanged.
 

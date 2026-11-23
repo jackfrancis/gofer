@@ -327,3 +327,4 @@ body {
 .zz-target-status { color: var(--muted); font-size: 13px; margin-left: auto; }
 .zz-target-ok .zz-target-status { color: var(--success); }
 .zz-target-fail .zz-target-status { color: var(--danger); }
+.zz-target-unknown .zz-target-status { color: var(--attention); }

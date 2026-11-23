@@ -2,8 +2,10 @@
 // this script the checkboxes and the textarea still post, and the server previews.
 // With it, the box shows how many items are checked, and typing "@" suggests logins
 // that can be assigned in the checked items' repositories (GET /items/mentions),
-// ranked by how many of them can assign each; one that cannot be assigned in all of
-// them says so, since a /assign for it would fail in some.
+// ranked by how many of them can assign each. The count is always against every
+// selected repository: one that cannot be assigned in all of them says so, since a
+// /assign for it would fail in some, and repositories gofer could not check are
+// shown as unknown, never as assignable.
 (function () {
   "use strict";
   var form = document.getElementById("zz-bulk-comment");
@@ -126,8 +128,10 @@
   }
   function render(answer, total) {
     list.textContent = "";
+    var unchecked = total - (answer.checked || 0);
     if (!shown.length) {
-      note(token.prefix ? "No assignable user starts with “" + token.prefix + "”" : "No assignable users found");
+      note((token.prefix ? "No assignable user starts with “" + token.prefix + "”" : "No assignable users found") +
+        (unchecked > 0 ? " (" + unchecked + " of " + total + " repositories not checked)" : ""));
       return;
     }
     shown.forEach(function (u, i) {
@@ -137,10 +141,11 @@
       var name = document.createElement("span");
       name.textContent = "@" + u.login;
       li.appendChild(name);
-      if (total > 1 && u.repos < total) {
+      if (u.repos < total) {
         var n = document.createElement("span");
         n.className = "zz-mention-note";
-        n.textContent = "assignable in " + u.repos + " of " + total;
+        n.textContent = "assignable in " + u.repos + " of " + total +
+          (u.unknown ? "; " + u.unknown + " not checked" : "");
         li.appendChild(n);
       }
       li.addEventListener("mousedown", function (e) {
@@ -182,7 +187,7 @@
         }
       });
       shown = starts.concat(contains).slice(0, maxShown);
-      render(answer, answer.repos || rs.length);
+      render(answer, answer.selected || rs.length);
     }, function () {
       if (mine === seq) {
         note("Suggestions are unavailable right now");

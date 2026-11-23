@@ -39,6 +39,9 @@ type fakeGitHub struct {
 	revokeErr bool // grant revocation fails
 	// checkStatus, when set, is check-token's answer whatever the token.
 	checkStatus int
+	// onCode, a func(), runs when an authorization code is exchanged, before the
+	// token is issued.
+	onCode atomic.Value
 	// onRefresh runs when a refresh is served, after the pair has rotated.
 	onRefresh func()
 	// onRevoke runs when a grant revocation arrives, with the token it carries.
@@ -61,6 +64,9 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 		switch {
 		case r.URL.Path == "/login/oauth/access_token":
 			_ = r.ParseForm()
+			if hook, _ := f.onCode.Load().(func()); hook != nil && r.Form.Get("grant_type") == "authorization_code" {
+				hook() // outside f.mu: the hook may call back into this server
+			}
 			w.Header().Set("Content-Type", "application/json")
 			f.mu.Lock()
 			defer f.mu.Unlock()

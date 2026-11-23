@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 const token = "gho_secret_token"
@@ -176,5 +178,88 @@ func TestAssignees(t *testing.T) {
 	}
 	if _, _, err := c.Assignees(context.Background(), token, "org/private"); !errors.Is(err, ErrNotPublic) {
 		t.Errorf("private repo assignees: %v", err)
+	}
+}
+
+// postServer answers the public check, then answers a comment POST with respond.
+func postServer(t *testing.T, respond func(w http.ResponseWriter, r *http.Request)) *Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"full_name":"o/r","private":false}`))
+			return
+		}
+		respond(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	return New(srv.URL, srv.Client().Transport)
+}
+
+// Review P2: rate limits are told apart from permission denials.
+func TestRateLimits(t *testing.T) {
+	cases := map[string]struct {
+		status  int
+		headers map[string]string
+		body    string
+		limited bool
+		after   time.Duration
+	}{
+		"429 with Retry-After":    {429, map[string]string{"Retry-After": "120"}, `{}`, true, 2 * time.Minute},
+		"secondary limit":         {403, nil, `{"message":"You have exceeded a secondary rate limit."}`, true, 0},
+		"primary limit exhausted": {403, map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)}, `{"message":"API rate limit exceeded"}`, true, time.Hour},
+		"plain permission denial": {403, nil, `{"message":"Must have push access"}`, false, 0},
+	}
+	for name, tc := range cases {
+		c := postServer(t, func(w http.ResponseWriter, _ *http.Request) {
+			for k, v := range tc.headers {
+				w.Header().Set(k, v)
+			}
+			w.WriteHeader(tc.status)
+			_, _ = w.Write([]byte(tc.body))
+		})
+		_, err := c.Comment(context.Background(), token, "o/r", 1, "hi")
+		var rl *RateLimitError
+		if errors.As(err, &rl) != tc.limited {
+			t.Errorf("%s: err = %v, rate limited = %v", name, err, tc.limited)
+			continue
+		}
+		if tc.limited && (rl.RetryAfter < tc.after-time.Minute || rl.RetryAfter > tc.after+time.Minute) {
+			t.Errorf("%s: retry after %s, want about %s", name, rl.RetryAfter, tc.after)
+		}
+	}
+}
+
+// Review P2: a 201 is posted even when its body is lost; a gateway error or a
+// connection lost after the request was sent is an unknown outcome.
+func TestPostOutcomes(t *testing.T) {
+	lostBody := postServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "1000")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"html_url":`)) // then the connection closes short
+	})
+	if link, err := lostBody.Comment(context.Background(), token, "o/r", 1, "hi"); err != nil || link != "" {
+		t.Errorf("201 with a lost body: link %q, err %v; want posted with no link", link, err)
+	}
+
+	gateway := postServer(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) })
+	if _, err := gateway.Comment(context.Background(), token, "o/r", 1, "hi"); !errors.Is(err, ErrOutcomeUnknown) {
+		t.Errorf("502 on a POST: %v, want ErrOutcomeUnknown", err)
+	}
+
+	dropped := postServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close() // the request arrived; the answer never does
+		}
+	})
+	if _, err := dropped.Comment(context.Background(), token, "o/r", 1, "hi"); !errors.Is(err, ErrOutcomeUnknown) {
+		t.Errorf("connection dropped after the POST: %v, want ErrOutcomeUnknown", err)
+	}
+
+	// Nothing sent: a definite failure, not unknown.
+	never := New("http://127.0.0.1:1", nil)
+	if _, err := never.Comment(context.Background(), token, "o/r", 1, "hi"); err == nil || errors.Is(err, ErrOutcomeUnknown) {
+		t.Errorf("unreachable host: %v, want a definite failure", err)
 	}
 }

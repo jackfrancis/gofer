@@ -48,7 +48,7 @@ func (f *fakeCommenter) Mentions(_ context.Context, _ string, repos []string) (c
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.mentions = repos
-	return comment.Mentions{Users: []comment.Mention{{Login: "tallaxes", Repos: len(repos)}}, Repos: len(repos)}, nil
+	return comment.Mentions{Users: []comment.Mention{{Login: "tallaxes", Repos: len(repos)}}, Selected: len(repos), Checked: len(repos)}, nil
 }
 
 func (f *fakeCommenter) postCount() int {
@@ -160,16 +160,32 @@ func TestCommentPreviewPostsNothing(t *testing.T) {
 	}
 }
 
-// Confirm posts once; resubmitting the same confirmation shows its results again
-// and posts nothing more.
+// preview posts a preview and returns its nonce.
+func preview(t *testing.T, h *Handler, body string, ids ...string) string {
+	t.Helper()
+	rec := postComment(h, commentForm(body, ids...))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("preview = %d\n%s", rec.Code, rec.Body)
+	}
+	return previewNonce(t, rec.Body.String())
+}
+
+func confirmForm(nonce string) url.Values {
+	return url.Values{"confirm": {"1"}, "nonce": {nonce}}
+}
+
+// Confirm posts exactly what the preview showed, once; resubmitting the same
+// confirmation shows its results again and posts nothing more.
 func TestCommentConfirmPostsOnce(t *testing.T) {
 	c := &fakeCommenter{enabled: true, connected: true}
 	h := commentFixture(t, c)
-	nonce := previewNonce(t, postComment(h, commentForm("/lgtm", "github:a/one#1", "github:b/two#2")).Body.String())
+	nonce := preview(t, h, "/lgtm", "github:a/one#1", "github:b/two#2")
 
-	form := commentForm("/lgtm", "github:a/one#1", "github:b/two#2")
-	form.Set("confirm", "1")
-	form.Set("nonce", nonce)
+	// Only the nonce goes back: the comment and items are the preview's, whatever
+	// else the form says.
+	form := confirmForm(nonce)
+	form.Set("content", "/close")
+	form.Add("item", "github:a/one#3")
 	rec := postComment(h, form, "Sec-Fetch-Site", "same-origin", "Origin", "http://example.com")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Posted 2 of 2") {
 		t.Fatalf("confirm = %d\n%s", rec.Code, rec.Body)
@@ -186,16 +202,73 @@ func TestCommentConfirmPostsOnce(t *testing.T) {
 	}
 }
 
-// A confirm keeps the comment's line breaks through the preview's form.
+// Review P1: a confirmation gofer does not hold (never issued, expired, or from
+// before a restart) posts nothing.
+func TestCommentUnknownConfirmationPostsNothing(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	nonce := preview(t, h, "/lgtm", "github:a/one#1")
+
+	// A restart: a new handler holds no previews.
+	restarted := commentFixture(t, c)
+	if rec := postComment(restarted, confirmForm(nonce), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "expired") {
+		t.Errorf("confirm after a restart = %d\n%s", rec.Code, rec.Body)
+	}
+	// Never issued.
+	if rec := postComment(h, confirmForm(newNonce()), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusConflict {
+		t.Errorf("confirm of an unissued nonce = %d", rec.Code)
+	}
+	// Expired.
+	now := time.Now()
+	h.now = func() time.Time { return now.Add(previewTTL + time.Minute) }
+	if rec := postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusConflict {
+		t.Errorf("confirm of an expired preview = %d", rec.Code)
+	}
+	if c.postCount() != 0 {
+		t.Errorf("posted %d times", c.postCount())
+	}
+}
+
+// A preview belongs to its owner.
+func TestCommentConfirmationIsTheOwners(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	nonce := preview(t, h, "/lgtm", "github:a/one#1")
+	h.sessions = fakeSessions{&session.User{ID: "github:7", Provider: "github"}}
+	if rec := postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusConflict {
+		t.Errorf("another user's confirm = %d", rec.Code)
+	}
+	if c.postCount() != 0 {
+		t.Error("posted another user's preview")
+	}
+}
+
+// The comment's line breaks survive from the preview to the post.
 func TestCommentKeepsLineBreaks(t *testing.T) {
 	c := &fakeCommenter{enabled: true, connected: true}
 	h := commentFixture(t, c)
-	body := "\n/assign @a\r\n/cc @b"
-	page := postComment(h, commentForm(body, "github:a/one#1")).Body.String()
-	// The preview's hidden textarea starts with a newline the parser drops, then the
-	// comment as normalised.
-	if !strings.Contains(page, "<textarea name=\"content\" hidden>\n\n/assign @a\n/cc @b</textarea>") {
-		t.Errorf("preview textarea does not carry the comment intact:\n%s", page)
+	nonce := preview(t, h, "\n/assign @a\r\n/cc @b", "github:a/one#1")
+	postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin")
+	if c.postCount() != 1 || c.bodies[0] != "\n/assign @a\n/cc @b" {
+		t.Errorf("posted %q", c.bodies)
+	}
+}
+
+// Review P1: the Post button works under gofer's referrer policy, which makes a
+// form POST send "Origin: null"; the preview also relaxes that policy for itself.
+func TestCommentConfirmUnderNoReferrer(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	rec := postComment(h, commentForm("/lgtm", "github:a/one#1"))
+	if got := rec.Header().Get("Referrer-Policy"); got != "same-origin" {
+		t.Errorf("preview Referrer-Policy = %q, want same-origin", got)
+	}
+	nonce := previewNonce(t, rec.Body.String())
+	if rec := postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin", "Origin", "null"); rec.Code != http.StatusOK {
+		t.Fatalf("same-origin confirm with Origin: null = %d", rec.Code)
+	}
+	if c.postCount() != 1 {
+		t.Errorf("posts = %d", c.postCount())
 	}
 }
 
@@ -203,15 +276,15 @@ func TestCommentKeepsLineBreaks(t *testing.T) {
 func TestCommentConfirmRefusesCrossSite(t *testing.T) {
 	c := &fakeCommenter{enabled: true, connected: true}
 	h := commentFixture(t, c)
-	form := commentForm("/lgtm", "github:a/one#1")
-	form.Set("confirm", "1")
-	form.Set("nonce", newNonce())
+	nonce := preview(t, h, "/lgtm", "github:a/one#1")
 	for _, hdr := range [][]string{
 		{"Sec-Fetch-Site", "cross-site"},
 		{"Sec-Fetch-Site", "same-site"},
+		{"Sec-Fetch-Site", "none"},
 		{"Origin", "https://evil.example"},
+		{"Origin", "null"}, // without fetch metadata, an opaque origin proves nothing
 	} {
-		if rec := postComment(h, form, hdr...); rec.Code != http.StatusForbidden {
+		if rec := postComment(h, confirmForm(nonce), hdr...); rec.Code != http.StatusForbidden {
 			t.Errorf("%v: status %d, want 403", hdr, rec.Code)
 		}
 	}
@@ -220,7 +293,7 @@ func TestCommentConfirmRefusesCrossSite(t *testing.T) {
 	}
 }
 
-// A form gofer cannot accept posts nothing.
+// A form gofer cannot accept previews and posts nothing.
 func TestCommentRefusesBadForms(t *testing.T) {
 	c := &fakeCommenter{enabled: true, connected: true}
 	h := commentFixture(t, c)
@@ -228,16 +301,15 @@ func TestCommentRefusesBadForms(t *testing.T) {
 	for i := range many {
 		many[i] = fmt.Sprintf("github:a/one#%d", i+100)
 	}
-	confirm := func(f url.Values) url.Values { f.Set("confirm", "1"); f.Set("nonce", newNonce()); return f }
 	cases := map[string]url.Values{
-		"empty comment": confirm(commentForm("  \n ", "github:a/one#1")),
-		"no items":      confirm(commentForm("/lgtm")),
-		"too many":      confirm(commentForm("/lgtm", many...)),
-		"too long":      confirm(commentForm(strings.Repeat("x", maxMessageBytes+1), "github:a/one#1")),
-		"bad nonce":     {"content": {"/lgtm"}, "item": {"github:a/one#1"}, "confirm": {"1"}, "nonce": {"nope"}},
+		"empty comment": commentForm("  \n ", "github:a/one#1"),
+		"no items":      commentForm("/lgtm"),
+		"too many":      commentForm("/lgtm", many...),
+		"too long":      commentForm(strings.Repeat("x", maxMessageBytes+1), "github:a/one#1"),
+		"bad nonce":     confirmForm("nope"),
 	}
 	for name, form := range cases {
-		if rec := postComment(h, form); rec.Code < 400 {
+		if rec := postComment(h, form, "Sec-Fetch-Site", "same-origin"); rec.Code < 400 {
 			t.Errorf("%s: status %d", name, rec.Code)
 		}
 	}
@@ -253,6 +325,19 @@ func TestCommentRefusesBadForms(t *testing.T) {
 	}
 }
 
+// Unconfirmed previews are bounded per owner; the oldest goes first.
+func TestCommentPreviewsAreBounded(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	first := preview(t, h, "/lgtm", "github:a/one#1")
+	for i := 0; i < maxPreviewsPerOwner; i++ {
+		preview(t, h, "/lgtm", "github:a/one#1")
+	}
+	if rec := postComment(h, confirmForm(first), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusConflict {
+		t.Errorf("the oldest preview past the bound = %d, want refused", rec.Code)
+	}
+}
+
 // A user who has not connected the write grant is sent to connect it.
 func TestCommentNeedsConnection(t *testing.T) {
 	h := commentFixture(t, &fakeCommenter{enabled: true})
@@ -262,24 +347,26 @@ func TestCommentNeedsConnection(t *testing.T) {
 	}
 }
 
-// A batch that posted nothing (no grant) frees its confirmation, so the same
-// confirmation works once the user reconnects.
-func TestCommentNotConnectedFreesNonce(t *testing.T) {
+// A batch that attempted nothing (no grant) reopens its preview, so the same
+// confirmation works once the user reconnects, and posts once.
+func TestCommentNotConnectedReopensPreview(t *testing.T) {
 	c := &fakeCommenter{enabled: true, connected: true, postErr: comment.ErrNotConnected}
 	h := commentFixture(t, c)
-	form := commentForm("/lgtm", "github:a/one#1")
-	form.Set("confirm", "1")
-	form.Set("nonce", newNonce())
-	rec := postComment(h, form)
+	nonce := preview(t, h, "/lgtm", "github:a/one#1")
+	rec := postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin")
 	if !strings.Contains(rec.Body.String(), "Connect commenting") {
 		t.Errorf("page:\n%s", rec.Body)
 	}
 	c.mu.Lock()
 	c.postErr = nil
 	c.mu.Unlock()
-	rec = postComment(h, form)
+	rec = postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin")
 	if c.postCount() != 1 || strings.Contains(rec.Body.String(), "Already posted") {
 		t.Errorf("retry after reconnecting: %d posts\n%s", c.postCount(), rec.Body)
+	}
+	postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin")
+	if c.postCount() != 1 {
+		t.Errorf("posted %d times", c.postCount())
 	}
 }
 
@@ -315,5 +402,20 @@ func TestReloadKeepsSelection(t *testing.T) {
 	}
 	if !strings.Contains(string(b), "[data-comment-item]:checked") {
 		t.Error("reload.js does not wait while items are checked")
+	}
+}
+
+// A result whose answer was lost is shown as unknown, not as failed or posted.
+func TestCommentResultsShowUnknown(t *testing.T) {
+	tgt := comment.Target{Repo: "a/one", Number: 1, Title: "t", URL: "https://github.com/a/one/pull/1"}
+	out := renderPage(t, pageData{View: "comment-results", Comment: &commentView{
+		Body: "/lgtm", Targets: []comment.Target{tgt, tgt}, Posted: 1, Unknown: 1,
+		Results: []comment.Result{
+			{Target: tgt, Posted: true},
+			{Target: tgt, Unknown: true, Error: "Unknown: GitHub's answer was lost"},
+		},
+	}})
+	if !strings.Contains(out, "Posted 1 of 2 (1 unknown)") || !strings.Contains(out, "zz-target-unknown") {
+		t.Errorf("results page:\n%s", out)
 	}
 }

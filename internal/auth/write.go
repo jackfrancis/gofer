@@ -2,7 +2,7 @@ package auth
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -180,21 +180,104 @@ func (h *Handler) ConnectWriteCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "gofer has nowhere to keep the grant", http.StatusInternalServerError)
 		return
 	}
-	restart, err := h.storeSignIn(ctx, p, user.ID, granted.Login, token)
-	if err != nil {
-		slog.WarnContext(ctx, "write grant: could not verify the new token", "user", user.ID, "err", err)
-		http.Error(w, "could not verify the grant with GitHub", http.StatusBadGateway)
-		return
+	// The session is checked again when the grant is stored, under the lock logout
+	// holds while it records what to revoke: a logout that ends this session while the
+	// code is being exchanged must not be followed by a grant stored for it.
+	sessionValid := func(ctx context.Context) (bool, error) {
+		u, err := h.sessions.Lookup(r.WithContext(ctx))
+		return u != nil && u.ID == user.ID, err
 	}
-	if restart {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.WriteHeader(http.StatusConflict)
-		_, _ = io.WriteString(w, `<!doctype html><meta charset="utf-8"><title>gofer</title>`+
-			`<p>The grant was revoked while you were connecting it, so it was not saved.</p>`+
+	outcome, err := h.storeWriteGrant(ctx, p, user.ID, granted.Login, token, sessionValid)
+	switch {
+	case err != nil || outcome == grantSessionEnded:
+		why := "gofer could not save the grant"
+		if outcome == grantSessionEnded {
+			why = "you signed out of gofer while connecting, so the grant was not saved"
+		}
+		slog.WarnContext(ctx, "write grant: not stored; revoking it", "user", user.ID, "session_ended", outcome == grantSessionEnded, "err", err)
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), exchangeTimeout)
+		rerr := h.revokeGrant(rctx, p, token.AccessToken)
+		rcancel()
+		msg := `<p>` + why + `, and GitHub confirmed the grant is revoked.</p>`
+		if rerr != nil {
+			slog.WarnContext(ctx, "write grant: revoking an unsaved grant failed", "user", user.ID, "err", rerr)
+			msg = `<p>` + why + `, and GitHub did not confirm the grant was revoked. ` +
+				`Revoke it in <a href="` + oauthAppsSettings + `">GitHub's settings</a> (Authorized OAuth Apps) to be sure.</p>`
+		}
+		writeGrantPage(w, http.StatusBadGateway, msg+`<p><a href="/">Back to radar</a></p>`)
+		return
+	case outcome == grantRevokedMidFlow:
+		writeGrantPage(w, http.StatusConflict, `<p>The grant was revoked while you were connecting it, so it was not saved.</p>`+
 			`<p><a href="`+writePath+`/login">Connect again</a> &middot; <a href="/">Back to radar</a></p>`)
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+func writeGrantPage(w http.ResponseWriter, status int, body string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, `<!doctype html><meta charset="utf-8"><title>gofer</title>`+body)
+}
+
+// grantOutcome is what storeWriteGrant did.
+type grantOutcome int
+
+const (
+	grantStored         grantOutcome = iota
+	grantRevokedMidFlow              // check-token says the new token is already dead
+	grantSessionEnded                // the session that began the flow has ended
+)
+
+// storeWriteGrant stores a new write grant, strictly: unlike sign-in's storeSignIn,
+// a vault failure is an error, since a grant gofer has not saved is one it could not
+// revoke at logout. Under the credential lock it re-checks the token with GitHub;
+// then, under the write grant's marker lock (which logout holds while it decides what
+// to revoke), it re-checks the initiating session and only then writes the grant and
+// clears any pending logout of it, together. On grantSessionEnded or an error the
+// caller revokes the token.
+func (h *Handler) storeWriteGrant(ctx context.Context, p *provider, userID, login string, tok *oauth2.Token, sessionValid func(context.Context) (bool, error)) (grantOutcome, error) {
+	unlock, err := h.locks.lock(ctx, userID, p.name)
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+	valid, err := h.checkToken(ctx, p, tok.AccessToken)
+	if err != nil {
+		return 0, fmt.Errorf("verify the grant: %w", err)
+	}
+	if !valid {
+		return grantRevokedMidFlow, nil
+	}
+	defer h.locks.markerLock(userID, p.name)()
+	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
+	defer cancel()
+	ok, err := sessionValid(lctx)
+	if err != nil {
+		return 0, fmt.Errorf("re-check the session: %w", err)
+	}
+	if !ok {
+		return grantSessionEnded, nil
+	}
+	cred := vault.Credential{
+		Provider:    p.name,
+		AccessToken: tok.AccessToken,
+		TokenType:   tok.TokenType,
+		Expiry:      tok.Expiry,
+		ClientID:    p.oauth.ClientID,
+		Version:     newVersion(),
+		Login:       login,
+	}
+	if l, ok := h.vault.(vault.LogoutLedger); ok {
+		err = l.PutClearingLogout(lctx, userID, cred)
+	} else if err = h.vault.Put(lctx, userID, cred); err == nil {
+		err = h.ledger.ClearLogout(lctx, userID, p.name)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("store the grant: %w", err)
+	}
+	h.supersedeLogoutLocked(userID, p.name)
+	return grantStored, nil
 }
 
 // refuseGrant revokes a grant gofer will not keep and tells the user why.
@@ -217,40 +300,33 @@ func (h *Handler) DisconnectWrite(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	res, ok := h.logoutWrite(r.Context(), user.ID)
+	lo, err := h.beginWriteDisconnect(r.Context(), user.ID)
 	switch {
-	case !ok:
+	case err != nil:
+		slog.WarnContext(r.Context(), "write grant: recording its disconnect failed", "user", user.ID, "err", err)
 		http.Redirect(w, r, "/?commenting=error", http.StatusSeeOther)
-	case !res.confirmed:
+	case lo == nil:
+		http.Redirect(w, r, "/", http.StatusSeeOther) // nothing was connected
+	case !h.revokeAndDelete(r.Context(), user.ID, WriteProvider, lo).confirmed:
 		http.Redirect(w, r, "/?commenting=unconfirmed", http.StatusSeeOther)
 	default:
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	}
 }
 
-// logoutWrite revokes and deletes the user's write grant, if they hold one. ok is
-// false when there was nothing to do (no grant stored, none pending, commenting not
-// configured) or the logout could not be recorded; a stored grant that cannot be
-// read is revoked anyway (fail closed).
-func (h *Handler) logoutWrite(ctx context.Context, userID string) (logoutResult, bool) {
-	if _, ok := h.providers[WriteProvider]; !ok || h.vault == nil {
-		return logoutResult{}, false
+// beginWriteDisconnect records the write grant's pending logout, if a grant is held
+// (or cannot be read: fail closed), and returns its operation; nil with no error
+// means there was nothing to revoke. An error means nothing was recorded.
+func (h *Handler) beginWriteDisconnect(ctx context.Context, userID string) (*localLogout, error) {
+	defer h.locks.markerLock(userID, WriteProvider)()
+	held, err := h.writeGrantHeldLocked(ctx, userID)
+	if err == nil && !held {
+		return nil, nil
 	}
-	gctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
-	_, err := h.vault.Get(gctx, userID, WriteProvider)
-	cancel()
-	if errors.Is(err, vault.ErrNotFound) {
-		pending, perr := h.logoutPending(ctx, userID, WriteProvider)
-		if perr == nil && !pending {
-			return logoutResult{}, false // never connected: nothing to revoke
-		}
+	if err := h.commitLogouts(ctx, "", userID, []string{WriteProvider}); err != nil {
+		return nil, err
 	}
-	lo, err := h.markLogout(ctx, userID, WriteProvider)
-	if err != nil {
-		slog.WarnContext(ctx, "write grant: recording its logout failed", "user", userID, "err", err)
-		return logoutResult{}, false
-	}
-	return h.revokeAndDelete(ctx, userID, WriteProvider, lo), true
+	return h.publishLogoutLocked(userID, WriteProvider), nil
 }
 
 // mergeLogout combines two logouts' outcomes: confirmed only if both were, with

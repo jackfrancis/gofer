@@ -1,17 +1,21 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/oauth2"
 
 	"github.com/jackfrancis/gofer/internal/config"
 	"github.com/jackfrancis/gofer/internal/session"
+	"github.com/jackfrancis/gofer/internal/storage"
 	"github.com/jackfrancis/gofer/internal/vault"
 )
 
@@ -51,6 +55,12 @@ func newWriteHandler(t *testing.T, gh *fakeGitHub, allowed ...string) (*Handler,
 // URL it was sent to, and a request carrying the browser's cookies afterwards.
 func connectWrite(t *testing.T, h *Handler, signedIn *http.Request) (*httptest.ResponseRecorder, *url.URL, *http.Request) {
 	t.Helper()
+	return connectWriteWith(t, h, signedIn, nil)
+}
+
+// connectWriteWith is connectWrite, running between before the callback.
+func connectWriteWith(t *testing.T, h *Handler, signedIn *http.Request, between func()) (*httptest.ResponseRecorder, *url.URL, *http.Request) {
+	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, writePath+"/login", nil)
 	for _, c := range signedIn.Cookies() {
 		req.AddCookie(c)
@@ -72,6 +82,9 @@ func connectWrite(t *testing.T, h *Handler, signedIn *http.Request) (*httptest.R
 	}
 	for _, c := range rec.Result().Cookies() {
 		cb.AddCookie(c)
+	}
+	if between != nil {
+		between()
 	}
 	out := httptest.NewRecorder()
 	h.ConnectWriteCallback(out, cb)
@@ -338,5 +351,171 @@ func TestCommentingOffWithoutWriteClient(t *testing.T) {
 	h.ConnectWrite(rec, httptest.NewRequest(http.MethodGet, writePath+"/login", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("connect without a write client = %d, want 404", rec.Code)
+	}
+}
+
+// Review P1: logout records the write grant's pending revocation in the same commit
+// as the session's end, so a restart right after it still revokes the grant.
+func TestLogoutCommitsWriteGrantMarkerWithSession(t *testing.T) {
+	gh := newFakeGitHub(t)
+	dir := t.TempDir()
+	db, err := storage.Open(bg, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	keys, _ := storage.NewKeyring(make([]byte, storage.KeySize))
+	h, _, cfg, _ := newWriteHandler(t, gh)
+	h.vault, h.ledger = db.Vault(keys), db.Vault(keys)
+	h.sessions = session.NewManager(cfg.SessionSecret, cfg.CookieSecure, session.WithStore(db.Sessions()))
+	_, signedIn := signIn(t, h)
+	connectWrite(t, h, signedIn)
+	if _, err := db.Vault(keys).Get(bg, user, WriteProvider); err != nil {
+		t.Fatalf("setup: no write grant: %v", err)
+	}
+
+	// Both credential locks are busy, so logout returns right after its commit.
+	defer func(d time.Duration) { logoutLockWait = d }(logoutLockWait)
+	logoutLockWait = 20 * time.Millisecond
+	u1, _ := h.locks.lock(bg, user, "github")
+	u2, _ := h.locks.lock(bg, user, WriteProvider)
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	for _, c := range signedIn.Cookies() {
+		req.AddCookie(c)
+	}
+	h.Logout(httptest.NewRecorder(), req)
+
+	for _, p := range []string{"github", WriteProvider} {
+		if pending, err := db.Vault(keys).LogoutPending(bg, user, p); err != nil || !pending {
+			t.Errorf("%s marker = %v, %v; want recorded with the session's end", p, pending, err)
+		}
+	}
+	// A new process over the same database (the old one's locks stay held, as if
+	// it had died) refuses the grant and finishes its revocation.
+	defer u1()
+	defer u2()
+	h2, _, _, _ := newWriteHandler(t, gh)
+	h2.vault, h2.ledger = db.Vault(keys), db.Vault(keys)
+	if _, err := h2.WriteCredential(bg, user); !errors.Is(err, vault.ErrSignInRequired) {
+		t.Errorf("write grant usable after the logout commit: %v", err)
+	}
+	if gh.revokedOther.Load() != 1 {
+		t.Errorf("write-grant revocations = %d, want 1", gh.revokedOther.Load())
+	}
+	if _, err := db.Vault(keys).Get(bg, user, WriteProvider); !errors.Is(err, vault.ErrNotFound) {
+		t.Errorf("write grant kept after the new process finished its logout: %v", err)
+	}
+}
+
+// Review P1: a write grant that cannot be read at logout is revoked anyway, and a
+// commit failure changes nothing for either credential.
+func TestLogoutWriteGrantFailsClosed(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, sessions, _, vlt := newWriteHandler(t, gh)
+	_, signedIn := signIn(t, h)
+	connectWrite(t, h, signedIn)
+
+	h.vault = failingCommitVault{vlt}
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	for _, c := range signedIn.Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.Logout(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || sessions.CurrentUser(signedIn) == nil {
+		t.Fatalf("logout = %d; want 503 with the session standing", rec.Code)
+	}
+	if gh.revoked.Load() != 0 {
+		t.Error("revoked although nothing was recorded")
+	}
+}
+
+// Review P2: a connection that completes after logout ended its session stores
+// nothing and revokes the grant it was issued.
+func TestConnectAfterLogoutStoresNothing(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newWriteHandler(t, gh)
+	_, signedIn := signIn(t, h)
+	ended := false
+	tok := &oauth2.Token{AccessToken: "w-tok", TokenType: "bearer"}
+	gh.seed("w-tok", "")
+	gh.mu.Lock()
+	gh.issuer["w-tok"] = "wcid"
+	gh.mu.Unlock()
+	out, err := h.storeWriteGrant(bg, h.providers[WriteProvider], user, "octocat", tok, func(context.Context) (bool, error) {
+		ended = true
+		return false, nil // logout ended the session during the exchange
+	})
+	if err != nil || out != grantSessionEnded || !ended {
+		t.Fatalf("outcome = %v, %v (checked=%v)", out, err, ended)
+	}
+	if _, ok := writeStored(t, vlt); ok {
+		t.Error("stored a grant for an ended session")
+	}
+
+	// Through the callback: logout lands while the code is being exchanged.
+	gh.onCode.Store(func() {
+		gh.onCode.Store(func() {})
+		req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+		for _, c := range signedIn.Cookies() {
+			req.AddCookie(c)
+		}
+		h.Logout(httptest.NewRecorder(), req)
+	})
+	rec, _, _ := connectWrite(t, h, signedIn)
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "signed out") {
+		t.Fatalf("callback after logout = %d %s", rec.Code, rec.Body)
+	}
+	if _, ok := writeStored(t, vlt); ok {
+		t.Error("the callback stored a grant after logout")
+	}
+	if gh.revokedOther.Load() != 1 {
+		t.Errorf("write-grant revocations = %d, want 1 (the unsaved grant)", gh.revokedOther.Load())
+	}
+}
+
+// failingPutLedger is a vault whose writes fail.
+type failingPutLedger struct{ *vault.MemoryVault }
+
+func (failingPutLedger) PutClearingLogout(context.Context, string, vault.Credential) error {
+	return errors.New("disk full")
+}
+
+// Review P2: a grant gofer could not save is reported, and revoked, not treated as
+// connected.
+func TestConnectWriteReportsVaultFailure(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newWriteHandler(t, gh)
+	_, signedIn := signIn(t, h)
+	h.vault = failingPutLedger{vlt.(*vault.MemoryVault)}
+	rec, _, _ := connectWrite(t, h, signedIn)
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "could not save") {
+		t.Fatalf("callback = %d %s", rec.Code, rec.Body)
+	}
+	if gh.revokedOther.Load() != 1 {
+		t.Errorf("write-grant revocations = %d, want 1", gh.revokedOther.Load())
+	}
+	h.vault = vlt
+	if st := h.CommentingState(bg, user); st.Connected {
+		t.Error("connected after a failed save")
+	}
+}
+
+// Disconnect with nothing connected changes nothing and reports no error.
+func TestDisconnectWithoutGrant(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newWriteHandler(t, gh)
+	_, signedIn := signIn(t, h)
+	req := httptest.NewRequest(http.MethodPost, writePath+"/disconnect", nil)
+	for _, c := range signedIn.Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.DisconnectWrite(rec, req)
+	if rec.Header().Get("Location") != "/" || gh.revokedOther.Load() != 0 {
+		t.Fatalf("disconnect = %q, revocations %d", rec.Header().Get("Location"), gh.revokedOther.Load())
+	}
+	if p, _ := vlt.(*vault.MemoryVault).LogoutPending(bg, user, WriteProvider); p {
+		t.Error("recorded a pending revocation of nothing")
 	}
 }

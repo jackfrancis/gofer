@@ -76,10 +76,7 @@
           {{if .Comment.Targets}}
           <form method="post" action="/items/comment">
             <input type="hidden" name="confirm" value="1">
-            <input type="hidden" name="nonce" value="{{.Comment.Nonce}}">
-            {{/* A textarea keeps the comment's line breaks; the newline after the tag protects a leading one. */}}<textarea name="content" hidden>
-{{.Comment.Body}}</textarea>
-            {{range .Comment.Targets}}<input type="hidden" name="item" value="{{.ID}}">{{end}}
+            {{/* The nonce names the comment and items this preview registered; Confirm posts exactly those. */}}<input type="hidden" name="nonce" value="{{.Comment.Nonce}}">
             <button class="btn btn-primary" type="submit">Post to {{len .Comment.Targets}} item{{if ne (len .Comment.Targets) 1}}s{{end}}</button>
           </form>
           {{end}}
@@ -90,13 +87,13 @@
     {{else if eq .View "comment-results"}}
       <p><a href="/">&larr; Back to radar</a></p>
       <div class="zz-comment-page">
-        <h1>{{if .Comment.Repeat}}Already posted:{{else}}Posted{{end}} {{.Comment.Posted}} of {{len .Comment.Targets}}</h1>
+        <h1>{{if .Comment.Repeat}}Already posted:{{else}}Posted{{end}} {{.Comment.Posted}} of {{len .Comment.Targets}}{{with .Comment.Unknown}} ({{.}} unknown){{end}}</h1>
         {{if .Comment.Repeat}}<p class="zz-meta">This confirmation was already used, so nothing was posted again. These are its results.</p>{{end}}
         {{with .Comment.Error}}<p class="zz-stalled" role="alert">{{.}}</p>{{end}}
         <pre class="zz-comment-body">{{.Comment.Body}}</pre>
         {{if .Comment.Results}}
         <ul class="zz-targets">
-          {{range .Comment.Results}}<li class="{{if .Posted}}zz-target-ok{{else}}zz-target-fail{{end}}"><a href="{{.URL}}" target="_blank" rel="noopener noreferrer">{{.Repo}} #{{.Number}}</a> <span>{{.Title}}</span> <span class="zz-target-status">{{if .Posted}}Posted{{with .CommentURL}} &middot; <a href="{{.}}" target="_blank" rel="noopener noreferrer">view comment</a>{{end}}{{else}}{{.Error}}{{end}}</span></li>{{end}}
+          {{range .Comment.Results}}<li class="{{if .Posted}}zz-target-ok{{else if .Unknown}}zz-target-unknown{{else}}zz-target-fail{{end}}"><a href="{{.URL}}" target="_blank" rel="noopener noreferrer">{{.Repo}} #{{.Number}}</a> <span>{{.Title}}</span> <span class="zz-target-status">{{if .Posted}}Posted{{with .CommentURL}} &middot; <a href="{{.}}" target="_blank" rel="noopener noreferrer">view comment</a>{{end}}{{else}}{{.Error}}{{end}}</span></li>{{end}}
         </ul>
         {{end}}
         {{template "skipped" .Comment.Skipped}}

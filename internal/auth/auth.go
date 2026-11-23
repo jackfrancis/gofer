@@ -394,14 +394,14 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	// Record the pending logout and end the session together (one commit with the
 	// SQLite vault), again detached from the browser. If that fails nothing changed:
 	// the session stands, nothing is revoked, and the user is told to try again.
-	var lo *localLogout
+	var lo, writeLo *localLogout
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
 	err := h.sessions.EndWith(w, r.WithContext(cctx), func(ctx context.Context, sessionKey string) error {
 		if u == nil || h.vault == nil {
 			return nil
 		}
 		var err error
-		lo, err = h.beginLogout(ctx, sessionKey, u.ID, u.Provider)
+		lo, writeLo, err = h.beginSessionLogout(ctx, sessionKey, u.ID, u.Provider)
 		return err
 	})
 	cancel()
@@ -420,11 +420,10 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	}
 	if lo != nil {
 		res = h.revokeAndDelete(r.Context(), u.ID, u.Provider, lo)
-		// The write grant (ADR 0009) goes with the session that connected it.
-		if u.Provider == "github" {
-			if wres, ok := h.logoutWrite(r.Context(), u.ID); ok {
-				res = mergeLogout(res, wres)
-			}
+		// The write grant (ADR 0009) goes with the session that connected it; its
+		// pending logout was recorded in the same commit.
+		if writeLo != nil {
+			res = mergeLogout(res, h.revokeAndDelete(r.Context(), u.ID, WriteProvider, writeLo))
 		}
 	}
 	if res.confirmed {

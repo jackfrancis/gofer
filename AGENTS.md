@@ -438,14 +438,22 @@ Wired on the web-tier side; they define what a runtime must respect:
   accumulates scopes per user and app, which would put `public_repo` on the token runs
   hold). The grant is connected under its own cookie (`session.StartGrant`, path
   `/auth/github-write`), so the session survives, and only by the GitHub account the
-  session belongs to; logout and "Disconnect commenting" revoke it through logout's
-  ledger. The web tier posts with it (`internal/comment` over `internal/ghcomment`,
-  which checks `"private": false` first and follows no redirect): a preview, then a
-  same-origin confirm carrying a one-time nonce, so a resubmit shows the first
-  results instead of posting again. Targets are items on the radar only
-  (`WorkItem.OnRadar`). @ suggestions are each repository's assignees, read with the
-  user's read credential and cached in memory, ranked by how many of the selected
-  repositories can assign each. `reload.js` does not reload while items are checked.
+  session belongs to. Logout records the write grant's pending revocation in the same
+  commit as the session's end (`beginSessionLogout`), and the callback re-checks the
+  session under the write grant's marker lock before storing, so an in-flight
+  connection cannot outlive a logout; storing a write grant is strict (a vault
+  failure revokes it and tells the user). The web tier posts with it
+  (`internal/comment` over `internal/ghcomment`, which checks `"private": false`
+  first and follows no redirect). The preview registers the comment and items under a
+  one-time nonce; a same-origin confirm consumes it, and a nonce gofer does not hold
+  is refused, so nothing posts twice from one preview, across a restart included.
+  Same-origin trusts `Sec-Fetch-Site: same-origin`, since `Referrer-Policy:
+  no-referrer` makes a form's `Origin` "null". Posts are serial, a second apart; a
+  rate limit stops the batch, and a POST whose answer was lost is "unknown", never
+  "not posted". Targets are items on the radar only (`WorkItem.OnRadar`). @
+  suggestions are each repository's assignees, read with the user's read credential
+  and cached in memory, counted against every selected repository (unchecked ones are
+  unknown). `reload.js` does not reload while items are checked.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

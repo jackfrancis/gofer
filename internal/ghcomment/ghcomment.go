@@ -19,10 +19,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -46,7 +48,26 @@ var (
 	ErrNotPublic = errors.New("repository is not public")
 	// ErrInvalidRepo means the name is not a plain owner/name.
 	ErrInvalidRepo = errors.New("not a repository name")
+	// ErrOutcomeUnknown means a POST was sent but gofer cannot tell whether GitHub
+	// acted on it: the answer was lost (timeout, dropped connection) or was a gateway
+	// error (502/503/504), which GitHub can give after the comment was created. A
+	// retry could post a duplicate.
+	ErrOutcomeUnknown = errors.New("github may or may not have acted on the request")
 )
+
+// RateLimitError is GitHub refusing because of a primary or secondary rate limit
+// (429, or 403 with rate-limit signals). RetryAfter is how long GitHub asked gofer to
+// wait, when it said (Retry-After, or X-RateLimit-Reset with none remaining).
+type RateLimitError struct {
+	RetryAfter time.Duration
+}
+
+func (e *RateLimitError) Error() string {
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("github: rate limited; retry after %s", e.RetryAfter.Round(time.Second))
+	}
+	return "github: rate limited"
+}
 
 // StatusError is any other non-success answer, with GitHub's message when it gave
 // one (never a token, never a URL).
@@ -132,9 +153,10 @@ func (c *Client) Comment(ctx context.Context, token, repo string, number int, bo
 		return "", err
 	}
 	resp, err := c.do(ctx, token, http.MethodPost, "/repos/"+canon+"/issues/"+strconv.Itoa(number)+"/comments", payload, http.StatusCreated)
-	if err != nil {
+	if err != nil && !errors.Is(err, errBodyLost) {
 		return "", err
 	}
+	// A 201 is posted, even if its body (the link) was lost on the way.
 	var out struct {
 		HTMLURL string `json:"html_url"`
 	}
@@ -176,11 +198,21 @@ func (c *Client) Assignees(ctx context.Context, token, repo string) (logins []st
 	return logins, false, nil
 }
 
+// errBodyLost is a response with the wanted status whose body could not be read.
+// do returns what it read with it.
+var errBodyLost = errors.New("github: response body lost")
+
 // do sends one request and returns the body of a response with status want. Any
-// redirect is an error: the client follows none.
+// redirect is an error: the client follows none. For a POST, an error after the
+// request was written, or a gateway error, is ErrOutcomeUnknown; an error before it
+// was written is a definite failure.
 func (c *Client) do(ctx context.Context, token, method, path string, payload []byte, want int) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
+	var wrote atomic.Bool
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { wrote.Store(true) },
+	})
 	var body io.Reader
 	if payload != nil {
 		body = bytes.NewReader(payload)
@@ -198,10 +230,14 @@ func (c *Client) do(ctx context.Context, token, method, path string, payload []b
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	post := method == http.MethodPost
 	resp, err := c.transport.RoundTrip(req)
 	if err != nil {
 		// A transport error can quote the URL; the path is not secret, but keep the
 		// error to its kind.
+		if post && wrote.Load() {
+			return nil, ErrOutcomeUnknown
+		}
 		if ctx.Err() != nil {
 			return nil, errors.New("github: request timed out")
 		}
@@ -212,21 +248,52 @@ func (c *Client) do(ctx context.Context, token, method, path string, payload []b
 	switch {
 	case resp.StatusCode == want:
 		if rerr != nil {
-			return nil, errors.New("github: unreadable response")
+			return data, errBodyLost
 		}
 		return data, nil
 	case resp.StatusCode == http.StatusUnauthorized:
 		return nil, ErrUnauthorized
 	case resp.StatusCode >= 300 && resp.StatusCode < 400:
 		return nil, &StatusError{Status: resp.StatusCode, Message: "redirected; gofer follows no redirect"}
+	case post && (resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout):
+		return nil, ErrOutcomeUnknown
 	}
 	var msg struct {
 		Message string `json:"message"`
 	}
 	_ = json.Unmarshal(data, &msg)
+	if rl := rateLimit(resp, msg.Message, time.Now()); rl != nil {
+		return nil, rl
+	}
 	m := msg.Message
 	if len(m) > 200 {
 		m = m[:200]
 	}
 	return nil, &StatusError{Status: resp.StatusCode, Message: m}
+}
+
+// rateLimit reads GitHub's rate-limit signals from a refusal: 429; or 403 with no
+// requests remaining, a Retry-After, or a message naming a rate limit (the secondary
+// limits on content creation). It returns nil for any other answer.
+func rateLimit(resp *http.Response, message string, now time.Time) *RateLimitError {
+	limited := resp.StatusCode == http.StatusTooManyRequests
+	if resp.StatusCode == http.StatusForbidden {
+		limited = resp.Header.Get("X-RateLimit-Remaining") == "0" ||
+			resp.Header.Get("Retry-After") != "" ||
+			strings.Contains(strings.ToLower(message), "rate limit")
+	}
+	if !limited {
+		return nil
+	}
+	rl := &RateLimitError{}
+	if secs, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); err == nil && secs > 0 {
+		rl.RetryAfter = time.Duration(secs) * time.Second
+	} else if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+		if reset, err := strconv.ParseInt(resp.Header.Get("X-RateLimit-Reset"), 10, 64); err == nil {
+			if d := time.Unix(reset, 0).Sub(now); d > 0 {
+				rl.RetryAfter = d
+			}
+		}
+	}
+	return rl
 }

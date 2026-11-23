@@ -98,12 +98,12 @@ func (l *credLocks) isCurrent(userID, provider string, lo *localLogout) bool {
 	return l.currentLogout(userID, provider) == lo
 }
 
-// logoutCommitter is a vault that consumes the browser session and records a pending
-// logout in one commit (storage.VaultStore, over the database that also holds the
+// logoutCommitter is a vault that consumes the browser session and records pending
+// logouts in one commit (storage.VaultStore, over the database that also holds the
 // sessions). It answers session.ErrNotFound, recording nothing, when the session is
 // already gone.
 type logoutCommitter interface {
-	MarkLogoutEndingSession(ctx context.Context, sessionKey, userID, provider string) error
+	MarkLogoutEndingSession(ctx context.Context, sessionKey, userID, provider string, more ...string) error
 }
 
 // beginLogout records a logout of the user's credential and consumes the browser
@@ -116,41 +116,106 @@ type logoutCommitter interface {
 // claimed), the new one joins it.
 func (h *Handler) beginLogout(ctx context.Context, sessionKey, userID, providerName string) (*localLogout, error) {
 	defer h.locks.markerLock(userID, providerName)()
-	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
-	defer cancel()
-	var err error
-	if c, ok := h.vault.(logoutCommitter); ok {
-		err = c.MarkLogoutEndingSession(lctx, sessionKey, userID, providerName)
-	} else {
-		// An in-memory vault: there is no restart to survive. Consume the session
-		// from the manager's own store first, so each session still starts at most
-		// one logout.
-		if sessionKey != "" {
-			consumed, cerr := h.sessions.ConsumeStored(lctx, sessionKey)
-			switch {
-			case cerr != nil:
-				err = cerr
-			case !consumed:
-				err = session.ErrNotFound
-			}
-		}
-		if err == nil {
-			err = h.ledger.MarkLogout(lctx, userID, providerName)
-		}
-	}
-	if err != nil {
+	if err := h.commitLogouts(ctx, sessionKey, userID, []string{providerName}); err != nil {
 		return nil, err
 	}
-	// An unfinished logout of this credential is reused, never replaced: joined if
-	// it is running, resumed if its background wait gave up. Replacing it would leave
-	// its waiters holding a record nobody supersedes when the user signs in again.
+	return h.publishLogoutLocked(userID, providerName), nil
+}
+
+// beginSessionLogout is beginLogout for an interactive logout: when the session is a
+// GitHub one and commenting is configured, the write grant's logout (ADR 0009) is
+// recorded in the same commit as the sign-in credential's and the session's end, if
+// a write grant is held, its logout is already pending, or that cannot be read
+// (fail closed). The check and the commit run under the write grant's marker lock,
+// which the connect callback also holds while it re-checks the session and stores a
+// grant, so a grant is either stored before this check sees it, or refused because
+// the session has ended. writeLo is nil when no write grant was recorded.
+func (h *Handler) beginSessionLogout(ctx context.Context, sessionKey, userID, providerName string) (lo, writeLo *localLogout, err error) {
+	defer h.locks.markerLock(userID, providerName)()
+	providers := []string{providerName}
+	if _, ok := h.providers[WriteProvider]; ok && providerName == "github" {
+		defer h.locks.markerLock(userID, WriteProvider)()
+		held, herr := h.writeGrantHeldLocked(ctx, userID)
+		if herr != nil {
+			slog.WarnContext(ctx, "logout: could not read the write grant; revoking it anyway", "user", userID, "err", herr)
+		}
+		if held || herr != nil {
+			providers = append(providers, WriteProvider)
+		}
+	}
+	if err := h.commitLogouts(ctx, sessionKey, userID, providers); err != nil {
+		return nil, nil, err
+	}
+	lo = h.publishLogoutLocked(userID, providerName)
+	if len(providers) > 1 {
+		writeLo = h.publishLogoutLocked(userID, WriteProvider)
+	}
+	return lo, writeLo, nil
+}
+
+// writeGrantHeldLocked reports whether the user holds a write grant or has its logout
+// pending. The caller holds the write grant's marker lock.
+func (h *Handler) writeGrantHeldLocked(ctx context.Context, userID string) (bool, error) {
+	if lo := h.locks.currentLogout(userID, WriteProvider); lo != nil {
+		return true, nil
+	}
+	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
+	defer cancel()
+	if marked, err := h.ledger.LogoutPending(lctx, userID, WriteProvider); err != nil || marked {
+		return marked, err
+	}
+	_, err := h.vault.Get(lctx, userID, WriteProvider)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, vault.ErrNotFound):
+		return false, nil
+	}
+	return false, err
+}
+
+// commitLogouts consumes the session (if any) and records each provider's pending
+// logout, in one commit where the vault allows it. The caller holds each provider's
+// marker lock.
+func (h *Handler) commitLogouts(ctx context.Context, sessionKey, userID string, providers []string) error {
+	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
+	defer cancel()
+	if c, ok := h.vault.(logoutCommitter); ok {
+		return c.MarkLogoutEndingSession(lctx, sessionKey, userID, providers[0], providers[1:]...)
+	}
+	// An in-memory vault: there is no restart to survive. Consume the session from
+	// the manager's own store first, so each session still starts at most one
+	// logout.
+	if sessionKey != "" {
+		consumed, err := h.sessions.ConsumeStored(lctx, sessionKey)
+		switch {
+		case err != nil:
+			return err
+		case !consumed:
+			return session.ErrNotFound
+		}
+	}
+	for _, p := range providers {
+		if err := h.ledger.MarkLogout(lctx, userID, p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// publishLogoutLocked publishes the logout operation of a just-recorded logout. An
+// unfinished logout of the credential is reused, never replaced: joined if it is
+// running, resumed if its background wait gave up. Replacing it would leave its
+// waiters holding a record nobody supersedes when the user signs in again. The
+// caller holds the provider's marker lock.
+func (h *Handler) publishLogoutLocked(userID, providerName string) *localLogout {
 	if lo := h.locks.currentLogout(userID, providerName); lo != nil && !lo.finished() {
 		lo.running = true
-		return lo, nil
+		return lo
 	}
 	lo := newLocalLogout()
 	h.locks.setLogout(userID, providerName, lo)
-	return lo, nil
+	return lo
 }
 
 // markLogout records a logout with no browser session to end.
