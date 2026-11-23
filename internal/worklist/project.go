@@ -93,9 +93,15 @@ var projectables = []projectable{
 			if w.GitHub.LabelColors == nil {
 				return
 			}
-			kept := map[string]string{}
+			// kept stays nil until a color survives: an empty map would be fingerprinted
+			// as {} but reach the run as nothing (omitempty) and come back nil, so the
+			// write-back would see a rewrite and drop the stored colors.
+			var kept map[string]string
 			for _, l := range w.Signals.Labels {
 				if c := w.GitHub.LabelColor(l); c != "" {
+					if kept == nil {
+						kept = map[string]string{}
+					}
 					kept[l] = c
 				}
 			}

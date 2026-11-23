@@ -1,9 +1,11 @@
 package webui
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -76,9 +78,66 @@ func TestLabelRuleContrast(t *testing.T) {
 		"a2eeef": "color:#000000;border-color:#a2eeef", // GitHub's enhancement cyan
 		"ededed": "color:#000000;border-color:#ededed",
 		"f9f9f9": "color:#000000;border-color:#b9b9b9",
+		"ff00ff": "color:#000000;border-color:#ff00ff", // GitHub's white is 3.1:1; black is 6.7:1
 	} {
 		if got := labelRule(c); !strings.Contains(got, want) {
 			t.Errorf("labelRule(%s) = %s, want %s", c, got, want)
 		}
+	}
+}
+
+// Whatever the color, the text drawn on it meets WCAG AA for its size.
+func TestLabelRuleTextIsReadable(t *testing.T) {
+	for r := 0; r <= 0xff; r += 0x11 { // a 16x16x16 grid, plus the primaries below
+		for g := 0; g <= 0xff; g += 0x11 {
+			for b := 0; b <= 0xff; b += 0x11 {
+				checkReadable(t, fmt.Sprintf("%02x%02x%02x", r, g, b))
+			}
+		}
+	}
+	for _, c := range []string{"ff0000", "00ff00", "0000ff", "ffff00", "00ffff", "ff00ff", "808080", "777777"} {
+		checkReadable(t, c)
+	}
+}
+
+func checkReadable(t *testing.T, c string) {
+	t.Helper()
+	rule := labelRule(c)
+	rgb, _ := strconv.ParseUint(c, 16, 32)
+	onWhite, onBlack := contrastWith(float64(rgb>>16&0xff), float64(rgb>>8&0xff), float64(rgb&0xff))
+	got := onBlack
+	if strings.Contains(rule, ";color:#ffffff;") {
+		got = onWhite
+	}
+	if got < minLabelContrast {
+		t.Errorf("%s: text contrast %.2f:1 in %s", c, got, rule)
+	}
+}
+
+// The handler refuses a query longer than any page writes before parsing it, and
+// the longest page query still fits.
+func TestLabelCSSBoundsTheQuery(t *testing.T) {
+	var items []worklist.WorkItem
+	for i := range maxLabelColors + 10 {
+		name := fmt.Sprintf("l%d", i)
+		items = append(items, worklist.WorkItem{ID: name,
+			GitHub:  worklist.GitHubRef{LabelColors: map[string]string{name: fmt.Sprintf("%06x", i)}},
+			Signals: worklist.Signals{Labels: []string{name}}})
+	}
+	longest := labelStylesheet(items)
+	q := strings.TrimPrefix(longest, LabelStylesheetPath+"?")
+	if len(q) != maxLabelQueryBytes {
+		t.Fatalf("the longest page query is %d bytes, the bound %d", len(q), maxLabelQueryBytes)
+	}
+	h := &Handler{}
+	rec := httptest.NewRecorder()
+	h.LabelCSS(rec, httptest.NewRequest(http.MethodGet, longest, nil))
+	if rec.Code != http.StatusOK || strings.Count(rec.Body.String(), "\n") != maxLabelColors {
+		t.Fatalf("longest page query: status %d, %d rules", rec.Code, strings.Count(rec.Body.String(), "\n"))
+	}
+	rec = httptest.NewRecorder()
+	h.LabelCSS(rec, httptest.NewRequest(http.MethodGet, longest+",", nil))
+	if rec.Code != http.StatusRequestURITooLong || strings.Contains(rec.Body.String(), ".ghl-") {
+		t.Fatalf("over-long query: status %d, body %q", rec.Code, rec.Body.String())
 	}
 }

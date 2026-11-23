@@ -1,6 +1,7 @@
 package worklist
 
 import (
+	"encoding/json"
 	"fmt"
 	"maps"
 	"strings"
@@ -64,5 +65,37 @@ func TestProjectionCutsLabelColorsWithLabels(t *testing.T) {
 	got := MergeRunItems([]WorkItem{stored}, []WorkItem{read})[0]
 	if !maps.Equal(got.GitHub.LabelColors, colors) {
 		t.Fatal("the write-back must restore the stored colors")
+	}
+}
+
+// An oversized item whose only colored label falls past the labels projection keeps
+// leaves the run no colors; the run's unchanged write-back, through JSON as the agent
+// plane carries it, must restore the stored color rather than erase it.
+func TestProjectionRestoresColorsNoKeptLabelHas(t *testing.T) {
+	var labels []string
+	for i := range projectedList {
+		labels = append(labels, fmt.Sprintf("plain-%02d", i))
+	}
+	labels = append(labels, "colored") // the 33rd: past the cut, every weight equal
+	colors := map[string]string{"colored": "d73a4a"}
+	stored := WorkItem{ID: "big", GitHub: GitHubRef{Title: strings.Repeat("t", MaxBriefBytes), LabelColors: colors},
+		Signals: Signals{Labels: labels}}
+	read := Project(stored)
+	if len(read.Signals.Labels) != projectedList || read.GitHub.LabelColors != nil {
+		t.Fatalf("fixture: want %d labels and no colors read, got %d and %v",
+			projectedList, len(read.Signals.Labels), read.GitHub.LabelColors)
+	}
+	b, err := json.Marshal(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back WorkItem
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	got := MergeRunItems([]WorkItem{stored}, []WorkItem{back})[0]
+	if !maps.Equal(got.GitHub.LabelColors, colors) || len(got.Signals.Labels) != len(labels) {
+		t.Fatalf("write-back stored %d labels and colors %v, want %d and %v",
+			len(got.Signals.Labels), got.GitHub.LabelColors, len(labels), colors)
 	}
 }

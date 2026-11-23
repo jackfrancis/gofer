@@ -26,6 +26,11 @@ const LabelStylesheetPath = "/labels.css"
 // asks for); a color past it falls back to the neutral outline.
 const maxLabelColors = 512
 
+// maxLabelQueryBytes is the longest query labelStylesheet writes: "c=" and
+// maxLabelColors six-digit colors joined by commas. LabelCSS refuses a longer one
+// before parsing it, so an anonymous request cannot make it split a huge list.
+const maxLabelQueryBytes = len("c=") + maxLabelColors*len("rrggbb,") - 1
+
 // ghLabel is one GitHub label as the radar draws it.
 type ghLabel struct {
 	Name  string
@@ -69,6 +74,10 @@ func labelStylesheet(items []worklist.WorkItem) string {
 // LabelCSS serves the label stylesheet: a rule per color the c query names. It is a
 // pure function of the URL, so it is cacheable for good and needs no session.
 func (h *Handler) LabelCSS(w http.ResponseWriter, r *http.Request) {
+	if len(r.URL.RawQuery) > maxLabelQueryBytes {
+		http.Error(w, "label query too long", http.StatusRequestURITooLong)
+		return
+	}
 	var b strings.Builder
 	seen := map[string]bool{}
 	for _, raw := range strings.Split(r.URL.Query().Get("c"), ",") {
@@ -87,23 +96,49 @@ func (h *Handler) LabelCSS(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(b.String()))
 }
 
+// minLabelContrast is WCAG AA's minimum contrast for normal-size text; label text
+// is 12px.
+const minLabelContrast = 4.5
+
 // labelRule is the rule for color c (six lowercase hex digits), drawn as GitHub's
 // light theme draws a label: filled with the color, with black text on a light
 // color and white on a dark one, and an outline in a darker shade only when the
-// color is nearly white, so it still stands off the page.
+// color is nearly white, so it still stands off the page. GitHub's choice of text
+// is kept when it is readable (minLabelContrast); on a saturated color where it is
+// not (white on #ff00ff is 3.1:1), the other one is used.
 func labelRule(c string) string {
 	rgb, _ := strconv.ParseUint(c, 16, 32)
 	r, g, b := float64(rgb>>16&0xff), float64(rgb>>8&0xff), float64(rgb&0xff)
-	lightness := (0.2126*r + 0.7152*g + 0.0722*b) / 255 // perceived
-	text := "#ffffff"
+	lightness := (0.2126*r + 0.7152*g + 0.0722*b) / 255 // perceived, as GitHub judges it
+	text, other := "#ffffff", "#000000"
+	onWhite, onBlack := contrastWith(r, g, b)
+	textContrast, otherContrast := onWhite, onBlack
 	if lightness > 0.453 {
-		text = "#000000"
+		text, other = other, text
+		textContrast, otherContrast = otherContrast, textContrast
+	}
+	if textContrast < minLabelContrast && otherContrast > textContrast {
+		text = other
 	}
 	border := "#" + c
 	if lightness > 0.96 {
 		border = darken(r, g, b, 0.25)
 	}
 	return fmt.Sprintf(".ghl-%s{background-color:#%s;color:%s;border-color:%s}\n", c, c, text, border)
+}
+
+// contrastWith returns the WCAG contrast ratios of white and of black text on the
+// color, from its relative luminance in linearized sRGB.
+func contrastWith(r, g, b float64) (white, black float64) {
+	lin := func(v float64) float64 {
+		v /= 255
+		if v <= 0.04045 {
+			return v / 12.92
+		}
+		return math.Pow((v+0.055)/1.055, 2.4)
+	}
+	l := 0.2126*lin(r) + 0.7152*lin(g) + 0.0722*lin(b)
+	return 1.05 / (l + 0.05), (l + 0.05) / 0.05
 }
 
 // darken returns the color lowered by by in HSL lightness, as #rrggbb.
