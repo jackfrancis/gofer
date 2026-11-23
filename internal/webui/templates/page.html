@@ -258,6 +258,25 @@
       {{end}}
       {{with .ProjectsError}}<p class="zz-stalled" role="alert">{{.}}</p>{{end}}
       {{range .Items}}
+        {{template "item" (row . $.ConvEnabled)}}
+      {{else}}
+        <div class="zz-empty"><p>{{if .ProjectsFiltered}}No items in the selected projects.{{else if .Waiting}}Nothing needs you right now.{{else}}Nothing on your radar right now.{{end}}</p></div>
+      {{end}}
+      {{with .Waiting}}
+      <section class="zz-waiting" aria-labelledby="zz-waiting-head">
+        <h2 id="zz-waiting-head" class="zz-section-head">Waiting on others <span class="zz-section-count">{{len .}}</span></h2>
+        <p class="zz-meta">Your last word is the latest, or a review left the next step to the author. These come back up when someone answers.</p>
+        {{range .}}
+          {{template "item" (row . $.ConvEnabled)}}
+        {{end}}
+      </section>
+      {{end}}
+    {{end}}
+  </div>
+</body>
+</html>
+{{define "projectScope"}}{{if .ProjectsFiltered}}<input type="hidden" name="scope" value="{{.ProjectScope}}">{{end}}{{end}}
+{{define "item"}}{{with .Item}}
         <div class="zz-item">
           <div class="zz-item-head">
             <div class="zz-title">{{stateIcon .}}<a href="{{.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.GitHub.Title}}</a></div>
@@ -273,7 +292,8 @@
           </div>
           <div class="zz-meta">
             <span>{{.GitHub.Repo}} #{{.GitHub.Number}}</span>
-            <span class="Label zz-priority {{priorityClass .Meta.Priority}}">{{with .Meta.Priority}}{{.}}{{else}}unranked{{end}}</span>
+            <span class="Label zz-priority {{priorityClass .Meta.Priority}}">{{with .Meta.Priority}}{{.}}{{else}}unranked{{end}}</span>{{with waitingBadge .}}
+            <span class="Label zz-waiting-badge" title="{{waitingTitle $.Item}}">{{.}}</span>{{end}}
             {{with ghLabels .}}<span class="zz-labels">{{range .}}<span class="Label zz-ghlabel{{with .Class}} {{.}}{{end}}">{{.Name}}</span>{{end}}</span>{{end}}
           </div>
           <div class="zz-bar"><span class="zz-w-{{pctBucket .Meta.Rank}}"></span></div>
@@ -285,11 +305,4 @@
           </div>
           {{with .Meta.Rationale}}<div class="zz-rationale">{{.}}</div>{{end}}
         </div>
-      {{else}}
-        <div class="zz-empty"><p>{{if .ProjectsFiltered}}No items in the selected projects.{{else}}Nothing on your radar right now.{{end}}</p></div>
-      {{end}}
-    {{end}}
-  </div>
-</body>
-</html>
-{{define "projectScope"}}{{if .ProjectsFiltered}}<input type="hidden" name="scope" value="{{.ProjectScope}}">{{end}}{{end}}
+{{end}}{{end}}

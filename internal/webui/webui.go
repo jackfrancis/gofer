@@ -19,6 +19,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -247,6 +248,7 @@ type pageData struct {
 	User                     *session.User
 	Providers                []string
 	Items                    []worklist.WorkItem
+	Waiting                  []worklist.WorkItem
 	LabelCSS                 string             // the stylesheet coloring the shown items' GitHub labels, if any
 	Item                     worklist.WorkItem  // the single item, for the thread view
 	ConvEnabled              bool               // whether the assistive conversation is available
@@ -781,8 +783,8 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		var changed []worklist.WorkItem
 		refs = refs[:0]
 		for _, it := range current {
-			if it.Type != worklist.TypePullRequest || !it.OnRadar() || !inScope(selected, it) {
-				continue // off the radar (hidden or closed) or outside the page's projects: never review it in bulk
+			if it.Type != worklist.TypePullRequest || !it.Actionable() || !inScope(selected, it) {
+				continue // off the radar (hidden or closed), waiting on someone else, or outside the page's projects: never review it in bulk
 			}
 			if it.HasReview() {
 				continue // already reviewed at least once — a first-review is no longer needed
@@ -878,7 +880,7 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 		var eligible []worklist.WorkItem
 		firstModels := map[string]struct{}{}
 		for _, it := range current {
-			if it.OnRadar() && inScope(selected, it) && it.NeedsSecondOpinion(now, reviewStaleAfter) {
+			if inScope(selected, it) && it.NeedsSecondOpinion(now, reviewStaleAfter) {
 				eligible = append(eligible, it)
 				firstModels[it.FirstReviewModel()] = struct{}{}
 			}
@@ -1000,8 +1002,11 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		// the scope each bulk form posts back (ProjectScope), cover only the selected
 		// projects the checklist names, so an action acts on what this page shows.
 		selected := savedSelection(r, user.ID)
-		projects := projectOptions(res.Items, selected)
+		// The project filter covers the waiting section too: its checklist counts
+		// every item on the radar, waiting or not.
+		projects := projectOptions(slices.Concat(res.Items, res.Waiting), selected)
 		shown := filterProjects(res.Items, selected)
+		shownWaiting := filterProjects(res.Waiting, selected)
 		scope := shownSelection(selected, projects)
 		selectedCount := 0
 		for _, p := range projects {
@@ -1023,6 +1028,13 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 				resetCount++
 			}
 		}
+		// Waiting items are no review action's to take (Actionable), but Reset clears
+		// their threads too.
+		for _, it := range shownWaiting {
+			if hasConversation(it) {
+				resetCount++
+			}
+		}
 		// The radar lists only items on it, but Reset clears every stored thread in the
 		// selected projects the checklist names, hidden and closed items' included; and the item just hidden is
 		// off the radar, to be offered for Undo. Both come from Resolve's same read
@@ -1038,12 +1050,12 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 			}
 		}
 		data := pageData{
-			View: "worklist", User: user, Items: shown, ConvEnabled: h.convEnabled,
+			View: "worklist", User: user, Items: shown, Waiting: shownWaiting, ConvEnabled: h.convEnabled,
 			ReviewCount: reviewCount, SecondOpinionEnabled: h.secondOpinionEnabled(), SecondOpinionCount: secondCount,
 			ResetCount: resetCount, JustHidden: justHidden,
 			Projects: projects, ProjectsFiltered: selected != nil, SelectedProjects: selectedCount, TotalItems: len(res.Items),
 		}
-		data.LabelCSS = labelStylesheet(shown)
+		data.LabelCSS = labelStylesheet(slices.Concat(shown, shownWaiting))
 		if scope != nil {
 			data.ProjectScope = encodeSelection(scope)
 		}
@@ -1129,6 +1141,9 @@ var funcs = template.FuncMap{
 	"markdown":               markdown.ToSafeHTML,
 	"discussBadge":           discussBadge,
 	"discussTitle":           discussTitle,
+	"row":                    newItemRow,
+	"waitingBadge":           waitingBadge,
+	"waitingTitle":           waitingTitle,
 	"isSecondOpinionRequest": isSecondOpinionRequest,
 	"isSynthesisRequest":     isSynthesisRequest,
 	"userHandle":             userHandle,
@@ -1271,4 +1286,63 @@ func titleProvider(s string) string {
 		}
 		return strings.ToUpper(s[:1]) + s[1:]
 	}
+}
+
+// itemRow is what the radar's item template renders: one item, and whether the
+// Discuss action is offered.
+type itemRow struct {
+	Item        worklist.WorkItem
+	ConvEnabled bool
+}
+
+func newItemRow(it worklist.WorkItem, convEnabled bool) itemRow {
+	return itemRow{Item: it, ConvEnabled: convEnabled}
+}
+
+// waitingBadge labels an item waiting on someone else: who, and for how long ("" for
+// an item that is not waiting).
+func waitingBadge(it worklist.WorkItem) string {
+	w, ok := it.Waiting()
+	if !ok {
+		return ""
+	}
+	var who string
+	switch {
+	case w.NothingPending:
+		who = "Nothing pending"
+	case w.On != "":
+		who = "Waiting on @" + w.On
+	default:
+		who = "Waiting on others"
+	}
+	return who + " · " + waitedFor(w.Since, time.Now())
+}
+
+// waitingTitle explains why an item is waiting, for the badge's tooltip.
+func waitingTitle(it worklist.WorkItem) string {
+	w, ok := it.Waiting()
+	if !ok {
+		return ""
+	}
+	since := w.Since.Format("Jan 2")
+	lw := it.Signals.LastWord
+	switch {
+	case w.NothingPending:
+		return "Your last word, on " + since + ", asks nothing of anyone"
+	case lw != nil && lw.Decisive:
+		return "You reviewed it on " + since + "; nobody has answered since"
+	case lw != nil:
+		return "You had the last word on " + since + "; nobody has answered since"
+	default:
+		return "A review on " + since + " left the next step to the author"
+	}
+}
+
+// waitedFor is a short age: "today", "1d", "12d".
+func waitedFor(since, now time.Time) string {
+	d := int(now.Sub(since).Hours() / 24)
+	if d < 1 {
+		return "today"
+	}
+	return strconv.Itoa(d) + "d"
 }

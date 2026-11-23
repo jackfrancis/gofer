@@ -286,6 +286,10 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 		merged = it.PullRequest.MergedAt != nil
 	}
 	repo := strings.TrimPrefix(it.RepositoryURL, defaultBaseURL+"/repos/")
+	var author string
+	if it.User != nil {
+		author = it.User.Login
+	}
 
 	sig := worklist.Signals{
 		Reasons:        reasonsFor(reason, it, viewer),
@@ -327,6 +331,7 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 			Draft:       it.Draft && itemType == worklist.TypePullRequest,
 			Merged:      merged,
 			StateReason: it.StateReason,
+			Author:      author,
 		},
 		Signals: sig,
 		Meta:    worklist.Metadata{Origin: worklist.OriginAgent},

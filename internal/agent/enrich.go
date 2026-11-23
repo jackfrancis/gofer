@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -19,8 +20,8 @@ const (
 )
 
 // runEnrich reads the user's persisted work and augments each item with per-item
-// timeline signals (AwaitingMeSince, participants, inbound refs, other reviewers,
-// review-requested-by) fetched directly from GitHub with the vended credential.
+// timeline signals (AwaitingMeSince, AwaitingOthersSince and the user's last word,
+// participants, inbound refs, other reviewers, review-requested-by) fetched directly from GitHub with the vended credential.
 // It writes back only the items it changed, so a read-time rescore reflects the
 // fresher signals. Per-item enrichment is best-effort and bounded in concurrency
 // so the fan-out does not blow the run deadline.
@@ -96,7 +97,11 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 			// reserve-adjusted deadline too, not just start before it, or one slow item
 			// holds the batch past the time kept for writing every result back.
 			actx, cancel := reserveContext(ctx, enrichReserve)
-			act, err := gh.ItemActivity(actx, token, items[i].GitHub.Repo, items[i].GitHub.Number, login)
+			opts := github.ActivityOptions{Author: items[i].GitHub.Author, Bots: p.Bots}
+			if slices.Contains(items[i].Signals.Reasons, worklist.ReasonAuthor) {
+				opts.Author = login // an item stored before its author was recorded
+			}
+			act, err := gh.ItemActivityFor(actx, token, items[i].GitHub.Repo, items[i].GitHub.Number, login, opts)
 			cancel()
 			if err != nil {
 				return // best-effort: leave the item's signals unchanged
@@ -126,7 +131,8 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 			if !reasonChanged &&
 				act.Participants == s.Participants && act.InboundRefs == s.InboundRefs &&
 				act.OtherReviewers == s.OtherReviewers && requester == s.ReviewRequestedBy &&
-				act.AwaitingMeSince.Equal(s.AwaitingMeSince) && act.AwaitingOthersSince.Equal(s.AwaitingOthersSince) {
+				act.AwaitingMeSince.Equal(s.AwaitingMeSince) && act.AwaitingOthersSince.Equal(s.AwaitingOthersSince) &&
+				reflect.DeepEqual(act.LastWord, s.LastWord) {
 				return
 			}
 			s.Reasons = reasons
@@ -136,7 +142,10 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 			s.ReviewRequestedBy = requester
 			s.AwaitingMeSince = act.AwaitingMeSince
 			s.AwaitingOthersSince = act.AwaitingOthersSince
-			// Enrich derives no model signals; leave them to the store.
+			s.LastWord = act.LastWord
+			// Enrich derives no model signals; leave them to the store. A turn reading
+			// of a replaced last word no longer applies (CurrentTurnReading), and the
+			// reading pass that follows reads the new one.
 			clearModelSignals(s)
 			mu.Lock()
 			changed = append(changed, items[i])

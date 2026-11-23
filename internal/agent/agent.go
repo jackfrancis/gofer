@@ -91,6 +91,8 @@ type Params struct {
 	Converser     worklist.Conversationalist // github-converse assistant; required for that job
 	Independent   bool                       // converse: answer blind — omit prior thread turns (independent review)
 	Researcher    worklist.ResearchRanker    // github-research re-ranker; required for that job
+	TurnReader    worklist.TurnReader        // reads the user's last word on waiting items; nil leaves the timeline to decide
+	Bots          []string                   // logins whose comments are automated (BOT_REVIEWERS): never the last word
 	EnrichLimit   int                        // optional cap on items to enrich; 0 enriches every item
 	ReadPageSize  int                        // items per worklist page read (readAll); 0 uses the default
 	Logger        *slog.Logger               // phase logger; nil uses slog.Default()
@@ -207,7 +209,13 @@ func Run(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	case JobIngest:
 		return runIngest(ctx, p, vendor, sink)
 	case JobEnrich:
-		return runEnrich(ctx, p, vendor, sink, nil)
+		if err := runEnrich(ctx, p, vendor, sink, nil); err != nil {
+			return err
+		}
+		if err := runReadTurns(ctx, p, sink); err != nil {
+			p.logger().Warn("turn reading failed", "err", err)
+		}
+		return nil
 	case JobRank:
 		return runRank(ctx, p, sink)
 	case JobConverse:
@@ -276,9 +284,10 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	if err := writeBack(ctx, sink, items); err != nil {
 		return fmt.Errorf("ingest: %w", err)
 	}
-	// The backfill continues into enrich (per-item timeline signals) then rank
-	// (the model proposal), so one pass yields a fully scored radar. Both are
-	// best-effort: a failure leaves the baseline-scored items in place. The
+	// The backfill continues into enrich (per-item timeline signals), the turn
+	// reading (whether the user's last word leaves the next step to someone else),
+	// then rank (the model proposal), so one pass yields a fully scored radar. Each
+	// is best-effort: a failure leaves the baseline-scored items in place. The
 	// separate JobEnrich / JobRank exist for an independent scheduled refresh.
 	if err := runEnrich(ctx, p, vendor, sink, carried); err != nil {
 		// The user's access is gone: stop here, and say so, rather than rank and
@@ -287,6 +296,9 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 			return fmt.Errorf("backfill enrich: %w", err)
 		}
 		log.Warn("backfill enrich failed", "err", err)
+	}
+	if err := runReadTurns(ctx, p, sink); err != nil {
+		log.Warn("backfill turn reading failed", "err", err)
 	}
 	if err := runRank(ctx, p, sink); err != nil {
 		log.Warn("backfill rank failed", "err", err)
@@ -331,6 +343,7 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 		// the copy read above, which a discussion may have replaced since. The
 		// chained enrich and rank read the store again.
 		clearModelSignals(&fetched[i].Signals)
+		carryTurnSignals(&fetched[i], old)
 		if old.Meta.CompletedAt.IsZero() {
 			// A retired item's request ended with it; a resurfaced item's request is new.
 			if carryPendingRequest(&fetched[i].Signals, old.Signals, reviewsComplete) {
@@ -400,13 +413,29 @@ func carryPendingRequest(fetched *worklist.Signals, stored worklist.Signals, rev
 	return inferred
 }
 
-// clearModelSignals drops the model proposal and research adjustment from a
-// write-back that did not derive them. A write-back that carries neither leaves the
-// stored values in place (worklist.MergeRunItems), so a pass never restores the
+// clearModelSignals drops the model proposal, research adjustment and turn reading
+// from a write-back that did not derive them. A write-back that carries none leaves
+// the stored values in place (worklist.MergeRunItems), so a pass never restores the
 // copy it read over a newer one written meanwhile.
 func clearModelSignals(s *worklist.Signals) {
 	s.Proposed = nil
 	s.Research = nil
+	s.Turn = nil
+}
+
+// carryTurnSignals keeps the timeline's word on whose turn it is (AwaitingMeSince,
+// AwaitingOthersSince, LastWord) across a refresh of an item GitHub has not updated
+// since: its timeline is unchanged, so they still hold, and the item keeps its place
+// on the radar (worklist.WorkItem.Waiting) until the chained enrich reads the
+// timeline again. An item GitHub updated (a comment, a push, a review request) starts
+// without them, so it is not shown as waiting on a stale reading of whose turn it is.
+func carryTurnSignals(fetched *worklist.WorkItem, stored worklist.WorkItem) {
+	if fetched.GitHub.UpdatedAt.IsZero() || !fetched.GitHub.UpdatedAt.Equal(stored.GitHub.UpdatedAt) {
+		return
+	}
+	fetched.Signals.AwaitingMeSince = stored.Signals.AwaitingMeSince
+	fetched.Signals.AwaitingOthersSince = stored.Signals.AwaitingOthersSince
+	fetched.Signals.LastWord = stored.Signals.LastWord
 }
 
 // runRank reads the user's persisted work, asks the AxisRanker to propose the
@@ -438,6 +467,12 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 	if err != nil {
 		return fmt.Errorf("list worklist: %w", err)
 	}
+	// An item waiting on someone else is listed apart from the rest (WorkItem.Waiting):
+	// a proposal would refine an order the user is not acting on, so spend nothing on it.
+	items = slices.DeleteFunc(items, func(it worklist.WorkItem) bool {
+		_, waiting := it.Waiting()
+		return waiting
+	})
 	log.Info("rank: proposing axes", "items", len(items), "stub", stub)
 
 	var (
@@ -465,8 +500,10 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 			// it changes (worklist.Signals.CurrentProposal).
 			prop.ReviewRequestedByBot = items[i].Signals.ReviewRequestedByBot
 			items[i].Signals.Proposed = &prop
-			// Rank derives only the proposal; the stored research adjustment stays.
+			// Rank derives only the proposal; the stored research adjustment and turn
+			// reading stay.
 			items[i].Signals.Research = nil
+			items[i].Signals.Turn = nil
 			mu.Lock()
 			changed = append(changed, items[i])
 			mu.Unlock()

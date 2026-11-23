@@ -78,6 +78,7 @@ func work(ctx context.Context, rt *aeiruntime.Runtime) error {
 		ItemID:      spec.Parameters["item"],
 		Turn:        strings.TrimSpace(spec.Parameters["turn"]),
 		Independent: strings.TrimSpace(spec.Parameters["independent"]) == "true",
+		Bots:        splitBots(spec.Parameters["bots"]),
 		Logger:      log,
 	}
 
@@ -97,6 +98,7 @@ func work(ctx context.Context, rt *aeiruntime.Runtime) error {
 		params.Ranker = llm.NewRanker(cfg)
 		params.Converser = llm.NewConverser(cfg)
 		params.Researcher = llm.NewResearchRanker(cfg)
+		params.TurnReader = llm.NewTurnReader(cfg)
 		log.Info("chat model configured", "endpoint", endpoint, "model", model)
 	} else {
 		log.Info("chat model not configured; ranking with the deterministic stub")
@@ -127,4 +129,15 @@ func modelToken(ctx context.Context, aiAuth, runCredential string, v agent.Vendo
 	default:
 		return "", fmt.Errorf("aei: unknown ai_auth %q", aiAuth)
 	}
+}
+
+// splitBots parses run parameter bots: the web tier's BOT_REVIEWERS, comma-separated.
+func splitBots(v string) []string {
+	var out []string
+	for _, b := range strings.Split(v, ",") {
+		if b = strings.TrimSpace(b); b != "" {
+			out = append(out, b)
+		}
+	}
+	return out
 }

@@ -215,6 +215,31 @@ Wired on the web-tier side; they define what a runtime must respect:
   pressure, low floors) unless the user is also an assignee. The web and runtime images must ship together: a runtime
   from before these rules posts its reply inside the item, where it is now ignored,
   and a web tier from before them has no research route.
+- An item is WAITING (`WorkItem.Waiting`, `internal/worklist/waiting.go`) when the
+  ball is in someone else's court; the radar lists waiting items in their own section
+  after the rest, ranked the same way (`Resolution.Waiting`; the JSON worklist's
+  `waiting`). It is not a score: it says whose turn it is, not how much the item
+  matters. Enrich decides it from the timeline (`github.ItemActivityFor`): the last
+  human word is the user's own comment or review (recorded as `Signals.LastWord`,
+  text cut to `MaxLastWordBytes`, mentions parsed outside quotes and code), or an
+  approving or changes-requested review on an item the user did not author. A bot's
+  comment never takes the last word (GitHub type `Bot`, a `[bot]` login, or
+  `BOT_REVIEWERS`, sent to every run as run parameter `bots`). On an item the user did
+  not author, a push (commit, force-push) or ready-for-review is the author's answer;
+  on the user's own item, a reviewer's decisive review is the user's turn. With a
+  chat model, a reading pass between enrich and rank (`runReadTurns`, at most
+  `turnReadLimit` calls a pass) asks the model to read a non-decisive last word
+  (`Signals.NeedsTurnReading`) and stores `Signals.Turn`, a model signal kept like
+  the proposal (`KeepModelSignals`) and applied only while it read the current last
+  word (`CurrentTurnReading`, keyed by the last word's ID and text): `my_turn` keeps
+  the item with the user, `nothing_pending` and `waiting_on` keep it waiting, and a
+  `waiting_on` login counts only if the last word mentions it or it is the author.
+  New activity always wins over a reading. A refresh keeps the timeline's turn
+  signals only for an item whose GitHub `updated_at` is unchanged
+  (`carryTurnSignals`). Rank spends nothing on a waiting item, and Review all PRs
+  and Get 2nd Opinion skip them (`WorkItem.Actionable`); Reset Conversations still
+  covers them. `RunPolicy.Apply` bounds the last word and reading on every
+  write-back.
 - A run never reads the whole worklist: its threads grow without bound and the agent
   plane caps a response at 8 MiB. `agent.Sink` has only bounded reads, served by the
   same `internal/worklist/select.go` functions in process and on the plane:
