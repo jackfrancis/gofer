@@ -369,7 +369,7 @@ func TestFetchWorklistSkipsOthersDraftsAndStaysComplete(t *testing.T) {
 	if !f.Complete || !f.ReviewRequestsComplete {
 		t.Fatalf("complete=%v reviewsComplete=%v, want both true", f.Complete, f.ReviewRequestsComplete)
 	}
-	if want := []string{"github:o/r#2", "github:o/r#4"}; !slices.Equal(f.OthersDrafts, want) {
+	if want := map[string]time.Time{"github:o/r#2": {}, "github:o/r#4": {}}; !maps.Equal(f.OthersDrafts, want) {
 		t.Fatalf("OthersDrafts %v, want %v", f.OthersDrafts, want)
 	}
 }
@@ -391,6 +391,10 @@ func TestFetchWorklistNewestCopyDecidesDraft(t *testing.T) {
 		{"marked draft between walks", fmt.Sprintf(ready, older), fmt.Sprintf(draft, newer), false},
 		{"marked ready between walks", fmt.Sprintf(draft, older), fmt.Sprintf(ready, newer), true},
 		{"newer copy first", fmt.Sprintf(draft, newer), fmt.Sprintf(ready, older), false},
+		// GitHub reports timestamps to the second, so two states can tie: the draft
+		// wins whichever search returned it.
+		{"tie, ready first", fmt.Sprintf(ready, newer), fmt.Sprintf(draft, newer), false},
+		{"tie, draft first", fmt.Sprintf(draft, newer), fmt.Sprintf(ready, newer), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -415,7 +419,8 @@ func TestFetchWorklistNewestCopyDecidesDraft(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !tc.kept {
-				if len(f.Items) != 0 || !slices.Equal(f.OthersDrafts, []string{"github:o/r#7"}) {
+				want := map[string]time.Time{"github:o/r#7": time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)}
+				if len(f.Items) != 0 || !maps.EqualFunc(f.OthersDrafts, want, time.Time.Equal) {
 					t.Fatalf("items %d, OthersDrafts %v; want the draft left out and reported", len(f.Items), f.OthersDrafts)
 				}
 				return

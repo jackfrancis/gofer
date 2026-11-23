@@ -262,9 +262,10 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	// partial walk (time budget, rate limit, result ceiling) simply may not have
 	// reached it, and retiring it then would hide open work.
 	// Another contributor's draft is different: the fetch SAW it, so it is retired
-	// even from a partial fetch (a complete one retires it as missing anyway).
+	// even from a partial fetch (a complete one retires it as missing anyway). Either
+	// way a stored ready PR newer than that draft result stands (readyAfterDraft).
 	if complete {
-		retired := retireMissing(items, existing, time.Now().UTC())
+		retired := retireMissing(items, existing, fetch.OthersDrafts, time.Now().UTC())
 		if len(retired) > 0 {
 			log.Info("ingest: retired items no longer open on GitHub", "count", len(retired))
 			items = append(items, retired...)
@@ -365,14 +366,18 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 // means the item was merged or closed, or no longer involves them. Retiring rather
 // than deleting keeps the thread: resolve drops completed items from the radar, an
 // agent can still see them, and a reopened item is fetched again and resurfaces.
-func retireMissing(fetched, existing []worklist.WorkItem, now time.Time) []worklist.WorkItem {
+//
+// drafts is github.Fetch.OthersDrafts: an item absent only because the fetch saw it
+// as another contributor's draft is kept when the store knows a newer ready state
+// (readyAfterDraft).
+func retireMissing(fetched, existing []worklist.WorkItem, drafts map[string]time.Time, now time.Time) []worklist.WorkItem {
 	open := make(map[string]bool, len(fetched))
 	for _, it := range fetched {
 		open[it.ID] = true
 	}
 	var retired []worklist.WorkItem
 	for _, it := range existing {
-		if it.Source != "github" || open[it.ID] || !it.Meta.CompletedAt.IsZero() {
+		if it.Source != "github" || open[it.ID] || !it.Meta.CompletedAt.IsZero() || readyAfterDraft(it, drafts) {
 			continue
 		}
 		retired = append(retired, retire(it, now))
@@ -380,19 +385,31 @@ func retireMissing(fetched, existing []worklist.WorkItem, now time.Time) []workl
 	return retired
 }
 
-// retireListed returns the persisted GitHub items named in ids and not yet marked
-// completed, each retired as retireMissing does. It serves a partial fetch, which
-// proves nothing by absence but names what it positively saw leave the worklist:
-// another contributor's draft (github.Fetch.OthersDrafts).
-func retireListed(ids []string, existing []worklist.WorkItem, now time.Time) []worklist.WorkItem {
+// retireListed returns the persisted GitHub items the fetch saw as another
+// contributor's draft (drafts, github.Fetch.OthersDrafts) and not yet marked
+// completed, each retired as retireMissing does, except where the store knows a
+// newer ready state (readyAfterDraft). It serves a partial fetch, which proves
+// nothing by absence but names what it positively saw leave the worklist.
+func retireListed(drafts map[string]time.Time, existing []worklist.WorkItem, now time.Time) []worklist.WorkItem {
 	var retired []worklist.WorkItem
 	for _, it := range existing {
-		if it.Source != "github" || !slices.Contains(ids, it.ID) || !it.Meta.CompletedAt.IsZero() {
+		if _, seen := drafts[it.ID]; !seen || it.Source != "github" || !it.Meta.CompletedAt.IsZero() || readyAfterDraft(it, drafts) {
 			continue
 		}
 		retired = append(retired, retire(it, now))
 	}
 	return retired
+}
+
+// readyAfterDraft reports that the fetch saw stored item it as another
+// contributor's draft, but the store holds it as a ready pull request GitHub updated
+// strictly later than that draft result: the search index lagged the item, so the
+// result is stale and must not retire it. The item is left as stored until a fresh
+// read decides. On a tie the draft wins, as in the fetch's own reconciliation
+// (GitHub reports timestamps to the second).
+func readyAfterDraft(it worklist.WorkItem, drafts map[string]time.Time) bool {
+	seen, ok := drafts[it.ID]
+	return ok && !it.GitHub.Draft && it.GitHub.UpdatedAt.After(seen)
 }
 
 // retire stamps a stored item completed for write-back.

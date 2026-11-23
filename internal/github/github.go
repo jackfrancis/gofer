@@ -137,13 +137,15 @@ type Fetch struct {
 	// review is requested: when that search is partial, an item may arrive through
 	// involves: alone while its request is still pending.
 	ReviewRequestsComplete bool
-	// OthersDrafts names, by item ID and sorted, the hits whose current state (the
-	// newest copy across the searches) is another contributor's draft pull request,
-	// left out of Items. Unlike an absence, this is positive evidence, so ingest
-	// retires a stored copy of each even when the fetch is partial. The IDs are not
-	// passed through the public-only gate: they are only matched against stored
-	// items, never fetched or kept.
-	OthersDrafts []string
+	// OthersDrafts maps, by item ID, the hits whose current state (the newest copy
+	// across the searches) is another contributor's draft pull request, left out of
+	// Items, to that copy's updated_at. Unlike an absence, this is positive evidence,
+	// so ingest retires a stored copy of each even when the fetch is partial, unless
+	// the stored copy is a ready pull request GitHub updated later than the draft
+	// result (the search index can lag the item). The IDs are not passed through the
+	// public-only gate: they are only matched against stored items, never fetched or
+	// kept.
+	OthersDrafts map[string]time.Time
 }
 
 // FetchWorklistDetail is FetchWorklist, also reporting whether the review-request
@@ -185,21 +187,23 @@ func (c *Client) FetchWorklistDetail(ctx context.Context, token string) (Fetch, 
 			for _, r := range rs {
 				h.reasons = appendReason(h.reasons, r)
 			}
-			if it.UpdatedAt.After(h.item.UpdatedAt) {
+			if newerState(it, h.item) {
 				h.item = it
 			}
 		}
 	}
 	out := make([]worklist.WorkItem, 0, len(seen))
-	var drafts []string
+	var drafts map[string]time.Time
 	for id, h := range seen {
 		if h.item.othersDraft(viewer) {
-			drafts = append(drafts, id)
+			if drafts == nil {
+				drafts = make(map[string]time.Time)
+			}
+			drafts[id] = h.item.UpdatedAt
 			continue
 		}
 		out = append(out, h.item.workItem(h.reasons, now))
 	}
-	slices.Sort(drafts)
 	out, confirmed := c.publicHits(ctx, token, out)
 	complete = complete && confirmed
 	// Deduplication runs through a map, so without this the result order is Go's
@@ -214,6 +218,18 @@ func (c *Client) FetchWorklistDetail(ctx context.Context, token string) (Fetch, 
 		return strings.Compare(a.ID, b.ID)
 	})
 	return Fetch{Items: out, Complete: complete, ReviewRequestsComplete: reviewsComplete, OthersDrafts: drafts}, nil
+}
+
+// newerState reports whether search hit a, for the same item as b, is its newer
+// state. The newer updated_at wins. GitHub reports timestamps to the second, so two
+// states can share one: on such a tie a draft beats a ready copy, so the answer never
+// depends on which search returned first, and the item stays off the worklist until
+// a later read shows it ready.
+func newerState(a, b searchItem) bool {
+	if c := a.UpdatedAt.Compare(b.UpdatedAt); c != 0 {
+		return c > 0
+	}
+	return a.Draft && !b.Draft
 }
 
 // appendReason adds r to rs if not already present, keeping reasons unique and in

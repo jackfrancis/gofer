@@ -947,3 +947,71 @@ func TestRunIngestPartialFetchRetiresOthersDrafts(t *testing.T) {
 		t.Error("an item missing from a PARTIAL fetch was retired")
 	}
 }
+
+// draftServer answers the radar queries with one pull request, #8, shown as another
+// contributor's draft last updated at draftAt. partial makes the issue search
+// incomplete, and with it the whole fetch.
+func draftServer(t *testing.T, draftAt time.Time, partial bool) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case r.URL.Path == "/search/issues":
+			q := r.URL.Query().Get("q")
+			switch {
+			case strings.Contains(q, "is:issue"):
+				fmt.Fprintf(w, `{"incomplete_results":%v,"total_count":0,"items":[]}`, partial)
+			case strings.Contains(q, "involves:@me"):
+				fmt.Fprintf(w, `{"total_count":1,"items":[{"number":8,"title":"T","html_url":"u","state":"open","draft":true,"updated_at":%q,"repository_url":"https://api.github.com/repos/o/r","user":{"login":"someone"},"pull_request":{"url":"x"}}]}`,
+					draftAt.Format(time.RFC3339))
+			default:
+				_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
+			}
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+}
+
+// The search index can lag an item: a draft result older than the ready state the
+// store already holds is stale, so neither a partial nor a complete refresh retires
+// the ready PR on its strength. On a tie the draft wins (GitHub's timestamps are to
+// the second), and a stored copy that is itself a draft is retired whatever its time.
+func TestRunIngestStaleDraftResultKeepsNewerReadyPR(t *testing.T) {
+	draftAt := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name      string
+		storedAt  time.Time
+		storedDft bool
+		retired   bool
+	}{
+		{"stored ready is newer", draftAt.Add(4 * time.Minute), false, false},
+		{"stored ready is older", draftAt.Add(-4 * time.Minute), false, true},
+		{"tie", draftAt, false, true},
+		{"stored copy is a newer draft", draftAt.Add(4 * time.Minute), true, true},
+	}
+	for _, partial := range []bool{true, false} {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("%s/partial=%v", tc.name, partial), func(t *testing.T) {
+				srv := draftServer(t, draftAt, partial)
+				defer srv.Close()
+				stored := prItem(8, worklist.Message{Role: worklist.RoleUser, Content: "review?"})
+				stored.GitHub.UpdatedAt, stored.GitHub.Draft = tc.storedAt, tc.storedDft
+				sink := &memSink{items: []worklist.WorkItem{stored}}
+				if err := Run(context.Background(),
+					Params{JobType: JobIngest, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+					fakeVendor{token: "tok"}, sink); err != nil {
+					t.Fatal(err)
+				}
+				got := itemByID(t, sink.items, "github:o/r#8")
+				if retired := !got.Meta.CompletedAt.IsZero(); retired != tc.retired {
+					t.Fatalf("retired = %v, want %v", retired, tc.retired)
+				}
+				if len(got.Thread) != 1 {
+					t.Errorf("thread has %d turns, want 1", len(got.Thread))
+				}
+			})
+		}
+	}
+}
