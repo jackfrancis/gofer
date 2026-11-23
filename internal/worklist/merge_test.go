@@ -21,17 +21,17 @@ func TestMergeRunItemsKeepsOwnerState(t *testing.T) {
 		ID:           "a",
 		Thread:       []Message{{Role: RoleUser, Content: "q", At: t0}, {Role: RoleAgent, Content: "r", At: t1, Hidden: true}, {Role: RoleUser, Content: "q2", At: t2}},
 		ThreadReadAt: t1,
-		Meta:         Metadata{HiddenAt: t1, Rank: 0.1},
+		Meta:         Metadata{Rank: 0.1},
 		// The read cursor names the reply at position 1 (a legacy, ID-less turn).
 		ThreadReadThrough: "pos:1",
 		Signals:           Signals{Comments: 1},
 		CreatedAt:         t0,
 	}
-	// The run read the item before q2 and the hide, then changed the signals.
+	// The run read the item before q2, then changed the signals, and claims a hide.
 	run := WorkItem{
 		ID:        "a",
 		Thread:    []Message{{Role: RoleUser, Content: "q", At: t0}},
-		Meta:      Metadata{Rank: 0.9, CompletedAt: t3},
+		Meta:      Metadata{Rank: 0.9, CompletedAt: t3, HiddenAt: t2},
 		Signals:   Signals{Comments: 5},
 		CreatedAt: t3,
 	}
@@ -46,7 +46,7 @@ func TestMergeRunItemsKeepsOwnerState(t *testing.T) {
 	if m.ThreadReadThrough != "pos:1" {
 		t.Fatalf("the read cursor must be the stored one, got %q", m.ThreadReadThrough)
 	}
-	if !m.ThreadReadAt.Equal(t1) || !m.Meta.HiddenAt.Equal(t1) || !m.CreatedAt.Equal(t0) {
+	if !m.ThreadReadAt.Equal(t1) || !m.Meta.HiddenAt.IsZero() || !m.CreatedAt.Equal(t0) {
 		t.Fatalf("read cursor, hidden flag and creation time must be the stored ones, got %v %v %v", m.ThreadReadAt, m.Meta.HiddenAt, m.CreatedAt)
 	}
 	if m.Signals.Comments != 5 || m.Meta.Rank != 0.9 || !m.Meta.CompletedAt.Equal(t3) {

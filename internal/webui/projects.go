@@ -4,6 +4,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 
 	"github.com/jackfrancis/gofer/internal/worklist"
@@ -40,9 +41,18 @@ const projectsTooMany = "too-many"
 // ProjectOption is one entry in the project filter's checklist.
 type ProjectOption struct {
 	Name     string // the repository, "owner/name"
-	Count    int    // items on the radar from this repository
+	Count    int    // items the radar lists from this repository (ranked or hidden)
 	Selected bool   // shown on the radar
 }
+
+// listedItems returns every item the radar lists: the ranked items and the hidden
+// section. The project filter offers their repositories and narrows both.
+func listedItems(res worklist.Resolution) []worklist.WorkItem {
+	return append(slices.Clip(res.Items), res.Hidden...)
+}
+
+// listed reports whether the radar lists it, ranked or in the hidden section.
+func listed(it worklist.WorkItem) bool { return it.OnRadar() || it.InHiddenList() }
 
 // projectOptions lists the repositories present in items, by name, with their item
 // counts, marking the ones selected (every one when selected is nil).
@@ -167,7 +177,7 @@ func formSelection(r *http.Request) (selected map[string]bool, ok bool) {
 }
 
 // shownSelection narrows a saved selection to the projects the checklist offers
-// (opts, the repositories on the radar). It is what each bulk form posts back, so an
+// (opts, the repositories the radar lists). It is what each bulk form posts back, so an
 // action never reaches a repository the page does not name — say one whose last
 // visible item closed after it was selected, which may still hold archived threads.
 // A nil selection (every project) stays nil.
@@ -205,15 +215,15 @@ func (h *Handler) FilterProjects(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/", http.StatusSeeOther)
 			return
 		}
-		// Keep only repositories on the user's radar: the cookie never carries a name
-		// the page did not offer.
-		var onRadar []worklist.WorkItem
+		// Keep only repositories the radar lists (ranked or hidden): the cookie never
+		// carries a name the page did not offer.
+		var onPage []worklist.WorkItem
 		for _, it := range items {
-			if it.OnRadar() {
-				onRadar = append(onRadar, it)
+			if listed(it) {
+				onPage = append(onPage, it)
 			}
 		}
-		opts := projectOptions(onRadar, nil)
+		opts := projectOptions(onPage, nil)
 		present := make(map[string]bool, len(opts))
 		for _, o := range opts {
 			present[o.Name] = true

@@ -1,13 +1,14 @@
 package worklist
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
 
 // Rescore re-derives an agent-scored item's Meta at read time but keeps what is not
-// scoring (the write time, hidden and completed marks), and returns a human
-// override verbatim.
+// scoring (the write time, completed mark, awaiting-refresh flag), and returns a
+// human override, or a hidden item's metadata, verbatim.
 func TestRescore(t *testing.T) {
 	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 	written := now.Add(-time.Hour)
@@ -15,7 +16,7 @@ func TestRescore(t *testing.T) {
 		Signals: Signals{Reasons: []Reason{ReasonReviewRequested}},
 		Meta: Metadata{
 			Rank: 0.01, Priority: PriorityLow, Rationale: "stale", Origin: OriginAgent,
-			UpdatedAt: written, HiddenAt: written, CompletedAt: written,
+			UpdatedAt: written, CompletedAt: written, AwaitingRefresh: true,
 		},
 	}
 	got := Rescore(item, now)
@@ -23,8 +24,14 @@ func TestRescore(t *testing.T) {
 	if got.Rank != want.Rank || got.Priority != want.Priority || got.Rationale != want.Rationale || !got.ScoredAt.Equal(now) {
 		t.Fatalf("Rescore = %+v, want the Score result %+v", got, want)
 	}
-	if !got.UpdatedAt.Equal(written) || !got.HiddenAt.Equal(written) || !got.CompletedAt.Equal(written) {
+	if !got.UpdatedAt.Equal(written) || !got.CompletedAt.Equal(written) || !got.AwaitingRefresh {
 		t.Fatalf("Rescore dropped non-scoring fields: %+v", got)
+	}
+
+	hidden := item
+	hidden.Meta = Metadata{HiddenAt: written}
+	if got := Rescore(hidden, now); !reflect.DeepEqual(got, hidden.Meta) {
+		t.Fatalf("a hidden item must stay unscored, got %+v", got)
 	}
 
 	item.Meta.Origin = OriginUser

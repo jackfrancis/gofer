@@ -488,6 +488,9 @@ func TestWorklistGetAndBriefsParity(t *testing.T) {
 			if id == "b" || id == "e" {
 				it.Meta.CompletedAt = retired
 			}
+			if id == "d" || id == "e" {
+				it.Meta.HiddenAt = retired // a hidden item is off the radar too
+			}
 			items = append(items, it)
 		}
 		return items
@@ -571,5 +574,40 @@ func TestWorklistOwners(t *testing.T) {
 				t.Fatalf("Owners = %v, want [github:1 github:2]", got)
 			}
 		})
+	}
+}
+
+// Migration 3 deletes the signals and score of items hidden before hiding became
+// permanent, keeping their labels, GitHub fields, thread and marks, and leaves every
+// other item alone; the result reads as worklist.StripScoring would leave it.
+func TestMigrationStripsHiddenItems(t *testing.T) {
+	db := open(t, t.TempDir())
+	s := db.Worklist()
+	hiddenAt := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	hidden, closed, visible := item("h", "Hidden"), item("c", "Hidden, closed"), item("v", "Visible")
+	hidden.Signals.Labels = []string{"bug"}
+	hidden.GitHub.LabelColors = map[string]string{"bug": "d73a4a"}
+	hidden.Meta.HiddenAt = hiddenAt
+	closed.Meta.HiddenAt, closed.Meta.CompletedAt = hiddenAt, hiddenAt
+	if err := s.Upsert(ctx, "u1", hidden, closed, visible); err != nil {
+		t.Fatal(err)
+	}
+	// Replay migration 3 over these rows.
+	if _, err := db.sql.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := []worklist.WorkItem{hidden, closed, visible}
+	worklist.StripScoring(&want[0])
+	worklist.StripScoring(&want[1])
+	got, err := s.List(ctx, "u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	same(t, got, scoped("u1", want...))
+	if got[0].GitHub.LabelColor("bug") == "" || len(got[0].Thread) != 2 || got[2].Meta.Rank != 0.5 {
+		t.Fatalf("migration must keep GitHub fields, threads and visible items' scores, got %+v", got)
 	}
 }

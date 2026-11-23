@@ -131,10 +131,15 @@ type Metadata struct {
 	ScoredAt  time.Time `json:"scored_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 
-	// HiddenAt is when the user hid this item; zero means visible. The user sets
-	// it; an agent clears it (auto-unhide) once the underlying GitHub item is
-	// updated after this time, so a changed item resurfaces.
+	// HiddenAt is when the user hid this item; zero means visible. Only the user
+	// sets or clears it (HideItem, UnhideItem): a hidden item stays hidden however
+	// it changes on GitHub, and carries no score while it does (see hide.go).
 	HiddenAt time.Time `json:"hidden_at,omitempty"`
+
+	// AwaitingRefresh marks an item the user unhid: it came back with no signals
+	// or score, and the radar says it waits for the next refresh. A run owns
+	// Metadata, so the refresh that writes the item back clears it.
+	AwaitingRefresh bool `json:"awaiting_refresh,omitempty"`
 
 	// CompletedAt is when the underlying GitHub item was closed or merged; zero
 	// means still open. An agent sets it when the item leaves the open radar;

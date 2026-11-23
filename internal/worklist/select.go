@@ -37,7 +37,9 @@ const (
 // Selection names a bounded read of one owner's items, without their threads.
 // Enrichment and ingest page through every item; ranking reads the top N.
 type Selection struct {
-	// Open keeps only items not yet retired (Meta.CompletedAt unset).
+	// Open keeps only items on the radar (WorkItem.OnRadar): not retired
+	// (Meta.CompletedAt unset) and not hidden by the owner, whose hidden items get no
+	// enrichment or ranking.
 	Open bool
 	// After is the cursor of the page to read: empty for the first, then the next
 	// value the previous page returned.
@@ -76,7 +78,7 @@ func Select(items []WorkItem, sel Selection, now time.Time) (page []WorkItem, ne
 	sel = sel.normalized()
 	out := make([]WorkItem, 0, len(items))
 	for _, it := range items {
-		if sel.Open && !it.Meta.CompletedAt.IsZero() {
+		if sel.Open && !it.OnRadar() {
 			continue
 		}
 		out = append(out, it)
@@ -165,7 +167,8 @@ func SelectFrom(ctx context.Context, store Store, ownerID string, sel Selection,
 
 // BriefQuery names the items Store.Briefs returns, without their threads.
 type BriefQuery struct {
-	// Open keeps only items not yet retired (Meta.CompletedAt unset).
+	// Open keeps only items on the radar (WorkItem.OnRadar): neither retired nor
+	// hidden.
 	Open bool
 	// With Limit > 0, Briefs returns up to Limit items whose ID sorts after After,
 	// in ID order. Otherwise it returns every item, in first-insertion order.
@@ -178,7 +181,7 @@ type BriefQuery struct {
 func ApplyBriefQuery(items []WorkItem, q BriefQuery) []WorkItem {
 	out := make([]WorkItem, 0, len(items))
 	for _, it := range items {
-		if q.Open && !it.Meta.CompletedAt.IsZero() {
+		if q.Open && !it.OnRadar() {
 			continue
 		}
 		if q.Limit > 0 && it.ID <= q.After {

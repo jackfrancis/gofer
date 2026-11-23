@@ -77,8 +77,9 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 	)
 	for i := range items {
 		// Retired items (closed, merged, no longer involving the user) are off the radar:
-		// spending a timeline call on each would grow with every item ever seen.
-		if items[i].Source != "github" || !items[i].Meta.CompletedAt.IsZero() {
+		// spending a timeline call on each would grow with every item ever seen. Hidden
+		// items carry no signals to enrich (the selection leaves both out already).
+		if items[i].Source != "github" || !items[i].OnRadar() {
 			continue
 		}
 		// Yield to the run clock: stop starting new lookups once what remains must be

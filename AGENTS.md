@@ -161,9 +161,8 @@ Wired on the web-tier side; they define what a runtime must respect:
   read-modify-write), never `List` then `Upsert`, which overwrites anything written
   in between. A run's write-back is merged into the stored item
   (`worklist.MergeRunItems`): runs own the GitHub fields, signals and scoring; the
-  thread, read cursor, hidden flag and creation time always come from the store,
-  except that a hidden item resurfaces when the run's GitHub update time is after
-  the hide (`worklist.HiddenAfter`). Hidden and closed items are off the radar
+  thread, read cursor, hidden flag and creation time always come from the store.
+  Hidden and closed items are off the radar
   (`WorkItem.OnRadar`), and no bulk action (Review all, the second-opinion batch)
   draws from them. A
   run adds a thread turn only through `POST /agent/worklist/reply`
@@ -257,10 +256,24 @@ Wired on the web-tier side; they define what a runtime must respect:
   `http.ResponseWriter` must implement `Unwrap` (as `statusRecorder` does), or the
   flush fails and no thread is ever marked read. The
   cursor only moves forward; a re-render of an already-read thread skips the store.
+- Hiding an item (`internal/worklist/hide.go`) is permanent until the owner unhides
+  it: no run clears `Meta.HiddenAt`, whatever changes on GitHub. A hidden item
+  carries no gofer judgment: `worklist.HideItem` deletes its signals (all but the
+  labels) and its scoring metadata (`worklist.StripScoring`), `MergeRunItems` and the
+  ingest reconcile strip every write-back while it stays hidden, `SetResearch` drops
+  research for it, `Rescore` leaves it unscored, and the selection a run reads
+  (`Selection.Open`, which means on the radar) leaves it out of enrichment and
+  ranking. The radar lists open hidden items in a greyscale section below the ranked
+  list (`Resolution.Hidden`, most recently hidden first) with an Unhide button and no
+  Discuss: a hidden item takes no new turn, retry or review panel (`appendTurn`,
+  `ThreadRetry`), and its thread page is read-only. Unhide (`worklist.UnhideItem`)
+  brings it back empty, flagged `Meta.AwaitingRefresh` (shown as waiting for the
+  next refresh), and asks for a refresh, whose write-back clears the flag since runs
+  own `Metadata`. A hidden item that closes leaves the section, still hidden.
 - The radar's project (repository) filter (`internal/webui/projects.go`) is a view
   preference kept in the `gofer_projects` cookie, bound to the account that saved it
-  (none = all projects). It only drops items from the already-ranked list, never
-  re-sorts. The cookie never decides what a bulk action touches: each bulk form posts
+  (none = all projects). It only drops items from the already-ranked list and the
+  hidden section (its checklist names both lists' repositories), never re-sorts. The cookie never decides what a bulk action touches: each bulk form posts
   the selection its page was rendered with (`scope`), narrowed to the projects the
   checklist names, so neither a filter changed in another tab nor a saved repository
   that left the radar can widen it; an unreadable form changes nothing, and only a

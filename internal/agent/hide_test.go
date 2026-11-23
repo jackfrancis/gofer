@@ -13,10 +13,11 @@ import (
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
-// "Hide this item until GitHub updates it", end to end through a re-ingest and the
-// plane's merge: an unchanged PR stays hidden across refreshes, and new GitHub
-// activity brings it back with its thread intact.
-func TestRefreshKeepsHiddenUntilGitHubUpdates(t *testing.T) {
+// A hidden item, end to end through re-ingests and the plane's merge: it stays
+// hidden however GitHub changes, takes fresh GitHub fields but no signals or score
+// (it is neither enriched nor ranked), and keeps its thread. Unhidden, it comes back
+// empty and the next refresh fills it in.
+func TestRefreshKeepsHiddenItemHiddenAndUnscored(t *testing.T) {
 	hiddenAt := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 	updated := hiddenAt.Add(-time.Hour) // GitHub's updated_at, as the fake serves it
 	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
@@ -25,7 +26,7 @@ func TestRefreshKeepsHiddenUntilGitHubUpdates(t *testing.T) {
 			return
 		}
 		if strings.Contains(r.URL.Query().Get("q"), "review-requested:@me") {
-			fmt.Fprintf(w, `{"items":[{"number":7,"title":"Fresh title","html_url":"u","state":"open","updated_at":%q,"repository_url":"https://api.github.com/repos/o/r","pull_request":{"url":"x"}}]}`, updated.Format(time.RFC3339))
+			fmt.Fprintf(w, `{"items":[{"number":7,"title":"Fresh title","html_url":"u","state":"open","updated_at":%q,"repository_url":"https://api.github.com/repos/o/r","pull_request":{"url":"x"},"labels":[{"name":"bug","color":"d73a4a"}]}]}`, updated.Format(time.RFC3339))
 			return
 		}
 		_, _ = w.Write([]byte(`{"items":[]}`))
@@ -58,22 +59,33 @@ func TestRefreshKeepsHiddenUntilGitHubUpdates(t *testing.T) {
 		return worklist.WorkItem{}
 	}
 
-	for i := 1; i <= 2; i++ {
+	for i, at := range []time.Time{updated, hiddenAt.Add(time.Minute)} { // unchanged, then new activity
+		updated = at
 		got := refresh()
 		if !got.Meta.HiddenAt.Equal(hiddenAt) {
-			t.Fatalf("refresh %d: an unchanged PR must stay hidden, HiddenAt = %v", i, got.Meta.HiddenAt)
+			t.Fatalf("refresh %d: a hidden PR must stay hidden, HiddenAt = %v", i, got.Meta.HiddenAt)
 		}
-		if got.GitHub.Title != "Fresh title" {
-			t.Fatalf("refresh %d: a hidden item still takes fresh GitHub fields, got %q", i, got.GitHub.Title)
+		if got.GitHub.Title != "Fresh title" || len(got.Signals.Labels) != 1 || got.GitHub.LabelColor("bug") == "" {
+			t.Fatalf("refresh %d: a hidden item still takes fresh GitHub fields and labels, got %+v", i, got)
+		}
+		if len(got.Signals.Reasons) != 0 || got.Signals.Proposed != nil || got.Meta.Rank != 0 || got.Meta.Rationale != "" || !got.Signals.ObservedAt.IsZero() {
+			t.Fatalf("refresh %d: a hidden item carries no signals or score, got %+v %+v", i, got.Signals, got.Meta)
+		}
+		if len(got.Thread) != 2 || got.Thread[1].Content != "Looks good." {
+			t.Fatalf("refresh %d: a hidden item keeps its thread, got %+v", i, got.Thread)
 		}
 	}
 
-	updated = hiddenAt.Add(time.Minute) // someone commented on the PR after the hide
-	got := refresh()
-	if !got.Meta.HiddenAt.IsZero() || !got.OnRadar() {
-		t.Fatalf("new GitHub activity must resurface the item, HiddenAt = %v", got.Meta.HiddenAt)
+	for i := range sink.items {
+		if sink.items[i].ID == id {
+			worklist.UnhideItem(&sink.items[i])
+		}
 	}
-	if len(got.Thread) != 2 || got.Thread[1].Content != "Looks good." {
-		t.Fatalf("a resurfaced item keeps its thread, got %+v", got.Thread)
+	got := refresh()
+	if got.IsHidden() || got.Meta.AwaitingRefresh || !got.OnRadar() {
+		t.Fatalf("an unhidden item is back on the radar once refreshed, got %+v", got.Meta)
+	}
+	if len(got.Signals.Reasons) == 0 || got.Signals.Proposed == nil {
+		t.Fatalf("the refresh fills an unhidden item in (signals, then a ranking), got %+v", got.Signals)
 	}
 }

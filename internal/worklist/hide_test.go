@@ -2,40 +2,97 @@ package worklist
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 )
 
-// A hidden item stays hidden through any write-back whose GitHub update time is not
-// after the hide, and resurfaces, thread intact, once a run brings a newer one.
-func TestMergeRunItemsAutoUnhide(t *testing.T) {
+// A hidden item stays hidden through every write-back, whatever GitHub shows, and
+// keeps only the run's GitHub fields, completion and labels: the signals and score a
+// run sends are stripped, and its thread stays as stored.
+func TestMergeRunItemsKeepsHiddenItemsHiddenAndUnscored(t *testing.T) {
 	thread := []Message{{ID: "m1", Role: RoleUser, Content: "q", At: t0}, {ID: "m2", Role: RoleAgent, Content: "a", ReplyTo: "m1", At: t1}}
 	stored := WorkItem{ID: "a", Thread: thread, CreatedAt: t0, Meta: Metadata{HiddenAt: t2},
-		GitHub: GitHubRef{Title: "old", UpdatedAt: t1}}
-	merge := func(updated time.Time) WorkItem {
-		run := WorkItem{ID: "a", GitHub: GitHubRef{Title: "new", UpdatedAt: updated}}
-		return MergeRunItems([]WorkItem{stored}, []WorkItem{run})[0]
-	}
-
-	for _, tc := range []struct {
-		name    string
-		updated time.Time
-	}{
-		{"no GitHub update time (a scoring run)", time.Time{}},
-		{"unchanged since before the hide", t1},
-		{"updated at the very instant of the hide", t2},
-	} {
-		if got := merge(tc.updated); !got.Meta.HiddenAt.Equal(t2) || got.OnRadar() {
-			t.Errorf("%s: HiddenAt = %v, want the stored %v (still hidden)", tc.name, got.Meta.HiddenAt, t2)
+		GitHub: GitHubRef{Title: "old", UpdatedAt: t1}, Signals: Signals{Labels: []string{"old"}}}
+	for _, updated := range []time.Time{{}, t1, t2, t3} {
+		run := WorkItem{ID: "a", GitHub: GitHubRef{Title: "new", UpdatedAt: updated},
+			Signals: Signals{Labels: []string{"bug"}, Reasons: []Reason{ReasonAuthor}, Comments: 4, ObservedAt: t3,
+				Proposed: &AxisProposal{Relevance: 1}, Research: &ResearchAdjustment{AppliedAt: t3}},
+			Meta: Metadata{Rank: 0.9, Relevance: 1, Rationale: "on your radar as a comment you left", Origin: OriginAgent, CompletedAt: t3}}
+		got := MergeRunItems([]WorkItem{stored}, []WorkItem{run})[0]
+		if !got.Meta.HiddenAt.Equal(t2) || got.OnRadar() {
+			t.Fatalf("updated %v: HiddenAt = %v, want the stored %v", updated, got.Meta.HiddenAt, t2)
+		}
+		if want := (Signals{Labels: []string{"bug"}}); !reflect.DeepEqual(got.Signals, want) {
+			t.Fatalf("updated %v: signals = %+v, want only the run's labels", updated, got.Signals)
+		}
+		if want := (Metadata{HiddenAt: t2, CompletedAt: t3}); !reflect.DeepEqual(got.Meta, want) {
+			t.Fatalf("updated %v: meta = %+v, want only the hide and completion marks", updated, got.Meta)
+		}
+		if got.GitHub.Title != "new" || len(got.Thread) != 2 || !got.CreatedAt.Equal(t0) {
+			t.Fatalf("updated %v: want the run's GitHub fields and the stored thread, got %+v", updated, got)
 		}
 	}
+}
 
-	got := merge(t3)
-	if !got.Meta.HiddenAt.IsZero() || !got.OnRadar() {
-		t.Fatalf("a GitHub update after the hide must unhide the item, HiddenAt = %v", got.Meta.HiddenAt)
+// Hide deletes the item's judgment and keeps the first hide time; Unhide brings back
+// an empty item awaiting a refresh. Neither touches the GitHub fields or thread.
+func TestHideAndUnhideItem(t *testing.T) {
+	it := WorkItem{ID: "a", GitHub: GitHubRef{Title: "t", LabelColors: map[string]string{"bug": "d73a4a"}},
+		Thread:  []Message{{ID: "m", Role: RoleUser, Content: "q", At: t0}},
+		Signals: Signals{Labels: []string{"bug"}, Reasons: []Reason{ReasonCommented}, ReviewRequestedBy: "x", Proposed: &AxisProposal{}},
+		Meta:    Metadata{Rank: 0.5, Relevance: 0.5, Rationale: "on your radar as a comment you left", Origin: OriginUser, CompletedAt: t1}}
+	if !HideItem(&it, t2) {
+		t.Fatal("hiding a visible item changes it")
 	}
-	if len(got.Thread) != 2 || got.Thread[1].Content != "a" || !got.CreatedAt.Equal(t0) || got.GitHub.Title != "new" {
-		t.Fatalf("a resurfaced item keeps its thread and takes the run's GitHub fields, got %+v", got)
+	if !reflect.DeepEqual(it.Signals, Signals{Labels: []string{"bug"}}) || !reflect.DeepEqual(it.Meta, Metadata{HiddenAt: t2, CompletedAt: t1}) {
+		t.Fatalf("hide must delete the signals and score, got %+v %+v", it.Signals, it.Meta)
+	}
+	if it.GitHub.Title != "t" || it.GitHub.LabelColor("bug") == "" || len(it.Thread) != 1 {
+		t.Fatalf("hide keeps the GitHub fields and thread, got %+v", it)
+	}
+	if HideItem(&it, t3) || !it.Meta.HiddenAt.Equal(t2) {
+		t.Fatalf("a repeated hide changes nothing and keeps the first time, HiddenAt = %v", it.Meta.HiddenAt)
+	}
+	if !UnhideItem(&it) {
+		t.Fatal("unhiding a hidden item changes it")
+	}
+	if it.IsHidden() || !it.Meta.AwaitingRefresh || it.Meta.Rank != 0 || len(it.Signals.Reasons) != 0 {
+		t.Fatalf("unhide brings back an empty item awaiting a refresh, got %+v", it.Meta)
+	}
+	if UnhideItem(&it) {
+		t.Fatal("unhiding a visible item changes nothing")
+	}
+	// The refresh's write-back carries its own Metadata, which clears the flag.
+	got := MergeRunItems([]WorkItem{it}, []WorkItem{{ID: "a", Meta: Metadata{Rank: 0.4}}})[0]
+	if got.Meta.AwaitingRefresh || got.Meta.Rank != 0.4 {
+		t.Fatalf("a run's write-back fills the item in, got %+v", got.Meta)
+	}
+}
+
+// A hidden item takes no research adjustment.
+func TestSetResearchSkipsHiddenItem(t *testing.T) {
+	it := WorkItem{ID: "a", Meta: Metadata{HiddenAt: t1}}
+	if changed, err := SetResearch(&it, ResearchAdjustment{AppliedAt: t2}); err != nil || changed || it.Signals.Research != nil {
+		t.Fatalf("SetResearch on a hidden item = %v, %v, research %+v; want nothing set", changed, err, it.Signals.Research)
+	}
+}
+
+// A run's on-radar selection (enrichment, ranking) leaves hidden items out, as the
+// stores' brief reads do.
+func TestSelectOpenSkipsHiddenItems(t *testing.T) {
+	items := []WorkItem{{ID: "v"}, {ID: "h", Meta: Metadata{HiddenAt: t1}}, {ID: "c", Meta: Metadata{CompletedAt: t1}}}
+	for _, sel := range []Selection{{Open: true}, {Open: true, Top: 10}} {
+		page, _ := Select(items, sel, t3)
+		if len(page) != 1 || page[0].ID != "v" {
+			t.Fatalf("Select(%+v) = %+v, want only the item on the radar", sel, page)
+		}
+	}
+	if got := ApplyBriefQuery(items, BriefQuery{Open: true}); len(got) != 1 || got[0].ID != "v" {
+		t.Fatalf("ApplyBriefQuery(open) = %+v, want only the item on the radar", got)
+	}
+	if got := ApplyBriefQuery(items, BriefQuery{}); len(got) != 3 {
+		t.Fatalf("an unfiltered read still returns every item, got %d", len(got))
 	}
 }
 
@@ -91,5 +148,34 @@ func TestResolveSplitsOffRadarItems(t *testing.T) {
 	}
 	if len(res.OffRadar) != 2 || !off["h"] || !off["c"] {
 		t.Fatalf("OffRadar = %+v, want the hidden and the closed item", res.OffRadar)
+	}
+	if len(res.Hidden) != 1 || res.Hidden[0].ID != "h" {
+		t.Fatalf("Hidden = %+v, want the open hidden item", res.Hidden)
+	}
+}
+
+// The hidden section lists open hidden items, most recently hidden first; a hidden
+// item that closed leaves it, still hidden.
+func TestResolveListsHiddenSection(t *testing.T) {
+	store := NewMemoryStore()
+	store.Seed("u1",
+		WorkItem{ID: "early", Meta: Metadata{HiddenAt: t1}},
+		WorkItem{ID: "closed", Meta: Metadata{HiddenAt: t3, CompletedAt: t3}},
+		WorkItem{ID: "late", Meta: Metadata{HiddenAt: t2}},
+		WorkItem{ID: "v"},
+	)
+	res, err := Resolve(context.Background(), store, nil, t3, "u1", DefaultSort, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, it := range res.Hidden {
+		ids = append(ids, it.ID)
+		if it.Meta.Rank != 0 || it.Meta.ScoredAt != (time.Time{}) {
+			t.Fatalf("a hidden item is never scored, got %+v", it.Meta)
+		}
+	}
+	if !reflect.DeepEqual(ids, []string{"late", "early"}) {
+		t.Fatalf("Hidden = %v, want [late early]", ids)
 	}
 }
