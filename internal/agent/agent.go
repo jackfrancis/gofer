@@ -75,6 +75,11 @@ type Sink interface {
 	// writes back its older GitHub fields. It is dropped, without error, if the item
 	// is gone.
 	Research(ctx context.Context, itemID string, adj worklist.ResearchAdjustment) error
+	// Turn sets itemID's turn reading and nothing else (see worklist.ApplyTurn), so a
+	// reading the model took a while over never writes back the item it read. It is
+	// dropped, without error, if the item is gone, hidden, or its last word is no
+	// longer the one the reading names.
+	Turn(ctx context.Context, itemID string, r worklist.TurnReading) error
 }
 
 // Params configures a single runtime invocation.
@@ -474,12 +479,9 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 	if err != nil {
 		return fmt.Errorf("list worklist: %w", err)
 	}
-	// An item waiting on someone else is listed apart from the rest (WorkItem.Waiting):
-	// a proposal would refine an order the user is not acting on, so spend nothing on it.
-	items = slices.DeleteFunc(items, func(it worklist.WorkItem) bool {
-		_, waiting := it.Waiting()
-		return waiting
-	})
+	// The selection leaves out items waiting on someone else (WorkItem.Waiting) before
+	// its cutoff: they are listed apart from the ranking, so their slots go to items
+	// that are the user's turn.
 	log.Info("rank: proposing axes", "items", len(items), "stub", stub)
 
 	var (

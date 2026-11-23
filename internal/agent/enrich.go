@@ -92,7 +92,9 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 		// reserve-adjusted deadline too, not just start before it, or one slow item
 		// holds the batch past the time kept for writing every result back.
 		actx, cancel := reserveContext(ctx, enrichReserve)
-		opts := github.ActivityOptions{Author: items[i].GitHub.Author, Bots: p.Bots}
+		opts := github.ActivityOptions{Author: items[i].GitHub.Author, Bots: p.Bots,
+			// The review-requested:@me search shows the item: a team request may be ours.
+			ReviewRequested: slices.Contains(items[i].Signals.Reasons, worklist.ReasonReviewRequested)}
 		if slices.Contains(items[i].Signals.Reasons, worklist.ReasonAuthor) {
 			opts.Author = login // an item stored before its author was recorded
 		}

@@ -64,3 +64,21 @@ func TestReviewAllSkipsWaiting(t *testing.T) {
 		t.Fatalf("reviewed %v, want only the PR that is the user's turn", pipe.reviewed)
 	}
 }
+
+// A selected project whose only item is waiting does not read as empty.
+func TestRadarOnlyWaitingInTheSelectedProject(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", waitingPR("wait", time.Now()), worklist.WorkItem{ID: "active", GitHub: worklist.GitHubRef{Repo: "else/where"}})
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{}, true, nil)
+	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r.AddCookie(&http.Cookie{Name: projectsCookie, Value: "u=u1&p=o%2Fr"})
+	rec := httptest.NewRecorder()
+	h.Index(rec, r)
+	out := rec.Body.String()
+	if !strings.Contains(out, "Waiting PR") {
+		t.Fatal("fixture: the waiting PR should be shown")
+	}
+	if strings.Contains(out, "No items in the selected projects.") || !strings.Contains(out, "Nothing in the selected projects needs you right now.") {
+		t.Fatalf("empty state wrong:\n%s", out)
+	}
+}

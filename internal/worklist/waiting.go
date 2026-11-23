@@ -172,6 +172,13 @@ type Waiting struct {
 //
 //   - The timeline must say the ball is in others' court (Signals.AwaitingOthersSince,
 //     and no review is awaiting the user).
+//   - On the user's own item it must rest on their recorded last word: a request for
+//     changes by someone else leaves the next step with the user, and an item stored
+//     before LastWord was recorded may carry that older reading of the timeline until
+//     enrich reads it again.
+//   - A last word that is not a decisive review must have text: one whose words could
+//     not be read (an inline-only review whose comments did not load) says nothing
+//     about whose turn it is.
 //   - A current reading (CurrentTurnReading) of the user's last word can keep the
 //     item with the user (TurnMine), mark it as needing nothing (TurnNothingPending),
 //     or name who it waits on (TurnWaitingOn). TurnUnclear leaves it to the timeline.
@@ -183,13 +190,21 @@ func (w WorkItem) Waiting() (Waiting, bool) {
 	if s.AwaitingOthersSince.IsZero() || !s.AwaitingMeSince.IsZero() {
 		return Waiting{}, false
 	}
+	own := containsReason(s.Reasons, ReasonAuthor)
+	lw := s.LastWord
+	if own && lw == nil {
+		return Waiting{}, false
+	}
+	if lw != nil && !lw.Decisive && strings.TrimSpace(lw.Text) == "" {
+		return Waiting{}, false
+	}
 	out := Waiting{Since: s.AwaitingOthersSince}
 	var mentions []string
-	if s.LastWord != nil {
-		mentions = s.LastWord.Mentions
+	if lw != nil {
+		mentions = lw.Mentions
 	}
 	author := w.GitHub.Author
-	if containsReason(s.Reasons, ReasonAuthor) {
+	if own {
 		author = "" // the user is the author: they are not who it waits on
 	}
 	if r := s.CurrentTurnReading(); r != nil {
@@ -217,8 +232,10 @@ func (w WorkItem) Waiting() (Waiting, bool) {
 
 // mentionRE matches an @-mention: an @ not preceded by a word character, backquote or
 // slash (an email address, code, a URL path), then a login. A login followed by a
-// slash is a team (@org/team), which names no one person.
-var mentionRE = regexp.MustCompile("(?:^|[^\\w`/@])@([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))(/)?")
+// slash is a team (@org/team), which names no one person; one followed by "[bot]" is
+// a GitHub App's bot account (@dependabot[bot]), not the person whose login it starts
+// with.
+var mentionRE = regexp.MustCompile("(?:^|[^\\w`/@])@([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))(/|\\[bot\\])?")
 
 // Mentions returns the logins text @-mentions, in order of first mention, without
 // repeats. Quoted lines ("> …") and code (fenced blocks and `spans`) are left out:
@@ -237,8 +254,8 @@ func Mentions(text string) []string {
 		}
 		line = stripCodeSpans(line)
 		for _, m := range mentionRE.FindAllStringSubmatch(line, -1) {
-			if m[2] == "/" {
-				continue // a team
+			if m[2] != "" {
+				continue // a team, or a bot account
 			}
 			if !containsFold(out, m[1]) {
 				out = append(out, m[1])
@@ -308,6 +325,38 @@ func headTail(s string, n int) string {
 }
 
 func isRuneStart(b byte) bool { return b&0xC0 != 0x80 }
+
+// ApplyTurn sets ownerID's item itemID's turn reading, and nothing else, in one
+// Store.Update (see SetTurn). A reading pass reads the item, asks the model, and
+// writes back only the reading, so whatever landed meanwhile (a refresh, a hide or
+// unhide) stands. It writes nothing, and returns no error, when the item is gone or
+// the reading is dropped.
+func ApplyTurn(ctx context.Context, store Store, ownerID, itemID string, r TurnReading) error {
+	return store.Update(ctx, ownerID, func(current []WorkItem) ([]WorkItem, error) {
+		for i := range current {
+			if current[i].ID != itemID {
+				continue
+			}
+			if !SetTurn(&current[i], r) {
+				return nil, nil
+			}
+			return current[i : i+1], nil
+		}
+		return nil, nil // item gone
+	})
+}
+
+// SetTurn sets item's turn reading, held to its bounds, and reports whether it did. A
+// reading is dropped unless it read the item's current last word (the key matches
+// Signals.LastWord), and for a hidden item, which carries no signals.
+func SetTurn(item *WorkItem, r TurnReading) bool {
+	r.bound()
+	if item.IsHidden() || item.Signals.LastWord == nil || r.LastWord != item.Signals.LastWord.Key() {
+		return false
+	}
+	item.Signals.Turn = &r
+	return true
+}
 
 // TurnReader reads the user's last word on a waiting item (Signals.LastWord) and says
 // whose turn it is. The real implementation calls a chat model from an agent runtime;

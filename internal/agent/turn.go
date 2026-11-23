@@ -27,8 +27,9 @@ const (
 // best-effort, like rank: an item it does not read is left to the timeline, which
 // already counts it as waiting. With no TurnReader (no chat model) it does nothing.
 //
-// The write-back carries the reading and no other model signal, so the stored
-// proposal and research adjustment stay (worklist.KeepModelSignals).
+// Each reading is written alone (Sink.Turn), never the item it was read from: a
+// refresh, a hide or an unhide that landed while the model worked stands, and a
+// reading of a last word that is no longer current is dropped.
 func runReadTurns(ctx context.Context, p Params, sink Sink) error {
 	if p.TurnReader == nil {
 		return nil
@@ -56,7 +57,7 @@ func runReadTurns(ctx context.Context, p Params, sink Sink) error {
 
 	var (
 		mu      sync.Mutex
-		changed []worklist.WorkItem
+		written int
 		wg      sync.WaitGroup
 		sem     = make(chan struct{}, turnReadConcurrency)
 		skipped int
@@ -80,20 +81,16 @@ func runReadTurns(ctx context.Context, p Params, sink Sink) error {
 			}
 			r.LastWord = it.Signals.LastWord.Key()
 			r.ReadAt = time.Now().UTC()
-			clearModelSignals(&it.Signals)
-			it.Signals.Turn = &r
+			if err := sink.Turn(ctx, it.ID, r); err != nil {
+				log.Warn("turns: write failed", "item", it.ID, "err", err)
+				return
+			}
 			mu.Lock()
-			changed = append(changed, it)
+			written++
 			mu.Unlock()
 		}(todo[i])
 	}
 	wg.Wait()
-	log.Info("turns: applied readings", "changed", len(changed), "skipped_out_of_time", skipped)
-	if len(changed) == 0 {
-		return nil
-	}
-	if err := writeBack(ctx, sink, changed); err != nil {
-		return fmt.Errorf("turns: %w", err)
-	}
+	log.Info("turns: sent readings", "sent", written, "skipped_out_of_time", skipped)
 	return nil
 }

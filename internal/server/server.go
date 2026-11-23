@@ -207,6 +207,7 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	mux.Handle("POST /agent/worklist/reply", authenticator.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(ingestHandler.Reply)))
 	// A converse or research run writes its research adjustment here, and nothing else.
 	mux.Handle("POST /agent/worklist/research", authenticator.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(ingestHandler.Research)))
+	mux.Handle("POST /agent/worklist/turn", authenticator.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(ingestHandler.Turn)))
 	// The credential broker: a runtime vends the acting user's delegated provider
 	// token here, so it never holds a standing secret.
 	mux.Handle("GET /agent/credential", authenticator.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(credentialHandler.Vend)))

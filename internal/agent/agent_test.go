@@ -82,6 +82,15 @@ func (m *memSink) Research(_ context.Context, itemID string, adj worklist.Resear
 	return nil
 }
 
+func (m *memSink) Turn(_ context.Context, itemID string, r worklist.TurnReading) error {
+	for i := range m.items {
+		if m.items[i].ID == itemID {
+			worklist.SetTurn(&m.items[i], r)
+		}
+	}
+	return nil
+}
+
 func (m *memSink) put(items []worklist.WorkItem) {
 	for _, it := range items {
 		found := false

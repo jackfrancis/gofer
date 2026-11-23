@@ -206,3 +206,84 @@ func TestResolveSplitsWaiting(t *testing.T) {
 		t.Fatal("the bulk review pool should skip waiting items only")
 	}
 }
+
+// On the user's own PR, a wait with no recorded last word is the older reading of a
+// request for changes (before LastWord existed): the user owes the changes.
+func TestWaitingLegacyOwnPR(t *testing.T) {
+	it := WorkItem{Type: TypePullRequest, Signals: Signals{Reasons: []Reason{ReasonAuthor}, AwaitingOthersSince: waitT0}}
+	if _, waiting := it.Waiting(); waiting {
+		t.Fatal("a legacy request for changes on the user's own PR moved to waiting")
+	}
+	it.Signals.LastWord = NewLastWord("comment:1", waitT0, false, []string{"rev"}, "@rev ok now?")
+	if w, waiting := it.Waiting(); !waiting || w.On != "rev" {
+		t.Fatalf("own PR with my last word: %+v, %v", w, waiting)
+	}
+}
+
+// An undecisive last word whose text could not be read says nothing about whose turn
+// it is.
+func TestWaitingNeedsTheLastWordsText(t *testing.T) {
+	it := waitingItem("")
+	if _, waiting := it.Waiting(); waiting {
+		t.Fatal("a last word with no text made the item wait")
+	}
+	it.Signals.LastWord.Decisive = true
+	if _, waiting := it.Waiting(); !waiting {
+		t.Fatal("a decisive review with no summary should still wait")
+	}
+}
+
+func TestMentionsSkipBotAccounts(t *testing.T) {
+	if got := Mentions("@dependabot[bot] rebase, @renovate[bot] too, cc @alice"); len(got) != 1 || got[0] != "alice" {
+		t.Fatalf("Mentions = %v, want [alice]", got)
+	}
+}
+
+// ApplyTurn writes the reading alone, and only for the current last word of an item
+// that is not hidden.
+func TestApplyTurn(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryStore()
+	it := waitingItem("I'll look tomorrow")
+	it.GitHub.Title = "stored title"
+	store.Seed("u", it)
+	key := it.Signals.LastWord.Key()
+
+	if err := ApplyTurn(ctx, store, "u", it.ID, TurnReading{LastWord: "comment:1#stale", Outcome: TurnMine}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ := store.Get(ctx, "u", it.ID); got.Signals.Turn != nil {
+		t.Fatal("a reading of another last word was stored")
+	}
+	if err := ApplyTurn(ctx, store, "u", it.ID, TurnReading{LastWord: key, Outcome: "anything"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ := store.Get(ctx, "u", it.ID)
+	if got.Signals.Turn == nil || got.Signals.Turn.Outcome != TurnUnclear || got.GitHub.Title != "stored title" {
+		t.Fatalf("reading %+v, title %q", got.Signals.Turn, got.GitHub.Title)
+	}
+	if err := ApplyTurn(ctx, store, "u", "gone", TurnReading{LastWord: key}); err != nil {
+		t.Fatal("a reading for a gone item should be dropped quietly")
+	}
+	hidden := waitingItem("x")
+	HideItem(&hidden, waitT0)
+	hidden.Signals.LastWord = NewLastWord("comment:1", waitT0, false, nil, "x")
+	if SetTurn(&hidden, TurnReading{LastWord: hidden.Signals.LastWord.Key()}) {
+		t.Fatal("a reading was set on a hidden item")
+	}
+}
+
+// The ranker's top N leaves out waiting items before the cutoff.
+func TestSelectTopSkipsWaiting(t *testing.T) {
+	waiting := waitingItem("why?")
+	waiting.Signals.Labels = []string{"security"}
+	mine := WorkItem{ID: "github:o/r#2", Type: TypePullRequest, Signals: Signals{Reasons: []Reason{ReasonInvolved}}}
+	page, _ := Select([]WorkItem{waiting, mine}, Selection{Open: true, Top: 1}, waitT0)
+	if len(page) != 1 || page[0].ID != mine.ID {
+		t.Fatalf("top 1 = %v, want the item that is the user's turn", page)
+	}
+	page, _ = Select([]WorkItem{waiting, mine}, Selection{Open: true}, waitT0)
+	if len(page) != 2 {
+		t.Fatal("a paged read should still include waiting items (enrich reads them)")
+	}
+}

@@ -258,7 +258,7 @@
       {{range .Items}}
         {{template "item" (row . $.ConvEnabled)}}
       {{else}}
-        <div class="zz-empty"><p>{{if .ProjectsFiltered}}No items in the selected projects.{{else if .Waiting}}Nothing needs you right now.{{else}}Nothing on your radar right now.{{end}}</p></div>
+        <div class="zz-empty"><p>{{if .Waiting}}Nothing{{if .ProjectsFiltered}} in the selected projects{{end}} needs you right now.{{else if .ProjectsFiltered}}No items in the selected projects.{{else}}Nothing on your radar right now.{{end}}</p></div>
       {{end}}
       {{with .Waiting}}
       <section class="zz-waiting" aria-labelledby="zz-waiting-head">

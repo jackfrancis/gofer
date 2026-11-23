@@ -185,6 +185,45 @@ func (h *IngestHandler) Research(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// turnRequest is the body of POST /agent/worklist/turn.
+type turnRequest struct {
+	ItemID  string                `json:"item_id"`
+	Reading *worklist.TurnReading `json:"reading"`
+}
+
+// maxTurnBody bounds a turn-reading request: a last-word key, an outcome and a login.
+const maxTurnBody = 16 << 10
+
+// Turn handles POST /agent/worklist/turn. A reading pass writes the turn reading it
+// derived here (worklist.ApplyTurn), and only that: the rest of the item stays as
+// stored now, so a reading the model took a while over never restores the item it
+// read. A reading for an item that is gone or hidden, or of a last word that is no
+// longer current, is accepted and dropped.
+func (h *IngestHandler) Turn(w http.ResponseWriter, r *http.Request) {
+	p, ok := principal.FromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var body turnRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxTurnBody)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if body.ItemID == "" || body.Reading == nil || body.Reading.LastWord == "" {
+		writeError(w, http.StatusBadRequest, "item_id and a reading naming its last_word are required")
+		return
+	}
+	if err := worklist.ApplyTurn(r.Context(), h.store, p.ActingUserID, body.ItemID, *body.Reading); err != nil {
+		writeError(w, http.StatusBadGateway, "could not persist turn reading")
+		return
+	}
+	if h.noter != nil && p.JobID != "" {
+		h.noter.NoteWriteback(p.JobID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // List handles GET /agent/worklist: the acting user's whole worklist, threads
 // included. No current run reads it (it outgrows the agent plane's response limit);
 // a run reads one item (Item) or a bounded selection (Select). It stays for a

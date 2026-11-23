@@ -183,3 +183,82 @@ func TestRunEnrichRecordsAndReadsTheLastWord(t *testing.T) {
 		t.Fatalf("Waiting = %+v, %v", w, ok)
 	}
 }
+
+type lateReader struct{ meanwhile func() }
+
+func (r lateReader) ReadTurn(context.Context, worklist.WorkItem) (worklist.TurnReading, error) {
+	r.meanwhile()
+	return worklist.TurnReading{Outcome: worklist.TurnWaitingOn}, nil
+}
+
+// A reading that lands after the author answered (a refresh replaced the last word)
+// is dropped, and nothing it read is written back.
+func TestRunReadTurnsLateAfterAnAnswer(t *testing.T) {
+	ctx := context.Background()
+	store := worklist.NewMemoryStore()
+	old := waitingPR(1, "Can you update this?")
+	store.Seed("u", old)
+	sink := NewStoreSink(store, "u")
+	reader := lateReader{func() {
+		fresh := old
+		fresh.Signals.LastWord, fresh.Signals.AwaitingOthersSince = nil, time.Time{}
+		fresh.GitHub.Title = "author answered"
+		if err := sink.Ingest(ctx, []worklist.WorkItem{fresh}); err != nil {
+			t.Error(err)
+		}
+	}}
+	if err := runReadTurns(ctx, Params{TurnReader: reader}, sink); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ := store.Get(ctx, "u", old.ID)
+	if _, waiting := got.Waiting(); waiting || got.GitHub.Title != "author answered" || got.Signals.Turn != nil {
+		t.Fatalf("late reading restored the old item: title %q, turn %+v", got.GitHub.Title, got.Signals.Turn)
+	}
+}
+
+// A reading that lands after a hide and unhide leaves the item awaiting its refresh.
+func TestRunReadTurnsLateAcrossUnhide(t *testing.T) {
+	ctx := context.Background()
+	store := worklist.NewMemoryStore()
+	old := waitingPR(1, "Can you update this?")
+	store.Seed("u", old)
+	reader := lateReader{func() {
+		_ = store.Update(ctx, "u", func(items []worklist.WorkItem) ([]worklist.WorkItem, error) {
+			worklist.HideItem(&items[0], time.Now())
+			return items, nil
+		})
+		_ = store.Update(ctx, "u", func(items []worklist.WorkItem) ([]worklist.WorkItem, error) {
+			worklist.UnhideItem(&items[0])
+			return items, nil
+		})
+	}}
+	if err := runReadTurns(ctx, Params{TurnReader: reader}, NewStoreSink(store, "u")); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ := store.Get(ctx, "u", old.ID)
+	if _, waiting := got.Waiting(); waiting || !got.Meta.AwaitingRefresh {
+		t.Fatalf("after hide/unhide: waiting=%v awaiting_refresh=%v", waiting, got.Meta.AwaitingRefresh)
+	}
+}
+
+// With room for one proposal, a high-scoring waiting PR leaves the slot to the next
+// item that is the user's turn.
+func TestRunRankGivesWaitingSlotsAway(t *testing.T) {
+	ctx := context.Background()
+	store := worklist.NewMemoryStore()
+	waiting := waitingPR(1, "Can you update this?")
+	waiting.Signals.Labels = []string{"security"}
+	mine := prItem(2)
+	mine.Signals.Reasons = []worklist.Reason{worklist.ReasonInvolved}
+	if worklist.BaselineScore(waiting, time.Now()).Rank <= worklist.BaselineScore(mine, time.Now()).Rank {
+		t.Fatal("fixture: the waiting PR must outrank the other")
+	}
+	store.Seed("u", waiting, mine)
+	r := &idRanker{}
+	if err := runRank(ctx, Params{Ranker: r, RankLimit: 1}, NewStoreSink(store, "u")); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.ids) != 1 || r.ids[0] != mine.ID {
+		t.Fatalf("ranked %v, want %s", r.ids, mine.ID)
+	}
+}

@@ -154,6 +154,11 @@ func (s *StoreSink) Research(ctx context.Context, itemID string, adj worklist.Re
 	return worklist.ApplyResearch(ctx, s.store, s.ownerID, itemID, adj)
 }
 
+// Turn sets the owner's item's turn reading, atomically (worklist.ApplyTurn).
+func (s *StoreSink) Turn(ctx context.Context, itemID string, r worklist.TurnReading) error {
+	return worklist.ApplyTurn(ctx, s.store, s.ownerID, itemID, r)
+}
+
 // PlaneClient is the out-of-process Vendor and Sink: it reaches gofer's agent plane
 // over HTTP, authenticating every call with the run credential (the audience-bound
 // token the runtime carries). The owner is implied by that credential, so — unlike
@@ -320,6 +325,17 @@ type ReplyRequest struct {
 // undo a later result.
 func (c *PlaneClient) Research(ctx context.Context, itemID string, adj worklist.ResearchAdjustment) error {
 	return c.post(ctx, "/agent/worklist/research", "research", ResearchRequest{ItemID: itemID, Adjustment: adj})
+}
+
+// Turn writes the item's turn reading alone: POST /agent/worklist/turn.
+func (c *PlaneClient) Turn(ctx context.Context, itemID string, r worklist.TurnReading) error {
+	return c.post(ctx, "/agent/worklist/turn", "turn reading", TurnRequest{ItemID: itemID, Reading: r})
+}
+
+// TurnRequest is the body of POST /agent/worklist/turn.
+type TurnRequest struct {
+	ItemID  string               `json:"item_id"`
+	Reading worklist.TurnReading `json:"reading"`
 }
 
 // ResearchRequest is the body of POST /agent/worklist/research.
