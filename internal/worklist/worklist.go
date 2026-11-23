@@ -10,6 +10,7 @@ package worklist
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -75,6 +76,35 @@ type GitHubRef struct {
 	Draft       bool   `json:"draft,omitempty"`
 	Merged      bool   `json:"merged,omitempty"`
 	StateReason string `json:"state_reason,omitempty"`
+
+	// LabelColors maps each of the item's labels (Signals.Labels) to its GitHub
+	// color, six hex digits without '#', for display only. Read a color through
+	// LabelColor, which refuses anything but six hex digits.
+	LabelColors map[string]string `json:"label_colors,omitempty"`
+}
+
+// LabelColor returns the GitHub color of the item's label name, normalized to six
+// lowercase hex digits, or "" if none is stored or the stored value is not a color.
+// The value reaches a stylesheet, so nothing else may pass.
+func (g GitHubRef) LabelColor(name string) string {
+	return NormalizeLabelColor(g.LabelColors[name])
+}
+
+// NormalizeLabelColor returns c as six lowercase hex digits (a leading '#' is
+// allowed), or "" if c is not a color in that form.
+func NormalizeLabelColor(c string) string {
+	c = strings.TrimPrefix(c, "#")
+	if len(c) != 6 {
+		return ""
+	}
+	for i := 0; i < len(c); i++ {
+		switch b := c[i]; {
+		case '0' <= b && b <= '9', 'a' <= b && b <= 'f', 'A' <= b && b <= 'F':
+		default:
+			return ""
+		}
+	}
+	return strings.ToLower(c)
 }
 
 // Metadata is gofer's judgment about an item, derived from its Signals. The four

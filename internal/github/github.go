@@ -260,7 +260,8 @@ type searchItem struct {
 		Login string `json:"login"`
 	} `json:"assignees"`
 	Labels []struct {
-		Name string `json:"name"`
+		Name  string `json:"name"`
+		Color string `json:"color"`
 	} `json:"labels"`
 	Milestone *struct {
 		DueOn time.Time `json:"due_on"`
@@ -299,8 +300,15 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 	if it.Milestone != nil {
 		sig.DeadlineAt = it.Milestone.DueOn
 	}
+	var colors map[string]string
 	for _, l := range it.Labels {
 		sig.Labels = append(sig.Labels, l.Name)
+		if c := worklist.NormalizeLabelColor(l.Color); c != "" {
+			if colors == nil {
+				colors = map[string]string{}
+			}
+			colors[l.Name] = c
+		}
 	}
 
 	return worklist.WorkItem{
@@ -308,12 +316,13 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 		Source: "github",
 		Type:   itemType,
 		GitHub: worklist.GitHubRef{
-			Number:    it.Number,
-			Repo:      repo,
-			Title:     it.Title,
-			URL:       it.HTMLURL,
-			State:     it.State,
-			UpdatedAt: it.UpdatedAt,
+			Number:      it.Number,
+			Repo:        repo,
+			Title:       it.Title,
+			URL:         it.HTMLURL,
+			State:       it.State,
+			UpdatedAt:   it.UpdatedAt,
+			LabelColors: colors,
 
 			Draft:       it.Draft && itemType == worklist.TypePullRequest,
 			Merged:      merged,
