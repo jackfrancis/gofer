@@ -304,7 +304,10 @@ const maxRankingDrivers = 6
 // (which replaces the signal-based axes), the signals themselves, and any discussion
 // adjustment that scaled them. A discussion adjustment that does not stand for the
 // visible thread is left out, and the axes are re-derived without it: it summarizes
-// turns the model must not see.
+// turns the model must not see. An item with no score yet (just unhidden and
+// awaiting the refresh that measures it, or hidden) gets no rank, axes or drivers:
+// the radar shows none, and its leftover labels would only describe a score that
+// does not exist.
 func rankingContext(item worklist.WorkItem, now time.Time) string {
 	var b strings.Builder
 	s := item.Signals
@@ -331,6 +334,15 @@ func rankingContext(item worklist.WorkItem, now time.Time) string {
 		fmt.Fprintf(&b, "discussion: %d comments (participants not yet counted)\n", s.Comments)
 	case s.Comments > 0 || s.Participants > 0:
 		fmt.Fprintf(&b, "discussion: %d comments, %d participants\n", s.Comments, s.Participants)
+	}
+
+	switch {
+	case item.IsHidden():
+		b.WriteString("rank: none (the user hid this item, so gofer keeps no score for it)\n")
+		return b.String()
+	case item.Meta.AwaitingRefresh:
+		b.WriteString("rank: not available yet (the user just unhid this item; the next refresh from GitHub measures it and the radar shows it unranked until then)\n")
+		return b.String()
 	}
 
 	withheld := false

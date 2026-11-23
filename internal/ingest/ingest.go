@@ -108,13 +108,15 @@ type Ingestor struct {
 	// to have ended (failed, succeeded, or past its deadline): the refresh version a
 	// worklist page compares to notice results it does not show (RefreshState).
 	gens, dones map[string]uint64
-	// followUps names the owners owed one more ingest run (RefreshFollowUp): a
-	// change needed a refresh while a run was already in flight, which may have read
-	// the store before it. Any later ingest reservation for the owner clears it;
-	// otherwise the in-flight run's observed end dispatches it. In memory only.
-	followUps map[string]bool
-	ledger    RunLedger  // nil: all of this is lost on restart (ledger.go)
-	persistMu sync.Mutex // serializes ledger writes (persist)
+	// followUps holds, per owner, an ingest run still owed to a change the next run
+	// must see (RefreshFollowUp), with the worker that drives it. In memory only.
+	followUps map[string]*followUp
+	// followUpPoll, followUpMaxWait and followUpGiveUp pace a follow-up's worker:
+	// how often it retries (doubling after a refusal, up to followUpMaxWait), and how
+	// long it tries before giving up. Fields, not constants, so tests run it fast.
+	followUpPoll, followUpMaxWait, followUpGiveUp time.Duration
+	ledger                                        RunLedger  // nil: all of this is lost on restart (ledger.go)
+	persistMu                                     sync.Mutex // serializes ledger writes (persist)
 }
 
 var (
@@ -131,7 +133,8 @@ func New(d Dispatcher, audience, sinkURL string, log *slog.Logger, aiEndpoint, a
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log, runs: map[runKey]*run{}, gens: map[string]uint64{}, dones: map[string]uint64{}, followUps: map[string]bool{}}
+	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log, runs: map[runKey]*run{}, gens: map[string]uint64{}, dones: map[string]uint64{},
+		followUps: map[string]*followUp{}, followUpPoll: followUpPoll, followUpMaxWait: followUpMaxWait, followUpGiveUp: followUpGiveUp}
 }
 
 // UseModelGateway marks every run this Ingestor dispatches as reaching the chat model
@@ -186,45 +189,90 @@ func (i *Ingestor) Refresh(ctx context.Context, ownerID string) error {
 }
 
 // RefreshFollowUp is Refresh for a change the next ingest run must see, such as an
-// item the owner just unhid, which waits empty until a run fills it in. If an ingest
-// run for the owner is already in flight it may have read the store before the
-// change, so instead of dropping the request it owes the owner one more run: the
-// first ingest reservation after this call (a click, a tick) pays it, and if none
-// comes first, the in-flight run's end, once gofer observes it (the radar's status
-// poll, a render past its deadline, a tick), dispatches it. The debt is in memory: a
-// restart forgets it, and the next refresh fills the item in.
+// item the owner just unhid, which waits empty until a run fills it in. It owes the
+// owner one ingest run reserved after this call, and keeps owing it until the
+// backend accepts such a run: a run already in flight may have read the store
+// before the change, and a refused submission runs nothing. It tries at once, like
+// Refresh, and while the debt stands a worker retries through the same gate
+// (followUpPoll, backing off after a refusal), asking the backend whether the run in
+// flight has ended, so nothing depends on a page polling. Any accepted ingest run
+// reserved after the call pays the debt (settle): a click, a tick, a backfill. The
+// worker gives up after followUpGiveUp, and a restart forgets the debt; in both cases
+// the item waits for the next refresh.
 func (i *Ingestor) RefreshFollowUp(ctx context.Context, ownerID string) error {
-	ok, err := i.dispatchIngest(ctx, ownerID, refreshGate, true)
-	if !ok && err == nil {
-		i.mu.Lock()
-		// Re-check under the lock: the in-flight run may have been seen to end since
-		// reserve refused, and nothing would observe that end again.
-		cur := i.runs[ingestKey(ownerID)]
-		live := cur != nil && cur.live(time.Now(), refreshGate.probe)
-		if live {
-			i.followUps[ownerID] = true
-		}
-		i.mu.Unlock()
-		if !live {
-			_, err = i.dispatchIngest(ctx, ownerID, refreshGate, true)
-		}
+	i.mu.Lock()
+	f := i.followUps[ownerID]
+	start := f == nil
+	if start {
+		f = &followUp{}
+		i.followUps[ownerID] = f
+	}
+	// Only a run reserved from now on reads the store after the change.
+	f.after = i.gens[ownerID]
+	i.mu.Unlock()
+	_, err := i.dispatchIngest(ctx, ownerID, refreshGate, true)
+	if start {
+		go i.driveFollowUp(ownerID, f)
 	}
 	return err
 }
 
-// followUpLocked dispatches the run owed to key's owner (RefreshFollowUp), in the
-// background, now that the ingest run that held it off has been seen to end. The
-// caller holds i.mu.
-func (i *Ingestor) followUpLocked(key runKey) {
-	if key.task != taskIngest || !i.followUps[key.owner] {
-		return
+// followUp is an ingest run owed to an owner (RefreshFollowUp): one whose
+// generation is above after, accepted by the backend.
+type followUp struct{ after uint64 }
+
+// Pacing of a follow-up's worker (Ingestor.followUpPoll and friends). The give-up
+// bound outlasts the longest hold the gate can place on the owner's ingest key
+// (holdPending), so the worker outlives any run that blocks it.
+const (
+	followUpPoll    = 15 * time.Second
+	followUpMaxWait = 2 * time.Minute
+	followUpGiveUp  = holdPending + 10*time.Minute
+)
+
+// payFollowUpLocked settles ownerID's debt (RefreshFollowUp) when the backend has
+// accepted r, an ingest run reserved after it was owed. The caller holds i.mu.
+func (i *Ingestor) payFollowUpLocked(key runKey, r *run) {
+	if f := i.followUps[key.owner]; key.task == taskIngest && f != nil && r.gen > f.after {
+		delete(i.followUps, key.owner)
 	}
-	delete(i.followUps, key.owner)
-	go func() {
-		if _, err := i.dispatchIngest(context.Background(), key.owner, refreshGate, true); err != nil {
-			i.log.Warn("follow-up refresh not dispatched", "owner", key.owner, "err", err)
+}
+
+// driveFollowUp retries ownerID's owed run f until a run pays it, f is replaced, or
+// the worker gives up. Each try goes through the refresh gate, which asks the
+// backend whether the run in flight has ended, so the owed run starts soon after it
+// does; a refused submission (ErrNotAccepted) keeps the debt and backs off.
+func (i *Ingestor) driveFollowUp(ownerID string, f *followUp) {
+	wait := i.followUpPoll
+	giveUp := time.Now().Add(i.followUpGiveUp)
+	for {
+		t := time.NewTimer(wait)
+		<-t.C
+		i.mu.Lock()
+		owed := i.followUps[ownerID] == f
+		expired := owed && time.Now().After(giveUp)
+		if expired {
+			delete(i.followUps, ownerID)
 		}
-	}()
+		i.mu.Unlock()
+		if !owed {
+			return
+		}
+		if expired {
+			i.log.Warn("follow-up refresh not run before giving up; the next refresh fills the item in", "owner", ownerID)
+			return
+		}
+		_, err := i.dispatchIngest(context.Background(), ownerID, refreshGate, true)
+		switch {
+		case errors.Is(err, ErrNotAccepted):
+			wait = min(2*wait, i.followUpMaxWait)
+		case err != nil:
+			i.log.Warn("follow-up refresh dispatch failed; retrying", "owner", ownerID, "err", err)
+			wait = i.followUpPoll
+		default:
+			wait = i.followUpPoll
+		}
+	}
 }
 
 // ScheduledRefresh requests a github-ingest run for ownerID on behalf of the

@@ -228,7 +228,7 @@ func TestHideItemControls(t *testing.T) {
 
 	pr.Meta.HiddenAt = time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 	// Thread disables the conversation controls for a hidden item (ItemHidden).
-	out = renderPage(t, pageData{View: "thread", Item: pr, ItemHidden: true, User: &session.User{ID: "u1"}})
+	out = renderPage(t, pageData{View: "thread", Item: pr, ItemHidden: true, Assistant: true, User: &session.User{ID: "u1"}})
 	if strings.Contains(out, ">Hide item</button>") || !strings.Contains(out, `name="back" value="thread"`) || !strings.Contains(out, "Hidden from your radar until you unhide it") {
 		t.Fatalf("a hidden item's thread offers Unhide instead, got:\n%s", out)
 	}
@@ -254,6 +254,25 @@ func TestHideItemControls(t *testing.T) {
 	}
 	if out := renderPage(t, pageData{View: "thread", Item: pr, User: &session.User{ID: "u1"}}); !strings.Contains(out, "The assistant is not configured.") {
 		t.Fatalf("without an assistant the thread says so, got:\n%s", out)
+	}
+}
+
+// With the assistant disabled, a hidden item's thread is still read-only: no
+// per-message Hide or Unhide (which HideMessage would refuse anyway), and no
+// invitation to discuss it once unhidden.
+func TestHiddenThreadWithoutAssistant(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest, Meta: worklist.Metadata{HiddenAt: time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)},
+		Thread: []worklist.Message{
+			{ID: "q", Role: worklist.RoleUser, Content: "q"},
+			{ID: "a", Role: worklist.RoleAgent, Content: "a", ReplyTo: "q", Hidden: true},
+		}})
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{}, false, nil)
+	rec := httptest.NewRecorder()
+	h.Thread(rec, httptest.NewRequest(http.MethodGet, "/items/thread?id=pr1", nil))
+	out := rec.Body.String()
+	if strings.Contains(out, `action="/items/thread/hide"`) || !strings.Contains(out, "This item is hidden.") || strings.Contains(out, "discuss it") {
+		t.Fatalf("a hidden thread without an assistant is read-only and says only that it is hidden, got:\n%s", out)
 	}
 }
 

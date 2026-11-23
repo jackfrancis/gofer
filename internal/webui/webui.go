@@ -257,7 +257,8 @@ type pageData struct {
 	Providers                []string
 	Items                    []worklist.WorkItem
 	HiddenItems              []worklist.WorkItem // worklist: the hidden section, most recently hidden first, unscored
-	ItemHidden               bool                // thread: the item is hidden, so Discuss is closed until it is unhidden
+	ItemHidden               bool                // thread: the item is hidden, so its thread is read-only until it is unhidden
+	Assistant                bool                // thread: the assistant is configured (ConvEnabled is off on a hidden item's page)
 	LabelCSS                 string              // the stylesheet coloring the shown items' GitHub labels, if any
 	Item                     worklist.WorkItem   // the single item, for the thread view
 	ConvEnabled              bool                // whether the assistive conversation is available
@@ -320,7 +321,7 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, it := range items {
 		if it.ID == id {
-			data := pageData{View: "thread", User: user, Item: it, ConvEnabled: h.convEnabled, ModelOptions: h.options, SecondOpinionEnabled: h.secondOpinionEnabled(), SecondOpinionOptions: h.alternativeOptions()}
+			data := pageData{View: "thread", User: user, Item: it, ConvEnabled: h.convEnabled, Assistant: h.convEnabled, ModelOptions: h.options, SecondOpinionEnabled: h.secondOpinionEnabled(), SecondOpinionOptions: h.alternativeOptions()}
 			data.SignInRequired = h.signInRequired(r, user)
 			now := h.now().UTC()
 			if it.IsHidden() {
@@ -328,7 +329,7 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 				// hiding until the owner unhides it (appendTurn, ThreadRetry and
 				// HideMessage refuse them too).
 				data.ConvEnabled, data.SecondOpinionEnabled = false, false
-				data.ItemHidden = h.convEnabled
+				data.ItemHidden = true
 			} else if it.ReplyPending(now, reviewStaleAfter) {
 				data.RefreshSecs = 3 // a reply is plausibly in flight — poll for it
 			} else if it.ReplyStalled(now, reviewStaleAfter) {

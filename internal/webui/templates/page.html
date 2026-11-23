@@ -139,7 +139,7 @@
       </div>
       {{end}}
       {{if .ItemHidden}}
-      <p class="zz-meta">This item is hidden. Unhide it to discuss it.</p>
+      <p class="zz-meta">This item is hidden.{{if .Assistant}} Unhide it to discuss it.{{end}}</p>
       {{else if .ConvEnabled}}
       <form class="zz-chat-form" method="post" action="/items/thread">
         <input type="hidden" name="id" value="{{.Item.ID}}">

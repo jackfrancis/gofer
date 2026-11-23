@@ -269,12 +269,16 @@ Wired on the web-tier side; they define what a runtime must respect:
   Discuss: a hidden item takes no new turn, retry, review panel or turn hide/unhide
   (`appendTurn`, `ThreadRetry`, `HideMessage`), and its thread page is read-only.
   Unhide (`worklist.UnhideItem`) brings it back empty, flagged `Meta.AwaitingRefresh`
-  (unscored by `Rescore`, shown as waiting for the next refresh), and calls
-  `Ingestor.RefreshFollowUp`: a refresh now, or, while an ingest run is in flight
-  (it may have read the store first), one owed run that the next ingest reservation
-  pays or that the in-flight run's observed end dispatches (in memory only). The
-  refresh's write-back clears the flag, since runs own `Metadata`. A hidden item
-  that closes leaves the section, still hidden.
+  (unscored by `Rescore` and by Discuss's ranking context, shown as waiting for the
+  next refresh), and calls `Ingestor.RefreshFollowUp`, which owes the owner one
+  ingest run reserved after the call until the backend accepts one (`settle` pays
+  it, whoever reserved the run). It tries at once; while the debt stands a
+  server-side worker retries through the refresh gate (which asks the backend
+  whether the run in flight ended), backing off after a refusal, so nothing waits
+  on a page polling. Never consume the debt on a run's end: only an accepted run
+  reserved after it pays. In memory only; the worker gives up after
+  `followUpGiveUp`. The refresh's write-back clears the flag, since runs own
+  `Metadata`. A hidden item that closes leaves the section, still hidden.
 - The radar's project (repository) filter (`internal/webui/projects.go`) is a view
   preference kept in the `gofer_projects` cookie, bound to the account that saved it
   (none = all projects). It only drops items from the already-ranked list and the

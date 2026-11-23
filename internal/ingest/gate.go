@@ -148,10 +148,6 @@ func (i *Ingestor) reserve(ctx context.Context, key runKey, g gate) (mine *run, 
 		i.mu.Lock()
 		cur := i.runs[key]
 		if cur == nil || !cur.live(now, g.probe) {
-			if key.task == taskIngest {
-				// This run reads the store after any change a follow-up was owed for.
-				delete(i.followUps, key.owner)
-			}
 			if cur != nil {
 				i.markDoneLocked(key, cur) // failed, succeeded, or past its deadline
 			}
@@ -195,6 +191,7 @@ func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 		// window does too; until then it ran from the reservation.
 		mine.at = time.Now()
 		mine.prev = nil // never rolled back now
+		i.payFollowUpLocked(key, mine)
 		return
 	}
 	if hold := uncertainHold(key.task); hold > 0 && !errors.Is(err, ErrNotAccepted) {
@@ -233,11 +230,9 @@ func uncertainHold(task string) time.Duration {
 
 // markDoneLocked records that r, an ingest run for key's owner, has ended (failed,
 // succeeded, or outlived its deadline), raising the owner's refresh version
-// (RefreshState), and dispatches any follow-up run owed to the owner
-// (RefreshFollowUp). Reservations the backend never accepted carry no generation. The
+// (RefreshState). Reservations the backend never accepted carry no generation. The
 // caller holds i.mu.
 func (i *Ingestor) markDoneLocked(key runKey, r *run) (changed bool) {
-	i.followUpLocked(key) // the run that held a follow-up off has ended
 	if key.task == taskIngest && r.gen > i.dones[key.owner] {
 		i.dones[key.owner] = r.gen
 		return true
