@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -164,5 +165,84 @@ func TestCIStatusSummaryCountsOutcomes(t *testing.T) {
 	}}
 	if sum := st.Summary(); sum.Passed != 1 || sum.Pending != 3 || strings.Join(sum.Failed, ",") != "h,i" {
 		t.Errorf("summary = %+v", sum)
+	}
+}
+
+// A branch can advance while its CI is paged: every page after the first is pinned
+// to the commit the first one resolved, for statuses and for check runs (by the
+// first run's head_sha when the statuses could not be read).
+func TestCIStatusPinsPagesToOneCommit(t *testing.T) {
+	runs := func(sha string, n int) string {
+		var b strings.Builder
+		for i := range n {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"name":"job-%s-%d","head_sha":"%s","status":"completed","conclusion":"success"}`, sha, i, sha)
+		}
+		return b.String()
+	}
+	statuses := func(n int) string {
+		var b strings.Builder
+		for i := range n {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `{"context":"s-%d","state":"success"}`, i)
+		}
+		return b.String()
+	}
+	for _, statusOK := range []bool{true, false} {
+		srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+			page := r.URL.Query().Get("page")
+			switch r.URL.Path {
+			case "/repos/o/r/commits/main/status", "/repos/o/r/commits/aaa/status":
+				if !statusOK {
+					http.Error(w, "forbidden", http.StatusForbidden)
+					return
+				}
+				sha, n := "aaa", 100
+				if page == "2" {
+					if strings.Contains(r.URL.Path, "/main/") {
+						sha = "bbb" // main has advanced
+					}
+					n = 1
+				}
+				fmt.Fprintf(w, `{"sha":%q,"total_count":101,"statuses":[%s]}`, sha, statuses(n))
+			case "/repos/o/r/commits/main/check-runs", "/repos/o/r/commits/aaa/check-runs":
+				if page == "1" {
+					fmt.Fprintf(w, `{"total_count":101,"check_runs":[%s]}`, runs("aaa", 100))
+					return
+				}
+				sha := "aaa"
+				if strings.Contains(r.URL.Path, "/main/") {
+					sha = "bbb"
+				}
+				fmt.Fprintf(w, `{"total_count":101,"check_runs":[%s]}`, runs(sha, 1))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		st, err := NewClient(srv.Client(), srv.URL).CIStatusForRef(context.Background(), "tok", "o/r", "main")
+		srv.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.SHA != "aaa" {
+			t.Errorf("statusOK=%v: SHA = %q, want the resolved commit", statusOK, st.SHA)
+		}
+		for _, c := range st.Checks {
+			if strings.Contains(c.Name, "bbb") {
+				t.Errorf("statusOK=%v: mixed in %s from the advanced branch", statusOK, c.Name)
+				break
+			}
+		}
+		want := 101 // check runs
+		if statusOK {
+			want += 101 // and statuses
+		}
+		if len(st.Checks) != want {
+			t.Errorf("statusOK=%v: %d checks, want %d", statusOK, len(st.Checks), want)
+		}
 	}
 }

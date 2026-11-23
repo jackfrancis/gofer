@@ -382,8 +382,10 @@ Wired on the web-tier side; they define what a runtime must respect:
   every timeline read, so CI never costs an item its ranking signals. Statuses and
   check runs are read independently (one unreadable = `Partial`; both = error, and
   the stored summary stands). A write-back that carries no CI keeps the stored one
-  (`worklist.KeepCI`, in the merge): never copy CI from a run's read, which may be a
-  projection. It is display-only: nothing scores on it.
+  (`worklist.KeepCI`, in the merge), so every pass but enrich (refresh, retire, rank)
+  sends none: never write back CI from a run's read, which may be a projection or
+  older than an enrich that landed meanwhile. CI pages after the first are pinned to
+  the commit the first resolved, since a named ref can advance between pages. It is display-only: nothing scores on it.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

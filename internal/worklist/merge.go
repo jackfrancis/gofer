@@ -23,7 +23,8 @@ import (
 // (HiddenAfter).
 //
 // A pull request's CI summary (GitHubRef.CI) follows the same rule: only enrich
-// reads it, so a write-back that carries none keeps the stored one (KeepCI).
+// reads it, so a write-back that carries none keeps the stored one (KeepCI), and
+// every other pass (refresh, retire, rank) sends none, never the copy it read.
 //
 // The two model-derived signals are the exception to "the run owns its signals": a
 // GitHub fetch cannot produce them, so a refresh sends none, and a scoring pass that

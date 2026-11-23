@@ -345,3 +345,32 @@ func TestRunEnrichSlowCIDoesNotStarveTimelines(t *testing.T) {
 		}
 	}
 }
+
+// Rank reads CI with the item but never fetches it: an enrich that lands while the
+// model works must not be undone by rank's write-back of the copy it read.
+func TestRunRankKeepsNewerCI(t *testing.T) {
+	read := &worklist.CISummary{SHA: "s", Pending: 1}
+	newer := &worklist.CISummary{SHA: "s", Failed: []string{"build"}}
+	sink := &memSink{items: []worklist.WorkItem{{ID: "pr", Source: "github", Type: worklist.TypePullRequest,
+		GitHub: worklist.GitHubRef{CI: read}}}}
+	sink.beforeIngest = func() { sink.items[0].GitHub.CI = newer }
+	if err := Run(context.Background(), Params{JobType: JobRank}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if sink.items[0].Signals.Proposed == nil {
+		t.Fatal("fixture: rank must write the item back")
+	}
+	if !sink.items[0].GitHub.CI.Equal(newer) {
+		t.Fatalf("rank overwrote the newer CI with %+v", sink.items[0].GitHub.CI)
+	}
+}
+
+// Retiring an item sends no CI either, so the stored summary stands.
+func TestRetireMissingSendsNoCI(t *testing.T) {
+	existing := []worklist.WorkItem{{ID: "pr", Source: "github", Type: worklist.TypePullRequest,
+		GitHub: worklist.GitHubRef{CI: &worklist.CISummary{Pending: 1}}}}
+	retired := retireMissing(nil, existing, time.Now())
+	if len(retired) != 1 || retired[0].GitHub.CI != nil {
+		t.Fatalf("retired = %+v", retired)
+	}
+}

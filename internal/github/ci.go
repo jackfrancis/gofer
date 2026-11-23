@@ -82,6 +82,12 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 	if err != nil {
 		return st, err
 	}
+	// A named ref (a branch) can advance while the pages are read, so every page
+	// after the first is pinned to the commit the first one resolved: the status
+	// pages to the combined status's SHA, and the check-run pages to it too, or,
+	// when the statuses could not be read, to the first check run's head_sha.
+	// pinned says st.SHA is a resolved commit rather than the ref as given.
+	pinned := false
 	esc := url.PathEscape(ref)
 
 	// The two sources are read independently: either alone still says something, so
@@ -114,8 +120,9 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 			st.Partial = append(st.Partial, "commit statuses could not be parsed")
 			break
 		}
-		if cs.SHA != "" {
-			st.SHA = cs.SHA
+		if page == 1 && cs.SHA != "" {
+			st.SHA, pinned = cs.SHA, true
+			esc = url.PathEscape(cs.SHA)
 		}
 		for _, s := range cs.Statuses {
 			st.Checks = append(st.Checks, CICheck{Name: s.Context, Kind: "status", State: s.State,
@@ -142,6 +149,7 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 			TotalCount int `json:"total_count"`
 			CheckRuns  []struct {
 				Name       string `json:"name"`
+				HeadSHA    string `json:"head_sha"`
 				Status     string `json:"status"`
 				Conclusion string `json:"conclusion"`
 				DetailsURL string `json:"details_url"`
@@ -160,6 +168,9 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 			}
 			st.Partial = append(st.Partial, "check runs could not be parsed")
 			break
+		}
+		if !pinned && len(cr.CheckRuns) > 0 && cr.CheckRuns[0].HeadSHA != "" {
+			st.SHA, pinned = cr.CheckRuns[0].HeadSHA, true
 		}
 		for _, r := range cr.CheckRuns {
 			state := r.Conclusion

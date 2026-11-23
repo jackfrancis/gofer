@@ -265,7 +265,13 @@ func formatCIStatus(label string, st github.CIStatus) string {
 		fmt.Fprintf(&b, "Partial: %s.\n", p)
 	}
 	if len(st.Checks) == 0 {
-		b.WriteString("No commit statuses or check runs on this commit.")
+		// Only a whole read shows there are none; after a partial one, say only what
+		// the readable part returned.
+		if len(st.Partial) > 0 {
+			b.WriteString("The part that could be read returned no commit statuses or check runs; the CI of this commit is unknown.")
+		} else {
+			b.WriteString("No commit statuses or check runs on this commit.")
+		}
 		return b.String()
 	}
 	b.WriteString("Entries marked [prow] can be opened with ci_job_summary, entries marked [actions] with gha_job_summary.\n\n" + untrustedOpen)

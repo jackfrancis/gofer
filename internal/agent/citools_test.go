@@ -256,3 +256,15 @@ func TestClampCIOutput(t *testing.T) {
 		t.Fatalf("frame closed twice:\n%s", got)
 	}
 }
+
+// After a partial read that returned nothing, the tool must not claim the commit
+// has no checks.
+func TestFormatCIStatusPartialEmpty(t *testing.T) {
+	out := formatCIStatus("o/r#1", github.CIStatus{SHA: "abc", Partial: []string{"commit statuses could not be read (403)"}})
+	if strings.Contains(out, "No commit statuses or check runs on this commit") || !strings.Contains(out, "unknown") {
+		t.Fatalf("partial empty read:\n%s", out)
+	}
+	if out := formatCIStatus("o/r#1", github.CIStatus{SHA: "abc"}); !strings.Contains(out, "No commit statuses or check runs on this commit.") {
+		t.Fatalf("whole empty read:\n%s", out)
+	}
+}
