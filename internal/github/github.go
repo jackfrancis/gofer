@@ -103,7 +103,8 @@ var signals = []struct {
 // FetchWorklist retrieves the issues and pull requests on the user's radar —
 // everything they are involved in, plus everything awaiting their review —
 // deduplicated by item ID. When an item surfaces under more than one query, the
-// reasons are merged onto a single work item.
+// reasons are merged onto a single work item. Another contributor's draft pull
+// request is left out (searchItem.othersDraft) without making the fetch partial.
 //
 // Each query is paged to exhaustion rather than sampled: a long-running
 // contributor's involvement runs to hundreds of open items, and taking one arbitrary
@@ -275,7 +276,27 @@ type searchItem struct {
 	} `json:"pull_request"`
 }
 
+// othersDraft reports a draft pull request someone other than the viewer opened.
+// Its author is still working on it, so it is not the viewer's work yet, whatever
+// their relationship to it (mentioned, assigned, even asked to review): it stays off
+// the worklist until it is marked ready for review. A hit with no author is not
+// proven to be the viewer's, so it is treated as someone else's.
+func (it searchItem) othersDraft(viewer string) bool {
+	if it.PullRequest == nil || !it.Draft {
+		return false
+	}
+	return it.User == nil || !strings.EqualFold(it.User.Login, viewer)
+}
+
+// toWorkItem maps a search hit to a work item. ok is false for a hit that does not
+// belong on the worklist: another contributor's draft pull request (othersDraft).
+// Leaving it out of the fetch means a complete refresh retires a stored copy (a pull
+// request converted back to draft), keeping its thread, and it resurfaces once it is
+// marked ready for review.
 func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.Time) (worklist.WorkItem, bool) {
+	if it.othersDraft(viewer) {
+		return worklist.WorkItem{}, false
+	}
 	// The search/issues endpoint returns both issues and PRs; a pull_request
 	// object marks a PR. Both belong on the radar, so map the type instead of
 	// dropping issues.

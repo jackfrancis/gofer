@@ -103,6 +103,11 @@ priority band. Server-side sort. Scoring is a pure function of an item's Signals
 the worklist is re-scored at read time. Job types the workload implements:
 github-ingest, github-enrich, llm-rank, github-converse, github-research.
 
+Ingest leaves out another contributor's draft pull request, whatever the user's
+relationship to it (`github.searchItem.othersDraft`); the user's own drafts stay. The
+fetch still counts as complete, so a stored PR converted back to draft is retired on
+the next complete refresh (thread kept) and resurfaces once marked ready for review.
+
 ## Security invariants (the contract a runtime must honor)
 
 Wired on the web-tier side; they define what a runtime must respect:

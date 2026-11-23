@@ -326,3 +326,46 @@ func TestSearchIssuesResultCeilingIsPartial(t *testing.T) {
 		t.Error("a walk ended by the result ceiling must not report the set as whole")
 	}
 }
+
+// Another contributor's draft is left out of the fetch without making it partial: the
+// walk still saw the whole open set, so a stored copy of the draft (a pull request
+// converted back to draft) is retired, and it resurfaces once marked ready.
+func TestFetchWorklistSkipsOthersDraftsAndStaysComplete(t *testing.T) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user" {
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+			return
+		}
+		q := r.URL.Query().Get("q")
+		switch {
+		case strings.Contains(q, "is:pr") && strings.Contains(q, "involves:@me"):
+			_, _ = w.Write([]byte(`{"total_count":3,"items":[
+				{"number":1,"repository_url":"https://api.github.com/repos/o/r","state":"open","draft":true,"user":{"login":"me"},"pull_request":{"url":"x"}},
+				{"number":2,"repository_url":"https://api.github.com/repos/o/r","state":"open","draft":true,"user":{"login":"someone"},"pull_request":{"url":"x"}},
+				{"number":3,"repository_url":"https://api.github.com/repos/o/r","state":"open","user":{"login":"someone"},"pull_request":{"url":"x"}}]}`))
+		case strings.Contains(q, "review-requested:@me"):
+			_, _ = w.Write([]byte(`{"total_count":1,"items":[
+				{"number":4,"repository_url":"https://api.github.com/repos/o/r","state":"open","draft":true,"user":{"login":"someone"},"pull_request":{"url":"x"}}]}`))
+		default:
+			_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.Client(), srv.URL)
+	f, err := c.FetchWorklistDetail(context.Background(), "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []int
+	for _, it := range f.Items {
+		got = append(got, it.GitHub.Number)
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, []int{1, 3}) {
+		t.Fatalf("items %v, want [1 3] (others' drafts #2 and #4 left out)", got)
+	}
+	if !f.Complete || !f.ReviewRequestsComplete {
+		t.Fatalf("complete=%v reviewsComplete=%v, want both true", f.Complete, f.ReviewRequestsComplete)
+	}
+}
