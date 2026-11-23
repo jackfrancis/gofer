@@ -1015,3 +1015,110 @@ func TestRunIngestStaleDraftResultKeepsNewerReadyPR(t *testing.T) {
 		}
 	}
 }
+
+// lifecycleServer answers the radar queries with the given pull request hits, from
+// repository o/r, whose visibility lookup answers private as given. partial makes
+// the issue search incomplete, and with it the whole fetch.
+func lifecycleServer(t *testing.T, partial, private bool, hits ...string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if name, ok := githubtest.RepoLookup(r); ok {
+			fmt.Fprintf(w, `{"id":1,"full_name":%q,"private":%v}`, name, private)
+			return
+		}
+		q := r.URL.Query().Get("q")
+		switch {
+		case r.URL.Path == "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case r.URL.Path == "/search/issues" && strings.Contains(q, "is:issue"):
+			fmt.Fprintf(w, `{"incomplete_results":%v,"total_count":0,"items":[]}`, partial)
+		case r.URL.Path == "/search/issues" && strings.Contains(q, "involves:@me"):
+			fmt.Fprintf(w, `{"total_count":%d,"items":[%s]}`, len(hits), strings.Join(hits, ","))
+		case r.URL.Path == "/search/issues":
+			_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// lifecycleHit is another contributor's pull request #n at 12:mm.
+func lifecycleHit(n int, draft bool, minute int) string {
+	return fmt.Sprintf(`{"number":%d,"title":"T","html_url":"u","state":"open","draft":%v,"updated_at":"2026-11-23T12:%02d:00Z","repository_url":"https://api.github.com/repos/o/r","user":{"login":"someone"},"pull_request":{"url":"x"}}`,
+		n, draft, minute)
+}
+
+func runLifecycleIngest(t *testing.T, srv *httptest.Server, sink *memSink) {
+	t.Helper()
+	if err := Run(context.Background(),
+		Params{JobType: JobIngest, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+		fakeVendor{token: "tok"}, sink); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Retiring a confirmed draft records its draft state and GitHub time, so a later
+// refresh whose index still serves the older ready copy cannot reopen it; a ready
+// copy GitHub updated after the draft is the PR marked ready, and resurfaces it with
+// its thread. Partial and complete refreshes alike.
+func TestRunIngestConfirmedDraftSurvivesStaleReadyResult(t *testing.T) {
+	for _, partial := range []bool{true, false} {
+		t.Run(fmt.Sprintf("partial=%v", partial), func(t *testing.T) {
+			const id = "github:o/r#8"
+			stored := prItem(8, worklist.Message{Role: worklist.RoleUser, Content: "note"})
+			stored.GitHub.UpdatedAt = time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+			sink := &memSink{items: []worklist.WorkItem{stored}}
+
+			runLifecycleIngest(t, lifecycleServer(t, partial, false, lifecycleHit(8, true, 4)), sink)
+			got := itemByID(t, sink.items, id)
+			if got.OnRadar() {
+				t.Fatal("the 12:04 draft was not retired")
+			}
+			if !got.GitHub.Draft || !got.GitHub.UpdatedAt.Equal(time.Date(2026, 11, 23, 12, 4, 0, 0, time.UTC)) {
+				t.Errorf("retirement recorded draft=%v updated=%v, want the 12:04 draft", got.GitHub.Draft, got.GitHub.UpdatedAt)
+			}
+			retiredAt := got.Meta.CompletedAt
+
+			runLifecycleIngest(t, lifecycleServer(t, partial, false, lifecycleHit(8, false, 0)), sink)
+			if got := itemByID(t, sink.items, id); got.OnRadar() {
+				t.Fatal("a stale 12:00 ready result reopened the 12:04 draft")
+			}
+			runLifecycleIngest(t, lifecycleServer(t, partial, false, lifecycleHit(8, false, 4)), sink)
+			if got := itemByID(t, sink.items, id); got.OnRadar() {
+				t.Fatal("a ready result tied with the draft reopened it")
+			}
+			// Seeing the same draft again writes nothing new.
+			runLifecycleIngest(t, lifecycleServer(t, partial, false, lifecycleHit(8, true, 4)), sink)
+			if got := itemByID(t, sink.items, id); !got.Meta.CompletedAt.Equal(retiredAt) {
+				t.Errorf("re-seeing the draft re-stamped CompletedAt: %v -> %v", retiredAt, got.Meta.CompletedAt)
+			}
+
+			runLifecycleIngest(t, lifecycleServer(t, partial, false, lifecycleHit(8, false, 9)), sink)
+			got = itemByID(t, sink.items, id)
+			if !got.OnRadar() || got.GitHub.Draft {
+				t.Fatalf("the 12:09 ready result did not resurface the PR (on radar %v, draft %v)", got.OnRadar(), got.GitHub.Draft)
+			}
+			if len(got.Thread) != 1 {
+				t.Errorf("thread has %d turns, want 1", len(got.Thread))
+			}
+		})
+	}
+}
+
+// A draft observation from a repository the gate confirms private is evidence of
+// nothing, so it cannot keep a newer stored ready PR on the radar: a complete
+// refresh retires it with everything else from that repository.
+func TestRunIngestPrivateRepoDraftPreservesNothing(t *testing.T) {
+	stored := prItem(8)
+	stored.GitHub.UpdatedAt = time.Date(2026, 11, 23, 12, 4, 0, 0, time.UTC)
+	sink := &memSink{items: []worklist.WorkItem{stored, prItem(9)}}
+	runLifecycleIngest(t, lifecycleServer(t, false, true, lifecycleHit(8, true, 0), lifecycleHit(9, false, 4)), sink)
+	if itemByID(t, sink.items, "github:o/r#9").OnRadar() {
+		t.Fatal("a PR from a repository confirmed private stayed on the radar")
+	}
+	if itemByID(t, sink.items, "github:o/r#8").OnRadar() {
+		t.Error("a draft result from a private repository kept a stored ready PR on the radar")
+	}
+}

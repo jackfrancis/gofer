@@ -111,9 +111,13 @@ are to the second, so on a tie the draft wins (`github.newerState`). The fetch s
 counts as complete, and it names the drafts it saw with their `updated_at`
 (`github.Fetch.OthersDrafts`), so a stored PR converted back to draft is retired
 (thread kept) even by a partial refresh (`agent.retireListed`), and resurfaces once
-marked ready for review. A draft result never retires a stored ready PR GitHub
-updated strictly later (`agent.readyAfterDraft`, in both retirement paths): the
-search index lagged it.
+marked ready for review. Retiring one records the confirmed state (`Draft`, and
+`GitHub.UpdatedAt` advanced to the draft result's, `agent.retireDrafts`), so a later
+ready result not strictly newer cannot reopen it (`agent.dropStaleReady`). A draft
+result never retires a stored ready PR GitHub updated strictly later
+(`agent.readyAfterDraft`): the search index lagged it. Draft observations pass the
+public-only gate like hits, so one from a repository not confirmed public is
+evidence of nothing.
 
 ## Security invariants (the contract a runtime must honor)
 

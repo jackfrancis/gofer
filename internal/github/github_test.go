@@ -438,3 +438,54 @@ func TestFetchWorklistNewestCopyDecidesDraft(t *testing.T) {
 		})
 	}
 }
+
+// A draft observation passes the public-only gate like a hit: one from a repository
+// confirmed private is not reported, and one whose check has no answer is not
+// reported and makes the fetch incomplete.
+func TestFetchWorklistGatesDraftObservations(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		lookup   func(w http.ResponseWriter, name string)
+		complete bool
+	}{
+		{"public", func(w http.ResponseWriter, name string) {
+			fmt.Fprintf(w, `{"id":1,"full_name":%q,"private":false}`, name)
+		}, true},
+		{"private", func(w http.ResponseWriter, name string) {
+			fmt.Fprintf(w, `{"id":1,"full_name":%q,"private":true}`, name)
+		}, true},
+		{"no answer", func(w http.ResponseWriter, _ string) {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if name, ok := githubtest.RepoLookup(r); ok {
+					tc.lookup(w, name)
+					return
+				}
+				q := r.URL.Query().Get("q")
+				switch {
+				case r.URL.Path == "/user":
+					_, _ = w.Write([]byte(`{"login":"me"}`))
+				case strings.Contains(q, "is:pr") && strings.Contains(q, "involves:@me"):
+					_, _ = w.Write([]byte(`{"total_count":1,"items":[{"number":2,"repository_url":"https://api.github.com/repos/o/r","state":"open","draft":true,"user":{"login":"someone"},"pull_request":{"url":"x"}}]}`))
+				default:
+					_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
+				}
+			}))
+			defer srv.Close()
+			f, err := NewClient(srv.Client(), srv.URL).FetchWorklistDetail(context.Background(), "tok")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, reported := f.OthersDrafts["github:o/r#2"]
+			if reported != (tc.name == "public") {
+				t.Errorf("draft reported = %v", reported)
+			}
+			if f.Complete != tc.complete {
+				t.Errorf("complete = %v, want %v", f.Complete, tc.complete)
+			}
+		})
+	}
+}

@@ -142,9 +142,10 @@ type Fetch struct {
 	// Items, to that copy's updated_at. Unlike an absence, this is positive evidence,
 	// so ingest retires a stored copy of each even when the fetch is partial, unless
 	// the stored copy is a ready pull request GitHub updated later than the draft
-	// result (the search index can lag the item). The IDs are not passed through the
-	// public-only gate: they are only matched against stored items, never fetched or
-	// kept.
+	// result (the search index can lag the item). Only observations from a repository
+	// the public-only gate confirms are listed; one from a repository that is private,
+	// gone or unanswered is evidence of nothing, and an unanswered check also makes
+	// the fetch incomplete, as for a hit.
 	OthersDrafts map[string]time.Time
 }
 
@@ -193,19 +194,33 @@ func (c *Client) FetchWorklistDetail(ctx context.Context, token string) (Fetch, 
 		}
 	}
 	out := make([]worklist.WorkItem, 0, len(seen))
-	var drafts map[string]time.Time
-	for id, h := range seen {
+	var draftHits []searchItem
+	for _, h := range seen {
 		if h.item.othersDraft(viewer) {
-			if drafts == nil {
-				drafts = make(map[string]time.Time)
-			}
-			drafts[id] = h.item.UpdatedAt
+			draftHits = append(draftHits, h.item)
 			continue
 		}
 		out = append(out, h.item.workItem(h.reasons, now))
 	}
-	out, confirmed := c.publicHits(ctx, token, out)
+	// A draft observation passes the same public-only gate as a hit: one from a
+	// repository not confirmed public is evidence of nothing (a definite private
+	// verdict overrides it), so it can neither retire nor preserve a stored item.
+	draftRepos := make([]string, 0, len(draftHits))
+	for _, d := range draftHits {
+		draftRepos = append(draftRepos, d.repo())
+	}
+	out, verdicts, confirmed := c.publicHits(ctx, token, out, draftRepos)
 	complete = complete && confirmed
+	var drafts map[string]time.Time
+	for _, d := range draftHits {
+		if verdicts[d.repo()] != verdictPublic {
+			continue
+		}
+		if drafts == nil {
+			drafts = make(map[string]time.Time)
+		}
+		drafts[d.id()] = d.UpdatedAt
+	}
 	// Deduplication runs through a map, so without this the result order is Go's
 	// randomized map iteration — and every downstream "first N" (the rank cap, any
 	// paging) would pick a different arbitrary subset on each run, reshuffling the
@@ -503,15 +518,22 @@ const (
 // is false when any repository's check had no answer (a timeout, a rate limit, the
 // run's time budget): its items are left out, and the caller must not treat the
 // fetch as the whole open set. A definite answer (private, not found, refused) drops
-// the items without that.
-func (c *Client) publicHits(ctx context.Context, token string, items []worklist.WorkItem) (kept []worklist.WorkItem, confirmed bool) {
+// the items without that. extraRepos are checked alongside (the repositories of the
+// draft observations, Fetch.OthersDrafts), and every verdict is returned.
+func (c *Client) publicHits(ctx context.Context, token string, items []worklist.WorkItem, extraRepos []string) (kept []worklist.WorkItem, verdicts map[string]verdict, confirmed bool) {
 	var repos []string
-	verdicts := make(map[string]verdict)
-	for _, it := range items {
-		if _, ok := verdicts[it.GitHub.Repo]; !ok {
-			verdicts[it.GitHub.Repo] = verdictUnknown
-			repos = append(repos, it.GitHub.Repo)
+	verdicts = make(map[string]verdict)
+	add := func(repo string) {
+		if _, ok := verdicts[repo]; !ok {
+			verdicts[repo] = verdictUnknown
+			repos = append(repos, repo)
 		}
+	}
+	for _, it := range items {
+		add(it.GitHub.Repo)
+	}
+	for _, repo := range extraRepos {
+		add(repo)
 	}
 	// The checks stop gateTimeReserve before the run's deadline, in flight or not:
 	// a repository left unchecked stays unknown rather than spend what the write-back
@@ -559,7 +581,7 @@ func (c *Client) publicHits(ctx context.Context, token string, items []worklist.
 			kept = append(kept, it)
 		}
 	}
-	return kept, confirmed
+	return kept, verdicts, confirmed
 }
 
 // hasNextPage reports whether a response's Link header advertises a further page.

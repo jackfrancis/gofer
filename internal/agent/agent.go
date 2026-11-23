@@ -257,26 +257,27 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	if lerr != nil {
 		return fmt.Errorf("ingest: read existing items: %w", lerr)
 	}
+	items = dropStaleReady(items, existing)
 	items, carried := reconcileFetched(items, existing, fetch.ReviewRequestsComplete)
 	// Retire what left the open set. Only a COMPLETE fetch proves an item is gone: a
 	// partial walk (time budget, rate limit, result ceiling) simply may not have
 	// reached it, and retiring it then would hide open work.
 	// Another contributor's draft is different: the fetch SAW it, so it is retired
-	// even from a partial fetch (a complete one retires it as missing anyway). Either
-	// way a stored ready PR newer than that draft result stands (readyAfterDraft).
+	// (and its draft state recorded) by a partial fetch too, unless the store holds a
+	// newer ready state (retireDrafts).
+	now := time.Now().UTC()
 	if complete {
-		retired := retireMissing(items, existing, fetch.OthersDrafts, time.Now().UTC())
+		retired := retireMissing(items, existing, fetch.OthersDrafts, now)
 		if len(retired) > 0 {
 			log.Info("ingest: retired items no longer open on GitHub", "count", len(retired))
 			items = append(items, retired...)
 		}
 	} else if len(existing) > 0 {
 		log.Info("ingest: fetch was partial; not retiring items missing from it")
-		retired := retireListed(fetch.OthersDrafts, existing, time.Now().UTC())
-		if len(retired) > 0 {
-			log.Info("ingest: retired other contributors' drafts", "count", len(retired))
-			items = append(items, retired...)
-		}
+	}
+	if drafts := retireDrafts(fetch.OthersDrafts, existing, now); len(drafts) > 0 {
+		log.Info("ingest: retired other contributors' drafts", "count", len(drafts))
+		items = append(items, drafts...)
 	}
 	if len(items) == 0 {
 		return nil
@@ -367,9 +368,8 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 // than deleting keeps the thread: resolve drops completed items from the radar, an
 // agent can still see them, and a reopened item is fetched again and resurfaces.
 //
-// drafts is github.Fetch.OthersDrafts: an item absent only because the fetch saw it
-// as another contributor's draft is kept when the store knows a newer ready state
-// (readyAfterDraft).
+// drafts is github.Fetch.OthersDrafts: an item absent because the fetch saw it as
+// another contributor's draft is left to retireDrafts, which records that state.
 func retireMissing(fetched, existing []worklist.WorkItem, drafts map[string]time.Time, now time.Time) []worklist.WorkItem {
 	open := make(map[string]bool, len(fetched))
 	for _, it := range fetched {
@@ -377,7 +377,8 @@ func retireMissing(fetched, existing []worklist.WorkItem, drafts map[string]time
 	}
 	var retired []worklist.WorkItem
 	for _, it := range existing {
-		if it.Source != "github" || open[it.ID] || !it.Meta.CompletedAt.IsZero() || readyAfterDraft(it, drafts) {
+		_, draft := drafts[it.ID]
+		if it.Source != "github" || open[it.ID] || draft || !it.Meta.CompletedAt.IsZero() {
 			continue
 		}
 		retired = append(retired, retire(it, now))
@@ -385,27 +386,72 @@ func retireMissing(fetched, existing []worklist.WorkItem, drafts map[string]time
 	return retired
 }
 
-// retireListed returns the persisted GitHub items the fetch saw as another
-// contributor's draft (drafts, github.Fetch.OthersDrafts) and not yet marked
-// completed, each retired as retireMissing does, except where the store knows a
-// newer ready state (readyAfterDraft). It serves a partial fetch, which proves
-// nothing by absence but names what it positively saw leave the worklist.
-func retireListed(drafts map[string]time.Time, existing []worklist.WorkItem, now time.Time) []worklist.WorkItem {
-	var retired []worklist.WorkItem
+// retireDrafts returns the write-backs for the persisted GitHub items the fetch saw
+// as another contributor's draft (drafts, github.Fetch.OthersDrafts), from a
+// complete fetch or a partial one: an observation, unlike an absence, is evidence.
+// A live item is retired as retireMissing does. Either way the confirmed state is
+// recorded on the item, Draft set and GitHub.UpdatedAt advanced to the draft
+// result's, so a later refresh that returns an older ready result cannot reopen it
+// (dropStaleReady), while a genuinely newer one still does. An item already
+// recorded at least that new is not written again. A stored ready PR GitHub updated
+// strictly later than the draft result stands (readyAfterDraft).
+func retireDrafts(drafts map[string]time.Time, existing []worklist.WorkItem, now time.Time) []worklist.WorkItem {
+	var out []worklist.WorkItem
 	for _, it := range existing {
-		if _, seen := drafts[it.ID]; !seen || it.Source != "github" || !it.Meta.CompletedAt.IsZero() || readyAfterDraft(it, drafts) {
+		seen, ok := drafts[it.ID]
+		if !ok || it.Source != "github" || readyAfterDraft(it, drafts) {
 			continue
 		}
-		retired = append(retired, retire(it, now))
+		if it.Meta.CompletedAt.IsZero() {
+			it = retire(it, now)
+		} else if it.GitHub.Draft && !seen.After(it.GitHub.UpdatedAt) {
+			continue // already retired with this draft state, or a newer one
+		} else {
+			// Retired already (an earlier draft, or closed and since reopened as a
+			// draft): only the recorded state changes, CompletedAt stands.
+			clearModelSignals(&it.Signals)
+			it.GitHub.CI = nil
+		}
+		it.GitHub.Draft = true
+		if seen.After(it.GitHub.UpdatedAt) {
+			it.GitHub.UpdatedAt = seen
+		}
+		out = append(out, it)
 	}
-	return retired
+	return out
+}
+
+// dropStaleReady removes from a fetch the ready hits for items the store holds
+// retired as a draft (retireDrafts recorded it) at the same GitHub time or later: the
+// search index lagged the item, and reconciling the hit would reopen a pull request
+// that is still a draft. A ready hit GitHub updated strictly later is the item marked
+// ready, and resurfaces it. On a tie the draft wins, as everywhere else (GitHub
+// reports timestamps to the second).
+func dropStaleReady(fetched, existing []worklist.WorkItem) []worklist.WorkItem {
+	retiredDraft := make(map[string]time.Time)
+	for _, it := range existing {
+		if !it.Meta.CompletedAt.IsZero() && it.GitHub.Draft {
+			retiredDraft[it.ID] = it.GitHub.UpdatedAt
+		}
+	}
+	if len(retiredDraft) == 0 {
+		return fetched
+	}
+	kept := fetched[:0]
+	for _, it := range fetched {
+		if at, ok := retiredDraft[it.ID]; ok && !it.GitHub.Draft && !it.GitHub.UpdatedAt.After(at) {
+			continue
+		}
+		kept = append(kept, it)
+	}
+	return kept
 }
 
 // readyAfterDraft reports that the fetch saw stored item it as another
 // contributor's draft, but the store holds it as a ready pull request GitHub updated
 // strictly later than that draft result: the search index lagged the item, so the
-// result is stale and must not retire it. The item is left as stored until a fresh
-// read decides. On a tie the draft wins, as in the fetch's own reconciliation
+// result is stale and must neither retire it nor record a draft state on it
+// (retireDrafts). The item is left as stored until a fresh read decides. On a tie the draft wins, as in the fetch's own reconciliation
 // (GitHub reports timestamps to the second).
 func readyAfterDraft(it worklist.WorkItem, drafts map[string]time.Time) bool {
 	seen, ok := drafts[it.ID]
