@@ -284,6 +284,7 @@ func TestHiddenSectionRendering(t *testing.T) {
 	hidden := worklist.WorkItem{ID: "pr-h", Type: worklist.TypePullRequest,
 		GitHub:  worklist.GitHubRef{Number: 1, Repo: "o/r", Title: "Hidden PR", URL: "https://github.com/o/r/pull/1", LabelColors: map[string]string{"bug": "d73a4a"}},
 		Signals: worklist.Signals{Labels: []string{"bug"}}, Meta: worklist.Metadata{HiddenAt: at}}
+	hidden.GitHub.CI = &worklist.CISummary{Passed: 2, Failed: []string{"pull-unit"}, FailedURLs: []string{"https://prow.example/job/1"}}
 	back := worklist.WorkItem{ID: "pr-b", Type: worklist.TypePullRequest,
 		GitHub: worklist.GitHubRef{Number: 2, Repo: "o/r", Title: "Back PR"}, Meta: worklist.Metadata{AwaitingRefresh: true}}
 	out := renderPage(t, pageData{View: "worklist", Items: []worklist.WorkItem{back}, HiddenItems: []worklist.WorkItem{hidden}, ConvEnabled: true})
@@ -303,6 +304,10 @@ func TestHiddenSectionRendering(t *testing.T) {
 	}
 	if !strings.Contains(section, `zz-item--hidden`) || !strings.Contains(section, `name="hidden" value="false"`) || !strings.Contains(section, ">Unhide</button>") || !strings.Contains(section, ">bug</span>") {
 		t.Fatalf("a hidden row is greyscale, keeps its labels and offers Unhide, got:\n%s", section)
+	}
+	if !strings.Contains(section, `class="zz-ci"`) || !strings.Contains(section, "2 CI jobs successful") ||
+		!strings.Contains(section, `href="https://prow.example/job/1"`) || !strings.Contains(section, "Last known CI results") {
+		t.Fatalf("a hidden PR keeps its CI, labeled as the last known results, got:\n%s", section)
 	}
 	if !strings.Contains(ranked, "Waiting for the next refresh") || strings.Contains(ranked, "Relevance") {
 		t.Fatalf("an unhidden item awaiting its refresh shows that instead of a score, got:\n%s", ranked)

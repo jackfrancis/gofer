@@ -214,3 +214,234 @@ func TestRunEnrichTimelineReadsKeepTheReserve(t *testing.T) {
 		t.Fatalf("item 1 ReviewRequestedBy = %q, want its result written back", got)
 	}
 }
+
+// enrich summarizes the CI on each open pull request's head commit. A pull request
+// whose CI cannot be read keeps the stored summary, and an issue has no CI to read.
+func TestRunEnrichSummarizesPullRequestCI(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case "/repos/o/r/pulls/1":
+			_, _ = w.Write([]byte(`{"head":{"ref":"b","sha":"sha1"}}`))
+		case "/repos/o/r/commits/sha1/status":
+			_, _ = w.Write([]byte(`{"sha":"sha1","total_count":2,"statuses":[
+				{"context":"pull-unit","state":"success"},{"context":"pull-e2e","state":"failure","target_url":"https://prow.k8s.io/view/gs/b/pull-e2e/1"}]}`))
+		case "/repos/o/r/commits/sha1/check-runs":
+			_, _ = w.Write([]byte(`{"total_count":2,"check_runs":[
+				{"name":"lint","status":"in_progress"},{"name":"build","status":"completed","conclusion":"failure","details_url":"https://github.com/o/r/actions/runs/5"}]}`))
+		case "/repos/o/r/pulls/2":
+			http.Error(w, "boom", http.StatusInternalServerError)
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+
+	kept := &worklist.CISummary{SHA: "old", Passed: 4}
+	sink := &memSink{items: []worklist.WorkItem{
+		{ID: "pr1", Source: "github", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1}},
+		{ID: "pr2", Source: "github", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "o/r", Number: 2, CI: kept}},
+		{ID: "issue3", Source: "github", Type: worklist.TypeIssue, GitHub: worklist.GitHubRef{Repo: "o/r", Number: 3}},
+	}}
+	if err := Run(context.Background(),
+		Params{JobType: JobEnrich, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]*worklist.CISummary{}
+	for _, it := range sink.items {
+		got[it.ID] = it.GitHub.CI
+	}
+	want := &worklist.CISummary{SHA: "sha1", Passed: 1, Pending: 1, Failed: []string{"build", "pull-e2e"},
+		FailedURLs: []string{"https://github.com/o/r/actions/runs/5", "https://prow.k8s.io/view/gs/b/pull-e2e/1"}}
+	if !got["pr1"].Equal(want) {
+		t.Errorf("pr1 CI = %+v, want %+v", got["pr1"], want)
+	}
+	if !got["pr2"].Equal(kept) {
+		t.Errorf("an unreadable CI must keep the stored summary, got %+v", got["pr2"])
+	}
+	if got["issue3"] != nil {
+		t.Errorf("an issue has no CI, got %+v", got["issue3"])
+	}
+	for _, p := range paths {
+		if strings.Contains(p, "/pulls/3") {
+			t.Errorf("enrich read CI for an issue: %s", p)
+		}
+	}
+}
+
+// A refresh's search hits carry no CI, and the run's read of an oversized item is a
+// projection whose failed-job list is cut: the refresh must not copy that cut list,
+// and the write-back keeps the stored summary whole (worklist.KeepCI).
+func TestRefreshKeepsWholeStoredCI(t *testing.T) {
+	ci := &worklist.CISummary{SHA: "s", Passed: 2}
+	for i := range 40 {
+		ci.Failed = append(ci.Failed, "job-"+strconv.Itoa(i))
+	}
+	stored := []worklist.WorkItem{
+		{ID: "pr", Type: worklist.TypePullRequest,
+			GitHub: worklist.GitHubRef{Title: strings.Repeat("t", worklist.MaxBriefBytes), CI: ci}},
+		{ID: "was-pr", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{CI: ci}},
+	}
+	read := []worklist.WorkItem{worklist.Project(stored[0]), stored[1]}
+	if len(read[0].GitHub.CI.Failed) >= 40 {
+		t.Fatal("fixture must be projected")
+	}
+	fetched := []worklist.WorkItem{
+		{ID: "pr", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Title: "fresh"}},
+		{ID: "was-pr", Type: worklist.TypeIssue},
+	}
+	out, _ := reconcileFetched(fetched, read, true)
+	merged := worklist.MergeRunItems(stored, out)
+	if !merged[0].GitHub.CI.Equal(ci) {
+		t.Errorf("refresh must keep the stored CI whole, got %d names, %d omitted",
+			len(merged[0].GitHub.CI.Failed), merged[0].GitHub.CI.FailedOmitted)
+	}
+	if merged[1].GitHub.CI != nil {
+		t.Errorf("only a pull request carries CI, got %+v", merged[1].GitHub.CI)
+	}
+}
+
+// The timeline feeds the score and CI is display-only, so CI reads that hang until
+// the enrich cutoff on every pull request must not keep an issue's timeline from
+// being read.
+func TestRunEnrichSlowCIDoesNotStarveTimelines(t *testing.T) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case strings.Contains(r.URL.Path, "/timeline"):
+			_, _ = w.Write([]byte(`[{"event":"commented","created_at":"2026-01-02T00:00:00Z","actor":{"login":"bob"}}]`))
+		case strings.Contains(r.URL.Path, "/pulls/"):
+			<-r.Context().Done() // a CI outage: the read never answers
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+
+	var items []worklist.WorkItem
+	for n := 1; n <= enrichConcurrency; n++ {
+		items = append(items, worklist.WorkItem{ID: "pr" + strconv.Itoa(n), Source: "github",
+			Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "o/r", Number: n}})
+	}
+	items = append(items, worklist.WorkItem{ID: "z-issue", Source: "github", Type: worklist.TypeIssue, // sorts after every PR
+		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 99}})
+	sink := &memSink{items: items}
+	ctx, cancel := context.WithTimeout(context.Background(), enrichReserve+2*time.Second)
+	defer cancel()
+	if err := Run(ctx, Params{JobType: JobEnrich, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range sink.items {
+		if it.Signals.Participants != 1 {
+			t.Errorf("%s: participants = %d, want 1 (timeline starved by CI reads)", it.ID, it.Signals.Participants)
+		}
+	}
+}
+
+// Rank reads CI with the item but never fetches it: an enrich that lands while the
+// model works must not be undone by rank's write-back of the copy it read.
+func TestRunRankKeepsNewerCI(t *testing.T) {
+	read := &worklist.CISummary{SHA: "s", Pending: 1}
+	newer := &worklist.CISummary{SHA: "s", Failed: []string{"build"}}
+	sink := &memSink{items: []worklist.WorkItem{{ID: "pr", Source: "github", Type: worklist.TypePullRequest,
+		GitHub: worklist.GitHubRef{CI: read}}}}
+	sink.beforeIngest = func() { sink.items[0].GitHub.CI = newer }
+	if err := Run(context.Background(), Params{JobType: JobRank}, fakeVendor{}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if sink.items[0].Signals.Proposed == nil {
+		t.Fatal("fixture: rank must write the item back")
+	}
+	if !sink.items[0].GitHub.CI.Equal(newer) {
+		t.Fatalf("rank overwrote the newer CI with %+v", sink.items[0].GitHub.CI)
+	}
+}
+
+// Retiring an item sends no CI either, so the stored summary stands.
+func TestRetireMissingSendsNoCI(t *testing.T) {
+	existing := []worklist.WorkItem{{ID: "pr", Source: "github", Type: worklist.TypePullRequest,
+		GitHub: worklist.GitHubRef{CI: &worklist.CISummary{Pending: 1}}}}
+	retired := retireMissing(nil, existing, time.Now())
+	if len(retired) != 1 || retired[0].GitHub.CI != nil {
+		t.Fatalf("retired = %+v", retired)
+	}
+}
+
+// An enrich that changes only the timeline (its CI read failed) must not write back
+// the CI it read: an overlapping enrich may have stored a newer result meanwhile.
+func TestRunEnrichTimelineOnlyWriteSendsNoCI(t *testing.T) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case strings.Contains(r.URL.Path, "/timeline"):
+			_, _ = w.Write([]byte(`[{"event":"commented","created_at":"2026-01-02T00:00:00Z","actor":{"login":"bob"}}]`))
+		case strings.Contains(r.URL.Path, "/pulls/"):
+			http.Error(w, "boom", http.StatusInternalServerError) // CI unreadable
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+
+	read := &worklist.CISummary{SHA: "s", Pending: 1}
+	newer := &worklist.CISummary{SHA: "s", Failed: []string{"build"}, FailedURLs: []string{""}}
+	sink := &memSink{items: []worklist.WorkItem{{ID: "pr", Source: "github", Type: worklist.TypePullRequest,
+		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, CI: read}}}}
+	sink.beforeIngest = func() { sink.items[0].GitHub.CI = newer } // the overlapping enrich lands
+	if err := Run(context.Background(),
+		Params{JobType: JobEnrich, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if sink.items[0].Signals.Participants != 1 {
+		t.Fatal("fixture: the timeline change must be written")
+	}
+	if !sink.items[0].GitHub.CI.Equal(newer) {
+		t.Fatalf("timeline-only write reverted CI to %+v", sink.items[0].GitHub.CI)
+	}
+}
+
+// An oversized item's read is projected, which drops a CI link too long to keep. If
+// GitHub then withdraws that link, the fresh summary equals the cut one, and must
+// still replace the stored summary rather than be taken for the unchanged cut.
+func TestRunEnrichClearsWithdrawnLinkOnProjectedItem(t *testing.T) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case "/repos/o/r/pulls/1":
+			_, _ = w.Write([]byte(`{"head":{"ref":"b","sha":"sha1"}}`))
+		case "/repos/o/r/commits/sha1/status":
+			_, _ = w.Write([]byte(`{"sha":"sha1","total_count":1,"statuses":[{"context":"pull-e2e","state":"failure"}]}`)) // no link now
+		case "/repos/o/r/commits/sha1/check-runs":
+			_, _ = w.Write([]byte(`{"total_count":0,"check_runs":[]}`))
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+
+	longLink := "https://prow.k8s.io/view/gs/b/" + strings.Repeat("x", 600)
+	stored := &worklist.CISummary{SHA: "sha1", Failed: []string{"pull-e2e"}, FailedURLs: []string{longLink}}
+	sink := &memSink{items: []worklist.WorkItem{{ID: "pr", Source: "github", Type: worklist.TypePullRequest,
+		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, Title: strings.Repeat("t", worklist.MaxBriefBytes), CI: stored}}}}
+	if err := Run(context.Background(),
+		Params{JobType: JobEnrich, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := sink.items[0].GitHub.CI
+	if want := (&worklist.CISummary{SHA: "sha1", Failed: []string{"pull-e2e"}, FailedURLs: []string{""}}); !got.Equal(want) {
+		t.Fatalf("withdrawn link kept: %+v", got)
+	}
+}

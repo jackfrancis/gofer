@@ -22,6 +22,12 @@ import (
 // GitHub fields, completion and labels: its signals and scoring are stripped
 // (StripScoring), so a hidden item never carries a score (see hide.go).
 //
+// A pull request's CI summary (GitHubRef.CI) is kept like the model signals below:
+// only enrich reads it, so a write-back that carries none keeps the stored one
+// (KeepCI), and every other pass (refresh, retire, rank) sends none, never the copy
+// it read. It is a GitHub field, so a hidden item keeps it (enrich skips hidden
+// items, so it is the last one read).
+//
 // The two model-derived signals are the exception to "the run owns its signals": a
 // GitHub fetch cannot produce them, so a refresh sends none, and a scoring pass that
 // failed for an item sends none either. A write-back that carries no model proposal
@@ -62,12 +68,24 @@ func MergeRunItems(current, incoming []WorkItem) []WorkItem {
 			it.CreatedAt = old.CreatedAt
 		}
 		KeepModelSignals(&it.Signals, old.Signals)
+		KeepCI(&it, old)
 		if it.IsHidden() {
-			StripScoring(&it)
+			StripScoring(&it) // GitHub fields, the CI summary among them, stay
 		}
 		out = append(out, it)
 	}
 	return out
+}
+
+// KeepCI fills in a pull request's CI summary from the stored item when the
+// write-back carries none. Only enrich reads CI; a refresh's search hits carry none,
+// and copying the stored summary into the refresh would copy whatever the run read,
+// which may be a projection (cut, and without its marker once copied). A summary the
+// write-back carries wins.
+func KeepCI(incoming *WorkItem, stored WorkItem) {
+	if incoming.GitHub.CI == nil && incoming.Type == TypePullRequest {
+		incoming.GitHub.CI = cloneCI(stored.GitHub.CI)
+	}
 }
 
 // KeepModelSignals fills in the model-derived signals an incoming write-back does not

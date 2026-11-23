@@ -35,6 +35,27 @@ func TestMergeRunItemsKeepsHiddenItemsHiddenAndUnscored(t *testing.T) {
 	}
 }
 
+// A hidden pull request keeps its CI summary, a GitHub field: through hiding, and
+// through a write-back that carries none (KeepCI) as well as one that carries a
+// fresh summary.
+func TestHiddenItemKeepsCI(t *testing.T) {
+	ci := &CISummary{SHA: "abc", Passed: 3, Failed: []string{"lint"}, FailedURLs: []string{"https://ci.example/lint"}}
+	it := WorkItem{ID: "a", Type: TypePullRequest, GitHub: GitHubRef{CI: ci}, Meta: Metadata{Rank: 0.4}}
+	HideItem(&it, t1)
+	if !it.GitHub.CI.Equal(ci) {
+		t.Fatalf("hiding keeps the CI summary, got %+v", it.GitHub.CI)
+	}
+	got := MergeRunItems([]WorkItem{it}, []WorkItem{{ID: "a", Type: TypePullRequest, Meta: Metadata{Rank: 0.9}}})[0]
+	if !got.GitHub.CI.Equal(ci) || got.Meta.Rank != 0 {
+		t.Fatalf("a write-back with no CI keeps the stored one and is still unscored, got %+v %+v", got.GitHub.CI, got.Meta)
+	}
+	fresh := &CISummary{SHA: "def", Passed: 4}
+	got = MergeRunItems([]WorkItem{it}, []WorkItem{{ID: "a", Type: TypePullRequest, GitHub: GitHubRef{CI: fresh}}})[0]
+	if !got.GitHub.CI.Equal(fresh) {
+		t.Fatalf("a write-back's fresh CI lands on a hidden item, got %+v", got.GitHub.CI)
+	}
+}
+
 // Hide deletes the item's judgment and keeps the first hide time; Unhide brings back
 // an empty item awaiting a refresh. Neither touches the GitHub fields or thread.
 func TestHideAndUnhideItem(t *testing.T) {

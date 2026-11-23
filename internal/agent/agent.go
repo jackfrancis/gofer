@@ -340,6 +340,9 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 				carried[fetched[i].ID] = true
 			}
 		}
+		// A search hit carries no CI summary, and none is copied from the read above,
+		// which may be a projection: the plane's merge keeps the stored one
+		// (worklist.KeepCI) until the chained enrich reads the head commit again.
 		// CompletedAt is deliberately NOT carried over: the item was just fetched from
 		// the open set, so it is open, and a reopened item resurfaces (see Metadata).
 		if !old.CreatedAt.IsZero() {
@@ -366,9 +369,10 @@ func retireMissing(fetched, existing []worklist.WorkItem, now time.Time) []workl
 			continue
 		}
 		it.Meta.CompletedAt = now
-		// Retiring derives no model signals; leave them to the store (see
-		// reconcileFetched).
+		// Retiring derives no model signals, and reads no CI; leave both to the store
+		// (see reconcileFetched and worklist.KeepCI).
 		clearModelSignals(&it.Signals)
+		it.GitHub.CI = nil
 		retired = append(retired, it)
 	}
 	return retired
@@ -470,6 +474,10 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 			items[i].Signals.Proposed = &prop
 			// Rank derives only the proposal; the stored research adjustment stays.
 			items[i].Signals.Research = nil
+			// Nor does it read CI: the summary it read may have been replaced by an
+			// enrich that landed while the model worked (worklist.KeepCI keeps the
+			// stored one).
+			items[i].GitHub.CI = nil
 			mu.Lock()
 			changed = append(changed, items[i])
 			mu.Unlock()

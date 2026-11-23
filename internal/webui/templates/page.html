@@ -80,6 +80,7 @@
           </form>
           {{end}}
         </div>
+        {{template "ci" ciSummary .Item}}
       </div>
       <div class="zz-chat">
         {{range $i, $m := .Item.Thread}}
@@ -273,6 +274,7 @@
             <span class="Label zz-priority {{priorityClass .Meta.Priority}}">{{with .Meta.Priority}}{{.}}{{else}}unranked{{end}}</span>
             {{with ghLabels .}}<span class="zz-labels">{{range .}}<span class="Label zz-ghlabel{{with .Class}} {{.}}{{end}}">{{.Name}}</span>{{end}}</span>{{end}}
           </div>
+          {{template "ci" ciSummary .}}
           {{if .Meta.AwaitingRefresh}}
           <div class="zz-rationale zz-awaiting">Waiting for the next refresh</div>
           {{else}}
@@ -309,6 +311,7 @@
             <span>{{.GitHub.Repo}} #{{.GitHub.Number}}</span>
             {{with ghLabels .}}<span class="zz-labels">{{range .}}<span class="Label zz-ghlabel">{{.Name}}</span>{{end}}</span>{{end}}
           </div>
+          {{template "ci" ciSummary .}}
         </div>
         {{end}}
       </section>
@@ -317,4 +320,13 @@
   </div>
 </body>
 </html>
+{{/* A pull request's CI summary (ciView), or nothing for nil. */}}
+{{define "ci"}}{{with .}}<ul class="zz-ci" aria-label="CI results">
+            {{if .Historical}}<li class="zz-ci-note">Last known CI results; no longer updated since this item left your radar.</li>{{end}}
+            {{with .Passed}}<li class="zz-ci-pass">{{.}}</li>{{end}}
+            {{with .Pending}}<li class="zz-ci-pending">{{.}}</li>{{end}}
+            {{range .Failed}}<li class="zz-ci-fail">{{if .URL}}<a href="{{.URL}}" target="_blank" rel="noopener noreferrer">{{.Name}}</a>{{else}}{{.Name}}{{end}}</li>{{end}}
+            {{with .More}}<li class="zz-ci-fail">{{.}}</li>{{end}}
+            {{if .Partial}}<li class="zz-ci-note">Some CI results could not be read.</li>{{end}}
+          </ul>{{end}}{{end}}
 {{define "projectScope"}}{{if .ProjectsFiltered}}<input type="hidden" name="scope" value="{{.ProjectScope}}">{{end}}{{end}}
