@@ -374,6 +374,27 @@ Wired on the web-tier side; they define what a runtime must respect:
   (`internal/webui/labels.go`), a stylesheet generated from the query alone. Colors
   live in `GitHubRef.LabelColors`, set at ingest; read one only through
   `GitHubRef.LabelColor` (six hex digits or nothing), since it reaches CSS.
+- A pull request's CI shows under its labels on the radar and at the top of its
+  Discuss page (one `ci` template): jobs succeeded, jobs in progress, and each failed
+  job's name, linked where GitHub's pull request links it (a status's target URL,
+  e.g. the Prow job page, or a check run's details URL) (`GitHubRef.CI`, a
+  `worklist.CISummary`). The links are `FailedURLs`, index-aligned with `Failed`, so
+  `failed` keeps its stored shape (a list of names) for an older web tier; read the
+  pairs only through `CISummary.FailedJobs`, which admits only http(s) links
+  (`worklist.CIJobURL`), since they reach an href. Counts follow the
+  outcome GitHub reported (`github.ciOutcome`: skipped, neutral and stale are in no
+  count), not the sorting class. Enrich sets it from `github.CIStatusForPR`
+  (`CIStatus.Summary`, bounded by `CISummary.AddFailed`) in a second pass, after
+  every timeline read, so CI never costs an item its ranking signals. Statuses and
+  check runs are read independently (one unreadable = `Partial`; both = error, and
+  the stored summary stands). A write-back that carries no CI keeps the stored one
+  (`worklist.KeepCI`, in the merge), so every pass but enrich's CI pass (refresh,
+  retire, rank, and an enrich write that changed only the timeline) sends none: never write back CI from a run's read, which may be a projection or
+  older than an enrich that landed meanwhile. CI pages after the first are pinned to
+  the commit the first resolved, since a named ref can advance between pages. After
+  a projected read, enrich writes the fresh summary through `WorkItem.SetCI`, which
+  drops the projection marker, since a cut summary compares equal to fresh data it
+  does not match. A retired item's CI is labeled as the last known result. It is display-only: nothing scores on it.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,
