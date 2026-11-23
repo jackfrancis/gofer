@@ -97,6 +97,19 @@ body {
 .zz-filter-all { font-weight: 600; border-bottom: 1px solid var(--border); border-radius: 6px 6px 0 0; padding-bottom: 6px; margin-bottom: 2px; }
 .zz-filter-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .zz-filter-count { color: var(--muted); font-size: 12px; }
+/* The selected projects, listed under the toolbar while the filter narrows the radar,
+   each a link to its repository's pull requests. */
+.zz-selected-projects {
+  list-style: none; margin: -8px 0 16px; padding: 0;
+  display: flex; flex-wrap: wrap; gap: 6px;
+}
+.zz-selected-projects li {
+  max-width: 100%; overflow-wrap: anywhere;
+  font-size: 13px; padding: 2px 8px;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--bg-subtle);
+}
+.zz-selected-projects a { color: var(--accent); text-decoration: none; }
+.zz-selected-projects a:hover { text-decoration: underline; }
 /* Apply comes first in the markup (the form's default button) but sits on the right. */
 .zz-filter-actions { display: flex; flex-direction: row-reverse; justify-content: flex-start; gap: 6px; margin-top: 4px; }
 
