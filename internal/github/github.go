@@ -103,8 +103,9 @@ var signals = []struct {
 // FetchWorklist retrieves the issues and pull requests on the user's radar —
 // everything they are involved in, plus everything awaiting their review —
 // deduplicated by item ID. When an item surfaces under more than one query, the
-// reasons are merged onto a single work item. Another contributor's draft pull
-// request is left out (searchItem.othersDraft) without making the fetch partial.
+// reasons are merged onto a single work item, and its newest copy decides its state.
+// Another contributor's draft pull request is left out (searchItem.othersDraft)
+// without making the fetch partial, and reported in Fetch.OthersDrafts.
 //
 // Each query is paged to exhaustion rather than sampled: a long-running
 // contributor's involvement runs to hundreds of open items, and taking one arbitrary
@@ -136,6 +137,13 @@ type Fetch struct {
 	// review is requested: when that search is partial, an item may arrive through
 	// involves: alone while its request is still pending.
 	ReviewRequestsComplete bool
+	// OthersDrafts names, by item ID and sorted, the hits whose current state (the
+	// newest copy across the searches) is another contributor's draft pull request,
+	// left out of Items. Unlike an absence, this is positive evidence, so ingest
+	// retires a stored copy of each even when the fetch is partial. The IDs are not
+	// passed through the public-only gate: they are only matched against stored
+	// items, never fetched or kept.
+	OthersDrafts []string
 }
 
 // FetchWorklistDetail is FetchWorklist, also reporting whether the review-request
@@ -148,7 +156,15 @@ func (c *Client) FetchWorklistDetail(ctx context.Context, token string) (Fetch, 
 	if err != nil {
 		return Fetch{}, fmt.Errorf("github login: %w", err)
 	}
-	seen := make(map[string]worklist.WorkItem)
+	// Hits are reconciled by item ID before anything is decided about them: the same
+	// item can come back from two queries walked at different moments, and the copy
+	// GitHub updated last is its current state (a pull request marked draft, or ready,
+	// between the two walks). Reasons are merged across every copy.
+	type hit struct {
+		item    searchItem
+		reasons []worklist.Reason
+	}
+	seen := make(map[string]*hit)
 	complete, reviewsComplete := true, true
 	for _, s := range signals {
 		found, whole, err := c.searchIssues(ctx, token, s.query)
@@ -160,24 +176,30 @@ func (c *Client) FetchWorklistDetail(ctx context.Context, token string) (Fetch, 
 			reviewsComplete = reviewsComplete && whole
 		}
 		for _, it := range found {
-			wi, ok := it.toWorkItem(s.reason, viewer, now)
-			if !ok {
+			id, rs := it.id(), reasonsFor(s.reason, it, viewer)
+			h, dup := seen[id]
+			if !dup {
+				seen[id] = &hit{item: it, reasons: rs}
 				continue
 			}
-			if existing, dup := seen[wi.ID]; dup {
-				for _, r := range wi.Signals.Reasons {
-					existing.Signals.Reasons = appendReason(existing.Signals.Reasons, r)
-				}
-				seen[wi.ID] = existing
-				continue
+			for _, r := range rs {
+				h.reasons = appendReason(h.reasons, r)
 			}
-			seen[wi.ID] = wi
+			if it.UpdatedAt.After(h.item.UpdatedAt) {
+				h.item = it
+			}
 		}
 	}
 	out := make([]worklist.WorkItem, 0, len(seen))
-	for _, wi := range seen {
-		out = append(out, wi)
+	var drafts []string
+	for id, h := range seen {
+		if h.item.othersDraft(viewer) {
+			drafts = append(drafts, id)
+			continue
+		}
+		out = append(out, h.item.workItem(h.reasons, now))
 	}
+	slices.Sort(drafts)
 	out, confirmed := c.publicHits(ctx, token, out)
 	complete = complete && confirmed
 	// Deduplication runs through a map, so without this the result order is Go's
@@ -191,7 +213,7 @@ func (c *Client) FetchWorklistDetail(ctx context.Context, token string) (Fetch, 
 		}
 		return strings.Compare(a.ID, b.ID)
 	})
-	return Fetch{Items: out, Complete: complete, ReviewRequestsComplete: reviewsComplete}, nil
+	return Fetch{Items: out, Complete: complete, ReviewRequestsComplete: reviewsComplete, OthersDrafts: drafts}, nil
 }
 
 // appendReason adds r to rs if not already present, keeping reasons unique and in
@@ -288,15 +310,32 @@ func (it searchItem) othersDraft(viewer string) bool {
 	return it.User == nil || !strings.EqualFold(it.User.Login, viewer)
 }
 
-// toWorkItem maps a search hit to a work item. ok is false for a hit that does not
-// belong on the worklist: another contributor's draft pull request (othersDraft).
-// Leaving it out of the fetch means a complete refresh retires a stored copy (a pull
-// request converted back to draft), keeping its thread, and it resurfaces once it is
-// marked ready for review.
+// repo is the hit's "owner/name".
+func (it searchItem) repo() string {
+	return strings.TrimPrefix(it.RepositoryURL, defaultBaseURL+"/repos/")
+}
+
+// id is the work item ID the hit maps to.
+func (it searchItem) id() string {
+	return "github:" + it.repo() + "#" + strconv.Itoa(it.Number)
+}
+
+// toWorkItem maps a single search hit to a work item. ok is false for a hit that
+// does not belong on the worklist: another contributor's draft pull request
+// (othersDraft). Ingest retires a stored copy of one (a pull request converted back
+// to draft), keeping its thread, and it resurfaces once it is marked ready for
+// review. FetchWorklistDetail reconciles hits across searches first and maps the
+// result with workItem.
 func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.Time) (worklist.WorkItem, bool) {
 	if it.othersDraft(viewer) {
 		return worklist.WorkItem{}, false
 	}
+	return it.workItem(reasonsFor(reason, it, viewer), now), true
+}
+
+// workItem maps a search hit, already judged to belong on the worklist, to a work
+// item with the given reasons.
+func (it searchItem) workItem(reasons []worklist.Reason, now time.Time) worklist.WorkItem {
 	// The search/issues endpoint returns both issues and PRs; a pull_request
 	// object marks a PR. Both belong on the radar, so map the type instead of
 	// dropping issues.
@@ -306,10 +345,10 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 		itemType = worklist.TypePullRequest
 		merged = it.PullRequest.MergedAt != nil
 	}
-	repo := strings.TrimPrefix(it.RepositoryURL, defaultBaseURL+"/repos/")
+	repo := it.repo()
 
 	sig := worklist.Signals{
-		Reasons:        reasonsFor(reason, it, viewer),
+		Reasons:        reasons,
 		Comments:       it.Comments,
 		OpenedAt:       it.CreatedAt,
 		LastActivityAt: it.UpdatedAt,
@@ -333,7 +372,7 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 	}
 
 	return worklist.WorkItem{
-		ID:     "github:" + repo + "#" + strconv.Itoa(it.Number),
+		ID:     it.id(),
 		Source: "github",
 		Type:   itemType,
 		GitHub: worklist.GitHubRef{
@@ -351,7 +390,7 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 		},
 		Signals: sig,
 		Meta:    worklist.Metadata{Origin: worklist.OriginAgent},
-	}, true
+	}
 }
 
 // searchIssues walks a search query page by page. whole reports that the walk saw

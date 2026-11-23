@@ -898,3 +898,52 @@ func TestRefreshReviewRequestEvidence(t *testing.T) {
 		}
 	})
 }
+
+// A partial fetch retires nothing it merely did not see, but a stored pull request
+// the fetch SAW as another contributor's draft is retired all the same (thread kept):
+// otherwise an account whose issue search never completes would keep a converted
+// draft on the radar as ready indefinitely.
+func TestRunIngestPartialFetchRetiresOthersDrafts(t *testing.T) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case r.URL.Path == "/search/issues":
+			q := r.URL.Query().Get("q")
+			switch {
+			case strings.Contains(q, "is:issue"):
+				// The issue search is partial, so the whole fetch is.
+				_, _ = w.Write([]byte(`{"incomplete_results":true,"items":[]}`))
+			case strings.Contains(q, "involves:@me"):
+				_, _ = w.Write([]byte(`{"total_count":2,"items":[
+					{"number":7,"title":"T","html_url":"u","state":"open","repository_url":"https://api.github.com/repos/o/r","user":{"login":"someone"},"pull_request":{"url":"x"}},
+					{"number":8,"title":"T","html_url":"u","state":"open","draft":true,"repository_url":"https://api.github.com/repos/o/r","user":{"login":"someone"},"pull_request":{"url":"x"}}]}`))
+			default:
+				_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
+			}
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+	thread := worklist.Message{Role: worklist.RoleUser, Content: "review?"}
+	sink := &memSink{items: []worklist.WorkItem{prItem(7), prItem(8, thread), prItem(9)}}
+	if err := Run(context.Background(),
+		Params{JobType: JobIngest, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+		fakeVendor{token: "tok"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	draft := itemByID(t, sink.items, "github:o/r#8")
+	if draft.Meta.CompletedAt.IsZero() {
+		t.Fatal("another contributor's draft stayed on the radar after a partial fetch")
+	}
+	if len(draft.Thread) != 1 {
+		t.Errorf("retiring must keep the thread; got %d turns", len(draft.Thread))
+	}
+	if got := itemByID(t, sink.items, "github:o/r#7"); !got.Meta.CompletedAt.IsZero() {
+		t.Error("a ready pull request was retired")
+	}
+	if got := itemByID(t, sink.items, "github:o/r#9"); !got.Meta.CompletedAt.IsZero() {
+		t.Error("an item missing from a PARTIAL fetch was retired")
+	}
+}

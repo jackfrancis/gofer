@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -367,5 +368,68 @@ func TestFetchWorklistSkipsOthersDraftsAndStaysComplete(t *testing.T) {
 	}
 	if !f.Complete || !f.ReviewRequestsComplete {
 		t.Fatalf("complete=%v reviewsComplete=%v, want both true", f.Complete, f.ReviewRequestsComplete)
+	}
+	if want := []string{"github:o/r#2", "github:o/r#4"}; !slices.Equal(f.OthersDrafts, want) {
+		t.Fatalf("OthersDrafts %v, want %v", f.OthersDrafts, want)
+	}
+}
+
+// The same pull request can come back from both searches, walked at different
+// moments, in different states. The copy GitHub updated last is its state: marked
+// draft after the involves: walk, it is left out (and reported as a draft); marked
+// ready after it, it is kept, with the reasons of both copies.
+func TestFetchWorklistNewestCopyDecidesDraft(t *testing.T) {
+	const (
+		ready = `{"number":7,"repository_url":"https://api.github.com/repos/o/r","state":"open","updated_at":%q,"user":{"login":"someone"},"pull_request":{"url":"x"}}`
+		draft = `{"number":7,"repository_url":"https://api.github.com/repos/o/r","state":"open","draft":true,"updated_at":%q,"user":{"login":"someone"},"pull_request":{"url":"x"}}`
+	)
+	older, newer := "2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z"
+	cases := []struct {
+		name, involves, reviews string
+		kept                    bool
+	}{
+		{"marked draft between walks", fmt.Sprintf(ready, older), fmt.Sprintf(draft, newer), false},
+		{"marked ready between walks", fmt.Sprintf(draft, older), fmt.Sprintf(ready, newer), true},
+		{"newer copy first", fmt.Sprintf(draft, newer), fmt.Sprintf(ready, older), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/user" {
+					_, _ = w.Write([]byte(`{"login":"me"}`))
+					return
+				}
+				q := r.URL.Query().Get("q")
+				switch {
+				case strings.Contains(q, "is:pr") && strings.Contains(q, "involves:@me"):
+					fmt.Fprintf(w, `{"total_count":1,"items":[%s]}`, tc.involves)
+				case strings.Contains(q, "review-requested:@me"):
+					fmt.Fprintf(w, `{"total_count":1,"items":[%s]}`, tc.reviews)
+				default:
+					_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
+				}
+			}))
+			defer srv.Close()
+			f, err := NewClient(srv.Client(), srv.URL).FetchWorklistDetail(context.Background(), "tok")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.kept {
+				if len(f.Items) != 0 || !slices.Equal(f.OthersDrafts, []string{"github:o/r#7"}) {
+					t.Fatalf("items %d, OthersDrafts %v; want the draft left out and reported", len(f.Items), f.OthersDrafts)
+				}
+				return
+			}
+			if len(f.Items) != 1 || len(f.OthersDrafts) != 0 {
+				t.Fatalf("items %d, OthersDrafts %v; want the ready PR kept", len(f.Items), f.OthersDrafts)
+			}
+			it := f.Items[0]
+			if it.GitHub.Draft || !it.GitHub.UpdatedAt.Equal(time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)) {
+				t.Errorf("kept the older copy: draft=%v updated=%v", it.GitHub.Draft, it.GitHub.UpdatedAt)
+			}
+			if !slices.Contains(it.Signals.Reasons, worklist.ReasonReviewRequested) || !slices.Contains(it.Signals.Reasons, worklist.ReasonInvolved) {
+				t.Errorf("reasons %v, want both copies' reasons", it.Signals.Reasons)
+			}
+		})
 	}
 }

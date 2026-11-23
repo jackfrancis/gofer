@@ -104,9 +104,12 @@ the worklist is re-scored at read time. Job types the workload implements:
 github-ingest, github-enrich, llm-rank, github-converse, github-research.
 
 Ingest leaves out another contributor's draft pull request, whatever the user's
-relationship to it (`github.searchItem.othersDraft`); the user's own drafts stay. The
-fetch still counts as complete, so a stored PR converted back to draft is retired on
-the next complete refresh (thread kept) and resurfaces once marked ready for review.
+relationship to it (`github.searchItem.othersDraft`); the user's own drafts stay.
+Hits are reconciled by ID first, and the copy with the newest `updated_at` decides
+the state, since the searches are walked at different moments. The fetch still counts
+as complete, and it names the drafts it saw (`github.Fetch.OthersDrafts`), so a
+stored PR converted back to draft is retired (thread kept) even by a partial refresh
+(`agent.retireListed`), and resurfaces once marked ready for review.
 
 ## Security invariants (the contract a runtime must honor)
 

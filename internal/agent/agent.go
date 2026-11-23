@@ -261,6 +261,8 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	// Retire what left the open set. Only a COMPLETE fetch proves an item is gone: a
 	// partial walk (time budget, rate limit, result ceiling) simply may not have
 	// reached it, and retiring it then would hide open work.
+	// Another contributor's draft is different: the fetch SAW it, so it is retired
+	// even from a partial fetch (a complete one retires it as missing anyway).
 	if complete {
 		retired := retireMissing(items, existing, time.Now().UTC())
 		if len(retired) > 0 {
@@ -269,6 +271,11 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 		}
 	} else if len(existing) > 0 {
 		log.Info("ingest: fetch was partial; not retiring items missing from it")
+		retired := retireListed(fetch.OthersDrafts, existing, time.Now().UTC())
+		if len(retired) > 0 {
+			log.Info("ingest: retired other contributors' drafts", "count", len(retired))
+			items = append(items, retired...)
+		}
 	}
 	if len(items) == 0 {
 		return nil
@@ -368,14 +375,34 @@ func retireMissing(fetched, existing []worklist.WorkItem, now time.Time) []workl
 		if it.Source != "github" || open[it.ID] || !it.Meta.CompletedAt.IsZero() {
 			continue
 		}
-		it.Meta.CompletedAt = now
-		// Retiring derives no model signals, and reads no CI; leave both to the store
-		// (see reconcileFetched and worklist.KeepCI).
-		clearModelSignals(&it.Signals)
-		it.GitHub.CI = nil
-		retired = append(retired, it)
+		retired = append(retired, retire(it, now))
 	}
 	return retired
+}
+
+// retireListed returns the persisted GitHub items named in ids and not yet marked
+// completed, each retired as retireMissing does. It serves a partial fetch, which
+// proves nothing by absence but names what it positively saw leave the worklist:
+// another contributor's draft (github.Fetch.OthersDrafts).
+func retireListed(ids []string, existing []worklist.WorkItem, now time.Time) []worklist.WorkItem {
+	var retired []worklist.WorkItem
+	for _, it := range existing {
+		if it.Source != "github" || !slices.Contains(ids, it.ID) || !it.Meta.CompletedAt.IsZero() {
+			continue
+		}
+		retired = append(retired, retire(it, now))
+	}
+	return retired
+}
+
+// retire stamps a stored item completed for write-back.
+func retire(it worklist.WorkItem, now time.Time) worklist.WorkItem {
+	it.Meta.CompletedAt = now
+	// Retiring derives no model signals, and reads no CI; leave both to the store
+	// (see reconcileFetched and worklist.KeepCI).
+	clearModelSignals(&it.Signals)
+	it.GitHub.CI = nil
+	return it
 }
 
 // carryPendingRequest keeps what a refresh cannot re-establish about a review the
