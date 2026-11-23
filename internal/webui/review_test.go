@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -683,11 +684,7 @@ func TestThreadAgentReplyCopyButton(t *testing.T) {
 	if !strings.Contains(out, `data-copy="**Hi** [design](https://example.com/d) &lt;script&gt;x&lt;/script&gt; &#34;q&#34;"`) {
 		t.Fatalf("Copy payload should be the escaped Markdown source, got:\n%s", out)
 	}
-	// Icon-only, so it must carry an accessible name, and its glyphs stay out of the
-	// accessibility tree.
-	if !strings.Contains(out, `aria-label="Copy reply"`) || strings.Count(out, `<svg class="zz-icon`) != 2 || strings.Count(out, `aria-hidden="true" focusable="false"`) != 2 {
-		t.Fatalf("Copy should be a labeled icon button with two hidden glyphs, got:\n%s", out)
-	}
+	assertCopyButtonA11y(t, out)
 	if !strings.Contains(out, `<script src="/static/copy.js" defer></script>`) {
 		t.Fatal("the thread view should load copy.js from /static")
 	}
@@ -702,5 +699,43 @@ func TestThreadAgentReplyCopyButton(t *testing.T) {
 	}
 	if js := rec.Body.String(); strings.Contains(js, "ClipboardItem") || strings.Contains(js, `"text/html"`) {
 		t.Fatal("copy.js must put only the Markdown (text/plain) on the clipboard")
+	}
+}
+
+var (
+	copyButtonRE = regexp.MustCompile(`(?s)<button class="zz-iconbtn zz-copy"([^>]*)>(.*?)</button>`)
+	svgTagRE     = regexp.MustCompile(`<svg\b[^>]*>`)
+	svgClassRE   = regexp.MustCompile(`class="zz-icon (zz-icon-[a-z]+)"`)
+)
+
+// assertCopyButtonA11y checks the Copy button itself, not the page around it. It is
+// icon-only, so the button carries the accessible name; each glyph — copy, copied
+// check, failure alert — is hidden from assistive tech and never focusable. The failure
+// state also has visible words (color is never the only cue), hidden from the
+// accessibility tree because copy.js announces the outcome in its status region.
+func assertCopyButtonA11y(t *testing.T, page string) {
+	t.Helper()
+	m := copyButtonRE.FindStringSubmatch(page)
+	if m == nil {
+		t.Fatalf("no Copy button in:\n%s", page)
+	}
+	open, inner := m[1], m[2]
+	if !strings.Contains(open, ` aria-label="Copy reply"`) {
+		t.Fatalf("the Copy button needs an accessible name, got <button%s>", open)
+	}
+	var glyphs []string
+	for _, tag := range svgTagRE.FindAllString(inner, -1) {
+		if !strings.Contains(tag, ` aria-hidden="true"`) || !strings.Contains(tag, ` focusable="false"`) {
+			t.Errorf("glyph must be aria-hidden and unfocusable: %s", tag)
+		}
+		if c := svgClassRE.FindStringSubmatch(tag); c != nil {
+			glyphs = append(glyphs, c[1])
+		}
+	}
+	if got, want := strings.Join(glyphs, ","), "zz-icon-copy,zz-icon-check,zz-icon-fail"; got != want {
+		t.Errorf("Copy glyphs = %q, want %q", got, want)
+	}
+	if !strings.Contains(inner, `<span class="zz-copy-fail" aria-hidden="true">Copy failed</span>`) {
+		t.Errorf("the failure state needs visible words, got:\n%s", inner)
 	}
 }

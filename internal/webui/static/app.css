@@ -172,13 +172,18 @@ body {
   stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
 }
 /* The Copy button is hidden until copy.js wires it, so a no-JS page shows no dead control.
-   copy.js marks the outcome: is-copied swaps in the check, is-failed tints it red. */
+   copy.js marks the outcome, each with its own glyph so color is never the only cue:
+   is-copied swaps in the check; is-failed swaps in an alert glyph and shows the words
+   "Copy failed", since a failure leaves the clipboard holding its old value. */
 .zz-copy[hidden] { display: none; }
-.zz-copy .zz-icon-check { display: none; }
+.zz-copy .zz-icon-check, .zz-copy .zz-icon-fail, .zz-copy .zz-copy-fail { display: none; }
 .zz-copy.is-copied { color: var(--success); }
 .zz-copy.is-copied .zz-icon-copy { display: none; }
 .zz-copy.is-copied .zz-icon-check { display: block; }
-.zz-copy.is-failed { color: var(--danger); }
+.zz-copy.is-failed { color: var(--danger); gap: 4px; }
+.zz-copy.is-failed .zz-icon-copy { display: none; }
+.zz-copy.is-failed .zz-icon-fail { display: block; }
+.zz-copy.is-failed .zz-copy-fail { display: inline; font-size: 12px; line-height: 14px; }
 /* Visually hidden, still read by screen readers (copy.js's status announcements). */
 .zz-sr {
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
