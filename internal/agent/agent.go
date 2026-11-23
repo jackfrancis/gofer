@@ -296,8 +296,8 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 }
 
 // reconcileFetched carries gofer-owned per-item state that GitHub cannot supply — the
-// conversation thread and its read cursor, the hidden flag (a hidden item keeps
-// only its GitHub fields and labels), and the original creation time — from the persisted items onto the
+// conversation thread and its read cursor, the hidden flag, and the original
+// creation time — from the persisted items onto the
 // freshly fetched ones, keyed by ID. Fetched items with no persisted counterpart (new
 // work) pass through unchanged. The agent plane also keeps the stored thread, read
 // cursor, hidden flag, creation time and, when a write-back carries none, the model
@@ -323,17 +323,12 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 		fetched[i].Thread = old.Thread
 		fetched[i].ThreadReadAt = old.ThreadReadAt
 		fetched[i].ThreadReadThrough = old.ThreadReadThrough
-		// A hidden item stays hidden, and carries only its GitHub fields and labels:
-		// the plane's merge applies the same rule (worklist.MergeRunItems), so the
-		// run's view and the store agree.
+		// The fresh signals are sent even for an item hidden when this run read it: the
+		// owner may unhide it before the write lands, and only the plane's merge
+		// (worklist.MergeRunItems), inside the store's atomic update, knows whether the
+		// item is hidden then and must be stripped. The flag is carried for the run's
+		// own view; the merge takes the stored one.
 		fetched[i].Meta.HiddenAt = old.Meta.HiddenAt
-		if fetched[i].IsHidden() {
-			worklist.StripScoring(&fetched[i])
-			if !old.CreatedAt.IsZero() {
-				fetched[i].CreatedAt = old.CreatedAt
-			}
-			continue
-		}
 		// A fetch derives no model proposal or research adjustment, so it sends none:
 		// the plane's merge then keeps whatever is stored when this write lands, not
 		// the copy read above, which a discussion may have replaced since. The

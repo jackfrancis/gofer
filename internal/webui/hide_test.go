@@ -61,7 +61,7 @@ func TestHideItemTogglesWholeItem(t *testing.T) {
 	if got.Meta.Rank != 0 || got.Meta.Rationale != "" || len(got.Signals.Reasons) != 0 || len(got.Signals.Labels) != 1 {
 		t.Fatalf("hide must delete the signals (but the labels) and the score, got %+v %+v", got.Signals, got.Meta)
 	}
-	if !get("pr2").Meta.HiddenAt.IsZero() || pipe.refreshed != 0 {
+	if !get("pr2").Meta.HiddenAt.IsZero() || pipe.refreshed+pipe.followUps != 0 {
 		t.Fatal("hiding one item must not touch another, nor refresh")
 	}
 	res, err := worklist.Resolve(context.Background(), store, pipe, now, "u1", worklist.DefaultSort, true)
@@ -89,11 +89,11 @@ func TestHideItemTogglesWholeItem(t *testing.T) {
 	if got := get("pr1"); got.IsHidden() || !got.Meta.AwaitingRefresh || len(got.Thread) != 1 {
 		t.Fatalf("unhide brings the item back, thread intact, awaiting a refresh, got %+v", got)
 	}
-	if pipe.refreshed != 1 {
-		t.Fatalf("unhide asks for a refresh to fill the item in, refreshed %d times", pipe.refreshed)
+	if pipe.followUps != 1 || pipe.refreshed != 0 {
+		t.Fatalf("unhide asks for a follow-up refresh to fill the item in, got %d follow-ups, %d refreshes", pipe.followUps, pipe.refreshed)
 	}
-	if rec := post(h, "id=pr1&hidden=false"); rec.Header().Get("Location") != "/" || pipe.refreshed != 1 {
-		t.Fatalf("unhiding a visible item changes nothing and refreshes nothing, got %q, %d", rec.Header().Get("Location"), pipe.refreshed)
+	if rec := post(h, "id=pr1&hidden=false"); rec.Header().Get("Location") != "/" || pipe.followUps != 1 {
+		t.Fatalf("unhiding a visible item changes nothing and refreshes nothing, got %q, %d", rec.Header().Get("Location"), pipe.followUps)
 	}
 	if rec := post(h, "id=pr2&back=thread"); rec.Header().Get("Location") != "/items/thread?id=pr2" || !get("pr2").IsHidden() {
 		t.Fatalf("hide from the thread returns to it, got %q", rec.Header().Get("Location"))
@@ -235,6 +235,26 @@ func TestHideItemControls(t *testing.T) {
 	if strings.Contains(out, `action="/items/thread"`) || strings.Contains(out, `action="/items/second-opinion"`) || !strings.Contains(out, "Unhide it to discuss it.") {
 		t.Fatalf("a hidden item's thread takes no new turn, got:\n%s", out)
 	}
+	if strings.Contains(out, "not configured") {
+		t.Fatalf("a hidden item is not an unconfigured assistant, got:\n%s", out)
+	}
+
+	// The turns of a hidden item's thread carry no Hide or Unhide of their own.
+	pr.Thread = []worklist.Message{
+		{ID: "q", Role: worklist.RoleUser, Content: "q"},
+		{ID: "a", Role: worklist.RoleAgent, Content: "a", ReplyTo: "q", Hidden: true},
+	}
+	out = renderPage(t, pageData{View: "thread", Item: pr, ItemHidden: true, User: &session.User{ID: "u1"}})
+	if strings.Contains(out, `action="/items/thread/hide"`) || !strings.Contains(out, "Hidden reply") {
+		t.Fatalf("a hidden item's turns offer no Hide or Unhide, got:\n%s", out)
+	}
+	pr.Meta.HiddenAt = time.Time{}
+	if out := renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true, User: &session.User{ID: "u1"}}); strings.Count(out, `action="/items/thread/hide"`) != 2 {
+		t.Fatalf("a visible item's turns offer Hide and Unhide, got:\n%s", out)
+	}
+	if out := renderPage(t, pageData{View: "thread", Item: pr, User: &session.User{ID: "u1"}}); !strings.Contains(out, "The assistant is not configured.") {
+		t.Fatalf("without an assistant the thread says so, got:\n%s", out)
+	}
 }
 
 // A hidden item's row sits in the hidden section: greyscale, no score, no colored
@@ -270,7 +290,8 @@ func TestHiddenSectionRendering(t *testing.T) {
 	}
 }
 
-// A hidden item takes no Discuss turn, review panel or retry: Unhide it first.
+// A hidden item takes no Discuss turn, review panel, retry or turn hiding: Unhide it
+// first.
 func TestHiddenItemRefusesDiscuss(t *testing.T) {
 	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 	stalled := []worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: "q", At: now.Add(-time.Hour)}}
@@ -288,6 +309,7 @@ func TestHiddenItemRefusesDiscuss(t *testing.T) {
 		{"/items/thread/retry?turn=q", h.ThreadRetry},
 		{"/items/thread?content=hello", h.ThreadPost},
 		{"/items/second-opinion?choice=c1%7Calt", h.SecondOpinion},
+		{"/items/thread/hide?msg=q&hidden=true", h.HideMessage},
 	} {
 		path, handle := c.path, c.handle
 		u, _ := url.Parse(path)
@@ -301,13 +323,13 @@ func TestHiddenItemRefusesDiscuss(t *testing.T) {
 		t.Fatalf("a hidden item dispatches nothing, got %v", pipe.turns)
 	}
 	items, _ := store.List(context.Background(), "u1")
-	if len(items[0].Thread) != 1 || !items[0].Thread[0].At.Equal(now.Add(-time.Hour)) {
+	if len(items[0].Thread) != 1 || !items[0].Thread[0].At.Equal(now.Add(-time.Hour)) || items[0].Thread[0].Hidden {
 		t.Fatalf("a hidden item's thread is unchanged, got %+v", items[0].Thread)
 	}
 
 	rec := httptest.NewRecorder()
 	h.Thread(rec, httptest.NewRequest(http.MethodGet, "/items/thread?id=pr1", nil))
-	if out := rec.Body.String(); strings.Contains(out, `action="/items/thread"`) || strings.Contains(out, `action="/items/thread/retry"`) || !strings.Contains(out, "Unhide it to discuss it.") {
+	if out := rec.Body.String(); strings.Contains(out, `action="/items/thread"`) || strings.Contains(out, `action="/items/thread/retry"`) || strings.Contains(out, `action="/items/thread/hide"`) || strings.Contains(out, "not configured") || !strings.Contains(out, "Unhide it to discuss it.") {
 		t.Fatalf("a hidden item's thread page is read-only, got:\n%s", out)
 	}
 }

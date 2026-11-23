@@ -108,8 +108,13 @@ type Ingestor struct {
 	// to have ended (failed, succeeded, or past its deadline): the refresh version a
 	// worklist page compares to notice results it does not show (RefreshState).
 	gens, dones map[string]uint64
-	ledger      RunLedger  // nil: all of this is lost on restart (ledger.go)
-	persistMu   sync.Mutex // serializes ledger writes (persist)
+	// followUps names the owners owed one more ingest run (RefreshFollowUp): a
+	// change needed a refresh while a run was already in flight, which may have read
+	// the store before it. Any later ingest reservation for the owner clears it;
+	// otherwise the in-flight run's observed end dispatches it. In memory only.
+	followUps map[string]bool
+	ledger    RunLedger  // nil: all of this is lost on restart (ledger.go)
+	persistMu sync.Mutex // serializes ledger writes (persist)
 }
 
 var (
@@ -126,7 +131,7 @@ func New(d Dispatcher, audience, sinkURL string, log *slog.Logger, aiEndpoint, a
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log, runs: map[runKey]*run{}, gens: map[string]uint64{}, dones: map[string]uint64{}}
+	return &Ingestor{d: d, audience: audience, sinkURL: sinkURL, aiEndpoint: aiEndpoint, aiModel: aiModel, log: log, runs: map[runKey]*run{}, gens: map[string]uint64{}, dones: map[string]uint64{}, followUps: map[string]bool{}}
 }
 
 // UseModelGateway marks every run this Ingestor dispatches as reaching the chat model
@@ -178,6 +183,48 @@ func (i *Ingestor) EnsureBackfill(ctx context.Context, ownerID string) error {
 func (i *Ingestor) Refresh(ctx context.Context, ownerID string) error {
 	_, err := i.dispatchIngest(ctx, ownerID, refreshGate, true)
 	return err
+}
+
+// RefreshFollowUp is Refresh for a change the next ingest run must see, such as an
+// item the owner just unhid, which waits empty until a run fills it in. If an ingest
+// run for the owner is already in flight it may have read the store before the
+// change, so instead of dropping the request it owes the owner one more run: the
+// first ingest reservation after this call (a click, a tick) pays it, and if none
+// comes first, the in-flight run's end, once gofer observes it (the radar's status
+// poll, a render past its deadline, a tick), dispatches it. The debt is in memory: a
+// restart forgets it, and the next refresh fills the item in.
+func (i *Ingestor) RefreshFollowUp(ctx context.Context, ownerID string) error {
+	ok, err := i.dispatchIngest(ctx, ownerID, refreshGate, true)
+	if !ok && err == nil {
+		i.mu.Lock()
+		// Re-check under the lock: the in-flight run may have been seen to end since
+		// reserve refused, and nothing would observe that end again.
+		cur := i.runs[ingestKey(ownerID)]
+		live := cur != nil && cur.live(time.Now(), refreshGate.probe)
+		if live {
+			i.followUps[ownerID] = true
+		}
+		i.mu.Unlock()
+		if !live {
+			_, err = i.dispatchIngest(ctx, ownerID, refreshGate, true)
+		}
+	}
+	return err
+}
+
+// followUpLocked dispatches the run owed to key's owner (RefreshFollowUp), in the
+// background, now that the ingest run that held it off has been seen to end. The
+// caller holds i.mu.
+func (i *Ingestor) followUpLocked(key runKey) {
+	if key.task != taskIngest || !i.followUps[key.owner] {
+		return
+	}
+	delete(i.followUps, key.owner)
+	go func() {
+		if _, err := i.dispatchIngest(context.Background(), key.owner, refreshGate, true); err != nil {
+			i.log.Warn("follow-up refresh not dispatched", "owner", key.owner, "err", err)
+		}
+	}()
 }
 
 // ScheduledRefresh requests a github-ingest run for ownerID on behalf of the

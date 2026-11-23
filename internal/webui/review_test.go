@@ -27,6 +27,7 @@ type recordPipeline struct {
 	reviewEndpoint    string
 	reviewModel       string
 	refreshed         int
+	followUps         int // RefreshFollowUp calls (FollowUpRefresher)
 	converses         []string
 	converseModels    []string
 	converseEndpoints []string
@@ -59,6 +60,10 @@ func (p *recordPipeline) ReviewAll(_ context.Context, _ string, refs []worklist.
 	return nil
 }
 func (p *recordPipeline) Refresh(context.Context, string) error { p.refreshed++; return nil }
+func (p *recordPipeline) RefreshFollowUp(context.Context, string) error {
+	p.followUps++
+	return nil
+}
 func (p *recordPipeline) SecondOpinion(_ context.Context, _ string, ref worklist.TurnRef, endpoint, model string) error {
 	if p.onDispatch != nil {
 		p.onDispatch()

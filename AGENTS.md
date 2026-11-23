@@ -259,17 +259,22 @@ Wired on the web-tier side; they define what a runtime must respect:
 - Hiding an item (`internal/worklist/hide.go`) is permanent until the owner unhides
   it: no run clears `Meta.HiddenAt`, whatever changes on GitHub. A hidden item
   carries no gofer judgment: `worklist.HideItem` deletes its signals (all but the
-  labels) and its scoring metadata (`worklist.StripScoring`), `MergeRunItems` and the
-  ingest reconcile strip every write-back while it stays hidden, `SetResearch` drops
-  research for it, `Rescore` leaves it unscored, and the selection a run reads
+  labels) and its scoring metadata (`worklist.StripScoring`), `MergeRunItems` strips
+  every write-back while it stays hidden (inside the store's update, so the run sends
+  its fresh signals: the owner may unhide the item before they land), `SetResearch`
+  drops research for it, `Rescore` leaves it unscored, and the selection a run reads
   (`Selection.Open`, which means on the radar) leaves it out of enrichment and
   ranking. The radar lists open hidden items in a greyscale section below the ranked
   list (`Resolution.Hidden`, most recently hidden first) with an Unhide button and no
-  Discuss: a hidden item takes no new turn, retry or review panel (`appendTurn`,
-  `ThreadRetry`), and its thread page is read-only. Unhide (`worklist.UnhideItem`)
-  brings it back empty, flagged `Meta.AwaitingRefresh` (shown as waiting for the
-  next refresh), and asks for a refresh, whose write-back clears the flag since runs
-  own `Metadata`. A hidden item that closes leaves the section, still hidden.
+  Discuss: a hidden item takes no new turn, retry, review panel or turn hide/unhide
+  (`appendTurn`, `ThreadRetry`, `HideMessage`), and its thread page is read-only.
+  Unhide (`worklist.UnhideItem`) brings it back empty, flagged `Meta.AwaitingRefresh`
+  (unscored by `Rescore`, shown as waiting for the next refresh), and calls
+  `Ingestor.RefreshFollowUp`: a refresh now, or, while an ingest run is in flight
+  (it may have read the store first), one owed run that the next ingest reservation
+  pays or that the in-flight run's observed end dispatches (in memory only). The
+  refresh's write-back clears the flag, since runs own `Metadata`. A hidden item
+  that closes leaves the section, still hidden.
 - The radar's project (repository) filter (`internal/webui/projects.go`) is a view
   preference kept in the `gofer_projects` cookie, bound to the account that saved it
   (none = all projects). It only drops items from the already-ranked list and the

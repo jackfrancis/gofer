@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -76,16 +77,21 @@ func TestRefreshKeepsHiddenItemHiddenAndUnscored(t *testing.T) {
 		}
 	}
 
-	for i := range sink.items {
-		if sink.items[i].ID == id {
-			worklist.UnhideItem(&sink.items[i])
+	// Unhide lands after this run read the (hidden) item and before its write-back:
+	// the run must still have sent the fresh signals, which the store's merge keeps
+	// now that the item is visible.
+	sink.beforeIngest = func() {
+		for i := range sink.items {
+			if sink.items[i].ID == id {
+				worklist.UnhideItem(&sink.items[i])
+			}
 		}
 	}
 	got := refresh()
 	if got.IsHidden() || got.Meta.AwaitingRefresh || !got.OnRadar() {
 		t.Fatalf("an unhidden item is back on the radar once refreshed, got %+v", got.Meta)
 	}
-	if len(got.Signals.Reasons) == 0 || got.Signals.Proposed == nil {
-		t.Fatalf("the refresh fills an unhidden item in (signals, then a ranking), got %+v", got.Signals)
+	if !slices.Contains(got.Signals.Reasons, worklist.ReasonReviewRequested) || got.Signals.ObservedAt.IsZero() || got.Signals.Proposed == nil {
+		t.Fatalf("the refresh fills an unhidden item in (fresh signals, then a ranking), got %+v", got.Signals)
 	}
 }

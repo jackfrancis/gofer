@@ -66,6 +66,15 @@ type RefreshProber interface {
 	RefreshState(ctx context.Context, ownerID string) (done uint64, active bool, err error)
 }
 
+// FollowUpRefresher is a Pipeline that can owe the owner a refresh: RefreshFollowUp
+// starts one now, or, while an ingest run is already in flight (which may have read
+// the store before the change), one more once that run ends. Unhide uses it, so an
+// unhidden item never waits on a refresh nobody queued; a Pipeline without it gets a
+// plain Refresh.
+type FollowUpRefresher interface {
+	RefreshFollowUp(ctx context.Context, ownerID string) error
+}
+
 // Pipeline triggers a user's backfill when the worklist is empty, schedules an
 // assistant turn for the Discuss action, and launches a concurrent batch of review
 // turns for the "Review all PRs" action. It is the same Ingestor the JSON API uses.
@@ -315,8 +324,9 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 			data.SignInRequired = h.signInRequired(r, user)
 			now := h.now().UTC()
 			if it.IsHidden() {
-				// A hidden item is read-only: no new turn, retry or review panel until
-				// the owner unhides it (appendTurn and ThreadRetry refuse them too).
+				// A hidden item is read-only: no new turn, retry, review panel or turn
+				// hiding until the owner unhides it (appendTurn, ThreadRetry and
+				// HideMessage refuse them too).
 				data.ConvEnabled, data.SecondOpinionEnabled = false, false
 				data.ItemHidden = h.convEnabled
 			} else if it.ReplyPending(now, reviewStaleAfter) {
@@ -640,11 +650,15 @@ func (h *Handler) HideMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	// The turn is named by its key, not its index, so a page rendered before newer
 	// turns landed still hides the turn it showed. A turn that is gone (the thread was
-	// cleared) is a no-op.
+	// cleared) is a no-op, and so is any turn of a hidden item: its thread is
+	// read-only until the owner unhides it, even from a stale tab.
 	_ = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		for i := range current {
 			if current[i].ID != id {
 				continue
+			}
+			if current[i].IsHidden() {
+				return nil, nil
 			}
 			j, ok := current[i].TurnIndex(key)
 			if !ok {
@@ -664,8 +678,8 @@ func (h *Handler) HideMessage(w http.ResponseWriter, r *http.Request) {
 // GitHub fields and thread, loses its signals and score (worklist.HideItem), and is
 // skipped by every bulk action, by enrichment, ranking and research, and by Discuss.
 // Unhiding brings it back as an empty item (worklist.UnhideItem) and asks for a
-// refresh, which fills it in; while one is already running nothing new starts and
-// the running one fills it. Hiding a hidden item, or unhiding a visible one, changes
+// refresh, which fills it in (FollowUpRefresher: while a run is already in flight,
+// one more follows it). Hiding a hidden item, or unhiding a visible one, changes
 // nothing. It redirects to the radar, or back to the item's thread when the form
 // says so ("back=thread"). A failed write renders an error rather than redirecting
 // as if it had worked. SameSite=Lax cookies give baseline CSRF protection.
@@ -717,8 +731,13 @@ func (h *Handler) HideItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if unhidden {
-		// The item is back with no signals or score; a refresh fills it in.
-		_ = h.pipeline.Refresh(r.Context(), user.ID)
+		// The item is back with no signals or score; a refresh fills it in, the next
+		// one if a run is already in flight.
+		if f, ok := h.pipeline.(FollowUpRefresher); ok {
+			_ = f.RefreshFollowUp(r.Context(), user.ID)
+		} else {
+			_ = h.pipeline.Refresh(r.Context(), user.ID)
+		}
 	}
 	http.Redirect(w, r, back, http.StatusSeeOther)
 }
