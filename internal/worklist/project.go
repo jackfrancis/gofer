@@ -112,7 +112,7 @@ var projectables = []projectable{
 	// list. The cut
 	// counts the names it drops as omitted, and leaves Failed nil rather than empty,
 	// as the JSON a run receives would.
-	{"github.ci", func(w *WorkItem) any { return w.GitHub.CI },
+	{projectedCI, func(w *WorkItem) any { return w.GitHub.CI },
 		func(d, s *WorkItem) { d.GitHub.CI = cloneCI(s.GitHub.CI) },
 		func(w *WorkItem) {
 			c := cloneCI(w.GitHub.CI)
@@ -287,6 +287,28 @@ func clonePtr[T any](p *T) *T {
 	}
 	c := *p
 	return &c
+}
+
+// projectedCI is the CI summary's key in WorkItem.Projected.
+const projectedCI = "github.ci"
+
+// CIProjected reports whether the item's CI summary was cut by projection, so it is
+// not the stored summary and a comparison against it says nothing.
+func (w *WorkItem) CIProjected() bool {
+	_, cut := w.Projected[projectedCI]
+	return cut
+}
+
+// SetCI replaces the item's CI summary with one freshly read and drops its
+// projection marker, so the write-back stores ci as it is: otherwise a fresh
+// summary that happens to match the cut one (a link projection dropped and GitHub
+// since withdrew) would be taken for the unchanged cut and the stored one restored.
+func (w *WorkItem) SetCI(ci *CISummary) {
+	w.GitHub.CI = ci
+	if w.CIProjected() {
+		w.Projected = maps.Clone(w.Projected)
+		delete(w.Projected, projectedCI)
+	}
 }
 
 // cloneCI deep-copies a CI summary, so a cut never writes through to the stored

@@ -3,6 +3,7 @@ package webui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
@@ -99,5 +100,22 @@ func TestThreadRendersCISummary(t *testing.T) {
 	pr.GitHub.CI = nil
 	if out := renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true}); strings.Contains(out, `class="zz-ci"`) {
 		t.Fatal("no CI summary, no section")
+	}
+}
+
+// A retired item's CI is no longer read, so the Discuss page labels it as the last
+// known result; an open item's is not labeled.
+func TestThreadLabelsRetiredItemCI(t *testing.T) {
+	pr := worklist.WorkItem{ID: "github:o/r#1", Type: worklist.TypePullRequest,
+		GitHub: worklist.GitHubRef{Number: 1, Repo: "o/r", Title: "A PR", CI: &worklist.CISummary{Pending: 1}}}
+	const note = "Last known CI results"
+	if out := renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true}); strings.Contains(out, note) {
+		t.Fatal("an open item's CI must not be labeled historical")
+	}
+	pr.Meta.CompletedAt = time.Now().Add(-7 * 24 * time.Hour)
+	out := renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true})
+	ci := out[strings.Index(out, `class="zz-ci"`):]
+	if !strings.Contains(ci[:strings.Index(ci, "</ul>")], note) {
+		t.Fatalf("a retired item's CI must be labeled as last known:\n%s", out)
 	}
 }

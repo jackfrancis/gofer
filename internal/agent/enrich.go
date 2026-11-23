@@ -103,8 +103,14 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 	ciSkipped := fanOut(ctx, items, func(it worklist.WorkItem) bool {
 		return open(it) && it.Type == worklist.TypePullRequest
 	}, func(i int) {
-		if ci, ok := readCI(ctx, gh, token, items[i].GitHub); ok && !ci.Equal(items[i].GitHub.CI) {
-			items[i].GitHub.CI = ci
+		ci, ok := readCI(ctx, gh, token, items[i].GitHub)
+		if !ok {
+			return // best-effort: the stored summary stands
+		}
+		// A projected read holds a cut summary, so an equal fresh one may still differ
+		// from what is stored: write it whenever the read was cut.
+		if items[i].CIProjected() || !ci.Equal(items[i].GitHub.CI) {
+			items[i].SetCI(ci)
 			changed[i], ciChanged[i] = true, true
 		}
 	})

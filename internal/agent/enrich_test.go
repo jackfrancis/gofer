@@ -410,3 +410,38 @@ func TestRunEnrichTimelineOnlyWriteSendsNoCI(t *testing.T) {
 		t.Fatalf("timeline-only write reverted CI to %+v", sink.items[0].GitHub.CI)
 	}
 }
+
+// An oversized item's read is projected, which drops a CI link too long to keep. If
+// GitHub then withdraws that link, the fresh summary equals the cut one, and must
+// still replace the stored summary rather than be taken for the unchanged cut.
+func TestRunEnrichClearsWithdrawnLinkOnProjectedItem(t *testing.T) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case "/repos/o/r/pulls/1":
+			_, _ = w.Write([]byte(`{"head":{"ref":"b","sha":"sha1"}}`))
+		case "/repos/o/r/commits/sha1/status":
+			_, _ = w.Write([]byte(`{"sha":"sha1","total_count":1,"statuses":[{"context":"pull-e2e","state":"failure"}]}`)) // no link now
+		case "/repos/o/r/commits/sha1/check-runs":
+			_, _ = w.Write([]byte(`{"total_count":0,"check_runs":[]}`))
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+
+	longLink := "https://prow.k8s.io/view/gs/b/" + strings.Repeat("x", 600)
+	stored := &worklist.CISummary{SHA: "sha1", Failed: []string{"pull-e2e"}, FailedURLs: []string{longLink}}
+	sink := &memSink{items: []worklist.WorkItem{{ID: "pr", Source: "github", Type: worklist.TypePullRequest,
+		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, Title: strings.Repeat("t", worklist.MaxBriefBytes), CI: stored}}}}
+	if err := Run(context.Background(),
+		Params{JobType: JobEnrich, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := sink.items[0].GitHub.CI
+	if want := (&worklist.CISummary{SHA: "sha1", Failed: []string{"pull-e2e"}, FailedURLs: []string{""}}); !got.Equal(want) {
+		t.Fatalf("withdrawn link kept: %+v", got)
+	}
+}

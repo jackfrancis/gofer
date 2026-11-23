@@ -289,6 +289,7 @@
 </html>
 {{/* A pull request's CI summary (ciView), or nothing for nil. */}}
 {{define "ci"}}{{with .}}<ul class="zz-ci" aria-label="CI results">
+            {{if .Historical}}<li class="zz-ci-note">Last known CI results; no longer updated since this item left your radar.</li>{{end}}
             {{with .Passed}}<li class="zz-ci-pass">{{.}}</li>{{end}}
             {{with .Pending}}<li class="zz-ci-pending">{{.}}</li>{{end}}
             {{range .Failed}}<li class="zz-ci-fail">{{if .URL}}<a href="{{.URL}}" target="_blank" rel="noopener noreferrer">{{.Name}}</a>{{else}}{{.Name}}{{end}}</li>{{end}}

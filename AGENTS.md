@@ -391,7 +391,10 @@ Wired on the web-tier side; they define what a runtime must respect:
   (`worklist.KeepCI`, in the merge), so every pass but enrich's CI pass (refresh,
   retire, rank, and an enrich write that changed only the timeline) sends none: never write back CI from a run's read, which may be a projection or
   older than an enrich that landed meanwhile. CI pages after the first are pinned to
-  the commit the first resolved, since a named ref can advance between pages. It is display-only: nothing scores on it.
+  the commit the first resolved, since a named ref can advance between pages. After
+  a projected read, enrich writes the fresh summary through `WorkItem.SetCI`, which
+  drops the projection marker, since a cut summary compares equal to fresh data it
+  does not match. A retired item's CI is labeled as the last known result. It is display-only: nothing scores on it.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

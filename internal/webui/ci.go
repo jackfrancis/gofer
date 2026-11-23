@@ -16,6 +16,10 @@ type ciView struct {
 	Failed  []worklist.CIJob // each failed job's full name and link
 	More    string           // failed jobs past the stored bound, or ""
 	Partial bool             // part of the CI could not be read
+	// Historical marks an item off the open radar (closed, merged, or no longer
+	// involving the user): enrich no longer reads its CI, so the summary is the
+	// last one read and is labeled so.
+	Historical bool
 }
 
 // ciSummary returns the item's CI view, or nil when there is nothing to show: no
@@ -31,6 +35,8 @@ func ciSummary(it worklist.WorkItem) *ciView {
 		Pending: ciCount(c.Pending, "in progress"),
 		Failed:  c.FailedJobs(),
 		Partial: c.Partial,
+
+		Historical: !it.Meta.CompletedAt.IsZero(),
 	}
 	if c.FailedOmitted > 0 {
 		v.More = fmt.Sprintf("and %d more failed", c.FailedOmitted)
