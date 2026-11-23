@@ -266,7 +266,7 @@
           </div>
           <div class="zz-meta">
             <span>{{.GitHub.Repo}} #{{.GitHub.Number}}</span>
-            <span class="Label {{priorityClass .Meta.Priority}}">{{with .Meta.Priority}}{{.}}{{else}}unranked{{end}}</span>
+            <span class="Label zz-priority {{priorityClass .Meta.Priority}}">{{with .Meta.Priority}}{{.}}{{else}}unranked{{end}}</span>
             {{with ghLabels .}}<span class="zz-labels">{{range .}}<span class="Label zz-ghlabel{{with .Class}} {{.}}{{end}}">{{.Name}}</span>{{end}}</span>{{end}}
           </div>
           <div class="zz-bar"><span class="zz-w-{{pctBucket .Meta.Rank}}"></span></div>

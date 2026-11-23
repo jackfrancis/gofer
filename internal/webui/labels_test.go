@@ -30,7 +30,7 @@ func TestWorklistRendersGitHubLabels(t *testing.T) {
 		t.Fatalf("missing %s in:\n%s", want, out)
 	}
 	first := out[strings.Index(out, "A PR"):strings.Index(out, "An issue")]
-	want := `<span class="Label Label--secondary">unranked</span>
+	want := `<span class="Label zz-priority Label--secondary">unranked</span>
             <span class="zz-labels"><span class="Label zz-ghlabel ghl-0e8a16">size/S</span><span class="Label zz-ghlabel ghl-d73a4a">kind/bug</span><span class="Label zz-ghlabel">legacy</span><span class="Label zz-ghlabel">evil</span></span>`
 	if !strings.Contains(first, want) {
 		t.Fatalf("labels not rendered after the priority, in order, with their colors:\n%s", first)
