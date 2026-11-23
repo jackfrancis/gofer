@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/jackfrancis/gofer/internal/webui"
 )
 
 // statusRecorder captures the response status code for logging.
@@ -55,14 +57,16 @@ func logRequests(log *slog.Logger, next http.Handler) http.Handler {
 // securityHeaders sets conservative security-related response headers. The CSP
 // allows same-origin styles and scripts (the UI ships app.css and a small
 // progressive-enhancement script from /static) but nothing else:
-// no inline styles or scripts, no third-party origins.
+// no inline styles or scripts, and no third-party origin except GitHub's avatar
+// host, for images only (the signed-in user's avatar; no-referrer keeps gofer's
+// URLs from reaching it).
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
-		h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+		h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data: "+webui.AvatarOrigin+"; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
 		next.ServeHTTP(w, r)
 	})
 }

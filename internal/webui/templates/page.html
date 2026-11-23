@@ -14,7 +14,7 @@
   <div class="zz-container">
     <header class="zz-header">
       <span class="zz-brand">gofer</span>
-      {{if .User}}<span class="zz-user">{{with .User.Name}}{{.}}{{else}}{{.User.Email}}{{end}}</span>{{end}}
+      {{if .User}}<span class="zz-user">{{with avatarURL .User}}<img class="zz-avatar" src="{{.}}" alt="" width="24" height="24" referrerpolicy="no-referrer">{{end}}{{with .User.Name}}{{.}}{{else}}{{.User.Email}}{{end}}</span>{{end}}
     </header>
     {{if and .User .SignInRequired}}
     <div class="zz-reconnect" role="alert">
