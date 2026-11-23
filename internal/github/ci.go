@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+
+	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
 // Bounds on a CI status lookup.
@@ -37,7 +39,7 @@ type CICheck struct {
 type CIStatus struct {
 	Repo   string
 	Ref    string // what was asked for (a PR's head branch, or the ref given)
-	SHA    string // the commit the checks are on
+	SHA    string // the commit the checks are on; "" when no response named it
 	Checks []CICheck
 	// Partial names a part that could not be read (check runs refused, more pages than
 	// fetched); the rest of the result still stands.
@@ -68,6 +70,9 @@ func (c *Client) CIStatusForPR(ctx context.Context, token, repo string, number i
 	}
 	st, err := c.CIStatusForRef(ctx, token, repo, pr.Head.SHA)
 	st.Ref = pr.Head.Ref
+	if st.SHA == "" {
+		st.SHA = pr.Head.SHA // asked for by SHA, so the commit is known
+	}
 	return st, err
 }
 
@@ -75,17 +80,31 @@ func (c *Client) CIStatusForPR(ctx context.Context, token, repo string, number i
 // commit SHA). Statuses are the latest per context, as GitHub's combined status
 // reports them; check runs are the latest per name, as GitHub lists them by default.
 func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (CIStatus, error) {
-	st := CIStatus{Repo: repo, Ref: ref, SHA: ref}
+	st := CIStatus{Repo: repo, Ref: ref}
 	repo, err := c.gate(ctx, token, repo)
 	if err != nil {
 		return st, err
 	}
+	// A named ref (a branch) can advance while the pages are read, so every page
+	// after the first is pinned to the commit the first one resolved: the status
+	// pages to the combined status's SHA, and the check-run pages to it too, or,
+	// when the statuses could not be read, to the first check run's head_sha.
+	// st.SHA is set only from a response that names the commit, never from the ref
+	// as given, so a ref no response resolved is not reported as a commit.
 	esc := url.PathEscape(ref)
 
+	// The two sources are read independently: either alone still says something, so
+	// one that cannot be read marks the result partial, and only both failing on
+	// their first page (nothing read at all) is an error.
+	var statusErr, checksErr error
 	for page := 1; page <= ciMaxPages; page++ {
 		body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/commits/%s/status?per_page=%d&page=%d", repo, esc, ciPerPage, page))
 		if err != nil {
-			return st, err
+			if page == 1 {
+				statusErr = err
+			}
+			st.Partial = append(st.Partial, "commit statuses could not be read ("+err.Error()+")")
+			break
 		}
 		var cs struct {
 			SHA        string `json:"sha"`
@@ -98,10 +117,15 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 			} `json:"statuses"`
 		}
 		if err := json.Unmarshal(body, &cs); err != nil {
-			return st, err
+			if page == 1 {
+				statusErr = err
+			}
+			st.Partial = append(st.Partial, "commit statuses could not be parsed")
+			break
 		}
-		if cs.SHA != "" {
+		if page == 1 && cs.SHA != "" {
 			st.SHA = cs.SHA
+			esc = url.PathEscape(cs.SHA)
 		}
 		for _, s := range cs.Statuses {
 			st.Checks = append(st.Checks, CICheck{Name: s.Context, Kind: "status", State: s.State,
@@ -116,9 +140,15 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 	}
 
 	for page := 1; page <= ciMaxPages; page++ {
-		body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/commits/%s/check-runs?per_page=%d&page=%d", repo, url.PathEscape(st.SHA), ciPerPage, page))
+		at := st.SHA
+		if at == "" {
+			at = ref // not resolved yet: the first page resolves it
+		}
+		body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/commits/%s/check-runs?per_page=%d&page=%d", repo, url.PathEscape(at), ciPerPage, page))
 		if err != nil {
-			// Statuses alone still answer the Prow question; say what is missing.
+			if page == 1 {
+				checksErr = err
+			}
 			st.Partial = append(st.Partial, "check runs could not be read ("+err.Error()+")")
 			break
 		}
@@ -126,6 +156,7 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 			TotalCount int `json:"total_count"`
 			CheckRuns  []struct {
 				Name       string `json:"name"`
+				HeadSHA    string `json:"head_sha"`
 				Status     string `json:"status"`
 				Conclusion string `json:"conclusion"`
 				DetailsURL string `json:"details_url"`
@@ -139,8 +170,14 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 			} `json:"check_runs"`
 		}
 		if err := json.Unmarshal(body, &cr); err != nil {
+			if page == 1 {
+				checksErr = err
+			}
 			st.Partial = append(st.Partial, "check runs could not be parsed")
 			break
+		}
+		if st.SHA == "" && len(cr.CheckRuns) > 0 && cr.CheckRuns[0].HeadSHA != "" {
+			st.SHA = cr.CheckRuns[0].HeadSHA
 		}
 		for _, r := range cr.CheckRuns {
 			state := r.Conclusion
@@ -160,6 +197,10 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 		if page == ciMaxPages {
 			st.Partial = append(st.Partial, fmt.Sprintf("only the first %d of %d check runs were read", page*ciPerPage, cr.TotalCount))
 		}
+	}
+
+	if statusErr != nil && checksErr != nil {
+		return st, statusErr // nothing was read
 	}
 
 	// Failing first, then pending, then passing; by name within a class, so the
@@ -197,5 +238,42 @@ func checkClass(status, conclusion string) string {
 		return CIPending
 	default: // failure, timed_out, cancelled, action_required, startup_failure
 		return CIFailing
+	}
+}
+
+// Summary condenses the status to what the radar shows: how many jobs succeeded and
+// are still running, and every failed job's name and link (by name, as the checks
+// are sorted), within worklist.CISummary's bounds. It counts each job by the outcome
+// GitHub reported, not by its sorting class: a skipped, neutral or stale check
+// neither succeeded nor is running, so it is in no count.
+func (s CIStatus) Summary() worklist.CISummary {
+	sum := worklist.CISummary{SHA: s.SHA, Partial: len(s.Partial) > 0}
+	for _, c := range s.Checks {
+		switch ciOutcome(c.State) {
+		case CIPassing:
+			sum.Passed++
+		case CIPending:
+			sum.Pending++
+		case CIFailing:
+			sum.AddFailed(c.Name, c.URL) // the link GitHub shows for the job on the PR
+		}
+	}
+	return sum
+}
+
+// ciOutcome maps a job's reported state (a commit status state, a check run's
+// conclusion, or a check run's status while it has none) to CIPassing (succeeded),
+// CIPending (not finished) or CIFailing (failed), or "" for an outcome that is none
+// of those (neutral, skipped, stale, or one GitHub adds later).
+func ciOutcome(state string) string {
+	switch state {
+	case "success":
+		return CIPassing
+	case "pending", "queued", "in_progress", "waiting", "requested", "expected":
+		return CIPending
+	case "failure", "error", "timed_out", "cancelled", "action_required", "startup_failure":
+		return CIFailing
+	default:
+		return ""
 	}
 }

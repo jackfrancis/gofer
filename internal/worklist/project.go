@@ -107,6 +107,38 @@ var projectables = []projectable{
 			}
 			w.GitHub.LabelColors = kept
 		}},
+	// Enrich stores the CI summary bounded (CISummary.AddFailed), but the store holds
+	// whatever a run wrote, so the failed-job names (and their links) are cut like any
+	// list. The cut
+	// counts the names it drops as omitted, and leaves Failed nil rather than empty,
+	// as the JSON a run receives would.
+	{projectedCI, func(w *WorkItem) any { return w.GitHub.CI },
+		func(d, s *WorkItem) { d.GitHub.CI = cloneCI(s.GitHub.CI) },
+		func(w *WorkItem) {
+			c := cloneCI(w.GitHub.CI)
+			if c == nil {
+				return
+			}
+			if len(c.Failed) > projectedList {
+				c.FailedOmitted += len(c.Failed) - projectedList
+			}
+			c.Failed = cutStrings(c.Failed)
+			if len(c.Failed) == 0 {
+				c.Failed = nil
+			}
+			// The links follow the names they belong to; a cut link would be a broken
+			// one, so a link past projectedString is dropped instead.
+			c.FailedURLs = c.FailedURLs[:min(len(c.FailedURLs), len(c.Failed))]
+			for i, l := range c.FailedURLs {
+				if len(l) > projectedString {
+					c.FailedURLs[i] = ""
+				}
+			}
+			if len(c.FailedURLs) == 0 {
+				c.FailedURLs = nil
+			}
+			w.GitHub.CI = c
+		}},
 	{"signals.roadmap_themes", func(w *WorkItem) any { return w.Signals.RoadmapThemes },
 		func(d, s *WorkItem) { d.Signals.RoadmapThemes = slices.Clone(s.Signals.RoadmapThemes) },
 		func(w *WorkItem) { w.Signals.RoadmapThemes = cutStrings(w.Signals.RoadmapThemes) }},
@@ -255,6 +287,40 @@ func clonePtr[T any](p *T) *T {
 	}
 	c := *p
 	return &c
+}
+
+// projectedCI is the CI summary's key in WorkItem.Projected.
+const projectedCI = "github.ci"
+
+// CIProjected reports whether the item's CI summary was cut by projection, so it is
+// not the stored summary and a comparison against it says nothing.
+func (w *WorkItem) CIProjected() bool {
+	_, cut := w.Projected[projectedCI]
+	return cut
+}
+
+// SetCI replaces the item's CI summary with one freshly read and drops its
+// projection marker, so the write-back stores ci as it is: otherwise a fresh
+// summary that happens to match the cut one (a link projection dropped and GitHub
+// since withdrew) would be taken for the unchanged cut and the stored one restored.
+func (w *WorkItem) SetCI(ci *CISummary) {
+	w.GitHub.CI = ci
+	if w.CIProjected() {
+		w.Projected = maps.Clone(w.Projected)
+		delete(w.Projected, projectedCI)
+	}
+}
+
+// cloneCI deep-copies a CI summary, so a cut never writes through to the stored
+// item's list.
+func cloneCI(c *CISummary) *CISummary {
+	if c == nil {
+		return nil
+	}
+	out := *c
+	out.Failed = slices.Clone(c.Failed)
+	out.FailedURLs = slices.Clone(c.FailedURLs)
+	return &out
 }
 
 // truncateUTF8 cuts s to at most n bytes without splitting a character.

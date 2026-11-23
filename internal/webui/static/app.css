@@ -156,6 +156,20 @@ body {
   max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
+/* The pull request's CI, under the labels on the radar and in the Discuss header: a line per count, then one per failed job
+   with its full name (wrapped, never cut). The mark before each line carries its
+   class's color. */
+.zz-ci { list-style: none; margin: 8px 0 0; padding: 0; font-size: 13px; color: var(--muted); }
+.zz-ci li { display: flex; gap: 6px; overflow-wrap: anywhere; }
+.zz-ci li::before { flex: none; width: 1em; text-align: center; font-weight: 600; }
+.zz-ci-pass::before { content: "\2713"; color: var(--success); }
+.zz-ci-pending::before { content: "\25CF"; color: var(--attention); }
+.zz-ci-fail { color: var(--fg); }
+.zz-ci-fail a { color: var(--accent); text-decoration: none; }
+.zz-ci-fail a:hover { text-decoration: underline; }
+.zz-ci-fail::before { content: "\2717"; color: var(--danger); }
+.zz-ci-note { font-style: italic; }
+.zz-ci-note::before { content: ""; }
 /* Items waiting on someone else: their own section after the radar, quieter than the
    items that need the user. */
 .zz-waiting { margin-top: 32px; padding-top: 16px; border-top: 1px solid var(--border); }
@@ -191,9 +205,13 @@ body {
 .zz-item-actions form { margin: 0; }
 .zz-thread-head .zz-meta form { margin: 0; }
 .zz-hidden-item { font-style: italic; }
-.zz-undo { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 16px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; }
-.zz-undo form { margin: 0; }
-.zz-undo .zz-linkbtn { font-size: 14px; color: var(--accent); }
+/* The radar's hidden section: greyscale, unscored rows below the ranked list. The
+   filter greys the state icon; the labels carry no color class, and the title takes
+   the muted text color instead of the link accent. */
+.zz-hidden-list { margin-top: 28px; }
+.zz-hidden-head { font-size: 14px; font-weight: 600; color: var(--muted); margin: 0 0 12px; }
+.zz-item--hidden { filter: grayscale(1); color: var(--muted); }
+.zz-item--hidden .zz-title a { color: var(--muted); font-weight: 500; }
 .btn-sm { padding: 2px 8px; font-size: 12px; }
 .zz-discuss { white-space: nowrap; }
 .zz-discuss--unread { border-color: var(--accent); color: var(--accent); font-weight: 600; }

@@ -161,9 +161,8 @@ Wired on the web-tier side; they define what a runtime must respect:
   read-modify-write), never `List` then `Upsert`, which overwrites anything written
   in between. A run's write-back is merged into the stored item
   (`worklist.MergeRunItems`): runs own the GitHub fields, signals and scoring; the
-  thread, read cursor, hidden flag and creation time always come from the store,
-  except that a hidden item resurfaces when the run's GitHub update time is after
-  the hide (`worklist.HiddenAfter`). Hidden and closed items are off the radar
+  thread, read cursor, hidden flag and creation time always come from the store.
+  Hidden and closed items are off the radar
   (`WorkItem.OnRadar`), and no bulk action (Review all, the second-opinion batch)
   draws from them. A
   run adds a thread turn only through `POST /agent/worklist/reply`
@@ -217,7 +216,7 @@ Wired on the web-tier side; they define what a runtime must respect:
   and a web tier from before them has no research route.
 - An item is WAITING (`WorkItem.Waiting`, `internal/worklist/waiting.go`) when the
   ball is in someone else's court; the radar lists waiting items in their own section
-  after the rest, ranked the same way (`Resolution.Waiting`; the JSON worklist's
+  after the rest and above the hidden section, ranked the same way (`Resolution.Waiting`; the JSON worklist's
   `waiting`). It is not a score: it says whose turn it is, not how much the item
   matters. Enrich decides it from the timeline (`github.ItemActivityFor`): the last
   human word is the user's own comment or review (recorded as `Signals.LastWord`,
@@ -282,10 +281,39 @@ Wired on the web-tier side; they define what a runtime must respect:
   `http.ResponseWriter` must implement `Unwrap` (as `statusRecorder` does), or the
   flush fails and no thread is ever marked read. The
   cursor only moves forward; a re-render of an already-read thread skips the store.
+- Hiding an item (`internal/worklist/hide.go`) is permanent until the owner unhides
+  it: no run clears `Meta.HiddenAt`, whatever changes on GitHub. A hidden item
+  carries no gofer judgment: `worklist.HideItem` deletes its signals (all but the
+  labels) and its scoring metadata (`worklist.StripScoring`), `MergeRunItems` strips
+  every write-back while it stays hidden (inside the store's update, so the run sends
+  its fresh signals: the owner may unhide the item before they land), `SetResearch`
+  drops research for it, `Rescore` leaves it unscored, and the selection a run reads
+  (`Selection.Open`, which means on the radar) leaves it out of enrichment and
+  ranking. The radar lists open hidden items in a greyscale section below the ranked
+  list (`Resolution.Hidden`, most recently hidden first) with an Unhide button and no
+  Discuss: a hidden item takes no new turn, retry, review panel or turn hide/unhide
+  (`appendTurn`, `ThreadRetry`, `HideMessage`), and its thread page is read-only.
+  Unhide (`worklist.UnhideItem`) brings it back empty. Its pre-hide CI summary is
+  kept but marked `CISummary.Stale` (labeled as last known) until enrich reads the
+  head; `Equal` compares the mark, so that read is written. An open item is flagged
+  `Meta.AwaitingRefresh`: unscored by `Rescore` and by Discuss's ranking context,
+  left out of the ranker's top-N selection, shown as waiting for the next refresh. A
+  retired one is not flagged, and a retirement's merge clears the flag, since no
+  refresh revisits a retired item. Unhide then calls `Ingestor.RefreshFollowUp`,
+  which owes the owner one ingest run reserved after the call until the backend
+  accepts one (`settle` pays it, whoever reserved the run). It tries at once; while
+  the debt stands a server-side worker retries through the refresh gate (which asks
+  the backend whether the run in flight ended), backing off after a refusal, so
+  nothing waits on a page polling. Never consume the debt on a run's end: only an
+  accepted run reserved after it pays, and every attempt (the unhide's own and the
+  worker's) reserves only while the debt still stands, checked under the reserving
+  lock after any probe. Each unhide joins a standing debt and gives it a full
+  `followUpGiveUp`; in memory only. The refresh's write-back clears the flag, since runs own
+  `Metadata`. A hidden item that closes leaves the section, still hidden.
 - The radar's project (repository) filter (`internal/webui/projects.go`) is a view
   preference kept in the `gofer_projects` cookie, bound to the account that saved it
-  (none = all projects). It only drops items from the already-ranked list, never
-  re-sorts. The cookie never decides what a bulk action touches: each bulk form posts
+  (none = all projects). It only drops items from the already-ranked list and the
+  hidden section (its checklist names both lists' repositories), never re-sorts. The cookie never decides what a bulk action touches: each bulk form posts
   the selection its page was rendered with (`scope`), narrowed to the projects the
   checklist names, so neither a filter changed in another tab nor a saved repository
   that left the radar can widen it; an unreadable form changes nothing, and only a
@@ -399,6 +427,29 @@ Wired on the web-tier side; they define what a runtime must respect:
   (`internal/webui/labels.go`), a stylesheet generated from the query alone. Colors
   live in `GitHubRef.LabelColors`, set at ingest; read one only through
   `GitHubRef.LabelColor` (six hex digits or nothing), since it reaches CSS.
+- A pull request's CI shows under its labels on the radar and at the top of its
+  Discuss page (one `ci` template): jobs succeeded, jobs in progress, and each failed
+  job's name, linked where GitHub's pull request links it (a status's target URL,
+  e.g. the Prow job page, or a check run's details URL) (`GitHubRef.CI`, a
+  `worklist.CISummary`). The links are `FailedURLs`, index-aligned with `Failed`, so
+  `failed` keeps its stored shape (a list of names) for an older web tier; read the
+  pairs only through `CISummary.FailedJobs`, which admits only http(s) links
+  (`worklist.CIJobURL`), since they reach an href. Counts follow the
+  outcome GitHub reported (`github.ciOutcome`: skipped, neutral and stale are in no
+  count), not the sorting class. Enrich sets it from `github.CIStatusForPR`
+  (`CIStatus.Summary`, bounded by `CISummary.AddFailed`) in a second pass, after
+  every timeline read, so CI never costs an item its ranking signals. Statuses and
+  check runs are read independently (one unreadable = `Partial`; both = error, and
+  the stored summary stands). A write-back that carries no CI keeps the stored one
+  (`worklist.KeepCI`, in the merge), so every pass but enrich's CI pass (refresh,
+  retire, rank, and an enrich write that changed only the timeline) sends none: never write back CI from a run's read, which may be a projection or
+  older than an enrich that landed meanwhile. CI pages after the first are pinned to
+  the commit the first resolved, since a named ref can advance between pages. After
+  a projected read, enrich writes the fresh summary through `WorkItem.SetCI`, which
+  drops the projection marker, since a cut summary compares equal to fresh data it
+  does not match. A retired or hidden item's CI (enrich reads neither) is labeled as
+  the last known result; hiding keeps it, since it is a GitHub field, and unhiding
+  marks it `Stale` (labeled as from before the hide) until enrich reads the head. It is display-only: nothing scores on it.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

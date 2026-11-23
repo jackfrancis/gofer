@@ -10,6 +10,8 @@ package worklist
 
 import (
 	"context"
+	"net/url"
+	"slices"
 	"strings"
 	"time"
 )
@@ -86,6 +88,100 @@ type GitHubRef struct {
 	// color, six hex digits without '#', for display only. Read a color through
 	// LabelColor, which refuses anything but six hex digits.
 	LabelColors map[string]string `json:"label_colors,omitempty"`
+
+	// CI summarizes the CI jobs on a pull request's head commit, for display only;
+	// nil when unknown (an issue, a pull request enrich has not read yet, or one
+	// whose CI could not be read). Enrich sets it; a refresh keeps the stored one.
+	CI *CISummary `json:"ci,omitempty"`
+}
+
+// CISummary is the CI picture of one pull request's head commit: how many jobs
+// succeeded and are still running, and every failed job, by name and link.
+type CISummary struct {
+	SHA     string `json:"sha,omitempty"` // the commit the jobs ran on
+	Passed  int    `json:"passed"`
+	Pending int    `json:"pending"`
+	// Failed names each failed job, in the order GitHub's checks were read (by name).
+	// At most MaxCIFailedNames are kept, each at most MaxCINameBytes; FailedOmitted
+	// counts the failed jobs past that bound.
+	Failed []string `json:"failed,omitempty"`
+	// FailedURLs holds, index for index with Failed, the link GitHub shows for that
+	// job on the pull request (a status's target URL, such as a Prow job page, or a
+	// check run's details URL); "" for none. It is a list beside Failed rather than
+	// a field of each entry so the stored shape of Failed stays a list of names,
+	// which an older web tier still reads. Read the pairs through FailedJobs, which
+	// admits only http(s) links.
+	FailedURLs    []string `json:"failed_urls,omitempty"`
+	FailedOmitted int      `json:"failed_omitted,omitempty"`
+	// Partial is set when part of the CI could not be read (check runs refused,
+	// more jobs than were paged), so the counts may be short.
+	Partial bool `json:"partial,omitempty"`
+	// Stale marks a summary read before the item was hidden and not read again
+	// since it was unhidden (UnhideItem): it may describe an older head commit, so
+	// the page labels it as the last known result. Enrich's next read replaces it
+	// (Equal tells the two apart, so an unchanged read is still written).
+	Stale bool `json:"stale,omitempty"`
+}
+
+// CIJob is one failed job as FailedJobs returns it.
+type CIJob struct {
+	Name string
+	URL  string // an absolute http(s) link, or "" for none
+}
+
+// Bounds on a stored CISummary.
+const (
+	MaxCIFailedNames = 50
+	MaxCINameBytes   = 256
+	MaxCIURLBytes    = 2048
+)
+
+// AddFailed records a failed job's name and link within the bounds. A link that is
+// not an absolute http(s) URL, or is longer than MaxCIURLBytes, is stored as none.
+func (c *CISummary) AddFailed(name, link string) {
+	if len(c.Failed) >= MaxCIFailedNames {
+		c.FailedOmitted++
+		return
+	}
+	c.Failed = append(c.Failed, truncateUTF8(name, MaxCINameBytes))
+	c.FailedURLs = append(c.FailedURLs, CIJobURL(link))
+}
+
+// FailedJobs returns each failed job with its link. The link is re-checked here,
+// since the store holds whatever a run wrote, and a list misaligned with Failed
+// leaves the unmatched jobs without one.
+func (c *CISummary) FailedJobs() []CIJob {
+	out := make([]CIJob, len(c.Failed))
+	for i, name := range c.Failed {
+		out[i].Name = name
+		if i < len(c.FailedURLs) {
+			out[i].URL = CIJobURL(c.FailedURLs[i])
+		}
+	}
+	return out
+}
+
+// CIJobURL returns link if it is an absolute http or https URL with a host and at
+// most MaxCIURLBytes, and "" otherwise. A CI link reaches a page's href.
+func CIJobURL(link string) string {
+	if link == "" || len(link) > MaxCIURLBytes {
+		return ""
+	}
+	u, err := url.Parse(link)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil {
+		return ""
+	}
+	return link
+}
+
+// Equal reports whether c and o summarize the same CI (nil only equals nil).
+func (c *CISummary) Equal(o *CISummary) bool {
+	if c == nil || o == nil {
+		return c == o
+	}
+	return c.SHA == o.SHA && c.Passed == o.Passed && c.Pending == o.Pending &&
+		c.FailedOmitted == o.FailedOmitted && c.Partial == o.Partial && c.Stale == o.Stale &&
+		slices.Equal(c.Failed, o.Failed) && slices.Equal(c.FailedURLs, o.FailedURLs)
 }
 
 // LabelColor returns the GitHub color of the item's label name, normalized to six
@@ -136,10 +232,15 @@ type Metadata struct {
 	ScoredAt  time.Time `json:"scored_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 
-	// HiddenAt is when the user hid this item; zero means visible. The user sets
-	// it; an agent clears it (auto-unhide) once the underlying GitHub item is
-	// updated after this time, so a changed item resurfaces.
+	// HiddenAt is when the user hid this item; zero means visible. Only the user
+	// sets or clears it (HideItem, UnhideItem): a hidden item stays hidden however
+	// it changes on GitHub, and carries no score while it does (see hide.go).
 	HiddenAt time.Time `json:"hidden_at,omitempty"`
+
+	// AwaitingRefresh marks an item the user unhid: it came back with no signals
+	// or score, and the radar says it waits for the next refresh. A run owns
+	// Metadata, so the refresh that writes the item back clears it.
+	AwaitingRefresh bool `json:"awaiting_refresh,omitempty"`
 
 	// CompletedAt is when the underlying GitHub item was closed or merged; zero
 	// means still open. An agent sets it when the item leaves the open radar;

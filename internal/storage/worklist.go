@@ -52,14 +52,16 @@ func (s *WorklistStore) Get(ctx context.Context, ownerID, id string) (worklist.W
 
 // Briefs reads the owner's items that q names without their threads: SQLite drops
 // each document's thread before it is returned, a page reads only its rows (through
-// the (owner_id, id) index), and the open filter runs in the query. It matches
+// the (owner_id, id) index), and the on-radar filter runs in the query. It matches
 // worklist.ApplyBriefQuery.
 func (s *WorklistStore) Briefs(ctx context.Context, ownerID string, q worklist.BriefQuery) ([]worklist.WorkItem, error) {
 	query := `SELECT json_remove(doc, '$.thread') FROM work_items WHERE owner_id = ?`
 	args := []any{ownerID}
 	if q.Open {
-		// A zero time.Time encodes as its zero value, not as an absent field.
-		query += ` AND coalesce(json_extract(doc, '$.gofer.completed_at'), '0001-01-01T00:00:00Z') = '0001-01-01T00:00:00Z'`
+		// On the radar: neither retired nor hidden. A zero time.Time encodes as its
+		// zero value, not as an absent field.
+		query += ` AND coalesce(json_extract(doc, '$.gofer.completed_at'), '0001-01-01T00:00:00Z') = '0001-01-01T00:00:00Z'` +
+			` AND coalesce(json_extract(doc, '$.gofer.hidden_at'), '0001-01-01T00:00:00Z') = '0001-01-01T00:00:00Z'`
 	}
 	if q.Limit > 0 {
 		query += ` AND id > ? ORDER BY id LIMIT ?`

@@ -308,8 +308,8 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 }
 
 // reconcileFetched carries gofer-owned per-item state that GitHub cannot supply — the
-// conversation thread and its read cursor, the user/agent metadata overrides (hidden,
-// completed), and the original creation time — from the persisted items onto the
+// conversation thread and its read cursor, the hidden flag, and the original
+// creation time — from the persisted items onto the
 // freshly fetched ones, keyed by ID. Fetched items with no persisted counterpart (new
 // work) pass through unchanged. The agent plane also keeps the stored thread, read
 // cursor, hidden flag, creation time and, when a write-back carries none, the model
@@ -335,9 +335,12 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 		fetched[i].Thread = old.Thread
 		fetched[i].ThreadReadAt = old.ThreadReadAt
 		fetched[i].ThreadReadThrough = old.ThreadReadThrough
-		// A hidden item stays hidden until GitHub shows it changed after the hide; the
-		// plane's merge applies the same rule, so the run's view and the store agree.
-		fetched[i].Meta.HiddenAt = worklist.HiddenAfter(old.Meta.HiddenAt, fetched[i].GitHub.UpdatedAt)
+		// The fresh signals are sent even for an item hidden when this run read it: the
+		// owner may unhide it before the write lands, and only the plane's merge
+		// (worklist.MergeRunItems), inside the store's atomic update, knows whether the
+		// item is hidden then and must be stripped. The flag is carried for the run's
+		// own view; the merge takes the stored one.
+		fetched[i].Meta.HiddenAt = old.Meta.HiddenAt
 		// A fetch derives no model proposal or research adjustment, so it sends none:
 		// the plane's merge then keeps whatever is stored when this write lands, not
 		// the copy read above, which a discussion may have replaced since. The
@@ -350,6 +353,9 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 				carried[fetched[i].ID] = true
 			}
 		}
+		// A search hit carries no CI summary, and none is copied from the read above,
+		// which may be a projection: the plane's merge keeps the stored one
+		// (worklist.KeepCI) until the chained enrich reads the head commit again.
 		// CompletedAt is deliberately NOT carried over: the item was just fetched from
 		// the open set, so it is open, and a reopened item resurfaces (see Metadata).
 		if !old.CreatedAt.IsZero() {
@@ -376,9 +382,10 @@ func retireMissing(fetched, existing []worklist.WorkItem, now time.Time) []workl
 			continue
 		}
 		it.Meta.CompletedAt = now
-		// Retiring derives no model signals; leave them to the store (see
-		// reconcileFetched).
+		// Retiring derives no model signals, and reads no CI; leave both to the store
+		// (see reconcileFetched and worklist.KeepCI).
 		clearModelSignals(&it.Signals)
+		it.GitHub.CI = nil
 		retired = append(retired, it)
 	}
 	return retired
@@ -504,6 +511,10 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 			// reading stay.
 			items[i].Signals.Research = nil
 			items[i].Signals.Turn = nil
+			// Nor does it read CI: the summary it read may have been replaced by an
+			// enrich that landed while the model worked (worklist.KeepCI keeps the
+			// stored one).
+			items[i].GitHub.CI = nil
 			mu.Lock()
 			changed = append(changed, items[i])
 			mu.Unlock()

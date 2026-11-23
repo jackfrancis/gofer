@@ -17,15 +17,18 @@ const (
 // items (StatusReady only); Message carries a human-facing explanation when the
 // backfill run failed (StatusFailed only). OffRadar carries the stored items left
 // out of Items because they are hidden or completed (StatusReady only), from the same
-// read, so a caller that also needs them (the radar's Reset count and Undo) does not
-// read the store a second time and cannot see the two halves disagree. Waiting
-// carries the items on the radar that are waiting on someone else (WorkItem.Waiting),
-// ranked the same way and left out of Items, so the radar lists them after the rest.
+// read, so a caller that also needs them (the radar's Reset count) does not read the
+// store a second time and cannot see the two halves disagree. Hidden is the subset of
+// OffRadar the radar lists in its hidden section (WorkItem.InHiddenList), most
+// recently hidden first, unscored. Waiting carries the items on the radar that are
+// waiting on someone else (WorkItem.Waiting), ranked the same way and left out of
+// Items, so the radar lists them after the rest and above the hidden section.
 type Resolution struct {
 	Status   string
 	Items    []WorkItem
 	Waiting  []WorkItem
 	OffRadar []WorkItem
+	Hidden   []WorkItem
 	Message  string
 }
 
@@ -98,16 +101,19 @@ func Resolve(ctx context.Context, store Store, ingestor Ingestor, now time.Time,
 		items[i].Meta = Rescore(items[i], now) // human overrides are preserved verbatim
 	}
 	// Hidden items (user-set) and completed items (closed/merged, agent-set) stay
-	// in the store so an agent can still see and revive them, but are dropped from
-	// the user-facing list.
-	// Items waiting on someone else stay on the radar, listed after the rest.
+	// in the store, but are dropped from the ranked list. Hidden items still open
+	// are listed apart (Hidden), for the owner to unhide. Items waiting on someone
+	// else stay on the radar, listed after the rest (Waiting).
 	visible := items[:0]
-	var off, waiting []WorkItem
+	var off, hidden, waiting []WorkItem
 	for _, it := range items {
 		_, wait := it.Waiting()
 		switch {
 		case !it.OnRadar():
 			off = append(off, it)
+			if it.InHiddenList() {
+				hidden = append(hidden, it)
+			}
 		case wait:
 			waiting = append(waiting, it)
 		default:
@@ -121,7 +127,8 @@ func Resolve(ctx context.Context, store Store, ingestor Ingestor, now time.Time,
 	if err := Sort(waiting, key, desc); err != nil {
 		return Resolution{}, err
 	}
-	return Resolution{Status: StatusReady, Items: items, Waiting: waiting, OffRadar: off}, nil
+	sortHidden(hidden)
+	return Resolution{Status: StatusReady, Items: items, Waiting: waiting, OffRadar: off, Hidden: hidden}, nil
 }
 
 // OnRadar reports whether the item belongs on the owner's radar: it is neither
@@ -141,15 +148,4 @@ func (w WorkItem) Actionable() bool {
 	}
 	_, waiting := w.Waiting()
 	return !waiting
-}
-
-// HiddenAfter returns the HiddenAt to keep for a re-ingested item: it preserves a
-// prior hidden timestamp, but clears it (auto-unhide) when the underlying item
-// has been updated since it was hidden, so a changed item resurfaces. updatedAt
-// is the GitHub item's updated_at.
-func HiddenAfter(prevHiddenAt, updatedAt time.Time) time.Time {
-	if prevHiddenAt.IsZero() || updatedAt.After(prevHiddenAt) {
-		return time.Time{}
-	}
-	return prevHiddenAt
 }
