@@ -39,7 +39,7 @@ type CICheck struct {
 type CIStatus struct {
 	Repo   string
 	Ref    string // what was asked for (a PR's head branch, or the ref given)
-	SHA    string // the commit the checks are on
+	SHA    string // the commit the checks are on; "" when no response named it
 	Checks []CICheck
 	// Partial names a part that could not be read (check runs refused, more pages than
 	// fetched); the rest of the result still stands.
@@ -70,6 +70,9 @@ func (c *Client) CIStatusForPR(ctx context.Context, token, repo string, number i
 	}
 	st, err := c.CIStatusForRef(ctx, token, repo, pr.Head.SHA)
 	st.Ref = pr.Head.Ref
+	if st.SHA == "" {
+		st.SHA = pr.Head.SHA // asked for by SHA, so the commit is known
+	}
 	return st, err
 }
 
@@ -77,7 +80,7 @@ func (c *Client) CIStatusForPR(ctx context.Context, token, repo string, number i
 // commit SHA). Statuses are the latest per context, as GitHub's combined status
 // reports them; check runs are the latest per name, as GitHub lists them by default.
 func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (CIStatus, error) {
-	st := CIStatus{Repo: repo, Ref: ref, SHA: ref}
+	st := CIStatus{Repo: repo, Ref: ref}
 	repo, err := c.gate(ctx, token, repo)
 	if err != nil {
 		return st, err
@@ -86,8 +89,8 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 	// after the first is pinned to the commit the first one resolved: the status
 	// pages to the combined status's SHA, and the check-run pages to it too, or,
 	// when the statuses could not be read, to the first check run's head_sha.
-	// pinned says st.SHA is a resolved commit rather than the ref as given.
-	pinned := false
+	// st.SHA is set only from a response that names the commit, never from the ref
+	// as given, so a ref no response resolved is not reported as a commit.
 	esc := url.PathEscape(ref)
 
 	// The two sources are read independently: either alone still says something, so
@@ -121,7 +124,7 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 			break
 		}
 		if page == 1 && cs.SHA != "" {
-			st.SHA, pinned = cs.SHA, true
+			st.SHA = cs.SHA
 			esc = url.PathEscape(cs.SHA)
 		}
 		for _, s := range cs.Statuses {
@@ -137,7 +140,11 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 	}
 
 	for page := 1; page <= ciMaxPages; page++ {
-		body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/commits/%s/check-runs?per_page=%d&page=%d", repo, url.PathEscape(st.SHA), ciPerPage, page))
+		at := st.SHA
+		if at == "" {
+			at = ref // not resolved yet: the first page resolves it
+		}
+		body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/commits/%s/check-runs?per_page=%d&page=%d", repo, url.PathEscape(at), ciPerPage, page))
 		if err != nil {
 			if page == 1 {
 				checksErr = err
@@ -169,8 +176,8 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 			st.Partial = append(st.Partial, "check runs could not be parsed")
 			break
 		}
-		if !pinned && len(cr.CheckRuns) > 0 && cr.CheckRuns[0].HeadSHA != "" {
-			st.SHA, pinned = cr.CheckRuns[0].HeadSHA, true
+		if st.SHA == "" && len(cr.CheckRuns) > 0 && cr.CheckRuns[0].HeadSHA != "" {
+			st.SHA = cr.CheckRuns[0].HeadSHA
 		}
 		for _, r := range cr.CheckRuns {
 			state := r.Conclusion

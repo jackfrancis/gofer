@@ -72,7 +72,12 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 	// Two passes, timeline first: the timeline feeds the score, the CI summary is
 	// display-only, so slow or failing CI reads must never cost an item its ranking
 	// signals. The CI pass spends only the time the timeline pass left.
+	// changed marks an item either pass changed; ciChanged one whose CI the CI pass
+	// read and found changed. Only those carry CI in the write-back: any other
+	// carries the summary this run read, which an overlapping enrich may have
+	// replaced since, so it sends none and worklist.KeepCI keeps the stored one.
 	changed := make([]bool, len(items))
+	ciChanged := make([]bool, len(items))
 	open := func(it worklist.WorkItem) bool {
 		// Retired items (closed, merged, no longer involving the user) are off the radar:
 		// spending a call on each would grow with every item ever seen.
@@ -100,7 +105,7 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 	}, func(i int) {
 		if ci, ok := readCI(ctx, gh, token, items[i].GitHub); ok && !ci.Equal(items[i].GitHub.CI) {
 			items[i].GitHub.CI = ci
-			changed[i] = true
+			changed[i], ciChanged[i] = true, true
 		}
 	})
 	if rerr := holder.Reconnect(); rerr != nil {
@@ -111,6 +116,9 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 		if changed[i] {
 			// Enrich derives no model signals; leave them to the store.
 			clearModelSignals(&items[i].Signals)
+			if !ciChanged[i] {
+				items[i].GitHub.CI = nil
+			}
 			out = append(out, items[i])
 		}
 	}

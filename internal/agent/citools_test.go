@@ -268,3 +268,12 @@ func TestFormatCIStatusPartialEmpty(t *testing.T) {
 		t.Fatalf("whole empty read:\n%s", out)
 	}
 }
+
+// With nothing naming the commit (statuses refused, no check runs), the tool says
+// which ref it looked up but labels no commit.
+func TestCIStatusToolOmitsUnresolvedCommit(t *testing.T) {
+	out := formatCIStatus("o/r at main", github.CIStatus{Ref: "main", Partial: []string{"commit statuses could not be read (403)"}})
+	if strings.Contains(out, "(commit") {
+		t.Fatalf("an unresolved ref was labeled a commit:\n%s", out)
+	}
+}

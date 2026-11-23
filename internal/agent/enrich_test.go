@@ -375,3 +375,38 @@ func TestRetireMissingSendsNoCI(t *testing.T) {
 		t.Fatalf("retired = %+v", retired)
 	}
 }
+
+// An enrich that changes only the timeline (its CI read failed) must not write back
+// the CI it read: an overlapping enrich may have stored a newer result meanwhile.
+func TestRunEnrichTimelineOnlyWriteSendsNoCI(t *testing.T) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case strings.Contains(r.URL.Path, "/timeline"):
+			_, _ = w.Write([]byte(`[{"event":"commented","created_at":"2026-01-02T00:00:00Z","actor":{"login":"bob"}}]`))
+		case strings.Contains(r.URL.Path, "/pulls/"):
+			http.Error(w, "boom", http.StatusInternalServerError) // CI unreadable
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+
+	read := &worklist.CISummary{SHA: "s", Pending: 1}
+	newer := &worklist.CISummary{SHA: "s", Failed: []string{"build"}, FailedURLs: []string{""}}
+	sink := &memSink{items: []worklist.WorkItem{{ID: "pr", Source: "github", Type: worklist.TypePullRequest,
+		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, CI: read}}}}
+	sink.beforeIngest = func() { sink.items[0].GitHub.CI = newer } // the overlapping enrich lands
+	if err := Run(context.Background(),
+		Params{JobType: JobEnrich, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if sink.items[0].Signals.Participants != 1 {
+		t.Fatal("fixture: the timeline change must be written")
+	}
+	if !sink.items[0].GitHub.CI.Equal(newer) {
+		t.Fatalf("timeline-only write reverted CI to %+v", sink.items[0].GitHub.CI)
+	}
+}

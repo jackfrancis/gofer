@@ -252,3 +252,36 @@ func TestCIStatusPinsPagesToOneCommit(t *testing.T) {
 		}
 	}
 }
+
+// A ref no response resolved is not reported as a commit; a PR lookup knows its
+// head commit even then.
+func TestCIStatusUnresolvedRefHasNoSHA(t *testing.T) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/o/r/pulls/42":
+			_, _ = w.Write([]byte(`{"head":{"ref":"fix/x","sha":"abc123"}}`))
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			http.Error(w, "forbidden", http.StatusForbidden)
+		case strings.HasSuffix(r.URL.Path, "/check-runs"):
+			_, _ = w.Write([]byte(`{"total_count":0,"check_runs":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := NewClient(srv.Client(), srv.URL)
+	st, err := c.CIStatusForRef(context.Background(), "tok", "o/r", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.SHA != "" || st.Ref != "main" || len(st.Partial) == 0 {
+		t.Errorf("status = %+v", st)
+	}
+	st, err = c.CIStatusForPR(context.Background(), "tok", "o/r", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.SHA != "abc123" {
+		t.Errorf("PR lookup SHA = %q, want its head commit", st.SHA)
+	}
+}
