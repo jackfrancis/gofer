@@ -363,6 +363,12 @@ Wired on the web-tier side; they define what a runtime must respect:
 - Without script, the radar's `<noscript>` refresh goes to `/?refresh=1`, whose
   render asks AEI (within 5s) instead of reading local state, so it stops once the
   run has ended.
+- The page's CSP admits one third-party origin, GitHub's avatar host, for images
+  only, for the header's avatar (`webui.AvatarOrigin`). Rendered Markdown never
+  emits an `<img>` (`internal/markdown` renders images as links), so no reply can
+  reach that host or make the browser fetch anything. The avatar is added by
+  `static/avatar.js` after the load event, never as an `<img>` in the markup, which
+  would delay a meta refresh until it loaded.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

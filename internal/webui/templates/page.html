@@ -9,12 +9,13 @@
   {{if eq .View "worklist"}}<script src="/static/projects.js" defer></script>{{end}}
   {{if .WatchRefresh}}{{if .Refreshing}}<noscript><meta http-equiv="refresh" content="{{.PollSecs}}; url={{.FallbackURL}}"></noscript>{{end}}<script src="/static/reload.js" data-done="{{.RefreshDone}}" data-active="{{if .Refreshing}}1{{else}}0{{end}}" data-poll-secs="{{.PollSecs}}" data-idle-poll-secs="{{.IdlePollSecs}}" defer></script>{{end}}
   {{if eq .View "thread"}}<script src="/static/copy.js" defer></script>{{end}}
+  {{if avatarURL .User}}<script src="/static/avatar.js" defer></script>{{end}}
 </head>
 <body>
   <div class="zz-container">
     <header class="zz-header">
       <span class="zz-brand">gofer</span>
-      {{if .User}}<span class="zz-user">{{with avatarURL .User}}<img class="zz-avatar" src="{{.}}" alt="" width="24" height="24" referrerpolicy="no-referrer">{{end}}{{with .User.Name}}{{.}}{{else}}{{.User.Email}}{{end}}</span>{{end}}
+      {{if .User}}<span class="zz-user"{{with avatarURL .User}} data-avatar="{{.}}"{{end}}>{{with .User.Name}}{{.}}{{else}}{{.User.Email}}{{end}}</span>{{end}}
     </header>
     {{if and .User .SignInRequired}}
     <div class="zz-reconnect" role="alert">
