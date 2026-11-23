@@ -111,6 +111,11 @@ type CISummary struct {
 	// Partial is set when part of the CI could not be read (check runs refused,
 	// more jobs than were paged), so the counts may be short.
 	Partial bool `json:"partial,omitempty"`
+	// Stale marks a summary read before the item was hidden and not read again
+	// since it was unhidden (UnhideItem): it may describe an older head commit, so
+	// the page labels it as the last known result. Enrich's next read replaces it
+	// (Equal tells the two apart, so an unchanged read is still written).
+	Stale bool `json:"stale,omitempty"`
 }
 
 // CIJob is one failed job as FailedJobs returns it.
@@ -170,7 +175,7 @@ func (c *CISummary) Equal(o *CISummary) bool {
 		return c == o
 	}
 	return c.SHA == o.SHA && c.Passed == o.Passed && c.Pending == o.Pending &&
-		c.FailedOmitted == o.FailedOmitted && c.Partial == o.Partial &&
+		c.FailedOmitted == o.FailedOmitted && c.Partial == o.Partial && c.Stale == o.Stale &&
 		slices.Equal(c.Failed, o.Failed) && slices.Equal(c.FailedURLs, o.FailedURLs)
 }
 
@@ -222,10 +227,15 @@ type Metadata struct {
 	ScoredAt  time.Time `json:"scored_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 
-	// HiddenAt is when the user hid this item; zero means visible. The user sets
-	// it; an agent clears it (auto-unhide) once the underlying GitHub item is
-	// updated after this time, so a changed item resurfaces.
+	// HiddenAt is when the user hid this item; zero means visible. Only the user
+	// sets or clears it (HideItem, UnhideItem): a hidden item stays hidden however
+	// it changes on GitHub, and carries no score while it does (see hide.go).
 	HiddenAt time.Time `json:"hidden_at,omitempty"`
+
+	// AwaitingRefresh marks an item the user unhid: it came back with no signals
+	// or score, and the radar says it waits for the next refresh. A run owns
+	// Metadata, so the refresh that writes the item back clears it.
+	AwaitingRefresh bool `json:"awaiting_refresh,omitempty"`
 
 	// CompletedAt is when the underlying GitHub item was closed or merged; zero
 	// means still open. An agent sets it when the item leaves the open radar;

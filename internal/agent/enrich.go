@@ -80,8 +80,10 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 	ciChanged := make([]bool, len(items))
 	open := func(it worklist.WorkItem) bool {
 		// Retired items (closed, merged, no longer involving the user) are off the radar:
-		// spending a call on each would grow with every item ever seen.
-		return it.Source == "github" && it.Meta.CompletedAt.IsZero()
+		// spending a call on each would grow with every item ever seen. Hidden items
+		// carry no signals to enrich, and their CI is the last one read (the selection
+		// leaves both out already).
+		return it.Source == "github" && it.OnRadar()
 	}
 	skipped := fanOut(ctx, items, open, func(i int) {
 		// The timeline can take several page reads; they must finish inside the

@@ -196,9 +196,13 @@ body {
 .zz-item-actions form { margin: 0; }
 .zz-thread-head .zz-meta form { margin: 0; }
 .zz-hidden-item { font-style: italic; }
-.zz-undo { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 16px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; }
-.zz-undo form { margin: 0; }
-.zz-undo .zz-linkbtn { font-size: 14px; color: var(--accent); }
+/* The radar's hidden section: greyscale, unscored rows below the ranked list. The
+   filter greys the state icon; the labels carry no color class, and the title takes
+   the muted text color instead of the link accent. */
+.zz-hidden-list { margin-top: 28px; }
+.zz-hidden-head { font-size: 14px; font-weight: 600; color: var(--muted); margin: 0 0 12px; }
+.zz-item--hidden { filter: grayscale(1); color: var(--muted); }
+.zz-item--hidden .zz-title a { color: var(--muted); font-weight: 500; }
 .btn-sm { padding: 2px 8px; font-size: 12px; }
 .zz-discuss { white-space: nowrap; }
 .zz-discuss--unread { border-color: var(--accent); color: var(--accent); font-weight: 600; }

@@ -113,15 +113,16 @@
           <form method="post" action="/items/hide">
             <input type="hidden" name="id" value="{{.Item.ID}}">
             <input type="hidden" name="hidden" value="true">
-            <button class="zz-linkbtn" type="submit" title="Hide this item from your radar until GitHub shows new activity on it">Hide item</button>
+            <input type="hidden" name="back" value="thread">
+            <button class="zz-linkbtn" type="submit" title="Move this item to the hidden section of your radar until you unhide it">Hide item</button>
           </form>
           {{else}}
-          <span class="zz-hidden-item">Hidden from your radar until GitHub shows new activity</span>
+          <span class="zz-hidden-item">Hidden from your radar until you unhide it</span>
           <form method="post" action="/items/hide">
             <input type="hidden" name="id" value="{{.Item.ID}}">
             <input type="hidden" name="hidden" value="false">
             <input type="hidden" name="back" value="thread">
-            <button class="zz-linkbtn" type="submit">Unhide</button>
+            <button class="zz-linkbtn" type="submit" title="Bring this item back to your radar; the next refresh scores it">Unhide</button>
           </form>
           {{end}}
         </div>
@@ -136,12 +137,14 @@
           {{else if $m.Hidden}}
           <div class="zz-hidden">
             <span>Hidden {{if eq $m.Role "agent"}}reply{{else}}message{{end}}</span>
+            {{if not $.ItemHidden}}
             <form method="post" action="/items/thread/hide">
               <input type="hidden" name="id" value="{{$.Item.ID}}">
               <input type="hidden" name="msg" value="{{$.Item.TurnKey $i}}">
               <input type="hidden" name="hidden" value="false">
               <button class="zz-linkbtn" type="submit">Unhide</button>
             </form>
+            {{end}}
           </div>
           {{else}}
           <div class="zz-msg zz-msg--{{$m.Role}}">
@@ -149,12 +152,14 @@
             <div class="zz-msgfoot">
               {{if $m.Model}}<span class="zz-model">via {{$m.Model}}</span>{{end}}
               {{if eq $m.Role "agent"}}<button class="zz-iconbtn zz-copy" type="button" data-copy="{{$m.Content}}" title="Copy" aria-label="Copy reply" hidden><svg class="zz-icon zz-icon-copy" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="5.5" y="5.5" width="9" height="9" rx="1.75"/><path d="M3.5 10.5h-.25A1.75 1.75 0 0 1 1.5 8.75v-5.5A1.75 1.75 0 0 1 3.25 1.5h5.5a1.75 1.75 0 0 1 1.75 1.75v.25"/></svg><svg class="zz-icon zz-icon-check" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3 8.5l3.25 3.25L13 5"/></svg><svg class="zz-icon zz-icon-fail" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.75v3.5M8 11.25h.01"/></svg><span class="zz-copy-fail" aria-hidden="true">Copy failed</span></button>{{end}}
+              {{if not $.ItemHidden}}
               <form method="post" action="/items/thread/hide">
                 <input type="hidden" name="id" value="{{$.Item.ID}}">
                 <input type="hidden" name="msg" value="{{$.Item.TurnKey $i}}">
                 <input type="hidden" name="hidden" value="true">
                 <button class="zz-linkbtn" type="submit" title="Hide this from the thread and from future model context">Hide</button>
               </form>
+              {{end}}
             </div>
           </div>
           {{end}}
@@ -180,7 +185,9 @@
         {{end}}
       </div>
       {{end}}
-      {{if .ConvEnabled}}
+      {{if .ItemHidden}}
+      <p class="zz-meta">This item is hidden.{{if .Assistant}} Unhide it to discuss it.{{end}}</p>
+      {{else if .ConvEnabled}}
       <form class="zz-chat-form" method="post" action="/items/thread">
         <input type="hidden" name="id" value="{{.Item.ID}}">
         {{/* maxlength matches maxMessageBytes in webui.go, which the server enforces in bytes */}}<textarea name="content" rows="3" maxlength="16384" placeholder="e.g. draft a review request for this PR"></textarea>
@@ -211,16 +218,6 @@
       {{end}}
 
     {{else}}
-      {{with .JustHidden}}
-      <div class="zz-undo" role="status">
-        <span>Hidden <b>{{.GitHub.Title}}</b> until GitHub shows new activity on it.</span>
-        <form method="post" action="/items/hide">
-          <input type="hidden" name="id" value="{{.ID}}">
-          <input type="hidden" name="hidden" value="false">
-          <button class="zz-linkbtn" type="submit">Undo</button>
-        </form>
-      </div>
-      {{end}}
       <div class="zz-toolbar">
         <div class="zz-toolbar-lead">
           {{if or (gt (len .Projects) 1) .ProjectsFiltered}}
@@ -335,7 +332,7 @@
               {{end}}
               <form method="post" action="/items/hide">
                 <input type="hidden" name="id" value="{{.ID}}">
-                <button class="btn btn-sm" type="submit" title="Hide this item until GitHub shows new activity on it">Hide</button>
+                <button class="btn btn-sm" type="submit" title="Move this item to the hidden section at the bottom of your radar until you unhide it">Hide</button>
               </form>
             </div>
           </div>
@@ -345,6 +342,9 @@
             {{with ghLabels .}}<span class="zz-labels">{{range .}}<span class="Label zz-ghlabel{{with .Class}} {{.}}{{end}}">{{.Name}}</span>{{end}}</span>{{end}}
           </div>
           {{template "ci" ciSummary .}}
+          {{if .Meta.AwaitingRefresh}}
+          <div class="zz-rationale zz-awaiting">Waiting for the next refresh</div>
+          {{else}}
           <div class="zz-bar"><span class="zz-w-{{pctBucket .Meta.Rank}}"></span></div>
           <div class="zz-axes">
             <span>Relevance <b>{{axis2 .Meta.Relevance}}</b></span>
@@ -353,9 +353,35 @@
             <span>Urgency <b>{{axis2 .Meta.Urgency}}</b></span>
           </div>
           {{with .Meta.Rationale}}<div class="zz-rationale">{{.}}</div>{{end}}
+          {{end}}
         </div>
       {{else}}
         <div class="zz-empty"><p>{{if .ProjectsFiltered}}No items in the selected projects.{{else}}Nothing on your radar right now.{{end}}</p></div>
+      {{end}}
+      {{with .HiddenItems}}
+      <section class="zz-hidden-list" aria-labelledby="zz-hidden-head">
+        <h2 class="zz-hidden-head" id="zz-hidden-head">Hidden ({{len .}})</h2>
+        {{range .}}
+        {{/* No color, no score: a hidden item keeps only its GitHub fields (worklist.HideItem). Its labels carry no ghl- class. */}}
+        <div class="zz-item zz-item--hidden">
+          <div class="zz-item-head">
+            <div class="zz-title">{{stateIcon .}}<a href="{{.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.GitHub.Title}}</a></div>
+            <div class="zz-item-actions">
+              <form method="post" action="/items/hide">
+                <input type="hidden" name="id" value="{{.ID}}">
+                <input type="hidden" name="hidden" value="false">
+                <button class="btn btn-sm" type="submit" title="Bring this item back to your radar; the next refresh scores it">Unhide</button>
+              </form>
+            </div>
+          </div>
+          <div class="zz-meta">
+            <span>{{.GitHub.Repo}} #{{.GitHub.Number}}</span>
+            {{with ghLabels .}}<span class="zz-labels">{{range .}}<span class="Label zz-ghlabel">{{.Name}}</span>{{end}}</span>{{end}}
+          </div>
+          {{template "ci" ciSummary .}}
+        </div>
+        {{end}}
+      </section>
       {{end}}
     {{end}}
   </div>
@@ -363,7 +389,7 @@
 </html>
 {{/* A pull request's CI summary (ciView), or nothing for nil. */}}
 {{define "ci"}}{{with .}}<ul class="zz-ci" aria-label="CI results">
-            {{if .Historical}}<li class="zz-ci-note">Last known CI results; no longer updated since this item left your radar.</li>{{end}}
+            {{if .Historical}}<li class="zz-ci-note">Last known CI results; no longer updated since this item left your radar.</li>{{else if .Stale}}<li class="zz-ci-note">Last known CI results, from before you hid this item; the next refresh checks them again.</li>{{end}}
             {{with .Passed}}<li class="zz-ci-pass">{{.}}</li>{{end}}
             {{with .Pending}}<li class="zz-ci-pending">{{.}}</li>{{end}}
             {{range .Failed}}<li class="zz-ci-fail">{{if .URL}}<a href="{{.URL}}" target="_blank" rel="noopener noreferrer">{{.Name}}</a>{{else}}{{.Name}}{{end}}</li>{{end}}

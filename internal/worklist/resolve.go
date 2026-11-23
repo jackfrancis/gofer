@@ -17,12 +17,15 @@ const (
 // items (StatusReady only); Message carries a human-facing explanation when the
 // backfill run failed (StatusFailed only). OffRadar carries the stored items left
 // out of Items because they are hidden or completed (StatusReady only), from the same
-// read, so a caller that also needs them (the radar's Reset count and Undo) does not
-// read the store a second time and cannot see the two halves disagree.
+// read, so a caller that also needs them (the radar's Reset count) does not read the
+// store a second time and cannot see the two halves disagree. Hidden is the subset of
+// OffRadar the radar lists in its hidden section (WorkItem.InHiddenList), most
+// recently hidden first, unscored.
 type Resolution struct {
 	Status   string
 	Items    []WorkItem
 	OffRadar []WorkItem
+	Hidden   []WorkItem
 	Message  string
 }
 
@@ -94,22 +97,26 @@ func Resolve(ctx context.Context, store Store, ingestor Ingestor, now time.Time,
 		items[i].Meta = Rescore(items[i], now) // human overrides are preserved verbatim
 	}
 	// Hidden items (user-set) and completed items (closed/merged, agent-set) stay
-	// in the store so an agent can still see and revive them, but are dropped from
-	// the user-facing list.
+	// in the store, but are dropped from the ranked list. Hidden items still open
+	// are listed apart (Hidden), for the owner to unhide.
 	visible := items[:0]
-	var off []WorkItem
+	var off, hidden []WorkItem
 	for _, it := range items {
 		if it.OnRadar() {
 			visible = append(visible, it)
 		} else {
 			off = append(off, it)
+			if it.InHiddenList() {
+				hidden = append(hidden, it)
+			}
 		}
 	}
 	items = visible
 	if err := Sort(items, key, desc); err != nil {
 		return Resolution{}, err
 	}
-	return Resolution{Status: StatusReady, Items: items, OffRadar: off}, nil
+	sortHidden(hidden)
+	return Resolution{Status: StatusReady, Items: items, OffRadar: off, Hidden: hidden}, nil
 }
 
 // OnRadar reports whether the item belongs on the owner's radar: it is neither
@@ -117,15 +124,4 @@ func Resolve(ctx context.Context, store Store, ingestor Ingestor, now time.Time,
 // and every bulk action (Review all, the second-opinion batch) draws only from them.
 func (w WorkItem) OnRadar() bool {
 	return w.Meta.HiddenAt.IsZero() && w.Meta.CompletedAt.IsZero()
-}
-
-// HiddenAfter returns the HiddenAt to keep for a re-ingested item: it preserves a
-// prior hidden timestamp, but clears it (auto-unhide) when the underlying item
-// has been updated since it was hidden, so a changed item resurfaces. updatedAt
-// is the GitHub item's updated_at.
-func HiddenAfter(prevHiddenAt, updatedAt time.Time) time.Time {
-	if prevHiddenAt.IsZero() || updatedAt.After(prevHiddenAt) {
-		return time.Time{}
-	}
-	return prevHiddenAt
 }

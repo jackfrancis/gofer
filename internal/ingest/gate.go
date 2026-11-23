@@ -142,10 +142,16 @@ var (
 // submit it. It refuses while a run for key is in flight, which includes a
 // reservation whose Submit has not returned, so a reservation is never replaced
 // before it is settled. A reservation is settled with settle once Submit returns.
-func (i *Ingestor) reserve(ctx context.Context, key runKey, g gate) (mine *run, ok bool) {
+// With want set, it reserves only while want (called with i.mu held, on every pass,
+// so after a status probe too) reports true.
+func (i *Ingestor) reserve(ctx context.Context, key runKey, g gate, want func() bool) (mine *run, ok bool) {
 	for probed := false; ; probed = true {
 		now := time.Now()
 		i.mu.Lock()
+		if want != nil && !want() {
+			i.mu.Unlock()
+			return nil, false
+		}
 		cur := i.runs[key]
 		if cur == nil || !cur.live(now, g.probe) {
 			if cur != nil {
@@ -191,6 +197,7 @@ func (i *Ingestor) settle(key runKey, mine *run, id string, err error) {
 		// window does too; until then it ran from the reservation.
 		mine.at = time.Now()
 		mine.prev = nil // never rolled back now
+		i.payFollowUpLocked(key, mine)
 		return
 	}
 	if hold := uncertainHold(key.task); hold > 0 && !errors.Is(err, ErrNotAccepted) {
