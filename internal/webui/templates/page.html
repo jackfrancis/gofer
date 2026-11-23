@@ -99,7 +99,7 @@
             {{if eq $m.Role "agent"}}{{markdown $m.Content}}{{else}}{{$m.Content}}{{end}}
             <div class="zz-msgfoot">
               {{if $m.Model}}<span class="zz-model">via {{$m.Model}}</span>{{end}}
-              {{if eq $m.Role "agent"}}<button class="zz-linkbtn zz-copy" type="button" data-copy="{{$m.Content}}" title="Copy this reply to the clipboard" hidden>Copy</button>{{end}}
+              {{if eq $m.Role "agent"}}<button class="zz-iconbtn zz-copy" type="button" data-copy="{{$m.Content}}" title="Copy" aria-label="Copy reply" hidden><svg class="zz-icon zz-icon-copy" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="5.5" y="5.5" width="9" height="9" rx="1.75"/><path d="M3.5 10.5h-.25A1.75 1.75 0 0 1 1.5 8.75v-5.5A1.75 1.75 0 0 1 3.25 1.5h5.5a1.75 1.75 0 0 1 1.75 1.75v.25"/></svg><svg class="zz-icon zz-icon-check" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3 8.5l3.25 3.25L13 5"/></svg><svg class="zz-icon zz-icon-fail" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.75v3.5M8 11.25h.01"/></svg><span class="zz-copy-fail" aria-hidden="true">Copy failed</span></button>{{end}}
               <form method="post" action="/items/thread/hide">
                 <input type="hidden" name="id" value="{{$.Item.ID}}">
                 <input type="hidden" name="msg" value="{{$.Item.TurnKey $i}}">

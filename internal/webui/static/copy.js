@@ -5,6 +5,8 @@
   "use strict";
 
   var FEEDBACK_MS = 1500;
+  // A failure stays up longer: the user has to notice it and copy another way.
+  var FAILURE_MS = 4000;
 
   // Last-resort copy for contexts where the async Clipboard API is missing or
   // rejected (plain-HTTP origins other than localhost, denied permission, embedded
@@ -47,19 +49,44 @@
     return clip.writeText(markdown).catch(function () { return legacyCopy(markdown); });
   }
 
+  // One shared, visually hidden live region announces each outcome, since an
+  // icon swap alone says nothing to a screen reader.
+  var status = null;
+  function announce(text) {
+    if (!status) {
+      status = document.createElement("div");
+      status.className = "zz-sr";
+      status.setAttribute("role", "status");
+      document.body.appendChild(status);
+    }
+    status.textContent = "";
+    setTimeout(function () { status.textContent = text; }, 50);
+  }
+
+  // The button is icon-only: copy.js shows the outcome by class (is-copied swaps in
+  // the check; is-failed swaps in an alert glyph and the visible words "Copy
+  // failed") and in the tooltip, then restores both.
   function wireCopyButtons() {
     var buttons = document.querySelectorAll(".zz-copy[data-copy]");
     Array.prototype.forEach.call(buttons, function (btn) {
-      var label = btn.textContent;
+      var title = btn.getAttribute("title");
       var timer = 0;
+      function show(cls, text, ms) {
+        clearTimeout(timer);
+        btn.classList.remove("is-copied", "is-failed");
+        btn.classList.add(cls);
+        btn.setAttribute("title", text);
+        announce(text);
+        timer = setTimeout(function () {
+          btn.classList.remove(cls);
+          btn.setAttribute("title", title);
+        }, ms);
+      }
       btn.addEventListener("click", function () {
         copyReply(btn.getAttribute("data-copy")).then(
-          function () { btn.textContent = "Copied"; },
-          function () { btn.textContent = "Copy failed"; }
-        ).then(function () {
-          clearTimeout(timer);
-          timer = setTimeout(function () { btn.textContent = label; }, FEEDBACK_MS);
-        });
+          function () { show("is-copied", "Copied", FEEDBACK_MS); },
+          function () { show("is-failed", "Copy failed", FAILURE_MS); }
+        );
       });
       btn.hidden = false;
     });
