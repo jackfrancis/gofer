@@ -212,13 +212,14 @@ func TestItemContextShowsScoredZeroRank(t *testing.T) {
 	}
 }
 
-// An item with no score yet, just unhidden or hidden, gets no rank, axes or signal
-// drivers: its leftover labels would otherwise describe a score the radar does not
-// show (a security label alone drives impact).
+// An item the radar does not rank (just unhidden, hidden, or retired) gets no rank,
+// axes or signal drivers: its leftover labels would otherwise describe a score the
+// radar does not show (a security label alone drives impact).
 func TestItemContextUnscoredItemHasNoRanking(t *testing.T) {
 	for name, meta := range map[string]worklist.Metadata{
 		"awaiting refresh": {AwaitingRefresh: true},
 		"hidden":           {HiddenAt: ctxNow},
+		"retired":          {CompletedAt: ctxNow}, // e.g. a closed PR unhidden: no flag, still off the radar
 	} {
 		item := worklist.WorkItem{Signals: worklist.Signals{Labels: []string{"security"}}, Meta: meta}
 		got := block(t, itemContext(item, ctxNow))
