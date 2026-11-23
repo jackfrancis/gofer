@@ -6,7 +6,8 @@
 // appears without a click: from a scheduled pass that started and ended between two
 // polls, or from one that ended while the next was already running. It shows "refreshing from GitHub…" while one runs. It never reloads
 // while the user is mid-choice: a menu (<details>, such as the project filter or a
-// model picker) is open, or a form control has focus. A failed poll keeps polling.
+// model picker) is open, a form control has focus, or items are checked for a bulk
+// comment (a reload would discard the selection). A failed poll keeps polling.
 // Without script, a <noscript> meta refresh reloads during a refresh shown at render.
 (function () {
   "use strict";
@@ -22,7 +23,7 @@
   var url = "/items/refresh-status?done=" + encodeURIComponent(done);
 
   function busy() {
-    if (document.querySelector("details[open]")) {
+    if (document.querySelector("details[open], [data-comment-item]:checked")) {
       return true;
     }
     var a = document.activeElement;

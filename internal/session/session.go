@@ -47,6 +47,9 @@ type OAuthFlow struct {
 	Provider string
 	State    string
 	Verifier string // PKCE code verifier
+	// UserID binds a grant flow (StartGrant) to the signed-in user who began it; the
+	// callback refuses to complete it for anyone else. Empty for a sign-in flow.
+	UserID string
 }
 
 // pendingFlow is a pre-auth session: an OAuth handshake in progress.
@@ -68,8 +71,9 @@ type Manager struct {
 	now    func() time.Time // the clock; replaced in tests
 	allow  func(*User) bool // nil: every stored session is honoured
 
-	mu    sync.Mutex
-	flows map[string]*pendingFlow // session id -> in-progress OAuth flow
+	mu     sync.Mutex
+	flows  map[string]*pendingFlow // session id -> in-progress OAuth flow
+	grants map[string]*pendingFlow // grant cookie id -> in-progress grant flow (grant.go)
 }
 
 // Option configures a Manager.
@@ -103,6 +107,7 @@ func NewManager(secret []byte, secure bool, opts ...Option) *Manager {
 		store:  NewMemoryStore(),
 		now:    time.Now,
 		flows:  make(map[string]*pendingFlow),
+		grants: make(map[string]*pendingFlow),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -127,6 +132,11 @@ func (m *Manager) sweep(ctx context.Context) {
 	for id, f := range m.flows {
 		if now.After(f.expiresAt) {
 			delete(m.flows, id)
+		}
+	}
+	for id, f := range m.grants {
+		if now.After(f.expiresAt) {
+			delete(m.grants, id)
 		}
 	}
 	m.mu.Unlock()

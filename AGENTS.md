@@ -62,6 +62,8 @@ internal/checkout/   unpack a repo tarball safely; search/list/read it (workload
 internal/prow/       read a Prow job's public logs/artifacts from GCS, allowlisted (workload-only)
 internal/llm/        LLM ranking / converse (workload-only)
 internal/markdown/   render + sanitize assistant Markdown
+internal/comment/    bulk comment: post the user's comment with the write grant; @ suggestions (web tier, ADR 0009)
+internal/ghcomment/  the web tier's only GitHub client: public check, post a comment, list assignees
 internal/metrics/    Prometheus metrics
 Dockerfile           web-tier image
 Dockerfile.runtime   agent-runtime image (AEI launches it per run)
@@ -115,7 +117,8 @@ Wired on the web-tier side; they define what a runtime must respect:
 - **Credentials vended on demand.** Downstream provider tokens come from
   `GET /agent/credential` (behind RequireScope) and are held by the workload for the
   run only — never a standing secret, never logged, never persisted. gofer core
-  packages import no provider client; only the workload (`internal/agent`) does.
+  packages import no provider client; only the workload (`internal/agent`) does,
+  apart from the web tier's narrow `internal/ghcomment` (ADR 0009).
   The broker vends through `auth.Handler.Credential`, which refreshes expiring
   (GitHub App) tokens; the refresh token never leaves the web tier.
 - **The chat-model token is the same class.** The web tier holds only the non-secret
@@ -123,7 +126,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   In the optional model-gateway profile (`AI_GATEWAY_URL`, ADR 0008) neither holds
   it: agentgateway does, runs present their run credential (`ai_auth=gateway`), and
   the gateway asks gofer (`/agent/model-access`) before attaching the key.
-- **Least privilege.** Source scopes are READ; only gofer metadata is WRITE.
+- **Least privilege.** Tokens vended to runs are READ; only gofer metadata is WRITE.
+  The one write-capable credential is the opt-in write grant (ADR 0009, vault
+  provider `github-write`, a separate classic OAuth app with `public_repo`), and it
+  never leaves the web tier: `auth.Handler.Credential` and the broker each refuse it,
+  independently. It posts only the user's own comment, from their confirmed
+  submission, with no model involved.
 
 ## Conventions & gotchas
 
@@ -395,6 +403,19 @@ Wired on the web-tier side; they define what a runtime must respect:
   a projected read, enrich writes the fresh summary through `WorkItem.SetCI`, which
   drops the projection marker, since a cut summary compares equal to fresh data it
   does not match. A retired item's CI is labeled as the last known result. It is display-only: nothing scores on it.
+- The bulk comment (ADR 0009) is on only with `GITHUB_WRITE_CLIENT_ID`/`_SECRET`,
+  which config requires to name a different OAuth app from sign-in (a classic grant
+  accumulates scopes per user and app, which would put `public_repo` on the token runs
+  hold). The grant is connected under its own cookie (`session.StartGrant`, path
+  `/auth/github-write`), so the session survives, and only by the GitHub account the
+  session belongs to; logout and "Disconnect commenting" revoke it through logout's
+  ledger. The web tier posts with it (`internal/comment` over `internal/ghcomment`,
+  which checks `"private": false` first and follows no redirect): a preview, then a
+  same-origin confirm carrying a one-time nonce, so a resubmit shows the first
+  results instead of posting again. Targets are items on the radar only
+  (`WorkItem.OnRadar`). @ suggestions are each repository's assignees, read with the
+  user's read credential and cached in memory, ranked by how many of the selected
+  repositories can assign each. `reload.js` does not reload while items are checked.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

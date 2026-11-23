@@ -402,7 +402,7 @@ func (h *Handler) revokeLocked(ctx context.Context, userID, providerName string)
 	step := func() (context.Context, context.CancelFunc) {
 		return context.WithTimeout(context.WithoutCancel(ctx), exchangeTimeout)
 	}
-	if providerName != "github" {
+	if !isGitHub(providerName) {
 		return logoutResult{confirmed: true} // gofer revokes nothing at other providers
 	}
 	p, ok := h.providers[providerName]
@@ -462,8 +462,12 @@ func (h *Handler) revokeLocked(ctx context.Context, userID, providerName string)
 // unconfirmed is an unconfirmed logoutResult, with the settings pages for the
 // credential's issuer. Non-GitHub providers get none: gofer revokes nothing there.
 func (h *Handler) unconfirmed(providerName string, p *provider, cred *vault.Credential) logoutResult {
-	if providerName != "github" {
+	if !isGitHub(providerName) {
 		return logoutResult{confirmed: true}
+	}
+	if providerName == WriteProvider {
+		// The write grant is always a classic OAuth app (ADR 0009).
+		return logoutResult{settings: []string{oauthAppsSettings}}
 	}
 	return logoutResult{settings: h.revocationSettings(p, cred)}
 }
