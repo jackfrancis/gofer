@@ -3,6 +3,7 @@ package worklist
 import (
 	"context"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 )
@@ -53,6 +54,17 @@ func TestHiddenItemKeepsCI(t *testing.T) {
 	got = MergeRunItems([]WorkItem{it}, []WorkItem{{ID: "a", Type: TypePullRequest, GitHub: GitHubRef{CI: fresh}}})[0]
 	if !got.GitHub.CI.Equal(fresh) {
 		t.Fatalf("a write-back's fresh CI lands on a hidden item, got %+v", got.GitHub.CI)
+	}
+
+	// Unhidden, the pre-hide summary is dropped, and a refresh (which carries no CI)
+	// does not bring it back: only enrich's next read of the head shows CI again.
+	UnhideItem(&it)
+	if it.GitHub.CI != nil {
+		t.Fatalf("unhide drops the pre-hide CI summary, got %+v", it.GitHub.CI)
+	}
+	got = MergeRunItems([]WorkItem{it}, []WorkItem{{ID: "a", Type: TypePullRequest, Meta: Metadata{Rank: 0.5}}})[0]
+	if got.GitHub.CI != nil {
+		t.Fatalf("a refresh after unhide shows no stale CI, got %+v", got.GitHub.CI)
 	}
 }
 
@@ -108,6 +120,16 @@ func TestSelectOpenSkipsHiddenItems(t *testing.T) {
 		if len(page) != 1 || page[0].ID != "v" {
 			t.Fatalf("Select(%+v) = %+v, want only the item on the radar", sel, page)
 		}
+	}
+	// An item awaiting its post-unhide refresh is on the radar and enriched (paged
+	// reads), but holds no signals to rank, so the ranker's top-N leaves it out.
+	back := WorkItem{ID: "b", Meta: Metadata{AwaitingRefresh: true}}
+	withBack := append(slices.Clone(items), back)
+	if page, _ := Select(withBack, Selection{Open: true}, t3); len(page) != 2 {
+		t.Fatalf("a paged read includes the item awaiting refresh, got %+v", page)
+	}
+	if page, _ := Select(withBack, Selection{Open: true, Top: 10}, t3); len(page) != 1 || page[0].ID != "v" {
+		t.Fatalf("the ranker's top-N leaves out the item awaiting refresh, got %+v", page)
 	}
 	if got := ApplyBriefQuery(items, BriefQuery{Open: true}); len(got) != 1 || got[0].ID != "v" {
 		t.Fatalf("ApplyBriefQuery(open) = %+v, want only the item on the radar", got)

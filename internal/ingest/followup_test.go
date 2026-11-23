@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -202,4 +203,88 @@ func TestRefreshFollowUpGivesUp(t *testing.T) {
 	if d.count() != 1 {
 		t.Fatalf("nothing could run; got %d runs", d.count())
 	}
+}
+
+// A second unhide while a follow-up is owed joins it, and gets its own full retry
+// window: the worker does not give up on the first unhide's deadline.
+func TestRefreshFollowUpLatestUnhideExtendsTheWindow(t *testing.T) {
+	ctx := context.Background()
+	d := &gateDispatcher{phase: "Running"}
+	ig := fastFollowUps(d, 200*time.Millisecond)
+	if err := ig.Refresh(ctx, "github:1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ig.RefreshFollowUp(ctx, "github:1"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if err := ig.RefreshFollowUp(ctx, "github:1"); err != nil { // just before the first deadline
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // past the first deadline, inside the second
+	if !owed(ig, "github:1") {
+		t.Fatal("the worker gave up on the first unhide's deadline, dropping the second")
+	}
+	d.set("Succeeded")
+	waitCount(t, d, 2)
+	stays(t, d, 2, "both unhides share one run")
+}
+
+// holdStatus is a gateDispatcher whose Status for one run blocks, once enabled,
+// until released: a status answer delayed in flight.
+type holdStatus struct {
+	*gateDispatcher
+	mu       sync.Mutex
+	holdID   string
+	arrived  chan struct{}
+	released chan struct{}
+}
+
+func (d *holdStatus) Status(ctx context.Context, id string) (RunStatus, error) {
+	d.mu.Lock()
+	hold := id == d.holdID
+	d.mu.Unlock()
+	if hold {
+		d.arrived <- struct{}{}
+		<-d.released
+	}
+	return d.gateDispatcher.Status(ctx, id)
+}
+
+// A run that paid the follow-up while the worker waited on a delayed status answer
+// about the run before it leaves the worker nothing to do: it re-checks the debt
+// under the lock that would reserve, after the probe, and starts no third run.
+func TestRefreshFollowUpRechecksTheDebtAfterAProbe(t *testing.T) {
+	ctx := context.Background()
+	d := &gateDispatcher{phase: "Running"}
+	hd := &holdStatus{gateDispatcher: d, arrived: make(chan struct{}, 1), released: make(chan struct{})}
+	ig := fastFollowUps(hd, time.Minute)
+	if err := ig.Refresh(ctx, "github:1"); err != nil { // run A: run-1
+		t.Fatal(err)
+	}
+	if err := ig.RefreshFollowUp(ctx, "github:1"); err != nil { // refused: A is running
+		t.Fatal(err)
+	}
+	hd.mu.Lock()
+	hd.holdID = "run-1" // the worker's next probe of A hangs
+	hd.mu.Unlock()
+	<-hd.arrived
+
+	// Meanwhile A passes its deadline and a tick starts B, which pays the debt and ends.
+	ig.mu.Lock()
+	ig.runs[ingestKey("github:1")].at = time.Now().Add(-2 * retryAfter)
+	ig.mu.Unlock()
+	if ok, err := ig.ScheduledRefresh(ctx, "github:1"); err != nil || !ok {
+		t.Fatalf("ScheduledRefresh = %v, %v; want run B", ok, err)
+	}
+	if owed(ig, "github:1") {
+		t.Fatal("B was reserved after the unhide and accepted: it pays the debt")
+	}
+	d.set("Succeeded")
+	if active, err := ig.Active(ctx, "github:1"); err != nil || active {
+		t.Fatalf("Active = %v, %v; want B seen to end", active, err)
+	}
+
+	close(hd.released) // A's delayed answer lands
+	stays(t, d, 2, "the worker must not start a third run once B paid the debt")
 }

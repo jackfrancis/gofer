@@ -95,3 +95,26 @@ func TestRefreshKeepsHiddenItemHiddenAndUnscored(t *testing.T) {
 		t.Fatalf("the refresh fills an unhidden item in (fresh signals, then a ranking), got %+v", got.Signals)
 	}
 }
+
+// A ranking pass leaves an item awaiting its post-unhide refresh alone: it holds no
+// signals (a partial fetch may have missed it), and a proposal made from nothing
+// would outlive the refresh that fills it in if that pass's ranking failed.
+func TestRankSkipsItemAwaitingRefresh(t *testing.T) {
+	sink := &memSink{items: []worklist.WorkItem{
+		{ID: "github:o/r#1", Source: "github", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1},
+			Meta: worklist.Metadata{AwaitingRefresh: true}},
+		{ID: "github:o/r#2", Source: "github", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "o/r", Number: 2},
+			Signals: worklist.Signals{Reasons: []worklist.Reason{worklist.ReasonReviewRequested}}},
+	}}
+	if err := Run(context.Background(), Params{JobType: JobRank}, fakeVendor{token: "tok"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range sink.items {
+		switch {
+		case it.ID == "github:o/r#1" && (it.Signals.Proposed != nil || !it.Meta.AwaitingRefresh):
+			t.Fatalf("the item awaiting refresh must not be ranked, got %+v %+v", it.Signals.Proposed, it.Meta)
+		case it.ID == "github:o/r#2" && it.Signals.Proposed == nil:
+			t.Fatal("test premise: the other item is ranked")
+		}
+	}
+}

@@ -51,7 +51,9 @@ type Selection struct {
 	// Top, when > 0, reads the Top items with the highest baseline score
 	// (BaselineScore(item, now).Rank, without the model signals a ranking pass
 	// replaces, which may rest on a classification since changed),
-	// highest first, instead of paging by ID; Limit is ignored. Equal scores keep the store's first-insertion order. It is clamped to
+	// highest first, instead of paging by ID; Limit is ignored. It leaves out items
+	// awaiting their post-unhide refresh (Metadata.AwaitingRefresh), which hold no
+	// signals to rank yet. Equal scores keep the store's first-insertion order. It is clamped to
 	// MaxSelectLimit, and its pages are positions in that ranking, so a score that
 	// changes between pages can shift an item across a page boundary: a reader
 	// drops an ID it already has.
@@ -79,6 +81,12 @@ func Select(items []WorkItem, sel Selection, now time.Time) (page []WorkItem, ne
 	out := make([]WorkItem, 0, len(items))
 	for _, it := range items {
 		if sel.Open && !it.OnRadar() {
+			continue
+		}
+		if sel.Top > 0 && it.Meta.AwaitingRefresh {
+			// Unhidden, with no GitHub signals yet (a partial fetch may have missed it):
+			// a ranking now would rest on nothing, and outlive the refresh that fills it
+			// in if that pass's ranking fails. It is ranked once a refresh writes it.
 			continue
 		}
 		out = append(out, it)

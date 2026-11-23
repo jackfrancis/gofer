@@ -196,9 +196,10 @@ func (i *Ingestor) Refresh(ctx context.Context, ownerID string) error {
 // Refresh, and while the debt stands a worker retries through the same gate
 // (followUpPoll, backing off after a refusal), asking the backend whether the run in
 // flight has ended, so nothing depends on a page polling. Any accepted ingest run
-// reserved after the call pays the debt (settle): a click, a tick, a backfill. The
-// worker gives up after followUpGiveUp, and a restart forgets the debt; in both cases
-// the item waits for the next refresh.
+// reserved after the call pays the debt (settle): a click, a tick, a backfill. A
+// further call while the debt stands joins it (one run pays both) and gives it a
+// full followUpGiveUp from now. The worker gives up after that, and a restart
+// forgets the debt; in both cases the item waits for the next refresh.
 func (i *Ingestor) RefreshFollowUp(ctx context.Context, ownerID string) error {
 	i.mu.Lock()
 	f := i.followUps[ownerID]
@@ -207,8 +208,10 @@ func (i *Ingestor) RefreshFollowUp(ctx context.Context, ownerID string) error {
 		f = &followUp{}
 		i.followUps[ownerID] = f
 	}
-	// Only a run reserved from now on reads the store after the change.
+	// Only a run reserved from now on reads the store after the change, and this
+	// change gets its own full retry window.
 	f.after = i.gens[ownerID]
+	f.until = time.Now().Add(i.followUpGiveUp)
 	i.mu.Unlock()
 	_, err := i.dispatchIngest(ctx, ownerID, refreshGate, true)
 	if start {
@@ -218,8 +221,12 @@ func (i *Ingestor) RefreshFollowUp(ctx context.Context, ownerID string) error {
 }
 
 // followUp is an ingest run owed to an owner (RefreshFollowUp): one whose
-// generation is above after, accepted by the backend.
-type followUp struct{ after uint64 }
+// generation is above after, accepted by the backend. Its worker gives up after
+// until. Both are guarded by Ingestor.mu.
+type followUp struct {
+	after uint64
+	until time.Time
+}
 
 // Pacing of a follow-up's worker (Ingestor.followUpPoll and friends). The give-up
 // bound outlasts the longest hold the gate can place on the owner's ingest key
@@ -239,18 +246,21 @@ func (i *Ingestor) payFollowUpLocked(key runKey, r *run) {
 }
 
 // driveFollowUp retries ownerID's owed run f until a run pays it, f is replaced, or
-// the worker gives up. Each try goes through the refresh gate, which asks the
-// backend whether the run in flight has ended, so the owed run starts soon after it
-// does; a refused submission (ErrNotAccepted) keeps the debt and backs off.
+// the worker gives up (f.until). Each try goes through the refresh gate, which asks
+// the backend whether the run in flight has ended, so the owed run starts soon after
+// it does; a refused submission (ErrNotAccepted) keeps the debt and backs off. A try
+// reserves only while the debt still stands, checked under the lock that reserves
+// (after any status probe), so a run that paid it meanwhile is not followed by
+// another.
 func (i *Ingestor) driveFollowUp(ownerID string, f *followUp) {
 	wait := i.followUpPoll
-	giveUp := time.Now().Add(i.followUpGiveUp)
+	stillOwed := func() bool { return i.followUps[ownerID] == f } // under i.mu
 	for {
 		t := time.NewTimer(wait)
 		<-t.C
 		i.mu.Lock()
-		owed := i.followUps[ownerID] == f
-		expired := owed && time.Now().After(giveUp)
+		owed := stillOwed()
+		expired := owed && time.Now().After(f.until)
 		if expired {
 			delete(i.followUps, ownerID)
 		}
@@ -262,7 +272,7 @@ func (i *Ingestor) driveFollowUp(ownerID string, f *followUp) {
 			i.log.Warn("follow-up refresh not run before giving up; the next refresh fills the item in", "owner", ownerID)
 			return
 		}
-		_, err := i.dispatchIngest(context.Background(), ownerID, refreshGate, true)
+		_, err := i.dispatchIngestIf(context.Background(), ownerID, refreshGate, true, stillOwed)
 		switch {
 		case errors.Is(err, ErrNotAccepted):
 			wait = min(2*wait, i.followUpMaxWait)
@@ -373,8 +383,14 @@ func (i *Ingestor) Active(ctx context.Context, ownerID string) (bool, error) {
 // goes away must not leave acceptance unknown), while without it ctx cancels it (the
 // Refresher's shutdown).
 func (i *Ingestor) dispatchIngest(ctx context.Context, ownerID string, g gate, detach bool) (bool, error) {
+	return i.dispatchIngestIf(ctx, ownerID, g, detach, nil)
+}
+
+// dispatchIngestIf is dispatchIngest that reserves only while want (when not nil),
+// called with i.mu held, still reports true (see reserve).
+func (i *Ingestor) dispatchIngestIf(ctx context.Context, ownerID string, g gate, detach bool, want func() bool) (bool, error) {
 	key := ingestKey(ownerID)
-	mine, ok := i.reserve(ctx, key, g)
+	mine, ok := i.reserve(ctx, key, g, want)
 	if !ok {
 		return false, nil
 	}
@@ -568,7 +584,7 @@ func (i *Ingestor) dispatchConverse(ctx context.Context, ownerID string, ref wor
 		params["independent"] = "true"
 	}
 	key := runKey{owner: ownerID, task: taskConverse, item: ref.Item, turn: ref.Turn}
-	mine, ok := i.reserve(ctx, key, converseGate)
+	mine, ok := i.reserve(ctx, key, converseGate, nil)
 	if !ok {
 		return nil // a run for this turn is already in flight
 	}
@@ -609,7 +625,7 @@ func (i *Ingestor) ScheduledResearch(ctx context.Context, ownerID, itemID string
 		return false, nil
 	}
 	key := runKey{owner: ownerID, task: taskResearch, item: itemID}
-	mine, ok := i.reserve(ctx, key, researchGate)
+	mine, ok := i.reserve(ctx, key, researchGate, nil)
 	if !ok {
 		return false, nil // a research run for this item is already in flight
 	}

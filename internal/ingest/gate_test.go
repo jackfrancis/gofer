@@ -162,7 +162,7 @@ func TestConverseRedispatchesAfterTheDeadline(t *testing.T) {
 
 	noop := New(NoopDispatcher{}, "", "", nil, "", "")
 	_ = noop.Converse(context.Background(), "github:1", ref, "", "")
-	if _, ok := noop.reserve(context.Background(), key, converseGate); ok {
+	if _, ok := noop.reserve(context.Background(), key, converseGate, nil); ok {
 		t.Fatal("a run with no id must gate the turn until its deadline")
 	}
 }

@@ -268,16 +268,19 @@ Wired on the web-tier side; they define what a runtime must respect:
   list (`Resolution.Hidden`, most recently hidden first) with an Unhide button and no
   Discuss: a hidden item takes no new turn, retry, review panel or turn hide/unhide
   (`appendTurn`, `ThreadRetry`, `HideMessage`), and its thread page is read-only.
-  Unhide (`worklist.UnhideItem`) brings it back empty, flagged `Meta.AwaitingRefresh`
-  (unscored by `Rescore` and by Discuss's ranking context, shown as waiting for the
-  next refresh), and calls `Ingestor.RefreshFollowUp`, which owes the owner one
-  ingest run reserved after the call until the backend accepts one (`settle` pays
-  it, whoever reserved the run). It tries at once; while the debt stands a
-  server-side worker retries through the refresh gate (which asks the backend
-  whether the run in flight ended), backing off after a refusal, so nothing waits
-  on a page polling. Never consume the debt on a run's end: only an accepted run
-  reserved after it pays. In memory only; the worker gives up after
-  `followUpGiveUp`. The refresh's write-back clears the flag, since runs own
+  Unhide (`worklist.UnhideItem`) brings it back empty (its pre-hide CI summary
+  dropped too, until enrich reads the head), flagged `Meta.AwaitingRefresh`
+  (unscored by `Rescore` and by Discuss's ranking context, left out of the ranker's
+  top-N selection, shown as waiting for the next refresh), and calls
+  `Ingestor.RefreshFollowUp`, which owes the owner one ingest run reserved after the
+  call until the backend accepts one (`settle` pays it, whoever reserved the run). It
+  tries at once; while the debt stands a server-side worker retries through the
+  refresh gate (which asks the backend whether the run in flight ended), backing off
+  after a refusal, so nothing waits on a page polling. Never consume the debt on a
+  run's end: only an accepted run reserved after it pays, and the worker reserves
+  only while the debt still stands, checked under the reserving lock after any
+  probe. Each unhide joins a standing debt and gives it a full `followUpGiveUp`; in
+  memory only. The refresh's write-back clears the flag, since runs own
   `Metadata`. A hidden item that closes leaves the section, still hidden.
 - The radar's project (repository) filter (`internal/webui/projects.go`) is a view
   preference kept in the `gofer_projects` cookie, bound to the account that saved it
@@ -417,7 +420,8 @@ Wired on the web-tier side; they define what a runtime must respect:
   a projected read, enrich writes the fresh summary through `WorkItem.SetCI`, which
   drops the projection marker, since a cut summary compares equal to fresh data it
   does not match. A retired or hidden item's CI (enrich reads neither) is labeled as
-  the last known result; hiding keeps it, since it is a GitHub field. It is display-only: nothing scores on it.
+  the last known result; hiding keeps it, since it is a GitHub field, and unhiding
+  drops it until enrich reads the current head. It is display-only: nothing scores on it.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,
