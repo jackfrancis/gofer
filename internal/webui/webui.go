@@ -1129,6 +1129,31 @@ var funcs = template.FuncMap{
 	"isSecondOpinionRequest": isSecondOpinionRequest,
 	"isSynthesisRequest":     isSynthesisRequest,
 	"userHandle":             userHandle,
+	"avatarURL":              avatarURL,
+}
+
+// AvatarOrigin serves GitHub avatars. It is the one third-party origin the page
+// loads anything from, and the CSP's img-src names it (internal/server).
+const AvatarOrigin = "https://avatars.githubusercontent.com"
+
+// avatarURL is the signed-in user's GitHub avatar, as GitHub's own header shows it,
+// or "" for another provider. It is derived from the numeric account id (the stable
+// part of session.User.ID), not a profile-supplied URL, so a session stored before
+// avatars were shown gets one too and only AvatarOrigin ever reaches the page.
+func avatarURL(u *session.User) string {
+	if u == nil || u.Provider != "github" {
+		return ""
+	}
+	id, ok := strings.CutPrefix(u.ID, "github:")
+	if !ok || id == "" {
+		return ""
+	}
+	for _, c := range id {
+		if c < '0' || c > '9' {
+			return ""
+		}
+	}
+	return AvatarOrigin + "/u/" + id + "?s=48&v=4"
 }
 
 // hasConversation reports whether the item carries conversation state that Reset

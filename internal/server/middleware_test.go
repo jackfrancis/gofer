@@ -76,3 +76,17 @@ func TestThreadReceiptOverRealConnection(t *testing.T) {
 		t.Fatalf("a delivered thread must be marked read, cursor = %q", items[0].ThreadReadThrough)
 	}
 }
+
+// The CSP lets the page load the GitHub avatar and still no other third-party image.
+func TestSecurityHeadersAllowAvatarHost(t *testing.T) {
+	rec := httptest.NewRecorder()
+	securityHeaders(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).
+		ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	csp := rec.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "img-src 'self' data: https://avatars.githubusercontent.com;") {
+		t.Fatalf("CSP img-src does not allow exactly the avatar host: %q", csp)
+	}
+	if got := rec.Header().Get("Referrer-Policy"); got != "no-referrer" {
+		t.Fatalf("Referrer-Policy = %q, want no-referrer", got)
+	}
+}
