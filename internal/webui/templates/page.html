@@ -243,6 +243,13 @@
           {{end}}
         </div>
       </div>
+      {{if and .ProjectsFiltered .SelectedProjects (lt .SelectedProjects (len .Projects))}}
+      <ul class="zz-selected-projects" aria-label="Selected projects">
+        {{range .Projects}}{{if .Selected}}
+        <li>{{with .PullsURL}}<a href="{{.}}" target="_blank" rel="noopener noreferrer" title="Open this project's pull requests on GitHub">{{end}}{{.Name}}{{if .PullsURL}}</a>{{end}}</li>
+        {{end}}{{end}}
+      </ul>
+      {{end}}
       {{with .ProjectsError}}<p class="zz-stalled" role="alert">{{.}}</p>{{end}}
       {{range .Items}}
         <div class="zz-item">
