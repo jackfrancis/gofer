@@ -122,9 +122,26 @@ body {
   display: inline-block; padding: 0 7px; border-radius: 999px;
   font-size: 12px; font-weight: 500; line-height: 18px; border: 1px solid transparent;
 }
-.Label--danger { color: var(--danger); border-color: var(--danger); }
-.Label--attention { color: var(--attention); border-color: var(--attention); }
-.Label--secondary { color: var(--muted); border-color: var(--border); }
+.Label--danger { color: var(--danger); border-color: var(--danger); --ring: var(--danger); }
+.Label--attention { color: var(--attention); border-color: var(--attention); --ring: var(--attention); }
+.Label--secondary { color: var(--muted); border-color: var(--border); --ring: var(--border); }
+/* gofer's own priority, set apart from the GitHub labels beside it by a second,
+   concentric ring: a 2px gap in the page color, then 1px in the pill's border color.
+   A shadow follows the rounded shape and takes no space, so the margin keeps the
+   ring clear of its neighbours. */
+.zz-priority { box-shadow: 0 0 0 2px #fff, 0 0 0 3px var(--ring); margin: 0 3px; }
+/* A GitHub label, in the label's own color: the ghl-<hex> rules come from /labels.css
+   (linked after this sheet, so they override the neutral outline here, which a label
+   with no known color keeps). */
+/* The group sits right of the repo, priority and type, taking the rest of the line and
+   wrapping inside it; only when less than 240px is left (a narrow screen) does it
+   move to a line of its own. */
+.zz-labels { display: flex; flex: 1 1 240px; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.zz-item .zz-meta { align-items: flex-start; } /* the repo line meets the labels' first row */
+.zz-ghlabel {
+  color: var(--muted); border-color: var(--border);
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 .zz-bar { height: 6px; background: var(--bg-subtle); border-radius: 3px; overflow: hidden; margin: 12px 0 8px; }
 .zz-bar span { display: block; height: 100%; background: var(--accent); }

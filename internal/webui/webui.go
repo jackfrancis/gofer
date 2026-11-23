@@ -247,6 +247,7 @@ type pageData struct {
 	User                     *session.User
 	Providers                []string
 	Items                    []worklist.WorkItem
+	LabelCSS                 string             // the stylesheet coloring the shown items' GitHub labels, if any
 	Item                     worklist.WorkItem  // the single item, for the thread view
 	ConvEnabled              bool               // whether the assistive conversation is available
 	ModelOptions             []ModelOption      // conversation picker options (default first)
@@ -1042,6 +1043,7 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 			ResetCount: resetCount, JustHidden: justHidden,
 			Projects: projects, ProjectsFiltered: selected != nil, SelectedProjects: selectedCount, TotalItems: len(res.Items),
 		}
+		data.LabelCSS = labelStylesheet(shown)
 		if scope != nil {
 			data.ProjectScope = encodeSelection(scope)
 		}
@@ -1121,6 +1123,7 @@ var funcs = template.FuncMap{
 	"title":                  titleProvider,
 	"priorityClass":          priorityClass,
 	"stateIcon":              stateIcon,
+	"ghLabels":               ghLabels,
 	"pctBucket":              pctBucket,
 	"axis2":                  axis2,
 	"markdown":               markdown.ToSafeHTML,

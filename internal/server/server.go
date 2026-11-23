@@ -131,6 +131,7 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// Landing page (server-rendered) and its static assets.
 	mux.Handle("GET /{$}", http.HandlerFunc(webHandler.Index))
 	mux.Handle("GET /static/", webHandler.Static())
+	mux.Handle("GET "+webui.LabelStylesheetPath, http.HandlerFunc(webHandler.LabelCSS))
 
 	// Per-item assistive conversation (server-rendered, Post/Redirect/Get). The
 	// handlers check the session themselves.

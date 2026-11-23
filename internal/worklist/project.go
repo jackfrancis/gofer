@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"unicode/utf8"
 )
@@ -83,6 +84,28 @@ var projectables = []projectable{
 					return weight
 				}))
 			}
+		}},
+	// After signals.labels, whose cut it follows: it keeps the colors of the labels
+	// that survived, and only well-formed ones, so it is bounded as they are.
+	{"github.label_colors", func(w *WorkItem) any { return w.GitHub.LabelColors },
+		func(d, s *WorkItem) { d.GitHub.LabelColors = maps.Clone(s.GitHub.LabelColors) },
+		func(w *WorkItem) {
+			if w.GitHub.LabelColors == nil {
+				return
+			}
+			// kept stays nil until a color survives: an empty map would be fingerprinted
+			// as {} but reach the run as nothing (omitempty) and come back nil, so the
+			// write-back would see a rewrite and drop the stored colors.
+			var kept map[string]string
+			for _, l := range w.Signals.Labels {
+				if c := w.GitHub.LabelColor(l); c != "" {
+					if kept == nil {
+						kept = map[string]string{}
+					}
+					kept[l] = c
+				}
+			}
+			w.GitHub.LabelColors = kept
 		}},
 	{"signals.roadmap_themes", func(w *WorkItem) any { return w.Signals.RoadmapThemes },
 		func(d, s *WorkItem) { d.Signals.RoadmapThemes = slices.Clone(s.Signals.RoadmapThemes) },

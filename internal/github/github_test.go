@@ -2,8 +2,10 @@ package github
 
 import (
 	"context"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -27,7 +29,7 @@ func TestFetchWorklistMapsAndDedups(t *testing.T) {
 		// The same PR surfaces under the involves and review-requested queries, so the
 		// two reasons must merge onto one deduped item.
 		if strings.Contains(q, "involves:@me") || strings.Contains(q, "review-requested:@me") {
-			_, _ = w.Write([]byte(`{"items":[{"number":42,"title":"Fix bug","html_url":"https://github.com/o/r/pull/42","state":"open","comments":3,"repository_url":"https://api.github.com/repos/o/r","user":{"login":"me"},"pull_request":{"url":"x"},"labels":[{"name":"kind/bug"}]}]}`))
+			_, _ = w.Write([]byte(`{"items":[{"number":42,"title":"Fix bug","html_url":"https://github.com/o/r/pull/42","state":"open","comments":3,"repository_url":"https://api.github.com/repos/o/r","user":{"login":"me"},"pull_request":{"url":"x"},"labels":[{"name":"kind/bug","color":"D73A4A"},{"name":"odd","color":"red}*{x"}]}]}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"items":[]}`))
@@ -54,6 +56,13 @@ func TestFetchWorklistMapsAndDedups(t *testing.T) {
 	}
 	if it.Signals.Comments != 3 {
 		t.Fatalf("want 3 comments, got %d", it.Signals.Comments)
+	}
+	// Every label is kept; only a well-formed color, normalized, comes with it.
+	if !slices.Equal(it.Signals.Labels, []string{"kind/bug", "odd"}) {
+		t.Fatalf("labels %v", it.Signals.Labels)
+	}
+	if !maps.Equal(it.GitHub.LabelColors, map[string]string{"kind/bug": "d73a4a"}) {
+		t.Fatalf("label colors %v", it.GitHub.LabelColors)
 	}
 	if len(it.Signals.Reasons) != 2 {
 		t.Fatalf("want author+review_requested reasons merged, got %v", it.Signals.Reasons)

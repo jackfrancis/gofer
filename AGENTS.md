@@ -369,6 +369,11 @@ Wired on the web-tier side; they define what a runtime must respect:
   reach that host or make the browser fetch anything. The avatar is added by
   `static/avatar.js` after the load event, never as an `<img>` in the markup, which
   would delay a meta refresh until it loaded.
+- GitHub labels render in their own colors on the radar. The CSP allows no inline
+  style, so a label carries a `ghl-<hex>` class and the page links `/labels.css?c=…`
+  (`internal/webui/labels.go`), a stylesheet generated from the query alone. Colors
+  live in `GitHubRef.LabelColors`, set at ingest; read one only through
+  `GitHubRef.LabelColor` (six hex digits or nothing), since it reaches CSS.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,
