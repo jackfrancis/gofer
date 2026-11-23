@@ -60,3 +60,15 @@ func TestWorklistRendersCISummary(t *testing.T) {
 		}
 	}
 }
+
+// A partial read that counted nothing (no statuses, check runs refused) is not a
+// confirmed empty result: the section shows, with only the note.
+func TestCISummaryPartialWithNoCounts(t *testing.T) {
+	v := ciSummary(worklist.WorkItem{GitHub: worklist.GitHubRef{CI: &worklist.CISummary{SHA: "s", Partial: true}}})
+	if v == nil || !v.Partial || v.Passed != "" || v.Pending != "" || len(v.Failed) != 0 {
+		t.Fatalf("view = %+v", v)
+	}
+	if ciSummary(worklist.WorkItem{GitHub: worklist.GitHubRef{CI: &worklist.CISummary{SHA: "s"}}}) != nil {
+		t.Fatal("a whole read with no jobs shows nothing")
+	}
+}

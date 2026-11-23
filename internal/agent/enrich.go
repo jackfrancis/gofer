@@ -69,23 +69,83 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 	}
 	p.logger().Info("enrich: augmenting work items", "items", len(items))
 
+	// Two passes, timeline first: the timeline feeds the score, the CI summary is
+	// display-only, so slow or failing CI reads must never cost an item its ranking
+	// signals. The CI pass spends only the time the timeline pass left.
+	changed := make([]bool, len(items))
+	open := func(it worklist.WorkItem) bool {
+		// Retired items (closed, merged, no longer involving the user) are off the radar:
+		// spending a call on each would grow with every item ever seen.
+		return it.Source == "github" && it.Meta.CompletedAt.IsZero()
+	}
+	skipped := fanOut(ctx, items, open, func(i int) {
+		// The timeline can take several page reads; they must finish inside the
+		// reserve-adjusted deadline too, not just start before it, or one slow item
+		// holds the batch past the time kept for writing every result back.
+		actx, cancel := reserveContext(ctx, enrichReserve)
+		act, err := gh.ItemActivity(actx, token, items[i].GitHub.Repo, items[i].GitHub.Number, login)
+		cancel()
+		// best-effort: an unreadable timeline leaves the item's signals unchanged
+		if err == nil && applyActivity(&items[i].Signals, act, carried[items[i].ID]) {
+			changed[i] = true
+		}
+	})
+	// A worker that found the user's access gone stops the pass: its results are
+	// partial, and the run should say why rather than write them.
+	if rerr := holder.Reconnect(); rerr != nil {
+		return fmt.Errorf("enrich: %w", rerr)
+	}
+	ciSkipped := fanOut(ctx, items, func(it worklist.WorkItem) bool {
+		return open(it) && it.Type == worklist.TypePullRequest
+	}, func(i int) {
+		if ci, ok := readCI(ctx, gh, token, items[i].GitHub); ok && !ci.Equal(items[i].GitHub.CI) {
+			items[i].GitHub.CI = ci
+			changed[i] = true
+		}
+	})
+	if rerr := holder.Reconnect(); rerr != nil {
+		return fmt.Errorf("enrich: %w", rerr)
+	}
+	var out []worklist.WorkItem
+	for i := range items {
+		if changed[i] {
+			// Enrich derives no model signals; leave them to the store.
+			clearModelSignals(&items[i].Signals)
+			out = append(out, items[i])
+		}
+	}
+	p.logger().Info("enrich: updated work items", "changed", len(out),
+		"skipped_out_of_time", skipped, "ci_skipped_out_of_time", ciSkipped)
+	if len(out) == 0 {
+		return nil
+	}
+	if err := writeBack(ctx, sink, out); err != nil {
+		return fmt.Errorf("ingest: %w", err)
+	}
+	return nil
+}
+
+// fanOut runs work(i) for every item want accepts, enrichConcurrency at a time, and
+// returns how many accepted items it did not start because the run clock reached
+// the time kept for writing the results back and ranking them. Each work call
+// writes only items[i] (and its own index elsewhere), so calls never share state.
+func fanOut(ctx context.Context, items []worklist.WorkItem, want func(worklist.WorkItem) bool, work func(i int)) (skipped int) {
 	var (
-		mu      sync.Mutex
-		changed []worklist.WorkItem
-		wg      sync.WaitGroup
-		sem     = make(chan struct{}, enrichConcurrency)
-		skipped int
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, enrichConcurrency)
 	)
 	for i := range items {
-		// Retired items (closed, merged, no longer involving the user) are off the radar:
-		// spending a timeline call on each would grow with every item ever seen.
-		if items[i].Source != "github" || !items[i].Meta.CompletedAt.IsZero() {
+		if !want(items[i]) {
 			continue
 		}
 		// Yield to the run clock: stop starting new lookups once what remains must be
 		// kept for writing these results back and ranking them.
 		if !hasBudget(ctx, enrichReserve) {
-			skipped = len(items) - i
+			for _, it := range items[i:] {
+				if want(it) {
+					skipped++
+				}
+			}
 			break
 		}
 		wg.Add(1)
@@ -93,46 +153,11 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			// The timeline can take several page reads; they must finish inside the
-			// reserve-adjusted deadline too, not just start before it, or one slow item
-			// holds the batch past the time kept for writing every result back.
-			actx, cancel := reserveContext(ctx, enrichReserve)
-			act, err := gh.ItemActivity(actx, token, items[i].GitHub.Repo, items[i].GitHub.Number, login)
-			cancel()
-			ciChanged := false
-			if items[i].Type == worklist.TypePullRequest {
-				if ci, ok := readCI(ctx, gh, token, items[i].GitHub); ok && !ci.Equal(items[i].GitHub.CI) {
-					items[i].GitHub.CI = ci
-					ciChanged = true
-				}
-			}
-			if err != nil || !applyActivity(&items[i].Signals, act, carried[items[i].ID]) {
-				// best-effort: an unreadable timeline leaves the item's signals unchanged
-				if !ciChanged {
-					return
-				}
-			}
-			// Enrich derives no model signals; leave them to the store.
-			clearModelSignals(&items[i].Signals)
-			mu.Lock()
-			changed = append(changed, items[i])
-			mu.Unlock()
+			work(i)
 		}(i)
 	}
 	wg.Wait()
-	// A worker that found the user's access gone stops the pass: its results are
-	// partial, and the run should say why rather than write them.
-	if rerr := holder.Reconnect(); rerr != nil {
-		return fmt.Errorf("enrich: %w", rerr)
-	}
-	p.logger().Info("enrich: updated work items", "changed", len(changed), "skipped_out_of_time", skipped)
-	if len(changed) == 0 {
-		return nil
-	}
-	if err := writeBack(ctx, sink, changed); err != nil {
-		return fmt.Errorf("ingest: %w", err)
-	}
-	return nil
+	return skipped
 }
 
 // applyActivity sets the timeline-derived signals from act and reports whether any

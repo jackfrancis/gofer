@@ -112,3 +112,57 @@ func TestCIStatusSummary(t *testing.T) {
 		t.Errorf("partial summary = %+v", sum)
 	}
 }
+
+// Once the head commit is known, statuses and check runs are read independently: a
+// refused status read still shows the check runs, marked partial; only both
+// failing is an error.
+func TestCIStatusStatusesRefused(t *testing.T) {
+	checks := http.StatusOK
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/o/r/commits/abc123/status":
+			http.Error(w, "forbidden", http.StatusForbidden)
+		case "/repos/o/r/commits/abc123/check-runs":
+			if checks != http.StatusOK {
+				http.Error(w, "forbidden", checks)
+				return
+			}
+			_, _ = w.Write([]byte(`{"total_count":1,"check_runs":[{"name":"build","status":"completed","conclusion":"failure"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := NewClient(srv.Client(), srv.URL)
+	st, err := c.CIStatusForRef(context.Background(), "tok", "o/r", "abc123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum := st.Summary(); !sum.Partial || strings.Join(sum.Failed, ",") != "build" {
+		t.Errorf("summary = %+v (partial %v)", sum, st.Partial)
+	}
+	checks = http.StatusForbidden
+	if _, err := c.CIStatusForRef(context.Background(), "tok", "o/r", "abc123"); err == nil {
+		t.Error("neither source readable must be an error")
+	}
+}
+
+// The counts follow the outcome GitHub reported: a skipped, neutral or stale check
+// neither succeeded nor is still running.
+func TestCIStatusSummaryCountsOutcomes(t *testing.T) {
+	st := CIStatus{SHA: "s", Checks: []CICheck{
+		{Name: "a", State: "success", Class: CIPassing},
+		{Name: "b", State: "skipped", Class: CIPassing},
+		{Name: "c", State: "neutral", Class: CIPassing},
+		{Name: "d", State: "stale", Class: CIPending},
+		{Name: "e", State: "queued", Class: CIPending},
+		{Name: "f", State: "in_progress", Class: CIPending},
+		{Name: "g", State: "pending", Class: CIPending},
+		{Name: "h", State: "cancelled", Class: CIFailing},
+		{Name: "i", State: "error", Class: CIFailing},
+		{Name: "j", State: "completed", Class: CIPending}, // completed with no conclusion
+	}}
+	if sum := st.Summary(); sum.Passed != 1 || sum.Pending != 3 || strings.Join(sum.Failed, ",") != "h,i" {
+		t.Errorf("summary = %+v", sum)
+	}
+}

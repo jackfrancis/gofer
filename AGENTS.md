@@ -374,11 +374,16 @@ Wired on the web-tier side; they define what a runtime must respect:
   (`internal/webui/labels.go`), a stylesheet generated from the query alone. Colors
   live in `GitHubRef.LabelColors`, set at ingest; read one only through
   `GitHubRef.LabelColor` (six hex digits or nothing), since it reaches CSS.
-- A pull request's CI shows under its labels: jobs passed, jobs in progress, and each
-  failed job's name (`GitHubRef.CI`, a `worklist.CISummary`). Enrich sets it from
-  `github.CIStatusForPR` (`CIStatus.Summary`, bounded by `CISummary.AddFailed`); a
-  refresh keeps the stored one (`reconcileFetched`), and an unreadable CI leaves it
-  unchanged. It is display-only: nothing scores on it.
+- A pull request's CI shows under its labels: jobs succeeded, jobs in progress, and
+  each failed job's name (`GitHubRef.CI`, a `worklist.CISummary`). Counts follow the
+  outcome GitHub reported (`github.ciOutcome`: skipped, neutral and stale are in no
+  count), not the sorting class. Enrich sets it from `github.CIStatusForPR`
+  (`CIStatus.Summary`, bounded by `CISummary.AddFailed`) in a second pass, after
+  every timeline read, so CI never costs an item its ranking signals. Statuses and
+  check runs are read independently (one unreadable = `Partial`; both = error, and
+  the stored summary stands). A write-back that carries no CI keeps the stored one
+  (`worklist.KeepCI`, in the merge): never copy CI from a run's read, which may be a
+  projection. It is display-only: nothing scores on it.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

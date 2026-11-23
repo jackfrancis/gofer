@@ -83,3 +83,27 @@ func TestProjectionCutsCISummary(t *testing.T) {
 		t.Fatalf("a rewritten CI summary must stand, got %+v", merged.GitHub.CI)
 	}
 }
+
+// A pull request's write-back that carries no CI keeps the stored summary; one that
+// carries a summary replaces it; an issue never takes one from the store.
+func TestMergeKeepsCI(t *testing.T) {
+	ci := &CISummary{SHA: "s", Passed: 1, Failed: []string{"e2e"}}
+	stored := []WorkItem{
+		{ID: "pr", Type: TypePullRequest, GitHub: GitHubRef{CI: ci}},
+		{ID: "pr2", Type: TypePullRequest, GitHub: GitHubRef{CI: ci}},
+		{ID: "issue", Type: TypeIssue, GitHub: GitHubRef{CI: ci}},
+	}
+	fresh := &CISummary{SHA: "t", Pending: 2}
+	got := MergeRunItems(stored, []WorkItem{
+		{ID: "pr", Type: TypePullRequest},
+		{ID: "pr2", Type: TypePullRequest, GitHub: GitHubRef{CI: fresh}},
+		{ID: "issue", Type: TypeIssue},
+	})
+	if !got[0].GitHub.CI.Equal(ci) || !got[1].GitHub.CI.Equal(fresh) || got[2].GitHub.CI != nil {
+		t.Fatalf("merged CI: %+v, %+v, %+v", got[0].GitHub.CI, got[1].GitHub.CI, got[2].GitHub.CI)
+	}
+	got[0].GitHub.CI.Failed[0] = "changed"
+	if ci.Failed[0] != "e2e" {
+		t.Fatal("the merge must not alias the stored summary")
+	}
+}

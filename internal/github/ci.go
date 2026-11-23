@@ -84,10 +84,18 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 	}
 	esc := url.PathEscape(ref)
 
+	// The two sources are read independently: either alone still says something, so
+	// one that cannot be read marks the result partial, and only both failing on
+	// their first page (nothing read at all) is an error.
+	var statusErr, checksErr error
 	for page := 1; page <= ciMaxPages; page++ {
 		body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/commits/%s/status?per_page=%d&page=%d", repo, esc, ciPerPage, page))
 		if err != nil {
-			return st, err
+			if page == 1 {
+				statusErr = err
+			}
+			st.Partial = append(st.Partial, "commit statuses could not be read ("+err.Error()+")")
+			break
 		}
 		var cs struct {
 			SHA        string `json:"sha"`
@@ -100,7 +108,11 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 			} `json:"statuses"`
 		}
 		if err := json.Unmarshal(body, &cs); err != nil {
-			return st, err
+			if page == 1 {
+				statusErr = err
+			}
+			st.Partial = append(st.Partial, "commit statuses could not be parsed")
+			break
 		}
 		if cs.SHA != "" {
 			st.SHA = cs.SHA
@@ -120,7 +132,9 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 	for page := 1; page <= ciMaxPages; page++ {
 		body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/commits/%s/check-runs?per_page=%d&page=%d", repo, url.PathEscape(st.SHA), ciPerPage, page))
 		if err != nil {
-			// Statuses alone still answer the Prow question; say what is missing.
+			if page == 1 {
+				checksErr = err
+			}
 			st.Partial = append(st.Partial, "check runs could not be read ("+err.Error()+")")
 			break
 		}
@@ -141,6 +155,9 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 			} `json:"check_runs"`
 		}
 		if err := json.Unmarshal(body, &cr); err != nil {
+			if page == 1 {
+				checksErr = err
+			}
 			st.Partial = append(st.Partial, "check runs could not be parsed")
 			break
 		}
@@ -162,6 +179,10 @@ func (c *Client) CIStatusForRef(ctx context.Context, token, repo, ref string) (C
 		if page == ciMaxPages {
 			st.Partial = append(st.Partial, fmt.Sprintf("only the first %d of %d check runs were read", page*ciPerPage, cr.TotalCount))
 		}
+	}
+
+	if statusErr != nil && checksErr != nil {
+		return st, statusErr // nothing was read
 	}
 
 	// Failing first, then pending, then passing; by name within a class, so the
@@ -202,20 +223,39 @@ func checkClass(status, conclusion string) string {
 	}
 }
 
-// Summary condenses the status to what the radar shows: how many jobs passed and are
-// still running, and the name of every failed job (failing first, by name, as the
-// checks are sorted), within worklist.CISummary's bounds.
+// Summary condenses the status to what the radar shows: how many jobs succeeded and
+// are still running, and the name of every failed job (by name, as the checks are
+// sorted), within worklist.CISummary's bounds. It counts each job by the outcome
+// GitHub reported, not by its sorting class: a skipped, neutral or stale check
+// neither succeeded nor is running, so it is in no count.
 func (s CIStatus) Summary() worklist.CISummary {
 	sum := worklist.CISummary{SHA: s.SHA, Partial: len(s.Partial) > 0}
 	for _, c := range s.Checks {
-		switch c.Class {
+		switch ciOutcome(c.State) {
 		case CIPassing:
 			sum.Passed++
 		case CIPending:
 			sum.Pending++
-		default:
+		case CIFailing:
 			sum.AddFailed(c.Name)
 		}
 	}
 	return sum
+}
+
+// ciOutcome maps a job's reported state (a commit status state, a check run's
+// conclusion, or a check run's status while it has none) to CIPassing (succeeded),
+// CIPending (not finished) or CIFailing (failed), or "" for an outcome that is none
+// of those (neutral, skipped, stale, or one GitHub adds later).
+func ciOutcome(state string) string {
+	switch state {
+	case "success":
+		return CIPassing
+	case "pending", "queued", "in_progress", "waiting", "requested", "expected":
+		return CIPending
+	case "failure", "error", "timed_out", "cancelled", "action_required", "startup_failure":
+		return CIFailing
+	default:
+		return ""
+	}
 }

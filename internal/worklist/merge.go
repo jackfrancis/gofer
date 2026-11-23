@@ -22,6 +22,9 @@ import (
 // is later than when the owner hid it has changed since, so it resurfaces
 // (HiddenAfter).
 //
+// A pull request's CI summary (GitHubRef.CI) follows the same rule: only enrich
+// reads it, so a write-back that carries none keeps the stored one (KeepCI).
+//
 // The two model-derived signals are the exception to "the run owns its signals": a
 // GitHub fetch cannot produce them, so a refresh sends none, and a scoring pass that
 // failed for an item sends none either. A write-back that carries no model proposal
@@ -62,9 +65,21 @@ func MergeRunItems(current, incoming []WorkItem) []WorkItem {
 			it.CreatedAt = old.CreatedAt
 		}
 		KeepModelSignals(&it.Signals, old.Signals)
+		KeepCI(&it, old)
 		out = append(out, it)
 	}
 	return out
+}
+
+// KeepCI fills in a pull request's CI summary from the stored item when the
+// write-back carries none. Only enrich reads CI; a refresh's search hits carry none,
+// and copying the stored summary into the refresh would copy whatever the run read,
+// which may be a projection (cut, and without its marker once copied). A summary the
+// write-back carries wins.
+func KeepCI(incoming *WorkItem, stored WorkItem) {
+	if incoming.GitHub.CI == nil && incoming.Type == TypePullRequest {
+		incoming.GitHub.CI = cloneCI(stored.GitHub.CI)
+	}
 }
 
 // KeepModelSignals fills in the model-derived signals an incoming write-back does not

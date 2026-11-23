@@ -18,7 +18,8 @@ type ciView struct {
 }
 
 // ciSummary returns the item's CI view, or nil when there is nothing to show: no
-// summary stored (an issue, a pull request enrich has not read), or no jobs.
+// summary stored (an issue, a pull request enrich has not read), or a whole read
+// that counted no jobs.
 func ciSummary(it worklist.WorkItem) *ciView {
 	c := it.GitHub.CI
 	if c == nil {
@@ -33,7 +34,9 @@ func ciSummary(it worklist.WorkItem) *ciView {
 	if c.FailedOmitted > 0 {
 		v.More = fmt.Sprintf("and %d more failed", c.FailedOmitted)
 	}
-	if v.Passed == "" && v.Pending == "" && len(v.Failed) == 0 && v.More == "" {
+	// No jobs counted is "nothing to show" only when the read was whole: a partial
+	// read with no counts (statuses empty, check runs refused) still says so.
+	if v.Passed == "" && v.Pending == "" && len(v.Failed) == 0 && v.More == "" && !v.Partial {
 		return nil
 	}
 	return v
