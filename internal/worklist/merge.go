@@ -72,6 +72,11 @@ func MergeRunItems(current, incoming []WorkItem) []WorkItem {
 		if it.IsHidden() {
 			StripScoring(&it) // GitHub fields, the CI summary among them, stay
 		}
+		if !it.Meta.CompletedAt.IsZero() {
+			// A retired item awaits no refresh: none revisits it until it reopens, and
+			// a retirement may echo the flag from the copy it read.
+			it.Meta.AwaitingRefresh = false
+		}
 		out = append(out, it)
 	}
 	return out

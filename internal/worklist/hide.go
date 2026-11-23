@@ -36,20 +36,26 @@ func HideItem(w *WorkItem, at time.Time) bool {
 	return true
 }
 
-// UnhideItem brings a hidden item back to the radar as an empty item: no signals and
-// no score, flagged AwaitingRefresh until a refresh writes it back. It also drops
-// the CI summary kept while hidden: that is the CI of whatever commit was current
-// before the hide, and a refresh keeps a stored summary (KeepCI), so it would read
-// as current until enrich reads the head again; until then the item shows none.
-// Unhiding an item that is not hidden changes nothing. It reports whether w changed.
+// UnhideItem brings a hidden item back as an empty item: no signals and no score.
+// An open item returns to the radar flagged AwaitingRefresh until a refresh writes
+// it back; a retired one (closed, merged) awaits nothing, since no refresh revisits
+// it until it reopens. The CI summary kept while hidden is that of whatever commit
+// was current before the hide, and a refresh keeps a stored summary (KeepCI), so it
+// is marked Stale (shown as the last known result) until enrich reads the head
+// again; a retired item's stays as its last known result. Unhiding an item that is
+// not hidden changes nothing. It reports whether w changed.
 func UnhideItem(w *WorkItem) bool {
 	if !w.IsHidden() {
 		return false
 	}
 	w.Meta.HiddenAt = time.Time{}
 	StripScoring(w)
-	w.Meta.AwaitingRefresh = true
-	w.GitHub.CI = nil
+	w.Meta.AwaitingRefresh = w.Meta.CompletedAt.IsZero()
+	if w.GitHub.CI != nil {
+		c := cloneCI(w.GitHub.CI)
+		c.Stale = true
+		w.GitHub.CI = c
+	}
 	return true
 }
 

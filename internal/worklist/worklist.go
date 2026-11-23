@@ -111,6 +111,11 @@ type CISummary struct {
 	// Partial is set when part of the CI could not be read (check runs refused,
 	// more jobs than were paged), so the counts may be short.
 	Partial bool `json:"partial,omitempty"`
+	// Stale marks a summary read before the item was hidden and not read again
+	// since it was unhidden (UnhideItem): it may describe an older head commit, so
+	// the page labels it as the last known result. Enrich's next read replaces it
+	// (Equal tells the two apart, so an unchanged read is still written).
+	Stale bool `json:"stale,omitempty"`
 }
 
 // CIJob is one failed job as FailedJobs returns it.
@@ -170,7 +175,7 @@ func (c *CISummary) Equal(o *CISummary) bool {
 		return c == o
 	}
 	return c.SHA == o.SHA && c.Passed == o.Passed && c.Pending == o.Pending &&
-		c.FailedOmitted == o.FailedOmitted && c.Partial == o.Partial &&
+		c.FailedOmitted == o.FailedOmitted && c.Partial == o.Partial && c.Stale == o.Stale &&
 		slices.Equal(c.Failed, o.Failed) && slices.Equal(c.FailedURLs, o.FailedURLs)
 }
 

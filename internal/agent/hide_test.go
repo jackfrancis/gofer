@@ -118,3 +118,34 @@ func TestRankSkipsItemAwaitingRefresh(t *testing.T) {
 		}
 	}
 }
+
+// An unhidden PR that the next complete fetch finds closed is retired: it awaits no
+// refresh any more (none revisits it), and keeps its CI as the last known result.
+func TestRetiringAnUnhiddenItemClearsTheWait(t *testing.T) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user" {
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"items":[]}`)) // a complete fetch: it is no longer open
+	}))
+	defer srv.Close()
+	const id = "github:o/r#7"
+	it := worklist.WorkItem{ID: id, Source: "github", Type: worklist.TypePullRequest,
+		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 7, CI: &worklist.CISummary{SHA: "abc", Passed: 2}},
+		Meta:   worklist.Metadata{HiddenAt: time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)}}
+	worklist.UnhideItem(&it)
+	sink := &memSink{items: []worklist.WorkItem{it}}
+	if err := Run(context.Background(),
+		Params{JobType: JobIngest, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+		fakeVendor{token: "tok"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := sink.items[0]
+	if got.Meta.CompletedAt.IsZero() {
+		t.Fatal("test premise: the complete fetch retires the item")
+	}
+	if got.Meta.AwaitingRefresh || got.GitHub.CI == nil || got.GitHub.CI.Passed != 2 {
+		t.Fatalf("a retired item awaits nothing and keeps its last known CI, got %+v %+v", got.Meta, got.GitHub.CI)
+	}
+}

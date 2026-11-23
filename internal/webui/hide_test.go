@@ -286,7 +286,7 @@ func TestHiddenSectionRendering(t *testing.T) {
 		Signals: worklist.Signals{Labels: []string{"bug"}}, Meta: worklist.Metadata{HiddenAt: at}}
 	hidden.GitHub.CI = &worklist.CISummary{Passed: 2, Failed: []string{"pull-unit"}, FailedURLs: []string{"https://prow.example/job/1"}}
 	back := worklist.WorkItem{ID: "pr-b", Type: worklist.TypePullRequest,
-		GitHub: worklist.GitHubRef{Number: 2, Repo: "o/r", Title: "Back PR"}, Meta: worklist.Metadata{AwaitingRefresh: true}}
+		GitHub: worklist.GitHubRef{Number: 2, Repo: "o/r", Title: "Back PR", CI: &worklist.CISummary{Pending: 1, Stale: true}}, Meta: worklist.Metadata{AwaitingRefresh: true}}
 	out := renderPage(t, pageData{View: "worklist", Items: []worklist.WorkItem{back}, HiddenItems: []worklist.WorkItem{hidden}, ConvEnabled: true})
 
 	i := strings.Index(out, `class="zz-hidden-list"`)
@@ -311,6 +311,9 @@ func TestHiddenSectionRendering(t *testing.T) {
 	}
 	if !strings.Contains(ranked, "Waiting for the next refresh") || strings.Contains(ranked, "Relevance") {
 		t.Fatalf("an unhidden item awaiting its refresh shows that instead of a score, got:\n%s", ranked)
+	}
+	if !strings.Contains(ranked, "1 CI job in progress") || !strings.Contains(ranked, "from before you hid this item") || strings.Contains(ranked, "left your radar") {
+		t.Fatalf("an unhidden PR's pre-hide CI is labeled as such until enrich reads it again, got:\n%s", ranked)
 	}
 }
 

@@ -56,15 +56,51 @@ func TestHiddenItemKeepsCI(t *testing.T) {
 		t.Fatalf("a write-back's fresh CI lands on a hidden item, got %+v", got.GitHub.CI)
 	}
 
-	// Unhidden, the pre-hide summary is dropped, and a refresh (which carries no CI)
-	// does not bring it back: only enrich's next read of the head shows CI again.
+	// Unhidden, the pre-hide summary is kept but marked stale, without touching the
+	// stored copy; a refresh (which carries no CI) keeps it stale, and enrich's next
+	// read replaces it, even when the jobs read the same.
+	stored := it
 	UnhideItem(&it)
-	if it.GitHub.CI != nil {
-		t.Fatalf("unhide drops the pre-hide CI summary, got %+v", it.GitHub.CI)
+	if c := it.GitHub.CI; c == nil || !c.Stale || c.Passed != 3 || stored.GitHub.CI.Stale {
+		t.Fatalf("unhide keeps the pre-hide CI summary, marked stale (and only its own copy), got %+v / stored %+v", c, stored.GitHub.CI)
 	}
 	got = MergeRunItems([]WorkItem{it}, []WorkItem{{ID: "a", Type: TypePullRequest, Meta: Metadata{Rank: 0.5}}})[0]
-	if got.GitHub.CI != nil {
-		t.Fatalf("a refresh after unhide shows no stale CI, got %+v", got.GitHub.CI)
+	if c := got.GitHub.CI; c == nil || !c.Stale {
+		t.Fatalf("a refresh after unhide keeps the stale CI, got %+v", c)
+	}
+	same := cloneCI(ci)
+	if same.Equal(got.GitHub.CI) {
+		t.Fatal("a fresh read must differ from the stale summary, or enrich would not write it")
+	}
+	got = MergeRunItems([]WorkItem{got}, []WorkItem{{ID: "a", Type: TypePullRequest, GitHub: GitHubRef{CI: same}}})[0]
+	if c := got.GitHub.CI; c == nil || c.Stale {
+		t.Fatalf("enrich's fresh read replaces the stale summary, got %+v", c)
+	}
+}
+
+// A retired PR (closed, merged) unhidden keeps its CI as the last known result and
+// awaits no refresh, since none revisits it until it reopens; a retirement learned
+// after the unhide clears the flag too.
+func TestUnhideRetiredItem(t *testing.T) {
+	ci := &CISummary{SHA: "abc", Passed: 1}
+	closed := WorkItem{ID: "a", Type: TypePullRequest, GitHub: GitHubRef{CI: ci}, Meta: Metadata{HiddenAt: t1, CompletedAt: t1}}
+	UnhideItem(&closed)
+	if closed.Meta.AwaitingRefresh || closed.GitHub.CI == nil || closed.GitHub.CI.Passed != 1 {
+		t.Fatalf("a retired item keeps its CI and awaits no refresh, got %+v %+v", closed.Meta, closed.GitHub.CI)
+	}
+
+	open := WorkItem{ID: "b", Type: TypePullRequest, GitHub: GitHubRef{CI: ci}, Meta: Metadata{HiddenAt: t1}}
+	UnhideItem(&open)
+	if !open.Meta.AwaitingRefresh {
+		t.Fatal("test premise: an open item awaits its refresh")
+	}
+	// The next complete fetch finds it closed: the retirement echoes the copy it read.
+	retired := open
+	retired.Meta.CompletedAt = t2
+	retired.GitHub.CI = nil // retiring reads no CI
+	got := MergeRunItems([]WorkItem{open}, []WorkItem{retired})[0]
+	if got.Meta.AwaitingRefresh || got.GitHub.CI == nil || !got.GitHub.CI.Stale {
+		t.Fatalf("a retired item awaits nothing and keeps its last known CI, got %+v %+v", got.Meta, got.GitHub.CI)
 	}
 }
 
@@ -87,6 +123,7 @@ func TestHideAndUnhideItem(t *testing.T) {
 	if HideItem(&it, t3) || !it.Meta.HiddenAt.Equal(t2) {
 		t.Fatalf("a repeated hide changes nothing and keeps the first time, HiddenAt = %v", it.Meta.HiddenAt)
 	}
+	it.Meta.CompletedAt = time.Time{} // it reopened while hidden (TestUnhideRetiredItem covers a closed one)
 	if !UnhideItem(&it) {
 		t.Fatal("unhiding a hidden item changes it")
 	}

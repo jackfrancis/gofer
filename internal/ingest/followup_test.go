@@ -288,3 +288,40 @@ func TestRefreshFollowUpRechecksTheDebtAfterAProbe(t *testing.T) {
 	close(hd.released) // A's delayed answer lands
 	stays(t, d, 2, "the worker must not start a third run once B paid the debt")
 }
+
+// The unhide's own first attempt re-checks the debt after a status probe too: a run
+// reserved after the unhide and accepted while that attempt waited on a delayed
+// status answer has paid it, so the attempt starts no third run.
+func TestRefreshFollowUpInitialAttemptRechecksTheDebt(t *testing.T) {
+	ctx := context.Background()
+	d := &gateDispatcher{phase: "Running"}
+	hd := &holdStatus{gateDispatcher: d, arrived: make(chan struct{}, 1), released: make(chan struct{})}
+	ig := fastFollowUps(hd, time.Minute)
+	if err := ig.Refresh(ctx, "github:1"); err != nil { // run A: run-1
+		t.Fatal(err)
+	}
+	hd.mu.Lock()
+	hd.holdID = "run-1" // the unhide's probe of A hangs
+	hd.mu.Unlock()
+	done := make(chan error, 1)
+	go func() { done <- ig.RefreshFollowUp(ctx, "github:1") }()
+	<-hd.arrived
+
+	// Meanwhile A passes its deadline and a tick starts B, which pays the debt and ends.
+	ig.mu.Lock()
+	ig.runs[ingestKey("github:1")].at = time.Now().Add(-2 * retryAfter)
+	ig.mu.Unlock()
+	if ok, err := ig.ScheduledRefresh(ctx, "github:1"); err != nil || !ok {
+		t.Fatalf("ScheduledRefresh = %v, %v; want run B", ok, err)
+	}
+	d.set("Succeeded")
+	if active, err := ig.Active(ctx, "github:1"); err != nil || active {
+		t.Fatalf("Active = %v, %v; want B seen to end", active, err)
+	}
+
+	close(hd.released) // A's delayed answer lands
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	stays(t, d, 2, "the unhide's attempt must not start a third run once B paid the debt")
+}

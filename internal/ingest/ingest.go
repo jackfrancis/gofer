@@ -213,7 +213,10 @@ func (i *Ingestor) RefreshFollowUp(ctx context.Context, ownerID string) error {
 	f.after = i.gens[ownerID]
 	f.until = time.Now().Add(i.followUpGiveUp)
 	i.mu.Unlock()
-	_, err := i.dispatchIngest(ctx, ownerID, refreshGate, true)
+	// Like the worker's, this attempt reserves only while the debt still stands: a
+	// run reserved after this call and accepted while it waited on a status probe
+	// has paid it.
+	_, err := i.dispatchIngestIf(ctx, ownerID, refreshGate, true, func() bool { return i.followUps[ownerID] == f })
 	if start {
 		go i.driveFollowUp(ownerID, f)
 	}
