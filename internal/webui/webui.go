@@ -1120,7 +1120,7 @@ func (h *Handler) render(w http.ResponseWriter, status int, data pageData) error
 var funcs = template.FuncMap{
 	"title":                  titleProvider,
 	"priorityClass":          priorityClass,
-	"typeLabel":              typeLabel,
+	"stateIcon":              stateIcon,
 	"pctBucket":              pctBucket,
 	"axis2":                  axis2,
 	"markdown":               markdown.ToSafeHTML,
@@ -1227,13 +1227,6 @@ func priorityClass(p worklist.Priority) string {
 	default:
 		return "Label--secondary"
 	}
-}
-
-func typeLabel(t worklist.ItemType) string {
-	if t == worklist.TypePullRequest {
-		return "PR"
-	}
-	return "Issue"
 }
 
 func titleProvider(s string) string {

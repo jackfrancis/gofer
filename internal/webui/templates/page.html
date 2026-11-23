@@ -58,7 +58,7 @@
     {{else if eq .View "thread"}}
       <p><a href="/">&larr; Back to radar</a></p>
       <div class="zz-thread-head">
-        <div class="zz-title"><a href="{{.Item.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.Item.GitHub.Title}}</a></div>
+        <div class="zz-title">{{stateIcon .Item}}<a href="{{.Item.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.Item.GitHub.Title}}</a></div>
         <div class="zz-meta">
           <span>{{.Item.GitHub.Repo}}{{if .Item.GitHub.Number}} #{{.Item.GitHub.Number}}{{end}}</span>
           {{if .Item.Meta.HiddenAt.IsZero}}
@@ -251,7 +251,7 @@
       {{range .Items}}
         <div class="zz-item">
           <div class="zz-item-head">
-            <div class="zz-title"><a href="{{.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.GitHub.Title}}</a></div>
+            <div class="zz-title">{{stateIcon .}}<a href="{{.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.GitHub.Title}}</a></div>
             <div class="zz-item-actions">
               {{if $.ConvEnabled}}
               <a class="btn btn-sm zz-discuss{{if .HasUnreadReply}} zz-discuss--unread{{end}}" href="/items/thread?id={{.ID | urlquery}}"{{with discussTitle .}} title="{{.}}"{{end}}>{{with discussBadge .}}{{.}} {{end}}Discuss</a>
@@ -265,7 +265,6 @@
           <div class="zz-meta">
             <span>{{.GitHub.Repo}} #{{.GitHub.Number}}</span>
             <span class="Label {{priorityClass .Meta.Priority}}">{{with .Meta.Priority}}{{.}}{{else}}unranked{{end}}</span>
-            <span class="Label Label--secondary">{{typeLabel .Type}}</span>
           </div>
           <div class="zz-bar"><span class="zz-w-{{pctBucket .Meta.Rank}}"></span></div>
           <div class="zz-axes">

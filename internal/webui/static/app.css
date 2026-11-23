@@ -7,6 +7,7 @@
   --danger: #cf222e;
   --attention: #9a6700;
   --success: #1a7f37;
+  --done: #8250df;
 }
 
 * { box-sizing: border-box; }
@@ -100,7 +101,15 @@ body {
   padding: 14px 16px; margin-bottom: 12px;
 }
 .zz-item-head { display: flex; justify-content: space-between; gap: 12px; }
+.zz-title { display: flex; align-items: flex-start; gap: 6px; }
 .zz-title a { color: var(--accent); text-decoration: none; font-weight: 600; }
+/* GitHub's state icon: the Octicon and colour github.com draws the item in. */
+.zz-state { display: inline-flex; flex: none; height: 1.5em; align-items: center; }
+.zz-state-icon { display: block; fill: currentColor; }
+.zz-state--open { color: var(--success); }
+.zz-state--draft, .zz-state--muted { color: var(--muted); }
+.zz-state--merged, .zz-state--done { color: var(--done); }
+.zz-state--closed { color: var(--danger); }
 .zz-title a:hover { text-decoration: underline; }
 
 .zz-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; margin-top: 6px; }
