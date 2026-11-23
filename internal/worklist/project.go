@@ -107,6 +107,26 @@ var projectables = []projectable{
 			}
 			w.GitHub.LabelColors = kept
 		}},
+	// Enrich stores the CI summary bounded (CISummary.AddFailed), but the store holds
+	// whatever a run wrote, so the failed-job names are cut like any list. The cut
+	// counts the names it drops as omitted, and leaves Failed nil rather than empty,
+	// as the JSON a run receives would.
+	{"github.ci", func(w *WorkItem) any { return w.GitHub.CI },
+		func(d, s *WorkItem) { d.GitHub.CI = cloneCI(s.GitHub.CI) },
+		func(w *WorkItem) {
+			c := cloneCI(w.GitHub.CI)
+			if c == nil {
+				return
+			}
+			if len(c.Failed) > projectedList {
+				c.FailedOmitted += len(c.Failed) - projectedList
+			}
+			c.Failed = cutStrings(c.Failed)
+			if len(c.Failed) == 0 {
+				c.Failed = nil
+			}
+			w.GitHub.CI = c
+		}},
 	{"signals.roadmap_themes", func(w *WorkItem) any { return w.Signals.RoadmapThemes },
 		func(d, s *WorkItem) { d.Signals.RoadmapThemes = slices.Clone(s.Signals.RoadmapThemes) },
 		func(w *WorkItem) { w.Signals.RoadmapThemes = cutStrings(w.Signals.RoadmapThemes) }},
@@ -255,6 +275,17 @@ func clonePtr[T any](p *T) *T {
 	}
 	c := *p
 	return &c
+}
+
+// cloneCI deep-copies a CI summary, so a cut never writes through to the stored
+// item's list.
+func cloneCI(c *CISummary) *CISummary {
+	if c == nil {
+		return nil
+	}
+	out := *c
+	out.Failed = slices.Clone(c.Failed)
+	return &out
 }
 
 // truncateUTF8 cuts s to at most n bytes without splitting a character.

@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+
+	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
 // Bounds on a CI status lookup.
@@ -198,4 +200,22 @@ func checkClass(status, conclusion string) string {
 	default: // failure, timed_out, cancelled, action_required, startup_failure
 		return CIFailing
 	}
+}
+
+// Summary condenses the status to what the radar shows: how many jobs passed and are
+// still running, and the name of every failed job (failing first, by name, as the
+// checks are sorted), within worklist.CISummary's bounds.
+func (s CIStatus) Summary() worklist.CISummary {
+	sum := worklist.CISummary{SHA: s.SHA, Partial: len(s.Partial) > 0}
+	for _, c := range s.Checks {
+		switch c.Class {
+		case CIPassing:
+			sum.Passed++
+		case CIPending:
+			sum.Pending++
+		default:
+			sum.AddFailed(c.Name)
+		}
+	}
+	return sum
 }

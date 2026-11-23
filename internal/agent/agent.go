@@ -337,6 +337,11 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 				carried[fetched[i].ID] = true
 			}
 		}
+		// A search hit carries no CI; keep the stored summary until the chained enrich
+		// reads the head commit again, so a refresh does not blank it meanwhile.
+		if fetched[i].GitHub.CI == nil && fetched[i].Type == worklist.TypePullRequest {
+			fetched[i].GitHub.CI = old.GitHub.CI
+		}
 		// CompletedAt is deliberately NOT carried over: the item was just fetched from
 		// the open set, so it is open, and a reopened item resurfaces (see Metadata).
 		if !old.CreatedAt.IsZero() {

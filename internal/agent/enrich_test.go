@@ -214,3 +214,84 @@ func TestRunEnrichTimelineReadsKeepTheReserve(t *testing.T) {
 		t.Fatalf("item 1 ReviewRequestedBy = %q, want its result written back", got)
 	}
 }
+
+// enrich summarizes the CI on each open pull request's head commit. A pull request
+// whose CI cannot be read keeps the stored summary, and an issue has no CI to read.
+func TestRunEnrichSummarizesPullRequestCI(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case "/repos/o/r/pulls/1":
+			_, _ = w.Write([]byte(`{"head":{"ref":"b","sha":"sha1"}}`))
+		case "/repos/o/r/commits/sha1/status":
+			_, _ = w.Write([]byte(`{"sha":"sha1","total_count":2,"statuses":[
+				{"context":"pull-unit","state":"success"},{"context":"pull-e2e","state":"failure"}]}`))
+		case "/repos/o/r/commits/sha1/check-runs":
+			_, _ = w.Write([]byte(`{"total_count":2,"check_runs":[
+				{"name":"lint","status":"in_progress"},{"name":"build","status":"completed","conclusion":"failure"}]}`))
+		case "/repos/o/r/pulls/2":
+			http.Error(w, "boom", http.StatusInternalServerError)
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+
+	kept := &worklist.CISummary{SHA: "old", Passed: 4}
+	sink := &memSink{items: []worklist.WorkItem{
+		{ID: "pr1", Source: "github", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1}},
+		{ID: "pr2", Source: "github", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "o/r", Number: 2, CI: kept}},
+		{ID: "issue3", Source: "github", Type: worklist.TypeIssue, GitHub: worklist.GitHubRef{Repo: "o/r", Number: 3}},
+	}}
+	if err := Run(context.Background(),
+		Params{JobType: JobEnrich, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]*worklist.CISummary{}
+	for _, it := range sink.items {
+		got[it.ID] = it.GitHub.CI
+	}
+	want := &worklist.CISummary{SHA: "sha1", Passed: 1, Pending: 1, Failed: []string{"build", "pull-e2e"}}
+	if !got["pr1"].Equal(want) {
+		t.Errorf("pr1 CI = %+v, want %+v", got["pr1"], want)
+	}
+	if !got["pr2"].Equal(kept) {
+		t.Errorf("an unreadable CI must keep the stored summary, got %+v", got["pr2"])
+	}
+	if got["issue3"] != nil {
+		t.Errorf("an issue has no CI, got %+v", got["issue3"])
+	}
+	for _, p := range paths {
+		if strings.Contains(p, "/pulls/3") {
+			t.Errorf("enrich read CI for an issue: %s", p)
+		}
+	}
+}
+
+// A refresh's search hits carry no CI, so the stored summary is kept for a pull
+// request until the chained enrich reads it again.
+func TestReconcileFetchedKeepsCI(t *testing.T) {
+	ci := &worklist.CISummary{SHA: "s", Passed: 2, Failed: []string{"e2e"}}
+	existing := []worklist.WorkItem{
+		{ID: "pr", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{CI: ci}},
+		{ID: "was-pr", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{CI: ci}},
+	}
+	fetched := []worklist.WorkItem{
+		{ID: "pr", Type: worklist.TypePullRequest},
+		{ID: "was-pr", Type: worklist.TypeIssue},
+	}
+	out, _ := reconcileFetched(fetched, existing, true)
+	if !out[0].GitHub.CI.Equal(ci) {
+		t.Errorf("refresh dropped the stored CI: %+v", out[0].GitHub.CI)
+	}
+	if out[1].GitHub.CI != nil {
+		t.Errorf("only a pull request carries CI, got %+v", out[1].GitHub.CI)
+	}
+}

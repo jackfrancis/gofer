@@ -1124,6 +1124,7 @@ var funcs = template.FuncMap{
 	"priorityClass":          priorityClass,
 	"stateIcon":              stateIcon,
 	"ghLabels":               ghLabels,
+	"ciSummary":              ciSummary,
 	"pctBucket":              pctBucket,
 	"axis2":                  axis2,
 	"markdown":               markdown.ToSafeHTML,

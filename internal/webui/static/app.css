@@ -143,6 +143,19 @@ body {
   max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
+/* The pull request's CI, under the labels: a line per count, then one per failed job
+   with its full name (wrapped, never cut). The mark before each line carries its
+   class's color. */
+.zz-ci { list-style: none; margin: 8px 0 0; padding: 0; font-size: 13px; color: var(--muted); }
+.zz-ci li { display: flex; gap: 6px; overflow-wrap: anywhere; }
+.zz-ci li::before { flex: none; width: 1em; text-align: center; font-weight: 600; }
+.zz-ci-pass::before { content: "\2713"; color: var(--success); }
+.zz-ci-pending::before { content: "\25CF"; color: var(--attention); }
+.zz-ci-fail { color: var(--fg); }
+.zz-ci-fail::before { content: "\2717"; color: var(--danger); }
+.zz-ci-note { font-style: italic; }
+.zz-ci-note::before { content: ""; }
+
 .zz-bar { height: 6px; background: var(--bg-subtle); border-radius: 3px; overflow: hidden; margin: 12px 0 8px; }
 .zz-bar span { display: block; height: 100%; background: var(--accent); }
 

@@ -374,6 +374,11 @@ Wired on the web-tier side; they define what a runtime must respect:
   (`internal/webui/labels.go`), a stylesheet generated from the query alone. Colors
   live in `GitHubRef.LabelColors`, set at ingest; read one only through
   `GitHubRef.LabelColor` (six hex digits or nothing), since it reaches CSS.
+- A pull request's CI shows under its labels: jobs passed, jobs in progress, and each
+  failed job's name (`GitHubRef.CI`, a `worklist.CISummary`). Enrich sets it from
+  `github.CIStatusForPR` (`CIStatus.Summary`, bounded by `CISummary.AddFailed`); a
+  refresh keeps the stored one (`reconcileFetched`), and an unreadable CI leaves it
+  unchanged. It is display-only: nothing scores on it.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

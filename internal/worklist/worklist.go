@@ -10,6 +10,7 @@ package worklist
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"time"
 )
@@ -81,6 +82,51 @@ type GitHubRef struct {
 	// color, six hex digits without '#', for display only. Read a color through
 	// LabelColor, which refuses anything but six hex digits.
 	LabelColors map[string]string `json:"label_colors,omitempty"`
+
+	// CI summarizes the CI jobs on a pull request's head commit, for display only;
+	// nil when unknown (an issue, a pull request enrich has not read yet, or one
+	// whose CI could not be read). Enrich sets it; a refresh keeps the stored one.
+	CI *CISummary `json:"ci,omitempty"`
+}
+
+// CISummary is the CI picture of one pull request's head commit: how many jobs
+// passed and are still running, and the name of every failed job.
+type CISummary struct {
+	SHA     string `json:"sha,omitempty"` // the commit the jobs ran on
+	Passed  int    `json:"passed"`
+	Pending int    `json:"pending"`
+	// Failed names each failed job, in the order GitHub's checks were read (by name).
+	// At most MaxCIFailedNames are kept, each at most MaxCINameBytes; FailedOmitted
+	// counts the failed jobs past that bound.
+	Failed        []string `json:"failed,omitempty"`
+	FailedOmitted int      `json:"failed_omitted,omitempty"`
+	// Partial is set when part of the CI could not be read (check runs refused,
+	// more jobs than were paged), so the counts may be short.
+	Partial bool `json:"partial,omitempty"`
+}
+
+// Bounds on a stored CISummary.
+const (
+	MaxCIFailedNames = 50
+	MaxCINameBytes   = 256
+)
+
+// AddFailed records a failed job's name within the bounds.
+func (c *CISummary) AddFailed(name string) {
+	if len(c.Failed) >= MaxCIFailedNames {
+		c.FailedOmitted++
+		return
+	}
+	c.Failed = append(c.Failed, truncateUTF8(name, MaxCINameBytes))
+}
+
+// Equal reports whether c and o summarize the same CI (nil only equals nil).
+func (c *CISummary) Equal(o *CISummary) bool {
+	if c == nil || o == nil {
+		return c == o
+	}
+	return c.SHA == o.SHA && c.Passed == o.Passed && c.Pending == o.Pending &&
+		c.FailedOmitted == o.FailedOmitted && c.Partial == o.Partial && slices.Equal(c.Failed, o.Failed)
 }
 
 // LabelColor returns the GitHub color of the item's label name, normalized to six

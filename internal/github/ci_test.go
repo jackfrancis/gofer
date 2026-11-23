@@ -88,3 +88,27 @@ func TestCIStatusErrors(t *testing.T) {
 		t.Error("an unauthorized call must be an error")
 	}
 }
+
+// Summary counts passing and pending jobs and names every failing one, failing jobs
+// in the order the checks are sorted; a status read with part missing says so.
+func TestCIStatusSummary(t *testing.T) {
+	srv := ciServer(t, http.StatusOK)
+	st, err := NewClient(srv.Client(), srv.URL).CIStatusForPR(context.Background(), "tok", "o/r", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := st.Summary()
+	if sum.SHA != "abc123" || sum.Passed != 2 || sum.Pending != 2 || sum.Partial ||
+		strings.Join(sum.Failed, ",") != "build,pull-o-r-e2e" || sum.FailedOmitted != 0 {
+		t.Errorf("summary = %+v", sum)
+	}
+
+	srv = ciServer(t, http.StatusForbidden)
+	st, err = NewClient(srv.Client(), srv.URL).CIStatusForPR(context.Background(), "tok", "o/r", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum := st.Summary(); !sum.Partial || sum.Passed != 1 || sum.Pending != 1 || strings.Join(sum.Failed, ",") != "pull-o-r-e2e" {
+		t.Errorf("partial summary = %+v", sum)
+	}
+}

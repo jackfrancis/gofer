@@ -20,7 +20,8 @@ const (
 
 // runEnrich reads the user's persisted work and augments each item with per-item
 // timeline signals (AwaitingMeSince, participants, inbound refs, other reviewers,
-// review-requested-by) fetched directly from GitHub with the vended credential.
+// review-requested-by), and each pull request with a summary of its head commit's
+// CI (GitHubRef.CI), fetched directly from GitHub with the vended credential.
 // It writes back only the items it changed, so a read-time rescore reflects the
 // fresher signals. Per-item enrichment is best-effort and bounded in concurrency
 // so the fan-out does not blow the run deadline.
@@ -28,9 +29,9 @@ const (
 // It deliberately covers EVERY item. Enrich feeds the deterministic baseline score,
 // so an item it skips is scored from missing signals and can never rise — a cap here
 // would decide the ranking instead of the ranking deciding the cap. The fan-out is
-// cheap (one timeline read per item, a few percent of the hourly core budget even for
-// a large worklist); it is bounded by concurrency and by the run clock instead of by
-// an arbitrary count. Params.EnrichLimit still caps it when a caller wants that.
+// cheap (one timeline read per item, and a few CI reads per pull request: a small
+// share of the hourly core budget even for a large worklist); it is bounded by
+// concurrency and by the run clock instead of by an arbitrary count. Params.EnrichLimit still caps it when a caller wants that.
 //
 // The read pages through the open items without their threads (readAll), so it
 // stays bounded however large the worklist grows without dropping any item.
@@ -98,46 +99,21 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 			actx, cancel := reserveContext(ctx, enrichReserve)
 			act, err := gh.ItemActivity(actx, token, items[i].GitHub.Repo, items[i].GitHub.Number, login)
 			cancel()
-			if err != nil {
-				return // best-effort: leave the item's signals unchanged
-			}
-			s := &items[i].Signals
-			// A union membership query cannot say whether the user actually spoke, so the
-			// timeline settles it: an item carrying only the generic "involved" reason is
-			// upgraded to "commented" once participation is proven.
-			reasons, reasonChanged := s.Reasons, false
-			if act.Commented {
-				if upgraded, ok := upgradeInvolved(reasons); ok {
-					reasons, reasonChanged = upgraded, true
+			ciChanged := false
+			if items[i].Type == worklist.TypePullRequest {
+				if ci, ok := readCI(ctx, gh, token, items[i].GitHub); ok && !ci.Equal(items[i].GitHub.CI) {
+					items[i].GitHub.CI = ci
+					ciChanged = true
 				}
 			}
-			if carried[items[i].ID] && act.RequestEnded && slices.Contains(reasons, worklist.ReasonReviewRequested) {
-				// The refresh kept a request its partial search did not show; the whole
-				// timeline shows it withdrawn or fulfilled.
-				reasons = slices.DeleteFunc(slices.Clone(reasons), func(r worklist.Reason) bool { return r == worklist.ReasonReviewRequested })
-				reasonChanged = true
+			if err != nil || !applyActivity(&items[i].Signals, act, carried[items[i].ID]) {
+				// best-effort: an unreadable timeline leaves the item's signals unchanged
+				if !ciChanged {
+					return
+				}
 			}
-			// Only a whole timeline says who requested the review; a partial one leaves
-			// what the store knows in place rather than reading as "nobody".
-			requester := act.RequestedByLogin
-			if !act.TimelineComplete {
-				requester = s.ReviewRequestedBy
-			}
-			if !reasonChanged &&
-				act.Participants == s.Participants && act.InboundRefs == s.InboundRefs &&
-				act.OtherReviewers == s.OtherReviewers && requester == s.ReviewRequestedBy &&
-				act.AwaitingMeSince.Equal(s.AwaitingMeSince) && act.AwaitingOthersSince.Equal(s.AwaitingOthersSince) {
-				return
-			}
-			s.Reasons = reasons
-			s.Participants = act.Participants
-			s.InboundRefs = act.InboundRefs
-			s.OtherReviewers = act.OtherReviewers
-			s.ReviewRequestedBy = requester
-			s.AwaitingMeSince = act.AwaitingMeSince
-			s.AwaitingOthersSince = act.AwaitingOthersSince
 			// Enrich derives no model signals; leave them to the store.
-			clearModelSignals(s)
+			clearModelSignals(&items[i].Signals)
 			mu.Lock()
 			changed = append(changed, items[i])
 			mu.Unlock()
@@ -157,6 +133,61 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 		return fmt.Errorf("ingest: %w", err)
 	}
 	return nil
+}
+
+// applyActivity sets the timeline-derived signals from act and reports whether any
+// changed. carried says the refresh chained into this pass kept the item's review
+// request although its search did not show it (see runEnrich).
+func applyActivity(s *worklist.Signals, act github.Activity, carried bool) bool {
+	// A union membership query cannot say whether the user actually spoke, so the
+	// timeline settles it: an item carrying only the generic "involved" reason is
+	// upgraded to "commented" once participation is proven.
+	reasons, reasonChanged := s.Reasons, false
+	if act.Commented {
+		if upgraded, ok := upgradeInvolved(reasons); ok {
+			reasons, reasonChanged = upgraded, true
+		}
+	}
+	if carried && act.RequestEnded && slices.Contains(reasons, worklist.ReasonReviewRequested) {
+		// The refresh kept a request its partial search did not show; the whole
+		// timeline shows it withdrawn or fulfilled.
+		reasons = slices.DeleteFunc(slices.Clone(reasons), func(r worklist.Reason) bool { return r == worklist.ReasonReviewRequested })
+		reasonChanged = true
+	}
+	// Only a whole timeline says who requested the review; a partial one leaves
+	// what the store knows in place rather than reading as "nobody".
+	requester := act.RequestedByLogin
+	if !act.TimelineComplete {
+		requester = s.ReviewRequestedBy
+	}
+	if !reasonChanged &&
+		act.Participants == s.Participants && act.InboundRefs == s.InboundRefs &&
+		act.OtherReviewers == s.OtherReviewers && requester == s.ReviewRequestedBy &&
+		act.AwaitingMeSince.Equal(s.AwaitingMeSince) && act.AwaitingOthersSince.Equal(s.AwaitingOthersSince) {
+		return false
+	}
+	s.Reasons = reasons
+	s.Participants = act.Participants
+	s.InboundRefs = act.InboundRefs
+	s.OtherReviewers = act.OtherReviewers
+	s.ReviewRequestedBy = requester
+	s.AwaitingMeSince = act.AwaitingMeSince
+	s.AwaitingOthersSince = act.AwaitingOthersSince
+	return true
+}
+
+// readCI reads the CI on a pull request's head commit, inside the reserve-adjusted
+// deadline as the timeline read is. ok is false when it could not be read, and the
+// stored summary then stands: a failed read is not "no CI".
+func readCI(ctx context.Context, gh *github.Client, token string, ref worklist.GitHubRef) (*worklist.CISummary, bool) {
+	cctx, cancel := reserveContext(ctx, enrichReserve)
+	defer cancel()
+	st, err := gh.CIStatusForPR(cctx, token, ref.Repo, ref.Number)
+	if err != nil {
+		return nil, false
+	}
+	sum := st.Summary()
+	return &sum, true
 }
 
 // upgradeInvolved replaces the generic ReasonInvolved with ReasonCommented, returning
