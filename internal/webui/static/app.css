@@ -104,6 +104,7 @@ body {
   display: flex; flex-wrap: wrap; gap: 6px;
 }
 .zz-selected-projects li {
+  max-width: 100%; overflow-wrap: anywhere;
   font-size: 13px; padding: 2px 8px;
   border: 1px solid var(--border); border-radius: 999px; background: var(--bg-subtle);
 }

@@ -648,6 +648,27 @@ func TestSelectedProjectsLinkToPullRequests(t *testing.T) {
 	}
 }
 
+// A saved selection that no longer narrows the radar — the other project's last item
+// closed, so the checklist reads "1 of 1" — lists no tags, though the filter stays
+// saved and clearable.
+func TestSelectedProjectsHiddenWhenFilterCoversRadar(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", worklist.WorkItem{
+		ID: "github:a/one#1", Source: "github", Type: worklist.TypeIssue,
+		GitHub: worklist.GitHubRef{Repo: "a/one", Number: 1, Title: "title-a/one-1"},
+		Meta:   worklist.Metadata{Origin: worklist.OriginUser, Urgency: 0.5, Rank: 0.5},
+	})
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{false}, false, nil)
+	saved := &http.Cookie{Name: projectsCookie, Value: url.Values{"u": {"u1"}, "p": {"a/one", "b/two"}}.Encode()}
+	page := getIndex(t, h, saved)
+	if !strings.Contains(page, "Projects: 1 of 1") || !strings.Contains(page, "Show all projects") {
+		t.Fatalf("expected the saved filter to stay visible and clearable:\n%s", page)
+	}
+	if strings.Contains(page, "zz-selected-projects") {
+		t.Error("tags listed although the selection covers every project on the radar")
+	}
+}
+
 // Only a well-formed "owner/name" gets a link; anything else is named without one.
 func TestProjectPullsURL(t *testing.T) {
 	for name, want := range map[string]string{
