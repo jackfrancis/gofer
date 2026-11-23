@@ -67,6 +67,14 @@ type GitHubRef struct {
 	URL       string    `json:"url"`
 	State     string    `json:"state"`
 	UpdatedAt time.Time `json:"updated_at"`
+
+	// Draft marks a draft pull request, Merged a closed pull request that was
+	// merged, and StateReason is GitHub's reason a closed issue was closed
+	// ("completed", "not_planned"). Only the radar's state icon reads them; an
+	// item stored before they were recorded reads as plain open/closed.
+	Draft       bool   `json:"draft,omitempty"`
+	Merged      bool   `json:"merged,omitempty"`
+	StateReason string `json:"state_reason,omitempty"`
 }
 
 // Metadata is gofer's judgment about an item, derived from its Signals. The four

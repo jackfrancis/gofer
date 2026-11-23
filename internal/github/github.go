@@ -245,6 +245,8 @@ type searchItem struct {
 	Title         string    `json:"title"`
 	HTMLURL       string    `json:"html_url"`
 	State         string    `json:"state"`
+	StateReason   string    `json:"state_reason"`
+	Draft         bool      `json:"draft"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 	Comments      int       `json:"comments"`
@@ -267,7 +269,8 @@ type searchItem struct {
 		TotalCount int `json:"total_count"`
 	} `json:"reactions"`
 	PullRequest *struct {
-		URL string `json:"url"`
+		URL      string     `json:"url"`
+		MergedAt *time.Time `json:"merged_at"`
 	} `json:"pull_request"`
 }
 
@@ -276,8 +279,10 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 	// object marks a PR. Both belong on the radar, so map the type instead of
 	// dropping issues.
 	itemType := worklist.TypeIssue
+	merged := false
 	if it.PullRequest != nil {
 		itemType = worklist.TypePullRequest
+		merged = it.PullRequest.MergedAt != nil
 	}
 	repo := strings.TrimPrefix(it.RepositoryURL, defaultBaseURL+"/repos/")
 
@@ -309,6 +314,10 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 			URL:       it.HTMLURL,
 			State:     it.State,
 			UpdatedAt: it.UpdatedAt,
+
+			Draft:       it.Draft && itemType == worklist.TypePullRequest,
+			Merged:      merged,
+			StateReason: it.StateReason,
 		},
 		Signals: sig,
 		Meta:    worklist.Metadata{Origin: worklist.OriginAgent},
