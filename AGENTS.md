@@ -161,9 +161,8 @@ Wired on the web-tier side; they define what a runtime must respect:
   read-modify-write), never `List` then `Upsert`, which overwrites anything written
   in between. A run's write-back is merged into the stored item
   (`worklist.MergeRunItems`): runs own the GitHub fields, signals and scoring; the
-  thread, read cursor, hidden flag and creation time always come from the store,
-  except that a hidden item resurfaces when the run's GitHub update time is after
-  the hide (`worklist.HiddenAfter`). Hidden and closed items are off the radar
+  thread, read cursor, hidden flag and creation time always come from the store.
+  Hidden and closed items are off the radar
   (`WorkItem.OnRadar`), and no bulk action (Review all, the second-opinion batch)
   draws from them. A
   run adds a thread turn only through `POST /agent/worklist/reply`
@@ -257,10 +256,39 @@ Wired on the web-tier side; they define what a runtime must respect:
   `http.ResponseWriter` must implement `Unwrap` (as `statusRecorder` does), or the
   flush fails and no thread is ever marked read. The
   cursor only moves forward; a re-render of an already-read thread skips the store.
+- Hiding an item (`internal/worklist/hide.go`) is permanent until the owner unhides
+  it: no run clears `Meta.HiddenAt`, whatever changes on GitHub. A hidden item
+  carries no gofer judgment: `worklist.HideItem` deletes its signals (all but the
+  labels) and its scoring metadata (`worklist.StripScoring`), `MergeRunItems` strips
+  every write-back while it stays hidden (inside the store's update, so the run sends
+  its fresh signals: the owner may unhide the item before they land), `SetResearch`
+  drops research for it, `Rescore` leaves it unscored, and the selection a run reads
+  (`Selection.Open`, which means on the radar) leaves it out of enrichment and
+  ranking. The radar lists open hidden items in a greyscale section below the ranked
+  list (`Resolution.Hidden`, most recently hidden first) with an Unhide button and no
+  Discuss: a hidden item takes no new turn, retry, review panel or turn hide/unhide
+  (`appendTurn`, `ThreadRetry`, `HideMessage`), and its thread page is read-only.
+  Unhide (`worklist.UnhideItem`) brings it back empty. Its pre-hide CI summary is
+  kept but marked `CISummary.Stale` (labeled as last known) until enrich reads the
+  head; `Equal` compares the mark, so that read is written. An open item is flagged
+  `Meta.AwaitingRefresh`: unscored by `Rescore` and by Discuss's ranking context,
+  left out of the ranker's top-N selection, shown as waiting for the next refresh. A
+  retired one is not flagged, and a retirement's merge clears the flag, since no
+  refresh revisits a retired item. Unhide then calls `Ingestor.RefreshFollowUp`,
+  which owes the owner one ingest run reserved after the call until the backend
+  accepts one (`settle` pays it, whoever reserved the run). It tries at once; while
+  the debt stands a server-side worker retries through the refresh gate (which asks
+  the backend whether the run in flight ended), backing off after a refusal, so
+  nothing waits on a page polling. Never consume the debt on a run's end: only an
+  accepted run reserved after it pays, and every attempt (the unhide's own and the
+  worker's) reserves only while the debt still stands, checked under the reserving
+  lock after any probe. Each unhide joins a standing debt and gives it a full
+  `followUpGiveUp`; in memory only. The refresh's write-back clears the flag, since runs own
+  `Metadata`. A hidden item that closes leaves the section, still hidden.
 - The radar's project (repository) filter (`internal/webui/projects.go`) is a view
   preference kept in the `gofer_projects` cookie, bound to the account that saved it
-  (none = all projects). It only drops items from the already-ranked list, never
-  re-sorts. The cookie never decides what a bulk action touches: each bulk form posts
+  (none = all projects). It only drops items from the already-ranked list and the
+  hidden section (its checklist names both lists' repositories), never re-sorts. The cookie never decides what a bulk action touches: each bulk form posts
   the selection its page was rendered with (`scope`), narrowed to the projects the
   checklist names, so neither a filter changed in another tab nor a saved repository
   that left the radar can widen it; an unreadable form changes nothing, and only a
@@ -394,7 +422,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   the commit the first resolved, since a named ref can advance between pages. After
   a projected read, enrich writes the fresh summary through `WorkItem.SetCI`, which
   drops the projection marker, since a cut summary compares equal to fresh data it
-  does not match. A retired item's CI is labeled as the last known result. It is display-only: nothing scores on it.
+  does not match. A retired or hidden item's CI (enrich reads neither) is labeled as
+  the last known result; hiding keeps it, since it is a GitHub field, and unhiding
+  marks it `Stale` (labeled as from before the hide) until enrich reads the head. It is display-only: nothing scores on it.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

@@ -37,7 +37,9 @@ const (
 // Selection names a bounded read of one owner's items, without their threads.
 // Enrichment and ingest page through every item; ranking reads the top N.
 type Selection struct {
-	// Open keeps only items not yet retired (Meta.CompletedAt unset).
+	// Open keeps only items on the radar (WorkItem.OnRadar): not retired
+	// (Meta.CompletedAt unset) and not hidden by the owner, whose hidden items get no
+	// enrichment or ranking.
 	Open bool
 	// After is the cursor of the page to read: empty for the first, then the next
 	// value the previous page returned.
@@ -49,7 +51,9 @@ type Selection struct {
 	// Top, when > 0, reads the Top items with the highest baseline score
 	// (BaselineScore(item, now).Rank, without the model signals a ranking pass
 	// replaces, which may rest on a classification since changed),
-	// highest first, instead of paging by ID; Limit is ignored. Equal scores keep the store's first-insertion order. It is clamped to
+	// highest first, instead of paging by ID; Limit is ignored. It leaves out items
+	// awaiting their post-unhide refresh (Metadata.AwaitingRefresh), which hold no
+	// signals to rank yet. Equal scores keep the store's first-insertion order. It is clamped to
 	// MaxSelectLimit, and its pages are positions in that ranking, so a score that
 	// changes between pages can shift an item across a page boundary: a reader
 	// drops an ID it already has.
@@ -76,7 +80,13 @@ func Select(items []WorkItem, sel Selection, now time.Time) (page []WorkItem, ne
 	sel = sel.normalized()
 	out := make([]WorkItem, 0, len(items))
 	for _, it := range items {
-		if sel.Open && !it.Meta.CompletedAt.IsZero() {
+		if sel.Open && !it.OnRadar() {
+			continue
+		}
+		if sel.Top > 0 && it.Meta.AwaitingRefresh {
+			// Unhidden, with no GitHub signals yet (a partial fetch may have missed it):
+			// a ranking now would rest on nothing, and outlive the refresh that fills it
+			// in if that pass's ranking fails. It is ranked once a refresh writes it.
 			continue
 		}
 		out = append(out, it)
@@ -165,7 +175,8 @@ func SelectFrom(ctx context.Context, store Store, ownerID string, sel Selection,
 
 // BriefQuery names the items Store.Briefs returns, without their threads.
 type BriefQuery struct {
-	// Open keeps only items not yet retired (Meta.CompletedAt unset).
+	// Open keeps only items on the radar (WorkItem.OnRadar): neither retired nor
+	// hidden.
 	Open bool
 	// With Limit > 0, Briefs returns up to Limit items whose ID sorts after After,
 	// in ID order. Otherwise it returns every item, in first-insertion order.
@@ -178,7 +189,7 @@ type BriefQuery struct {
 func ApplyBriefQuery(items []WorkItem, q BriefQuery) []WorkItem {
 	out := make([]WorkItem, 0, len(items))
 	for _, it := range items {
-		if q.Open && !it.Meta.CompletedAt.IsZero() {
+		if q.Open && !it.OnRadar() {
 			continue
 		}
 		if q.Limit > 0 && it.ID <= q.After {

@@ -212,6 +212,31 @@ func TestItemContextShowsScoredZeroRank(t *testing.T) {
 	}
 }
 
+// An item the radar does not rank (just unhidden, hidden, or retired) gets no rank,
+// axes or signal drivers: its leftover labels would otherwise describe a score the
+// radar does not show (a security label alone drives impact).
+func TestItemContextUnscoredItemHasNoRanking(t *testing.T) {
+	for name, meta := range map[string]worklist.Metadata{
+		"awaiting refresh": {AwaitingRefresh: true},
+		"hidden":           {HiddenAt: ctxNow},
+		"retired":          {CompletedAt: ctxNow}, // e.g. a closed PR unhidden: no flag, still off the radar
+	} {
+		item := worklist.WorkItem{Signals: worklist.Signals{Labels: []string{"security"}}, Meta: meta}
+		got := block(t, itemContext(item, ctxNow))
+		for _, absent := range []string{"axes:", "rank: 0", "impact 1.00", "signals"} {
+			if strings.Contains(got, absent) {
+				t.Errorf("%s: the block must not report %q:\n%s", name, absent, got)
+			}
+		}
+		if !strings.Contains(got, "rank: n") || !strings.Contains(got, "labels: ") {
+			t.Errorf("%s: the block says there is no rank and keeps the labels:\n%s", name, got)
+		}
+	}
+	if !strings.Contains(block(t, itemContext(worklist.WorkItem{Signals: worklist.Signals{Labels: []string{"security"}}}, ctxNow)), "impact 1.00") {
+		t.Error("test premise: the label alone drives impact on a scored item")
+	}
+}
+
 // Comments counted by search before timeline enrichment has counted participants
 // must not be reported as zero participants, in the counts or the driver text.
 func TestItemContextParticipantsNotYetCounted(t *testing.T) {

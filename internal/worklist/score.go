@@ -102,13 +102,15 @@ func Score(item WorkItem, now time.Time) Metadata {
 }
 
 // Rescore returns item's Metadata as the radar shows it at now: re-derived from
-// its Signals by Score, keeping the persisted write time and the hidden and
-// completed marks, which are not scoring. A human override (OriginUser) is
-// returned verbatim. The landing page and the assistant both read an item's
+// its Signals by Score, keeping the persisted write time and the completed mark,
+// which are not scoring. A human override (OriginUser) is returned verbatim, and so
+// is the metadata of an item with no score: a hidden one, or one unhidden and
+// awaiting the refresh that fills it in (see hide.go), whose leftover labels must
+// not score it. The landing page and the assistant both read an item's
 // ranking through this, so Discuss explains the rank the user is looking at
 // rather than whatever was last stored.
 func Rescore(item WorkItem, now time.Time) Metadata {
-	if item.Meta.Origin == OriginUser {
+	if item.Meta.Origin == OriginUser || item.IsHidden() || item.Meta.AwaitingRefresh {
 		return item.Meta
 	}
 	scored := Score(item, now)

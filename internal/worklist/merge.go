@@ -17,14 +17,16 @@ import (
 // the scoring metadata, and whether the item is completed. The OWNER's state always
 // comes from the stored item: the conversation thread (its messages and their hidden
 // flags), the read cursor, the hidden-item flag, and when gofer first saw the item.
-// A run adds to the thread only through AppendReply. The one thing a run can do to
-// the hidden flag is clear it: an item whose GitHub update time (a run-owned field)
-// is later than when the owner hid it has changed since, so it resurfaces
-// (HiddenAfter).
+// A run adds to the thread only through AppendReply, and never changes the
+// hidden-item flag. While an item is hidden, a write-back keeps only the run's
+// GitHub fields, completion and labels: its signals and scoring are stripped
+// (StripScoring), so a hidden item never carries a score (see hide.go).
 //
-// A pull request's CI summary (GitHubRef.CI) follows the same rule: only enrich
-// reads it, so a write-back that carries none keeps the stored one (KeepCI), and
-// every other pass (refresh, retire, rank) sends none, never the copy it read.
+// A pull request's CI summary (GitHubRef.CI) is kept like the model signals below:
+// only enrich reads it, so a write-back that carries none keeps the stored one
+// (KeepCI), and every other pass (refresh, retire, rank) sends none, never the copy
+// it read. It is a GitHub field, so a hidden item keeps it (enrich skips hidden
+// items, so it is the last one read).
 //
 // The two model-derived signals are the exception to "the run owns its signals": a
 // GitHub fetch cannot produce them, so a refresh sends none, and a scoring pass that
@@ -61,12 +63,20 @@ func MergeRunItems(current, incoming []WorkItem) []WorkItem {
 		it.Thread = old.Thread
 		it.ThreadReadAt = old.ThreadReadAt
 		it.ThreadReadThrough = old.ThreadReadThrough
-		it.Meta.HiddenAt = HiddenAfter(old.Meta.HiddenAt, it.GitHub.UpdatedAt)
+		it.Meta.HiddenAt = old.Meta.HiddenAt
 		if !old.CreatedAt.IsZero() {
 			it.CreatedAt = old.CreatedAt
 		}
 		KeepModelSignals(&it.Signals, old.Signals)
 		KeepCI(&it, old)
+		if it.IsHidden() {
+			StripScoring(&it) // GitHub fields, the CI summary among them, stay
+		}
+		if !it.Meta.CompletedAt.IsZero() {
+			// A retired item awaits no refresh: none revisits it until it reopens, and
+			// a retirement may echo the flag from the copy it read.
+			it.Meta.AwaitingRefresh = false
+		}
 		out = append(out, it)
 	}
 	return out
@@ -104,9 +114,10 @@ var ErrUnstampedResearch = errors.New("worklist: research adjustment has no appl
 // and writes back only what it derived: the GitHub fields, the other signals and
 // the thread are left as stored now, so a refresh that landed meanwhile stands.
 //
-// An adjustment is dropped if any turn it read (ResearchAdjustment.Turns) is no
-// longer in the stored thread: the owner cleared the conversation, and research on
-// the old one must not outlive it. Then AppliedAt orders adjustments: one older than
+// An adjustment is dropped if the item is hidden (a hidden item carries no score),
+// or if any turn it read (ResearchAdjustment.Turns) is no longer in the stored
+// thread: the owner cleared the conversation, and research on the old one must not
+// outlive it. Then AppliedAt orders adjustments: one older than
 // the stored adjustment is dropped, so a resent write cannot undo a later result. It
 // writes nothing, and returns no error, when the item is gone or the adjustment is
 // dropped.
@@ -129,12 +140,15 @@ func ApplyResearch(ctx context.Context, store Store, ownerID, itemID string, adj
 	})
 }
 
-// SetResearch sets item's research adjustment unless a turn it read is gone from
-// the thread or the stored adjustment is newer (by AppliedAt), and reports whether it
-// did. An adjustment with no AppliedAt is ErrUnstampedResearch.
+// SetResearch sets item's research adjustment unless the item is hidden, a turn it
+// read is gone from the thread, or the stored adjustment is newer (by AppliedAt), and
+// reports whether it did. An adjustment with no AppliedAt is ErrUnstampedResearch.
 func SetResearch(item *WorkItem, adj ResearchAdjustment) (bool, error) {
 	if adj.AppliedAt.IsZero() {
 		return false, ErrUnstampedResearch
+	}
+	if item.IsHidden() {
+		return false, nil // a hidden item carries no score
 	}
 	if !turnsInThread(*item, adj.Turns) {
 		return false, nil // read a conversation since cleared
