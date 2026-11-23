@@ -7,6 +7,7 @@
 package markdown
 
 import (
+	"bufio"
 	"bytes"
 	"html/template"
 
@@ -48,14 +49,14 @@ func renderImageAsLink(w util.BufWriter, source []byte, node ast.Node, entering 
 	}
 	n := node.(*ast.Image)
 	dest := util.URLEscape(n.Destination, true)
-	text := plainText(source, n)
-	if len(text) == 0 {
-		text = n.Destination
+	label := labelHTML(source, n)
+	if len(label) == 0 {
+		label = util.EscapeHTML(n.Destination)
 	}
 	// Inside a link ([![alt](img)](url)) the alt text joins the outer link: anchors
 	// cannot nest. A dangerous scheme gets no link (the sanitizer would drop it too).
 	if inLink(n) || len(dest) == 0 || html.IsDangerousURL(dest) {
-		_, _ = w.Write(util.EscapeHTML(text))
+		_, _ = w.Write(label)
 		return ast.WalkSkipChildren, nil
 	}
 	_, _ = w.WriteString(`<a href="`)
@@ -67,25 +68,48 @@ func renderImageAsLink(w util.BufWriter, source []byte, node ast.Node, entering 
 		_ = w.WriteByte('"')
 	}
 	_ = w.WriteByte('>')
-	_, _ = w.Write(util.EscapeHTML(text))
+	_, _ = w.Write(label)
 	_, _ = w.WriteString("</a>")
 	return ast.WalkSkipChildren, nil
 }
 
-// plainText is the text of n's descendants, without markup.
-func plainText(source []byte, n ast.Node) []byte {
-	var b []byte
+// labelHTML is the text of n's descendants as escaped HTML without markup, as
+// goldmark renders an image's alt text: through its text writer, which resolves
+// entities and backslash escapes (&amp; shows as &, \* as *) and escapes the
+// result. A line break inside the label becomes a space.
+func labelHTML(source []byte, n ast.Node) []byte {
+	var buf bytes.Buffer
+	w := bufio.NewWriter(&buf)
+	writeLabel(w, source, n)
+	_ = w.Flush()
+	return buf.Bytes()
+}
+
+func writeLabel(w util.BufWriter, source []byte, n ast.Node) {
 	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
 		switch t := c.(type) {
 		case *ast.Text:
-			b = append(b, t.Segment.Value(source)...)
+			if t.IsRaw() {
+				html.DefaultWriter.RawWrite(w, t.Segment.Value(source))
+			} else {
+				html.DefaultWriter.Write(w, t.Segment.Value(source))
+			}
+			if t.SoftLineBreak() || t.HardLineBreak() {
+				_ = w.WriteByte(' ')
+			}
 		case *ast.String:
-			b = append(b, t.Value...)
+			switch {
+			case t.IsCode():
+				_, _ = w.Write(t.Value) // already HTML (a typographer entity such as &hellip;)
+			case t.IsRaw():
+				html.DefaultWriter.RawWrite(w, t.Value)
+			default:
+				html.DefaultWriter.Write(w, t.Value)
+			}
 		default:
-			b = append(b, plainText(source, c)...)
+			writeLabel(w, source, c)
 		}
 	}
-	return b
 }
 
 // inLink reports whether n sits inside a link.
