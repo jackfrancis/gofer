@@ -6,15 +6,16 @@ import (
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
-// ciView is a pull request's CI summary as the radar draws it, under the labels:
-// a line for the jobs that passed, one for the jobs still running, and one per
-// failed job, naming it. A count of zero draws no line.
+// ciView is a pull request's CI summary as the page draws it (under the labels on
+// the radar, in the header of the Discuss page): a line for the jobs that
+// succeeded, one for the jobs still running, and one per failed job, naming it and
+// linking it where GitHub's pull request does. A count of zero draws no line.
 type ciView struct {
-	Passed  string   // "N CI jobs successful", or ""
-	Pending string   // "N CI jobs in progress", or ""
-	Failed  []string // each failed job's full name
-	More    string   // failed jobs past the stored bound, or ""
-	Partial bool     // part of the CI could not be read
+	Passed  string           // "N CI jobs successful", or ""
+	Pending string           // "N CI jobs in progress", or ""
+	Failed  []worklist.CIJob // each failed job's full name and link
+	More    string           // failed jobs past the stored bound, or ""
+	Partial bool             // part of the CI could not be read
 }
 
 // ciSummary returns the item's CI view, or nil when there is nothing to show: no
@@ -28,7 +29,7 @@ func ciSummary(it worklist.WorkItem) *ciView {
 	v := &ciView{
 		Passed:  ciCount(c.Passed, "successful"),
 		Pending: ciCount(c.Pending, "in progress"),
-		Failed:  c.Failed,
+		Failed:  c.FailedJobs(),
 		Partial: c.Partial,
 	}
 	if c.FailedOmitted > 0 {

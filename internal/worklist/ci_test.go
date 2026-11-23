@@ -11,12 +11,15 @@ import (
 // failures are only counted, and a long name is cut without splitting a character.
 func TestCISummaryAddFailedBounds(t *testing.T) {
 	var c CISummary
-	c.AddFailed(strings.Repeat("é", MaxCINameBytes)) // 2 bytes each
+	c.AddFailed(strings.Repeat("é", MaxCINameBytes), "") // 2 bytes each
 	for i := range MaxCIFailedNames + 4 {
-		c.AddFailed(fmt.Sprintf("job-%d", i))
+		c.AddFailed(fmt.Sprintf("job-%d", i), fmt.Sprintf("https://prow.example/view/%d", i))
 	}
-	if len(c.Failed) != MaxCIFailedNames || c.FailedOmitted != 5 {
-		t.Fatalf("kept %d names, omitted %d", len(c.Failed), c.FailedOmitted)
+	if len(c.Failed) != MaxCIFailedNames || len(c.FailedURLs) != MaxCIFailedNames || c.FailedOmitted != 5 {
+		t.Fatalf("kept %d names, %d links, omitted %d", len(c.Failed), len(c.FailedURLs), c.FailedOmitted)
+	}
+	if c.FailedURLs[0] != "" || c.FailedURLs[1] != "https://prow.example/view/0" {
+		t.Fatalf("links not aligned with names: %q", c.FailedURLs[:2])
 	}
 	if n := c.Failed[0]; len(n) > MaxCINameBytes || !strings.HasPrefix(strings.Repeat("é", MaxCINameBytes), n) {
 		t.Fatalf("long name cut to %d bytes: %q", len(n), n)
@@ -105,5 +108,73 @@ func TestMergeKeepsCI(t *testing.T) {
 	got[0].GitHub.CI.Failed[0] = "changed"
 	if ci.Failed[0] != "e2e" {
 		t.Fatal("the merge must not alias the stored summary")
+	}
+}
+
+// A CI link reaches an href, so only an absolute http(s) URL with a host passes,
+// within the length bound.
+func TestCIJobURL(t *testing.T) {
+	for in, ok := range map[string]bool{
+		"https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/1/job/2": true,
+		"http://ci.example/job/1":      true,
+		"":                             false,
+		"javascript:alert(1)":          false,
+		"data:text/html,x":             false,
+		"//prow.k8s.io/view/x":         false,
+		"/view/x":                      false,
+		"https://":                     false,
+		"https://user:pw@ci.example/x": false,
+		"ftp://ci.example/x":           false,
+		"https://ci.example/" + strings.Repeat("x", MaxCIURLBytes): false,
+	} {
+		if got := CIJobURL(in); (got != "") != ok || (ok && got != in) {
+			t.Errorf("CIJobURL(%q) = %q, want ok=%v", in, got, ok)
+		}
+	}
+}
+
+// FailedJobs pairs names with their links, re-checks each link, and leaves a job
+// without one when the stored lists do not line up.
+func TestCISummaryFailedJobs(t *testing.T) {
+	c := CISummary{Failed: []string{"a", "b", "c"}, FailedURLs: []string{"https://ci.example/a", "javascript:x"}}
+	got := c.FailedJobs()
+	want := []CIJob{{"a", "https://ci.example/a"}, {"b", ""}, {"c", ""}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("FailedJobs = %v, want %v", got, want)
+	}
+	if a, b := (&CISummary{Failed: []string{"a"}, FailedURLs: []string{"https://x.example/1"}}),
+		(&CISummary{Failed: []string{"a"}, FailedURLs: []string{"https://x.example/2"}}); a.Equal(b) {
+		t.Fatal("summaries with different links must differ")
+	}
+}
+
+// Projection cuts the links with the names they belong to, dropping (not cutting) a
+// link too long to keep whole; the write-back restores both lists.
+func TestProjectionCutsCILinksWithNames(t *testing.T) {
+	ci := &CISummary{SHA: "abc"}
+	for i := range 2 * projectedList {
+		link := fmt.Sprintf("https://ci.example/%d", i)
+		if i == 0 {
+			link = "https://ci.example/" + strings.Repeat("x", projectedString)
+		}
+		ci.AddFailed(fmt.Sprintf("job-%d", i), link)
+	}
+	stored := WorkItem{ID: "big", Type: TypePullRequest,
+		GitHub: GitHubRef{Title: strings.Repeat("t", MaxBriefBytes), CI: ci}}
+	read := Project(stored)
+	got := read.GitHub.CI
+	if len(got.FailedURLs) != len(got.Failed) || got.FailedURLs[0] != "" || got.FailedURLs[1] != "https://ci.example/1" {
+		t.Fatalf("cut links: %d for %d names, first %q", len(got.FailedURLs), len(got.Failed), got.FailedURLs[:2])
+	}
+	if len(ci.FailedURLs[0]) <= projectedString {
+		t.Fatal("projection must not write through to the stored links")
+	}
+	b, _ := json.Marshal(read)
+	var back WorkItem
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatal(err)
+	}
+	if merged := MergeRunItems([]WorkItem{stored}, []WorkItem{back})[0]; !merged.GitHub.CI.Equal(ci) {
+		t.Fatal("write-back must restore the stored links")
 	}
 }

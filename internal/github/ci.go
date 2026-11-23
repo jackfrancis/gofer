@@ -235,8 +235,8 @@ func checkClass(status, conclusion string) string {
 }
 
 // Summary condenses the status to what the radar shows: how many jobs succeeded and
-// are still running, and the name of every failed job (by name, as the checks are
-// sorted), within worklist.CISummary's bounds. It counts each job by the outcome
+// are still running, and every failed job's name and link (by name, as the checks
+// are sorted), within worklist.CISummary's bounds. It counts each job by the outcome
 // GitHub reported, not by its sorting class: a skipped, neutral or stale check
 // neither succeeded nor is running, so it is in no count.
 func (s CIStatus) Summary() worklist.CISummary {
@@ -248,7 +248,7 @@ func (s CIStatus) Summary() worklist.CISummary {
 		case CIPending:
 			sum.Pending++
 		case CIFailing:
-			sum.AddFailed(c.Name)
+			sum.AddFailed(c.Name, c.URL) // the link GitHub shows for the job on the PR
 		}
 	}
 	return sum

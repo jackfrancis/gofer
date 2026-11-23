@@ -103,6 +103,12 @@ func TestCIStatusSummary(t *testing.T) {
 		strings.Join(sum.Failed, ",") != "build,pull-o-r-e2e" || sum.FailedOmitted != 0 {
 		t.Errorf("summary = %+v", sum)
 	}
+	// Each failed job keeps the link GitHub shows for it on the PR: a check run's
+	// details URL, a status's target URL (the Prow job page).
+	if len(sum.FailedURLs) != 2 || sum.FailedURLs[0] != "https://github.com/o/r/actions/runs/9" ||
+		!strings.HasPrefix(sum.FailedURLs[1], "https://prow.k8s.io/view/gs/kubernetes-ci-logs/pr-logs/pull/o_r/42/pull-o-r-e2e/") {
+		t.Errorf("failed links = %q", sum.FailedURLs)
+	}
 
 	srv = ciServer(t, http.StatusForbidden)
 	st, err = NewClient(srv.Client(), srv.URL).CIStatusForPR(context.Background(), "tok", "o/r", 42)

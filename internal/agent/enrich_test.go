@@ -231,10 +231,10 @@ func TestRunEnrichSummarizesPullRequestCI(t *testing.T) {
 			_, _ = w.Write([]byte(`{"head":{"ref":"b","sha":"sha1"}}`))
 		case "/repos/o/r/commits/sha1/status":
 			_, _ = w.Write([]byte(`{"sha":"sha1","total_count":2,"statuses":[
-				{"context":"pull-unit","state":"success"},{"context":"pull-e2e","state":"failure"}]}`))
+				{"context":"pull-unit","state":"success"},{"context":"pull-e2e","state":"failure","target_url":"https://prow.k8s.io/view/gs/b/pull-e2e/1"}]}`))
 		case "/repos/o/r/commits/sha1/check-runs":
 			_, _ = w.Write([]byte(`{"total_count":2,"check_runs":[
-				{"name":"lint","status":"in_progress"},{"name":"build","status":"completed","conclusion":"failure"}]}`))
+				{"name":"lint","status":"in_progress"},{"name":"build","status":"completed","conclusion":"failure","details_url":"https://github.com/o/r/actions/runs/5"}]}`))
 		case "/repos/o/r/pulls/2":
 			http.Error(w, "boom", http.StatusInternalServerError)
 		default:
@@ -258,7 +258,8 @@ func TestRunEnrichSummarizesPullRequestCI(t *testing.T) {
 	for _, it := range sink.items {
 		got[it.ID] = it.GitHub.CI
 	}
-	want := &worklist.CISummary{SHA: "sha1", Passed: 1, Pending: 1, Failed: []string{"build", "pull-e2e"}}
+	want := &worklist.CISummary{SHA: "sha1", Passed: 1, Pending: 1, Failed: []string{"build", "pull-e2e"},
+		FailedURLs: []string{"https://github.com/o/r/actions/runs/5", "https://prow.k8s.io/view/gs/b/pull-e2e/1"}}
 	if !got["pr1"].Equal(want) {
 		t.Errorf("pr1 CI = %+v, want %+v", got["pr1"], want)
 	}

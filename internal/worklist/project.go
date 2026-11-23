@@ -108,7 +108,8 @@ var projectables = []projectable{
 			w.GitHub.LabelColors = kept
 		}},
 	// Enrich stores the CI summary bounded (CISummary.AddFailed), but the store holds
-	// whatever a run wrote, so the failed-job names are cut like any list. The cut
+	// whatever a run wrote, so the failed-job names (and their links) are cut like any
+	// list. The cut
 	// counts the names it drops as omitted, and leaves Failed nil rather than empty,
 	// as the JSON a run receives would.
 	{"github.ci", func(w *WorkItem) any { return w.GitHub.CI },
@@ -124,6 +125,17 @@ var projectables = []projectable{
 			c.Failed = cutStrings(c.Failed)
 			if len(c.Failed) == 0 {
 				c.Failed = nil
+			}
+			// The links follow the names they belong to; a cut link would be a broken
+			// one, so a link past projectedString is dropped instead.
+			c.FailedURLs = c.FailedURLs[:min(len(c.FailedURLs), len(c.Failed))]
+			for i, l := range c.FailedURLs {
+				if len(l) > projectedString {
+					c.FailedURLs[i] = ""
+				}
+			}
+			if len(c.FailedURLs) == 0 {
+				c.FailedURLs = nil
 			}
 			w.GitHub.CI = c
 		}},
@@ -285,6 +297,7 @@ func cloneCI(c *CISummary) *CISummary {
 	}
 	out := *c
 	out.Failed = slices.Clone(c.Failed)
+	out.FailedURLs = slices.Clone(c.FailedURLs)
 	return &out
 }
 

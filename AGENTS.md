@@ -374,8 +374,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   (`internal/webui/labels.go`), a stylesheet generated from the query alone. Colors
   live in `GitHubRef.LabelColors`, set at ingest; read one only through
   `GitHubRef.LabelColor` (six hex digits or nothing), since it reaches CSS.
-- A pull request's CI shows under its labels: jobs succeeded, jobs in progress, and
-  each failed job's name (`GitHubRef.CI`, a `worklist.CISummary`). Counts follow the
+- A pull request's CI shows under its labels on the radar and at the top of its
+  Discuss page (one `ci` template): jobs succeeded, jobs in progress, and each failed
+  job's name, linked where GitHub's pull request links it (a status's target URL,
+  e.g. the Prow job page, or a check run's details URL) (`GitHubRef.CI`, a
+  `worklist.CISummary`). The links are `FailedURLs`, index-aligned with `Failed`, so
+  `failed` keeps its stored shape (a list of names) for an older web tier; read the
+  pairs only through `CISummary.FailedJobs`, which admits only http(s) links
+  (`worklist.CIJobURL`), since they reach an href. Counts follow the
   outcome GitHub reported (`github.ciOutcome`: skipped, neutral and stale are in no
   count), not the sorting class. Enrich sets it from `github.CIStatusForPR`
   (`CIStatus.Summary`, bounded by `CISummary.AddFailed`) in a second pass, after
