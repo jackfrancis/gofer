@@ -677,11 +677,16 @@ func TestThreadAgentReplyCopyButton(t *testing.T) {
 	}
 	out := renderPage(t, pageData{View: "thread", Item: pr, ConvEnabled: true})
 
-	if n := strings.Count(out, `class="zz-linkbtn zz-copy"`); n != 1 {
+	if n := strings.Count(out, `class="zz-iconbtn zz-copy"`); n != 1 {
 		t.Fatalf("want exactly one Copy button (agent turn only), got %d:\n%s", n, out)
 	}
 	if !strings.Contains(out, `data-copy="**Hi** [design](https://example.com/d) &lt;script&gt;x&lt;/script&gt; &#34;q&#34;"`) {
 		t.Fatalf("Copy payload should be the escaped Markdown source, got:\n%s", out)
+	}
+	// Icon-only, so it must carry an accessible name, and its glyphs stay out of the
+	// accessibility tree.
+	if !strings.Contains(out, `aria-label="Copy reply"`) || strings.Count(out, `<svg class="zz-icon`) != 2 || strings.Count(out, `aria-hidden="true" focusable="false"`) != 2 {
+		t.Fatalf("Copy should be a labeled icon button with two hidden glyphs, got:\n%s", out)
 	}
 	if !strings.Contains(out, `<script src="/static/copy.js" defer></script>`) {
 		t.Fatal("the thread view should load copy.js from /static")

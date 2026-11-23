@@ -6,6 +6,7 @@
   --bg-subtle: #f6f8fa;
   --danger: #cf222e;
   --attention: #9a6700;
+  --success: #1a7f37;
 }
 
 * { box-sizing: border-box; }
@@ -157,8 +158,32 @@ body {
 .zz-model { font-size: 12px; color: var(--muted); }
 .zz-msg .zz-msgfoot { display: flex; gap: 12px; align-items: center; margin-top: 8px; }
 .zz-msgfoot form { margin: 0; }
-/* The Copy button is hidden until copy.js wires it, so a no-JS page shows no dead control. */
+/* Icon-only button (the reply's Copy). The glyphs are inline SVG drawn for gofer —
+   two overlapping rounded squares, and a check for "copied" — stroked in currentColor. */
+.zz-iconbtn {
+  display: inline-flex; align-items: center; justify-content: center;
+  background: none; border: 0; padding: 3px; margin: -3px 0; border-radius: 4px;
+  color: var(--muted); cursor: pointer; line-height: 0;
+}
+.zz-iconbtn:hover { color: var(--accent); background: rgba(31, 35, 40, 0.06); }
+.zz-iconbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.zz-icon {
+  width: 14px; height: 14px; fill: none; stroke: currentColor;
+  stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+}
+/* The Copy button is hidden until copy.js wires it, so a no-JS page shows no dead control.
+   copy.js marks the outcome: is-copied swaps in the check, is-failed tints it red. */
 .zz-copy[hidden] { display: none; }
+.zz-copy .zz-icon-check { display: none; }
+.zz-copy.is-copied { color: var(--success); }
+.zz-copy.is-copied .zz-icon-copy { display: none; }
+.zz-copy.is-copied .zz-icon-check { display: block; }
+.zz-copy.is-failed { color: var(--danger); }
+/* Visually hidden, still read by screen readers (copy.js's status announcements). */
+.zz-sr {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
 .zz-linkbtn { background: none; border: 0; padding: 0; font-family: inherit; font-size: 12px; text-decoration: underline; cursor: pointer; color: var(--muted); }
 .zz-linkbtn:hover { color: var(--accent); }
 .zz-msg--user .zz-linkbtn { color: rgba(255, 255, 255, 0.85); }
