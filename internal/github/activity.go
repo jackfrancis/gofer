@@ -27,11 +27,13 @@ type timelineEvent struct {
 	} `json:"requested_team"`
 	User  *timelineUser `json:"user"`
 	Actor *timelineUser `json:"actor"`
-	// Committer dates a "committed" event, which names no GitHub account; a rebase
-	// re-dates the commits it rewrites.
-	Committer *struct {
-		Date time.Time `json:"date"`
-	} `json:"committer"`
+}
+
+// teamRequest is a team review request outstanding as of some event: when it was
+// made, and by whom.
+type teamRequest struct {
+	at    time.Time
+	actor string
 }
 
 type timelineUser struct {
@@ -49,11 +51,20 @@ type ActivityOptions struct {
 	// regard to case. An account GitHub types "Bot", or whose login ends in "[bot]",
 	// is a bot too. A bot's comment never takes the last word.
 	Bots []string
-	// ReviewRequested says GitHub's review-requested:@me search shows the item, so a
-	// team review request may include login. A team request outstanding since login's
-	// last comment or review then awaits login (AwaitingMeSince); without the search's
-	// word, team membership is unknown and a team request awaits no one in particular.
+	// ReviewRequested says GitHub's review-requested:@me search shows the item. That
+	// is evidence a team request names login only when nothing else explains the hit:
+	// no personal request of login's is outstanding, and exactly one team request is,
+	// so it is the one. That request is then login's (RequestedByLogin is its actor),
+	// and it awaits login if made since login's last comment or review. Otherwise team
+	// membership is unknown and a team request awaits no one in particular.
 	ReviewRequested bool
+	// PullRequest says the item is a pull request, whose head commit says whether the
+	// author pushed since login's last word.
+	PullRequest bool
+	// Prior is the last word stored for the item, if any. A comment names no commit,
+	// so the head first seen with it (LastWord.Head) is kept: a later head means the
+	// author pushed since.
+	Prior *worklist.LastWord
 }
 
 // Activity holds the signals derived from a single read of an item's timeline.
@@ -64,9 +75,11 @@ type Activity struct {
 	Commented           bool      // login themselves commented or reviewed — proves participation
 	AwaitingMeSince     time.Time // when login was asked to review with no engagement since; zero if none
 	AwaitingOthersSince time.Time // when the ball is in others' court; zero if none
-	RequestedByLogin    string    // who requested login's pending review (the actor); empty when none pending or unknown
-	// LastWord is login's own comment or review when it is the last human word and
-	// so is why AwaitingOthersSince is set; nil otherwise.
+	RequestedByLogin    string    // who requested login's pending review (the actor), personal or attributed team; empty when none pending or unknown
+	// LastWord is login's own comment or review when it is the last human word: why
+	// AwaitingOthersSince is set, or, with it unset, the last word a push to the pull
+	// request has answered since (LastWord.Head is the head it was made on); nil
+	// otherwise.
 	LastWord *worklist.LastWord
 	// TimelineComplete reports that every timeline event was read, so
 	// RequestedByLogin is authoritative; when false it is unknown, not "none".
@@ -105,22 +118,24 @@ func (c *Client) ItemActivity(ctx context.Context, token, repo string, number in
 // whether or not the ball is in login's court.
 //
 // Whose turn it is comes from the last human word: comments and reviews by anyone but
-// a bot (opts.Bots). On an item login did not author, a push to the pull request
-// (a commit, a force-push) or marking it ready for review is the author answering,
-// and so is the last word too. The ball is in others' court when login had the last
+// a bot (opts.Bots). On a pull request login did not author, a push or marking it
+// ready for review is the author answering, and so is the last word too. The ball is in others' court when login had the last
 // word (LastWord records it), or when someone's approving or changes-requested review
 // is the last word on an item login did not author, so progress is on its author.
 // A review request still awaiting login outranks any later word: login's personal
-// request with no comment or review by login since, or (opts.ReviewRequested) a team
-// request made since login's last comment or review.
+// request with no comment or review by login since, or a team request attributed to
+// login (see ActivityOptions.ReviewRequested) made since login's last one.
 //
-// A commit's date is not when it was pushed, so when the last word is a review, the
-// pull request's head is read (one more call): a head other than the commit the review
-// was made on means the author pushed since, and the item is not waiting. A head that
-// cannot be read leaves the item off the waiting list rather than guess. A review with
-// no summary (only inline comments) is read through its comments, so its text is what
-// the user wrote inline; if they cannot be read the last word has no text, and an
-// undecisive last word with no text never makes an item wait (worklist.WorkItem.Waiting).
+// A commit's date is not when it was pushed (a commit made earlier can be pushed
+// later, and committer clocks drift), so pushes are judged by the head, read once
+// (opts.PullRequest, on an item login did not author): a review's last word stands
+// while the head is the commit it was made on, and a head that cannot be read leaves
+// it off the waiting list rather than guess; a comment's last word stands while the
+// head is the one first seen with it (opts.Prior), and a force-push or ready-for-review
+// since it, which GitHub dates itself, answers it too. A review with no summary (only
+// inline comments) is read through its comments, so its text is what the user wrote
+// inline; if they cannot all be read the last word has no text, and an undecisive
+// last word with no text never makes an item wait (worklist.WorkItem.Waiting).
 //
 // When the timeline is longer than the pages read, the latest events are unseen, so
 // who is waiting on whom is unknown: RequestedByLogin, both waiting timestamps and
@@ -156,9 +171,9 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 	// when it was made. sawRequest records that the timeline holds any request
 	// evidence at all — a request event, or login's own review.
 	var lastActivityDecisive, personalPending, sawRequest bool
-	teamRequests := make(map[string]time.Time)
-	// answered records a push or ready-for-review on an item login did not author:
-	// the author's answer, which takes the last word.
+	teamRequests := make(map[string]teamRequest)
+	// answered records a force-push or ready-for-review, which GitHub dates, on an item
+	// login did not author: the author's answer, which takes the last word.
 	answered := func(at time.Time) {
 		if !isAuthor && at.After(lastActivityAt) {
 			lastActivityAt, lastActor, lastActivityDecisive, lastEvent = at, "", false, nil
@@ -197,7 +212,7 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 				}
 				// It fulfils the team requests made before it too.
 				for team, requested := range teamRequests {
-					if !requested.After(at) {
+					if !requested.at.After(at) {
 						delete(teamRequests, team)
 					}
 				}
@@ -215,17 +230,13 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 			}
 		case "cross-referenced":
 			inbound++
-		case "committed":
-			if e.Committer != nil {
-				answered(e.Committer.Date)
-			}
 		case "head_ref_force_pushed", "ready_for_review":
 			answered(e.CreatedAt)
 		case "review_requested", "review_request_removed":
 			if e.RequestedTeam != nil {
 				sawRequest = true
 				if e.Event == "review_requested" {
-					teamRequests[e.RequestedTeam.Slug] = e.CreatedAt
+					teamRequests[e.RequestedTeam.Slug] = teamRequest{at: e.CreatedAt, actor: eventLogin(e)}
 				} else {
 					delete(teamRequests, e.RequestedTeam.Slug)
 				}
@@ -260,10 +271,13 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 	if !requestedAt.IsZero() && requestedAt.After(myLastActivityAt) {
 		meSince = requestedAt
 	}
-	if opts.ReviewRequested {
-		for _, at := range teamRequests {
-			if at.After(myLastActivityAt) && at.After(meSince) {
-				meSince = at
+	if opts.ReviewRequested && !personalPending && len(teamRequests) == 1 {
+		// The search hit is otherwise unexplained, and one team request stands: it
+		// names login.
+		for _, tr := range teamRequests {
+			a.RequestedByLogin = tr.actor
+			if tr.at.After(myLastActivityAt) && tr.at.After(meSince) {
+				meSince = tr.at
 			}
 		}
 	}
@@ -278,10 +292,28 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 	case lastActivityDecisive && !isAuthor:
 		othersSince = lastActivityAt
 	}
-	if !othersSince.IsZero() && !isAuthor && lastEvent != nil && lastEvent.Event == "reviewed" && lastEvent.CommitID != "" {
-		// A review's last word stands only while the head is the commit it reviewed.
-		if head, err := c.pullHead(ctx, token, repo, number); err != nil || !strings.EqualFold(head, lastEvent.CommitID) {
-			othersSince, lastWord = time.Time{}, nil
+	if !othersSince.IsZero() && opts.PullRequest && !isAuthor {
+		head, headErr := c.pullHead(ctx, token, repo, number)
+		switch {
+		case lastEvent != nil && lastEvent.Event == "reviewed" && lastEvent.CommitID != "":
+			// A review names the commit it was made on; it stands while that is the head.
+			if lastWord != nil {
+				lastWord.Head = lastEvent.CommitID
+			}
+			if headErr != nil || !strings.EqualFold(head, lastEvent.CommitID) {
+				othersSince = time.Time{}
+			}
+		case lastWord != nil:
+			// A comment names no commit: it stands while the head is the one first seen
+			// with it. Unread, the head anchors nothing new, and the timeline decides.
+			if p := opts.Prior; p != nil && p.ID == lastWord.ID && p.Head != "" {
+				lastWord.Head = p.Head
+				if headErr == nil && !strings.EqualFold(head, p.Head) {
+					othersSince = time.Time{}
+				}
+			} else if headErr == nil {
+				lastWord.Head = head
+			}
 		}
 	}
 	switch {
@@ -289,6 +321,10 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 		a.AwaitingMeSince = meSince
 	case !othersSince.IsZero():
 		a.AwaitingOthersSince = othersSince
+		a.LastWord = lastWord
+	case lastWord != nil && lastWord.Head != "":
+		// A push answered it: keep the head it was made on, so the next read still
+		// knows the head moved since.
 		a.LastWord = lastWord
 	}
 	return a, nil
@@ -314,26 +350,37 @@ func (c *Client) pullHead(ctx context.Context, token, repo string, number int) (
 	return pr.Head.SHA, nil
 }
 
-// reviewCommentText returns the inline comments of review id, joined, read in one
-// bounded page; "" when they cannot be read. worklist.NewLastWord cuts the result.
+// reviewCommentPages bounds the pages of inline comments read for one review.
+const reviewCommentPages = 3
+
+// reviewCommentText returns the inline comments of review id, joined, following the
+// Link header up to reviewCommentPages pages; "" when they cannot all be read (an
+// error, or more pages than that), since a turn read from part of a review could be
+// wrong. worklist.NewLastWord cuts the result.
 func (c *Client) reviewCommentText(ctx context.Context, token, repo string, number int, id int64) string {
-	body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/pulls/%d/reviews/%d/comments?per_page=%d", repo, number, id, timelinePerPage))
-	if err != nil {
-		return ""
-	}
-	var comments []struct {
-		Body string `json:"body"`
-	}
-	if err := json.Unmarshal(body, &comments); err != nil {
-		return ""
-	}
 	var parts []string
-	for _, cm := range comments {
-		if t := strings.TrimSpace(cm.Body); t != "" {
-			parts = append(parts, t)
+	for page := 1; page <= reviewCommentPages; page++ {
+		path := fmt.Sprintf("/repos/%s/pulls/%d/reviews/%d/comments?per_page=%d&page=%d", repo, number, id, timelinePerPage, page)
+		body, header, err := c.getHeader(ctx, token, path)
+		if err != nil {
+			return ""
+		}
+		var comments []struct {
+			Body string `json:"body"`
+		}
+		if err := json.Unmarshal(body, &comments); err != nil {
+			return ""
+		}
+		for _, cm := range comments {
+			if t := strings.TrimSpace(cm.Body); t != "" {
+				parts = append(parts, t)
+			}
+		}
+		if len(comments) == 0 || !hasNextPage(header) {
+			return strings.Join(parts, "\n\n")
 		}
 	}
-	return strings.Join(parts, "\n\n")
+	return "" // more pages than read: the review cannot be read whole
 }
 
 // decisive reports whether a review in state settles the turn by itself: an approval

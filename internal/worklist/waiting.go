@@ -38,6 +38,11 @@ type LastWord struct {
 	// Text is the body, at most MaxLastWordBytes: a longer one keeps its start and its
 	// end, where a closing question usually is.
 	Text string `json:"text,omitempty"`
+	// Head is the pull request's head commit when the last word was made: the commit a
+	// review names, or for a comment the head enrich first saw with it. A later head
+	// means the author pushed since, which answers it (AwaitingOthersSince unset). It
+	// is not part of Key: anchoring a last word does not change what it says.
+	Head string `json:"head,omitempty"`
 }
 
 const (
@@ -60,6 +65,9 @@ func NewLastWord(id string, at time.Time, decisive bool, mentions []string, text
 func (lw *LastWord) bound() {
 	lw.ID = truncateUTF8(lw.ID, projectedString)
 	lw.Text = headTail(lw.Text, MaxLastWordBytes)
+	if !validSHA(lw.Head) {
+		lw.Head = ""
+	}
 	var ms []string
 	for _, m := range lw.Mentions {
 		if validLogin(m) && !containsFold(ms, m) {
@@ -284,6 +292,21 @@ func stripCodeSpans(line string) string {
 	return b.String()
 }
 
+// validSHA reports whether s has the shape of a git commit ID (SHA-1 or SHA-256).
+func validSHA(s string) bool {
+	if len(s) < 7 || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case '0' <= c && c <= '9', 'a' <= c && c <= 'f', 'A' <= c && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // validLogin reports whether s has the shape of a GitHub login.
 func validLogin(s string) bool {
 	if s == "" || len(s) > maxLogin || s[0] == '-' {
@@ -326,23 +349,38 @@ func headTail(s string, n int) string {
 
 func isRuneStart(b byte) bool { return b&0xC0 != 0x80 }
 
-// ApplyTurn sets ownerID's item itemID's turn reading, and nothing else, in one
-// Store.Update (see SetTurn). A reading pass reads the item, asks the model, and
-// writes back only the reading, so whatever landed meanwhile (a refresh, a hide or
-// unhide) stands. It writes nothing, and returns no error, when the item is gone or
-// the reading is dropped.
-func ApplyTurn(ctx context.Context, store Store, ownerID, itemID string, r TurnReading) error {
+// ItemTurn is one item's turn reading, as a reading pass writes it back.
+type ItemTurn struct {
+	ItemID  string      `json:"item_id"`
+	Reading TurnReading `json:"reading"`
+}
+
+// MaxTurnBatch bounds the readings one ApplyTurns call (one agent-plane request)
+// carries.
+const MaxTurnBatch = 1000
+
+// ApplyTurns sets the turn readings of ownerID's items, and nothing else, in one
+// Store.Update (see SetTurn): a pass's readings land in one transaction, not one
+// whole-worklist read and write each. A reading pass reads the items, asks the
+// model, and writes back only the readings, so whatever landed meanwhile (a refresh,
+// a hide or unhide) stands. A reading for an item that is gone, or that SetTurn
+// drops, is skipped without error; only the items it changed are written.
+func ApplyTurns(ctx context.Context, store Store, ownerID string, turns []ItemTurn) error {
+	if len(turns) == 0 {
+		return nil
+	}
+	byID := make(map[string]TurnReading, len(turns))
+	for _, t := range turns {
+		byID[t.ItemID] = t.Reading
+	}
 	return store.Update(ctx, ownerID, func(current []WorkItem) ([]WorkItem, error) {
+		var changed []WorkItem
 		for i := range current {
-			if current[i].ID != itemID {
-				continue
+			if r, ok := byID[current[i].ID]; ok && SetTurn(&current[i], r) {
+				changed = append(changed, current[i])
 			}
-			if !SetTurn(&current[i], r) {
-				return nil, nil
-			}
-			return current[i : i+1], nil
 		}
-		return nil, nil // item gone
+		return changed, nil
 	})
 }
 

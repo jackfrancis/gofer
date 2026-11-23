@@ -185,37 +185,43 @@ func (h *IngestHandler) Research(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// turnRequest is the body of POST /agent/worklist/turn.
-type turnRequest struct {
-	ItemID  string                `json:"item_id"`
-	Reading *worklist.TurnReading `json:"reading"`
+// turnsRequest is the body of POST /agent/worklist/turns.
+type turnsRequest struct {
+	Readings []worklist.ItemTurn `json:"readings"`
 }
 
-// maxTurnBody bounds a turn-reading request: a last-word key, an outcome and a login.
-const maxTurnBody = 16 << 10
+// maxTurnsBody bounds a turn-readings request: up to worklist.MaxTurnBatch readings,
+// each an item ID, a last-word key, an outcome and a login.
+const maxTurnsBody = 2 << 20
 
-// Turn handles POST /agent/worklist/turn. A reading pass writes the turn reading it
-// derived here (worklist.ApplyTurn), and only that: the rest of the item stays as
-// stored now, so a reading the model took a while over never restores the item it
-// read. A reading for an item that is gone or hidden, or of a last word that is no
-// longer current, is accepted and dropped.
-func (h *IngestHandler) Turn(w http.ResponseWriter, r *http.Request) {
+// Turns handles POST /agent/worklist/turns. A reading pass writes the turn readings
+// it derived here, in one update (worklist.ApplyTurns), and only those: the rest of
+// each item stays as stored now, so a reading the model took a while over never
+// restores the item it read. A reading for an item that is gone or hidden, or of a
+// last word that is no longer current, is accepted and dropped.
+func (h *IngestHandler) Turns(w http.ResponseWriter, r *http.Request) {
 	p, ok := principal.FromContext(r.Context())
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	var body turnRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxTurnBody)).Decode(&body); err != nil {
+	var body turnsRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxTurnsBody)).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if body.ItemID == "" || body.Reading == nil || body.Reading.LastWord == "" {
-		writeError(w, http.StatusBadRequest, "item_id and a reading naming its last_word are required")
+	if len(body.Readings) > worklist.MaxTurnBatch {
+		writeError(w, http.StatusBadRequest, "too many readings in one request")
 		return
 	}
-	if err := worklist.ApplyTurn(r.Context(), h.store, p.ActingUserID, body.ItemID, *body.Reading); err != nil {
-		writeError(w, http.StatusBadGateway, "could not persist turn reading")
+	for _, t := range body.Readings {
+		if t.ItemID == "" || t.Reading.LastWord == "" {
+			writeError(w, http.StatusBadRequest, "every reading needs an item_id and the last_word it read")
+			return
+		}
+	}
+	if err := worklist.ApplyTurns(r.Context(), h.store, p.ActingUserID, body.Readings); err != nil {
+		writeError(w, http.StatusBadGateway, "could not persist turn readings")
 		return
 	}
 	if h.noter != nil && p.JobID != "" {

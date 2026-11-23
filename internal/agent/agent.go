@@ -75,11 +75,11 @@ type Sink interface {
 	// writes back its older GitHub fields. It is dropped, without error, if the item
 	// is gone.
 	Research(ctx context.Context, itemID string, adj worklist.ResearchAdjustment) error
-	// Turn sets itemID's turn reading and nothing else (see worklist.ApplyTurn), so a
-	// reading the model took a while over never writes back the item it read. It is
-	// dropped, without error, if the item is gone, hidden, or its last word is no
-	// longer the one the reading names.
-	Turn(ctx context.Context, itemID string, r worklist.TurnReading) error
+	// Turns sets items' turn readings and nothing else, in one write (see
+	// worklist.ApplyTurns), so a reading the model took a while over never writes back
+	// the item it read. A reading is dropped, without error, if its item is gone,
+	// hidden, or its last word is no longer the one the reading names.
+	Turns(ctx context.Context, turns []worklist.ItemTurn) error
 }
 
 // Params configures a single runtime invocation.
@@ -435,19 +435,21 @@ func clearModelSignals(s *worklist.Signals) {
 	s.Turn = nil
 }
 
-// carryTurnSignals keeps the timeline's word on whose turn it is (AwaitingMeSince,
-// AwaitingOthersSince, LastWord) across a refresh of an item GitHub has not updated
-// since: its timeline is unchanged, so they still hold, and the item keeps its place
-// on the radar (worklist.WorkItem.Waiting) until the chained enrich reads the
-// timeline again. An item GitHub updated (a comment, a push, a review request) starts
-// without them, so it is not shown as waiting on a stale reading of whose turn it is.
+// carryTurnSignals keeps what a refresh cannot re-derive about whose turn it is. The
+// stored last word always carries over: it holds the head first seen with it
+// (LastWord.Head), which the chained enrich compares with the head now to tell
+// whether the author pushed since, and which a push (it updates the item) must not
+// erase. The waiting timestamps carry over only for an item GitHub has not updated
+// since: its timeline is unchanged, so the item keeps its place on the radar
+// (worklist.WorkItem.Waiting) until enrich reads the timeline again. An item GitHub
+// updated (a comment, a push, a review request) is not shown as waiting until then.
 func carryTurnSignals(fetched *worklist.WorkItem, stored worklist.WorkItem) {
+	fetched.Signals.LastWord = stored.Signals.LastWord
 	if fetched.GitHub.UpdatedAt.IsZero() || !fetched.GitHub.UpdatedAt.Equal(stored.GitHub.UpdatedAt) {
 		return
 	}
 	fetched.Signals.AwaitingMeSince = stored.Signals.AwaitingMeSince
 	fetched.Signals.AwaitingOthersSince = stored.Signals.AwaitingOthersSince
-	fetched.Signals.LastWord = stored.Signals.LastWord
 }
 
 // runRank reads the user's persisted work, asks the AxisRanker to propose the

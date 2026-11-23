@@ -27,9 +27,10 @@ const (
 // best-effort, like rank: an item it does not read is left to the timeline, which
 // already counts it as waiting. With no TurnReader (no chat model) it does nothing.
 //
-// Each reading is written alone (Sink.Turn), never the item it was read from: a
-// refresh, a hide or an unhide that landed while the model worked stands, and a
-// reading of a last word that is no longer current is dropped.
+// The readings are written alone (Sink.Turns), never the items they were read from,
+// in one write once every model call has answered: a refresh, a hide or an unhide
+// that landed while the model worked stands, and a reading of a last word that is no
+// longer current is dropped.
 func runReadTurns(ctx context.Context, p Params, sink Sink) error {
 	if p.TurnReader == nil {
 		return nil
@@ -56,11 +57,11 @@ func runReadTurns(ctx context.Context, p Params, sink Sink) error {
 	log.Info("turns: reading last words", "items", len(todo), "deferred", deferred)
 
 	var (
-		mu      sync.Mutex
-		written int
-		wg      sync.WaitGroup
-		sem     = make(chan struct{}, turnReadConcurrency)
-		skipped int
+		mu       sync.Mutex
+		readings []worklist.ItemTurn
+		wg       sync.WaitGroup
+		sem      = make(chan struct{}, turnReadConcurrency)
+		skipped  int
 	)
 	for i := range todo {
 		if !hasBudget(ctx, turnReadReserve) {
@@ -81,16 +82,15 @@ func runReadTurns(ctx context.Context, p Params, sink Sink) error {
 			}
 			r.LastWord = it.Signals.LastWord.Key()
 			r.ReadAt = time.Now().UTC()
-			if err := sink.Turn(ctx, it.ID, r); err != nil {
-				log.Warn("turns: write failed", "item", it.ID, "err", err)
-				return
-			}
 			mu.Lock()
-			written++
+			readings = append(readings, worklist.ItemTurn{ItemID: it.ID, Reading: r})
 			mu.Unlock()
 		}(todo[i])
 	}
 	wg.Wait()
-	log.Info("turns: sent readings", "sent", written, "skipped_out_of_time", skipped)
+	log.Info("turns: sending readings", "readings", len(readings), "skipped_out_of_time", skipped)
+	if err := sink.Turns(ctx, readings); err != nil {
+		return fmt.Errorf("turns: %w", err)
+	}
 	return nil
 }

@@ -226,27 +226,36 @@ Wired on the web-tier side; they define what a runtime must respect:
   comment never takes the last word (GitHub type `Bot`, a `[bot]` login, or
   `BOT_REVIEWERS`, sent to every run as run parameter `bots`). A review request still
   awaiting the user outranks any later word: their personal request with no comment
-  or review by them since, or a team request made since their last one when the
-  `review-requested:@me` search shows the item (`ActivityOptions.ReviewRequested`).
-  On an item the user did not author, a push (commit, force-push) or ready-for-review
-  is the author's answer; a commit's date is not its push time, so when the last word
-  is a review the PR's head is read, and a head other than the reviewed `commit_id`
-  (or one that cannot be read) ends the wait. A review with no summary is read through
-  its inline comments. On the user's own item a reviewer's decisive review is the
+  or review by them since, or a team request made since their last one that is
+  attributed to them. A team request is the user's only on evidence: the
+  `review-requested:@me` search shows the item (`ActivityOptions.ReviewRequested`),
+  no personal request of theirs explains that, and exactly one team request is
+  outstanding; its actor is then the requester (`ReviewRequestedBy`, so a bot's team
+  request scores as a bot's). On a pull request the user did not author, a push or
+  ready-for-review is the author's answer. A commit's date is never its push time
+  (commits are pushed late, clocks drift), so pushes are judged by the head
+  (`ActivityOptions.PullRequest`): a review's last word stands while the head is its
+  `commit_id` (an unreadable head ends the wait); a comment's last word stands while
+  the head is the one first seen with it (`LastWord.Head`, passed back as
+  `ActivityOptions.Prior`, and kept on an answered last word, and across every
+  refresh, so the next read still knows the head moved). Force-push and
+  ready-for-review events, which GitHub dates, answer a comment too. A review with no
+  summary is read through its inline comments, up to `reviewCommentPages` pages; one
+  longer than that has no text. On the user's own item a reviewer's decisive review is the
   user's turn, and a wait with no recorded last word (stored before `LastWord`
   existed) is not trusted; an undecisive last word with no text never waits. With a
   chat model, a reading pass between enrich and rank (`runReadTurns`, at most
   `turnReadLimit` calls a pass) asks the model to read a non-decisive last word
-  (`Signals.NeedsTurnReading`) and writes `Signals.Turn` alone, through
-  `POST /agent/worklist/turn` (`worklist.ApplyTurn`), never the item it read: the
-  reading is dropped unless the stored last word is still the one it read (keyed by
+  (`Signals.NeedsTurnReading`) and writes the pass's readings alone, in one store
+  transaction, through `POST /agent/worklist/turns` (`worklist.ApplyTurns`), never the
+  items it read: a reading is dropped unless the stored last word is still the one it read (keyed by
   the last word's ID and text) and the item is not hidden. It is a model signal kept
   like the proposal (`KeepModelSignals`) and applied only while current
   (`CurrentTurnReading`): `my_turn` keeps the item with the user, `nothing_pending`
   and `waiting_on` keep it waiting, and a `waiting_on` login counts only if the last
   word mentions it or it is the author. New activity always wins over a reading. A
-  refresh keeps the timeline's turn signals only for an item whose GitHub
-  `updated_at` is unchanged (`carryTurnSignals`). The rank selection leaves waiting
+  refresh keeps the waiting timestamps only for an item whose GitHub `updated_at` is
+  unchanged, and the last word always (`carryTurnSignals`). The rank selection leaves waiting
   items out before its top-N cutoff (`Selection.Top`), and Review all PRs and Get 2nd
   Opinion skip them (`WorkItem.Actionable`); Reset Conversations still covers them.
   `RunPolicy.Apply` bounds the last word and reading on every write-back.

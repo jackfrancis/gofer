@@ -3,14 +3,17 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackfrancis/gofer/internal/github/githubtest"
+	"github.com/jackfrancis/gofer/internal/storage"
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
@@ -123,8 +126,8 @@ func TestRunRankSkipsWaiting(t *testing.T) {
 	}
 }
 
-// A refresh keeps whose turn it is for an item GitHub has not updated, and drops it
-// for one GitHub has.
+// A refresh keeps whose turn it is for an item GitHub has not updated, and only the
+// last word (its head anchor) for one GitHub has.
 func TestCarryTurnSignals(t *testing.T) {
 	stored := waitingPR(1, "why?")
 	stored.GitHub.UpdatedAt = turnT0
@@ -137,8 +140,11 @@ func TestCarryTurnSignals(t *testing.T) {
 	updated := prItem(1)
 	updated.GitHub.UpdatedAt = turnT0.Add(time.Hour)
 	carryTurnSignals(&updated, stored)
-	if updated.Signals.LastWord != nil || !updated.Signals.AwaitingOthersSince.IsZero() {
-		t.Fatal("an updated item kept a stale turn")
+	if !updated.Signals.AwaitingOthersSince.IsZero() {
+		t.Fatal("an updated item kept a stale wait")
+	}
+	if updated.Signals.LastWord == nil {
+		t.Fatal("an updated item lost its last word, and with it the head that tells enrich whether the author pushed")
 	}
 }
 
@@ -260,5 +266,86 @@ func TestRunRankGivesWaitingSlotsAway(t *testing.T) {
 	}
 	if len(r.ids) != 1 || r.ids[0] != mine.ID {
 		t.Fatalf("ranked %v, want %s", r.ids, mine.ID)
+	}
+}
+
+// Through the production refresh path (search, ingest, enrich): a team request made
+// after my review is mine when the search shows the item and nothing else explains
+// it, and a bot's team request keeps its requester, so it is scored as a bot's.
+func TestRefreshTeamRequests(t *testing.T) {
+	sink := NewStoreSink(worklist.NewMemoryStore(), "owner")
+	item := reviewSnapshot(t, sink, true, `[
+		{"event":"reviewed","id":1,"state":"approved","user":{"login":"me"},"submitted_at":"2026-01-01T00:00:00Z"},
+		{"event":"review_requested","requested_team":{"slug":"my-team"},"actor":{"login":"owner"},"created_at":"2026-01-02T00:00:00Z"}
+	]`, false)
+	if _, w := item.Waiting(); w || item.Signals.AwaitingMeSince.IsZero() {
+		t.Fatal("a confirmed team re-request after my review was missed")
+	}
+
+	sink = NewStoreSink(worklist.NewMemoryStore(), "owner")
+	before := `[{"event":"review_requested","requested_reviewer":{"login":"me"},"actor":{"login":"owner"},"created_at":"2026-01-01T00:00:00Z"},{"event":"commented","id":1,"body":"@owner can you split this?","user":{"login":"me"},"created_at":"2026-01-02T00:00:00Z"}`
+	if _, w := reviewSnapshot(t, sink, true, before+`]`, false).Waiting(); !w {
+		t.Fatal("fixture: my question should be waiting")
+	}
+	item = reviewSnapshot(t, sink, true, before+`,{"event":"review_requested","requested_team":{"slug":"not-my-team"},"actor":{"login":"maintainer"},"created_at":"2026-01-03T00:00:00Z"}]`, false)
+	if _, w := item.Waiting(); !w {
+		t.Fatal("another team's request displaced my question, though my own request explains the search hit")
+	}
+
+	sink = NewStoreSink(worklist.NewMemoryStore(), "owner").WithPolicy(worklist.NewRunPolicy([]string{"review-bot"}))
+	item = reviewSnapshot(t, sink, true, `[{"event":"review_requested","requested_team":{"slug":"my-team"},"actor":{"login":"review-bot"},"created_at":"2026-01-02T00:00:00Z"}]`, false)
+	if item.Signals.AwaitingMeSince.IsZero() || item.Signals.ReviewRequestedBy != "review-bot" || !item.Signals.ReviewRequestedByBot {
+		t.Fatalf("a bot's team request: awaiting %v, requester %q, by bot %v", item.Signals.AwaitingMeSince, item.Signals.ReviewRequestedBy, item.Signals.ReviewRequestedByBot)
+	}
+}
+
+type countingStore struct {
+	worklist.Store
+	tx, rows atomic.Int64
+}
+
+func (c *countingStore) Update(ctx context.Context, owner string, f func([]worklist.WorkItem) ([]worklist.WorkItem, error)) error {
+	return c.Store.Update(ctx, owner, func(rows []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		c.tx.Add(1)
+		c.rows.Add(int64(len(rows)))
+		return f(rows)
+	})
+}
+
+// A pass's readings land in one transaction on the SQLite store, not one
+// whole-worklist read and write per reading.
+func TestRunReadTurnsOneTransaction(t *testing.T) {
+	ctx := context.Background()
+	db, err := storage.Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := &countingStore{Store: db.Worklist()}
+	var items []worklist.WorkItem
+	for i := 1; i <= 200; i++ {
+		it := prItem(i)
+		if i <= 50 {
+			it = waitingPR(i, fmt.Sprintf("Question %d?", i))
+		}
+		items = append(items, it)
+	}
+	if err := store.Upsert(ctx, "u", items...); err != nil {
+		t.Fatal(err)
+	}
+	if err := runReadTurns(ctx, Params{TurnReader: &fakeTurnReader{outcome: worklist.TurnWaitingOn}}, NewStoreSink(store, "u")); err != nil {
+		t.Fatal(err)
+	}
+	if store.tx.Load() != 1 || store.rows.Load() != 200 {
+		t.Fatalf("%d transactions over %d documents, want 1 over 200", store.tx.Load(), store.rows.Load())
+	}
+	read := 0
+	for i := 1; i <= 50; i++ {
+		if it, _, _ := db.Worklist().Get(ctx, "u", prItem(i).ID); it.Signals.CurrentTurnReading() != nil {
+			read++
+		}
+	}
+	if read != 50 {
+		t.Fatalf("%d of 50 readings stored", read)
 	}
 }

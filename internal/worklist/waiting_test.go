@@ -239,9 +239,9 @@ func TestMentionsSkipBotAccounts(t *testing.T) {
 	}
 }
 
-// ApplyTurn writes the reading alone, and only for the current last word of an item
-// that is not hidden.
-func TestApplyTurn(t *testing.T) {
+// ApplyTurns writes the readings alone, in one update, and each only for the current
+// last word of an item that is not hidden.
+func TestApplyTurns(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemoryStore()
 	it := waitingItem("I'll look tomorrow")
@@ -249,21 +249,18 @@ func TestApplyTurn(t *testing.T) {
 	store.Seed("u", it)
 	key := it.Signals.LastWord.Key()
 
-	if err := ApplyTurn(ctx, store, "u", it.ID, TurnReading{LastWord: "comment:1#stale", Outcome: TurnMine}); err != nil {
+	if err := ApplyTurns(ctx, store, "u", []ItemTurn{{ItemID: it.ID, Reading: TurnReading{LastWord: "comment:1#stale", Outcome: TurnMine}}}); err != nil {
 		t.Fatal(err)
 	}
 	if got, _, _ := store.Get(ctx, "u", it.ID); got.Signals.Turn != nil {
 		t.Fatal("a reading of another last word was stored")
 	}
-	if err := ApplyTurn(ctx, store, "u", it.ID, TurnReading{LastWord: key, Outcome: "anything"}); err != nil {
+	if err := ApplyTurns(ctx, store, "u", []ItemTurn{{ItemID: it.ID, Reading: TurnReading{LastWord: key, Outcome: "anything"}}, {ItemID: "gone", Reading: TurnReading{LastWord: key}}}); err != nil {
 		t.Fatal(err)
 	}
 	got, _, _ := store.Get(ctx, "u", it.ID)
 	if got.Signals.Turn == nil || got.Signals.Turn.Outcome != TurnUnclear || got.GitHub.Title != "stored title" {
 		t.Fatalf("reading %+v, title %q", got.Signals.Turn, got.GitHub.Title)
-	}
-	if err := ApplyTurn(ctx, store, "u", "gone", TurnReading{LastWord: key}); err != nil {
-		t.Fatal("a reading for a gone item should be dropped quietly")
 	}
 	hidden := waitingItem("x")
 	HideItem(&hidden, waitT0)

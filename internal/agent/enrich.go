@@ -94,7 +94,9 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 		actx, cancel := reserveContext(ctx, enrichReserve)
 		opts := github.ActivityOptions{Author: items[i].GitHub.Author, Bots: p.Bots,
 			// The review-requested:@me search shows the item: a team request may be ours.
-			ReviewRequested: slices.Contains(items[i].Signals.Reasons, worklist.ReasonReviewRequested)}
+			ReviewRequested: slices.Contains(items[i].Signals.Reasons, worklist.ReasonReviewRequested),
+			PullRequest:     items[i].Type == worklist.TypePullRequest,
+			Prior:           items[i].Signals.LastWord}
 		if slices.Contains(items[i].Signals.Reasons, worklist.ReasonAuthor) {
 			opts.Author = login // an item stored before its author was recorded
 		}

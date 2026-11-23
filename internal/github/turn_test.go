@@ -2,13 +2,16 @@ package github
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackfrancis/gofer/internal/github/githubtest"
+	"github.com/jackfrancis/gofer/internal/worklist"
 )
 
 func activityFor(t *testing.T, timeline string, opts ActivityOptions) Activity {
@@ -70,26 +73,27 @@ func TestItemActivityBotCommentsDoNotTakeTheLastWord(t *testing.T) {
 	}
 }
 
-// On someone else's PR, the author pushing after my review answers it: the ball is
-// back with me, whether by a new commit, a force-push or marking it ready.
+// On someone else's PR, a force-push or marking it ready after my comment answers it:
+// GitHub dates both itself. A commit's own date says nothing about when it was pushed,
+// whichever side of my comment it falls.
 func TestItemActivityAuthorPushAnswers(t *testing.T) {
-	review := `{"event":"reviewed","id":5,"state":"commented","submitted_at":"2026-01-02T00:00:00Z","user":{"login":"me"},"body":"a few nits"}`
+	comment := `{"event":"commented","id":5,"created_at":"2026-01-02T00:00:00Z","actor":{"login":"me"},"body":"a few nits"}`
 	for name, push := range map[string]string{
-		"commit":     `{"event":"committed","sha":"abc","committer":{"date":"2026-01-03T00:00:00Z"}}`,
 		"force-push": `{"event":"head_ref_force_pushed","created_at":"2026-01-03T00:00:00Z","actor":{"login":"author"}}`,
 		"ready":      `{"event":"ready_for_review","created_at":"2026-01-03T00:00:00Z","actor":{"login":"author"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			a := activityFor(t, "["+review+","+push+"]", ActivityOptions{Author: "author"})
+			a := activityFor(t, "["+comment+","+push+"]", ActivityOptions{Author: "author"})
 			if !a.AwaitingOthersSince.IsZero() || a.LastWord != nil {
 				t.Fatalf("still waiting on others after the author's %s", name)
 			}
 		})
 	}
-	// A commit dated before my review (it was pushed before I looked) answers nothing.
-	a := activityFor(t, `[{"event":"committed","sha":"abc","committer":{"date":"2026-01-01T00:00:00Z"}},`+review+`]`, ActivityOptions{Author: "author"})
-	if a.AwaitingOthersSince.IsZero() {
-		t.Fatal("an older commit took the last word")
+	for _, date := range []string{"2026-01-01T00:00:00Z", "2026-01-03T00:00:00Z"} {
+		a := activityFor(t, `[`+comment+`,{"event":"committed","sha":"abc","committer":{"date":"`+date+`"}}]`, ActivityOptions{Author: "author"})
+		if a.AwaitingOthersSince.IsZero() {
+			t.Fatalf("a commit dated %s decided the turn by its date", date)
+		}
 	}
 }
 
@@ -192,18 +196,19 @@ func TestItemActivityReviewStandsOnlyOnItsCommit(t *testing.T) {
 		{"event":"reviewed","id":1,"commit_id":"first","state":"changes_requested","user":{"login":"me"},"submitted_at":"2026-01-03T00:00:00Z","body":"please split"},
 		{"event":"committed","sha":"second","committer":{"date":"2026-01-02T00:00:00Z"}}
 	]`
-	if a := activityRoutes(t, timeline, map[string]string{"/repos/o/r/pulls/1": `{"head":{"sha":"second"}}`}, ActivityOptions{Author: "owner"}); !a.AwaitingOthersSince.IsZero() {
+	pr := ActivityOptions{Author: "owner", PullRequest: true}
+	if a := activityRoutes(t, timeline, map[string]string{"/repos/o/r/pulls/1": `{"head":{"sha":"second"}}`}, pr); !a.AwaitingOthersSince.IsZero() {
 		t.Fatal("still waiting after the head moved past the reviewed commit")
 	}
-	if a := activityRoutes(t, timeline, map[string]string{"/repos/o/r/pulls/1": `{"head":{"sha":"first"}}`}, ActivityOptions{Author: "owner"}); a.AwaitingOthersSince.IsZero() || a.LastWord == nil {
+	if a := activityRoutes(t, timeline, map[string]string{"/repos/o/r/pulls/1": `{"head":{"sha":"first"}}`}, pr); a.AwaitingOthersSince.IsZero() || a.LastWord == nil {
 		t.Fatal("the head is the reviewed commit, yet the review's last word was dropped")
 	}
-	if a := activityRoutes(t, timeline, nil, ActivityOptions{Author: "owner"}); !a.AwaitingOthersSince.IsZero() {
+	if a := activityRoutes(t, timeline, nil, pr); !a.AwaitingOthersSince.IsZero() {
 		t.Fatal("an unreadable head left the item waiting")
 	}
 	// On my own PR my pushes are no answer to me: no head read.
 	own := `[{"event":"commented","id":2,"created_at":"2026-01-03T00:00:00Z","actor":{"login":"me"},"body":"@rev ok now?"}]`
-	if a := activityRoutes(t, own, nil, ActivityOptions{Author: "me"}); a.AwaitingOthersSince.IsZero() {
+	if a := activityRoutes(t, own, nil, ActivityOptions{Author: "me", PullRequest: true}); a.AwaitingOthersSince.IsZero() {
 		t.Fatal("my own PR: my last comment no longer waits")
 	}
 }
@@ -214,7 +219,7 @@ func TestItemActivityInlineOnlyReview(t *testing.T) {
 	a := activityRoutes(t, timeline, map[string]string{
 		"/repos/o/r/pulls/1":                    `{"head":{"sha":"h"}}`,
 		"/repos/o/r/pulls/1/reviews/5/comments": `[{"id":6,"body":"I'll fix this tomorrow"},{"id":7,"body":"@owner also this?"}]`,
-	}, ActivityOptions{Author: "owner"})
+	}, ActivityOptions{Author: "owner", PullRequest: true})
 	if a.LastWord == nil || !strings.Contains(a.LastWord.Text, "fix this tomorrow") || len(a.LastWord.Mentions) != 1 {
 		t.Fatalf("inline-only review: last word %+v", a.LastWord)
 	}
@@ -230,5 +235,120 @@ func TestItemActivityBotMention(t *testing.T) {
 	a := activityFor(t, `[{"event":"commented","id":1,"body":"@dependabot[bot] rebase please","actor":{"login":"me"},"created_at":"2026-01-01T00:00:00Z"}]`, ActivityOptions{Author: "owner"})
 	if a.LastWord == nil || len(a.LastWord.Mentions) > 0 {
 		t.Fatalf("bot mention parsed as %v", a.LastWord)
+	}
+}
+
+// A comment names no commit: the head first seen with it is kept (opts.Prior), and a
+// later head means the author pushed since, even a commit dated before the question.
+// The answer holds on later reads, and a new comment anchors afresh.
+func TestItemActivityCommentAnchoredToTheHead(t *testing.T) {
+	const q = `{"event":"commented","id":1,"actor":{"login":"me"},"body":"@owner can you add the test?","created_at":"2026-01-03T00:00:00Z"}`
+	pr := ActivityOptions{Author: "owner", PullRequest: true}
+	first := activityRoutes(t, "["+q+"]", map[string]string{"/repos/o/r/pulls/1": `{"head":{"sha":"aaaaaaa"}}`}, pr)
+	if first.AwaitingOthersSince.IsZero() || first.LastWord == nil || first.LastWord.Head != "aaaaaaa" {
+		t.Fatalf("first read: waiting since %v, last word %+v", first.AwaitingOthersSince, first.LastWord)
+	}
+	pr.Prior = first.LastWord
+	pushed := "[" + q + `,{"event":"committed","sha":"bbbbbbb","committer":{"date":"2026-01-02T00:00:00Z"}}]`
+	after := activityRoutes(t, pushed, map[string]string{"/repos/o/r/pulls/1": `{"head":{"sha":"bbbbbbb"}}`}, pr)
+	if !after.AwaitingOthersSince.IsZero() {
+		t.Fatal("still waiting after the head moved past the one first seen with my question")
+	}
+	if after.LastWord == nil || after.LastWord.Head != "aaaaaaa" {
+		t.Fatalf("the answered last word must keep its anchor, got %+v", after.LastWord)
+	}
+	pr.Prior = after.LastWord
+	if again := activityRoutes(t, pushed, map[string]string{"/repos/o/r/pulls/1": `{"head":{"sha":"bbbbbbb"}}`}, pr); !again.AwaitingOthersSince.IsZero() {
+		t.Fatal("the next read forgot the push and waited again")
+	}
+	// An unreadable head anchors nothing, and the timeline decides.
+	pr.Prior = nil
+	if u := activityRoutes(t, "["+q+"]", nil, pr); u.AwaitingOthersSince.IsZero() || u.LastWord.Head != "" {
+		t.Fatalf("unreadable head: waiting since %v, head %q", u.AwaitingOthersSince, u.LastWord.Head)
+	}
+	// An issue has no head to read.
+	if i := activityFor(t, "["+q+"]", ActivityOptions{Author: "owner"}); i.AwaitingOthersSince.IsZero() {
+		t.Fatal("an issue comment stopped waiting")
+	}
+}
+
+// A committer clock ahead of my review does not clear it while its commit is the head.
+func TestItemActivityReviewIgnoresCommitClocks(t *testing.T) {
+	a := activityRoutes(t, `[
+		{"event":"committed","sha":"5a3e","committer":{"date":"2026-01-03T10:05:00Z"}},
+		{"event":"reviewed","id":3,"state":"changes_requested","user":{"login":"me"},"submitted_at":"2026-01-03T10:00:00Z","commit_id":"5a3e"}
+	]`, map[string]string{"/repos/o/r/pulls/1": `{"head":{"sha":"5a3e"}}`}, ActivityOptions{Author: "owner", PullRequest: true})
+	if a.AwaitingOthersSince.IsZero() {
+		t.Fatal("a commit clock five minutes ahead cleared a review of the head")
+	}
+}
+
+// A team request counts as mine only when nothing else explains the search hit, and
+// then names its requester.
+func TestItemActivityTeamRequestNeedsEvidence(t *testing.T) {
+	personal := `[
+		{"event":"review_requested","requested_reviewer":{"login":"me"},"actor":{"login":"owner"},"created_at":"2026-01-01T00:00:00Z"},
+		{"event":"commented","id":1,"body":"@owner can you split this?","actor":{"login":"me"},"created_at":"2026-01-02T00:00:00Z"},
+		{"event":"review_requested","requested_team":{"slug":"not-my-team"},"actor":{"login":"maintainer"},"created_at":"2026-01-03T00:00:00Z"}
+	]`
+	if a := activityFor(t, personal, ActivityOptions{Author: "owner", ReviewRequested: true}); a.AwaitingOthersSince.IsZero() || !a.AwaitingMeSince.IsZero() {
+		t.Fatal("my own pending request explains the search hit, yet a team request displaced my question")
+	}
+	two := `[
+		{"event":"reviewed","id":1,"state":"approved","user":{"login":"me"},"submitted_at":"2026-01-01T00:00:00Z"},
+		{"event":"review_requested","requested_team":{"slug":"a"},"actor":{"login":"owner"},"created_at":"2026-01-02T00:00:00Z"},
+		{"event":"review_requested","requested_team":{"slug":"b"},"actor":{"login":"owner"},"created_at":"2026-01-03T00:00:00Z"}
+	]`
+	if a := activityFor(t, two, ActivityOptions{Author: "owner", ReviewRequested: true}); !a.AwaitingMeSince.IsZero() {
+		t.Fatal("two team requests: which one names me is unknown, yet one was attributed")
+	}
+	one := `[{"event":"review_requested","requested_team":{"slug":"my-team"},"actor":{"login":"review-bot"},"created_at":"2026-01-02T00:00:00Z"}]`
+	if a := activityFor(t, one, ActivityOptions{Author: "owner", ReviewRequested: true}); a.AwaitingMeSince.IsZero() || a.RequestedByLogin != "review-bot" {
+		t.Fatalf("one team request: awaiting me %v, requested by %q", a.AwaitingMeSince, a.RequestedByLogin)
+	}
+}
+
+// Inline comments are read across pages; a review longer than the pages read has no
+// text, so no turn is read from part of it.
+func TestItemActivityInlineReviewPages(t *testing.T) {
+	const timeline = `[{"event":"reviewed","id":5,"state":"commented","user":{"login":"me"},"submitted_at":"2026-01-03T10:00:00Z","commit_id":"5a3e"}]`
+	serve := func(pages int) *httptest.Server {
+		return httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/repos/o/r/issues/1/timeline":
+				fmt.Fprint(w, timeline)
+			case "/repos/o/r/pulls/1":
+				fmt.Fprint(w, `{"head":{"sha":"5a3e"}}`)
+			case "/repos/o/r/pulls/1/reviews/5/comments":
+				page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+				if page < pages {
+					w.Header().Set("Link", fmt.Sprintf(`<%s?per_page=100&page=%d>; rel="next"`, r.URL.Path, page+1))
+					fmt.Fprint(w, "["+strings.Repeat(`{"body":"Please fix this"},`, 99)+`{"body":"Please fix this"}]`)
+					return
+				}
+				fmt.Fprint(w, `[{"body":"I'll implement these changes tomorrow."}]`)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+	}
+	read := func(pages int) *worklist.LastWord {
+		srv := serve(pages)
+		defer srv.Close()
+		a, err := NewClient(srv.Client(), srv.URL).ItemActivityFor(context.Background(), "tok", "o/r", 1, "me", ActivityOptions{Author: "owner", PullRequest: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a.LastWord
+	}
+	if lw := read(2); lw == nil || !strings.Contains(lw.Text, "tomorrow") {
+		t.Fatalf("two pages: last word %+v, want page two's promise read", lw)
+	}
+	lw := read(reviewCommentPages + 1)
+	if lw == nil || lw.Text != "" {
+		t.Fatalf("more pages than read: last word text %q, want none", lw.Text)
+	}
+	if _, waiting := (worklist.WorkItem{Signals: worklist.Signals{AwaitingOthersSince: time.Now(), LastWord: lw}}).Waiting(); waiting {
+		t.Fatal("a review read only in part made the item wait")
 	}
 }

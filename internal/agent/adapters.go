@@ -154,9 +154,9 @@ func (s *StoreSink) Research(ctx context.Context, itemID string, adj worklist.Re
 	return worklist.ApplyResearch(ctx, s.store, s.ownerID, itemID, adj)
 }
 
-// Turn sets the owner's item's turn reading, atomically (worklist.ApplyTurn).
-func (s *StoreSink) Turn(ctx context.Context, itemID string, r worklist.TurnReading) error {
-	return worklist.ApplyTurn(ctx, s.store, s.ownerID, itemID, r)
+// Turns sets the owner's items' turn readings in one update (worklist.ApplyTurns).
+func (s *StoreSink) Turns(ctx context.Context, turns []worklist.ItemTurn) error {
+	return worklist.ApplyTurns(ctx, s.store, s.ownerID, turns)
 }
 
 // PlaneClient is the out-of-process Vendor and Sink: it reaches gofer's agent plane
@@ -327,15 +327,21 @@ func (c *PlaneClient) Research(ctx context.Context, itemID string, adj worklist.
 	return c.post(ctx, "/agent/worklist/research", "research", ResearchRequest{ItemID: itemID, Adjustment: adj})
 }
 
-// Turn writes the item's turn reading alone: POST /agent/worklist/turn.
-func (c *PlaneClient) Turn(ctx context.Context, itemID string, r worklist.TurnReading) error {
-	return c.post(ctx, "/agent/worklist/turn", "turn reading", TurnRequest{ItemID: itemID, Reading: r})
+// Turns writes items' turn readings alone, in batches of worklist.MaxTurnBatch: POST
+// /agent/worklist/turns.
+func (c *PlaneClient) Turns(ctx context.Context, turns []worklist.ItemTurn) error {
+	for start := 0; start < len(turns); start += worklist.MaxTurnBatch {
+		batch := turns[start:min(start+worklist.MaxTurnBatch, len(turns))]
+		if err := c.post(ctx, "/agent/worklist/turns", "turn readings", TurnsRequest{Readings: batch}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// TurnRequest is the body of POST /agent/worklist/turn.
-type TurnRequest struct {
-	ItemID  string               `json:"item_id"`
-	Reading worklist.TurnReading `json:"reading"`
+// TurnsRequest is the body of POST /agent/worklist/turns.
+type TurnsRequest struct {
+	Readings []worklist.ItemTurn `json:"readings"`
 }
 
 // ResearchRequest is the body of POST /agent/worklist/research.
