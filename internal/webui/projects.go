@@ -4,7 +4,9 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
@@ -42,6 +44,22 @@ type ProjectOption struct {
 	Name     string // the repository, "owner/name"
 	Count    int    // items on the radar from this repository
 	Selected bool   // shown on the radar
+}
+
+// repoName matches a GitHub repository name, "owner/name": an owner of letters,
+// digits and hyphens, and a name of letters, digits, '.', '_' and '-'.
+var repoName = regexp.MustCompile(`^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`)
+
+// PullsURL is the repository's open pull-request queue on GitHub, or "" when Name is
+// not a well-formed "owner/name" (the page then names the project without a link).
+func (o ProjectOption) PullsURL() string {
+	if !repoName.MatchString(o.Name) {
+		return ""
+	}
+	if _, name, _ := strings.Cut(o.Name, "/"); name == "." || name == ".." {
+		return ""
+	}
+	return "https://github.com/" + o.Name + "/pulls"
 }
 
 // projectOptions lists the repositories present in items, by name, with their item

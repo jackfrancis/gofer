@@ -616,3 +616,55 @@ func TestProjectFilterShowAllButton(t *testing.T) {
 		t.Fatalf("Show all projects must clear the filter on an empty radar, got %+v", c)
 	}
 }
+
+// A narrowed selection lists each selected project under the toolbar, linked to its
+// pull-request queue; an unfiltered radar, or an empty selection, lists none.
+func TestSelectedProjectsLinkToPullRequests(t *testing.T) {
+	h := projectsFixture(t)
+	page := getIndex(t, h, postFilter(t, h, url.Values{"project": {"b/two", "a/one"}}))
+	list := page[strings.Index(page, `<ul class="zz-selected-projects"`):]
+	list = list[:strings.Index(list, "</ul>")]
+	for _, want := range []string{
+		`<a href="https://github.com/a/one/pulls" target="_blank" rel="noopener noreferrer"`,
+		`>a/one</a>`,
+		`<a href="https://github.com/b/two/pulls"`,
+	} {
+		if !strings.Contains(list, want) {
+			t.Errorf("selected-projects list lacks %q:\n%s", want, list)
+		}
+	}
+	if strings.Contains(list, "c/three") {
+		t.Error("an unselected project is listed")
+	}
+	if strings.Index(list, "a/one") > strings.Index(list, "b/two") {
+		t.Error("selected projects are not listed by name")
+	}
+
+	if page := getIndex(t, h, nil); strings.Contains(page, "zz-selected-projects") {
+		t.Error("an unfiltered radar lists selected projects")
+	}
+	if page := getIndex(t, h, postFilter(t, h, url.Values{"project": {"x/none"}})); strings.Contains(page, "zz-selected-projects") {
+		t.Error("an empty selection lists selected projects")
+	}
+}
+
+// Only a well-formed "owner/name" gets a link; anything else is named without one.
+func TestProjectPullsURL(t *testing.T) {
+	for name, want := range map[string]string{
+		"kubernetes-sigs/cluster-api": "https://github.com/kubernetes-sigs/cluster-api/pulls",
+		"a/b.go_x-y":                  "https://github.com/a/b.go_x-y/pulls",
+		"":                            "",
+		"noslash":                     "",
+		"a/b/c":                       "",
+		"a/..":                        "",
+		"a/.":                         "",
+		"a/b?x=1":                     "",
+		"a/b#c":                       "",
+		"javascript:alert(1)/x":       "",
+		"a /b":                        "",
+	} {
+		if got := (ProjectOption{Name: name}).PullsURL(); got != want {
+			t.Errorf("PullsURL(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
