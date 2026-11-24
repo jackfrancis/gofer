@@ -5,7 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -24,6 +27,7 @@ const (
 	MaxDraftCommentBytes = 4 << 10
 	MaxDraftPathBytes    = 1 << 10
 	MaxDraftBodyBytes    = 8 << 10
+	maxDraftRefBytes     = 255
 )
 
 // Diff sides a draft comment anchors to, as GitHub names them: RIGHT is the pull
@@ -35,13 +39,18 @@ const (
 )
 
 // DraftReview is the structured result of a draft-review run: inline comments
-// anchored to lines of the pull request's diff at Commit, and a summary Body for the
-// agreed points no diff line carries. It rides on the agent reply (Message.Draft).
+// anchored to lines of one pull request's diff, and a summary Body for the agreed
+// points no diff line carries. It rides on the agent reply (Message.Draft).
+//
+// Repo, Number, Commit and BaseRef pin what the comments were anchored to. They are
+// part of the draft, so its Digest binds them: the web tier creates the review only
+// on that pull request (still the item's), while its head is still Commit and its
+// base branch still BaseRef, since a push or a retarget changes what the lines mean.
 type DraftReview struct {
-	// Commit is the head commit the comments are anchored to. The web tier creates
-	// the pending review only while the pull request's head is still this commit,
-	// since a push moves the lines.
+	Repo     string         `json:"repo"`
+	Number   int            `json:"number"`
 	Commit   string         `json:"commit"`
+	BaseRef  string         `json:"base_ref"`
 	Body     string         `json:"body,omitempty"`
 	Comments []DraftComment `json:"comments,omitempty"`
 }
@@ -54,14 +63,32 @@ type DraftComment struct {
 	Body string `json:"body"`
 }
 
+// DraftReceipt records the owner's confirmation of a draft (Message.DraftReceipt),
+// written by the web tier only. It is claimed (DraftCreating) in the store before
+// gofer asks GitHub for anything, so a replayed confirmation finds it and writes
+// nothing, across a restart too; then settled to what happened, or removed when
+// GitHub certainly created nothing, so the owner can try again.
+type DraftReceipt struct {
+	State string    `json:"state"` // DraftCreating | DraftCreated | DraftUnknown
+	URL   string    `json:"url,omitempty"`
+	At    time.Time `json:"at"`
+}
+
+// DraftReceipt states.
+const (
+	DraftCreating = "creating" // claimed; the request to GitHub may be under way, or was cut off
+	DraftCreated  = "created"
+	DraftUnknown  = "unknown" // the request reached GitHub, but its answer was lost
+)
+
 // Empty reports whether the draft has nothing to post.
 func (d *DraftReview) Empty() bool {
 	return d == nil || (strings.TrimSpace(d.Body) == "" && len(d.Comments) == 0)
 }
 
-// Digest identifies the draft's content. The thread page posts it back with the
-// owner's selection, and the web tier refuses a confirmation whose stored draft no
-// longer matches what the page showed.
+// Digest identifies the draft: its content and the pull request, commit and base it
+// is pinned to. The thread page posts it back with the owner's selection, and the
+// web tier refuses a confirmation whose stored draft no longer matches.
 func (d *DraftReview) Digest() string {
 	if d == nil {
 		return ""
@@ -71,15 +98,27 @@ func (d *DraftReview) Digest() string {
 	return hex.EncodeToString(sum[:])
 }
 
-// BoundDraft returns d normalized to what may be stored: nil when it has no valid
-// commit or nothing left to post; comments with an empty body, an invalid path, a
-// line below 1 or an unknown side dropped; text cut to its bound; at most
-// MaxDraftComments comments. A side left empty is RIGHT.
+// For reports whether the draft is pinned to the item's pull request as it stands now.
+func (d *DraftReview) For(it WorkItem) bool {
+	return d != nil && it.Type == TypePullRequest && strings.EqualFold(d.Repo, it.GitHub.Repo) && d.Number == it.GitHub.Number
+}
+
+var draftRepo = regexp.MustCompile(`^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`)
+
+// BoundDraft returns d normalized to what may be stored: nil when its pin (repo,
+// number, full commit id, base branch) is invalid or nothing is left to post;
+// comments with an empty body, an invalid path, a line below 1 or an unknown side
+// dropped; text cut to its bound; at most MaxDraftComments comments. A side left
+// empty is RIGHT.
 func BoundDraft(d *DraftReview) *DraftReview {
-	if d == nil || !validCommit(d.Commit) {
+	if d == nil || !validCommit(d.Commit) || !draftRepo.MatchString(d.Repo) || d.Number <= 0 ||
+		d.BaseRef == "" || len(d.BaseRef) > maxDraftRefBytes || !utf8.ValidString(d.BaseRef) {
 		return nil
 	}
-	out := &DraftReview{Commit: strings.ToLower(d.Commit), Body: cutText(strings.TrimSpace(d.Body), MaxDraftBodyBytes)}
+	out := &DraftReview{
+		Repo: d.Repo, Number: d.Number, Commit: strings.ToLower(d.Commit), BaseRef: d.BaseRef,
+		Body: cutText(strings.TrimSpace(d.Body), MaxDraftBodyBytes),
+	}
 	for _, c := range d.Comments {
 		if len(out.Comments) == MaxDraftComments {
 			break
@@ -141,20 +180,130 @@ func (w WorkItem) IsDraftReviewRequest(i int) bool {
 	return i >= 0 && i < len(w.Thread) && w.Thread[i].Role == RoleUser && w.Thread[i].Kind == KindDraftReviewRequest
 }
 
-// LatestDraft returns the position of the newest agent turn carrying a draft review
-// that is not hidden, or -1. The thread offers to create a pending review from that
-// draft only: an older one was superseded.
+// LatestDraft returns the position of the reply carrying the draft the thread
+// offers, or -1. Only the newest draft request counts: its reply, if it has one, is
+// not hidden, and carries a draft. So a redraft that found nothing to draft retires
+// the draft before it, and a late reply to an older request never supersedes a newer
+// result. A hidden request or reply offers nothing.
 func (w WorkItem) LatestDraft() int {
 	for i := len(w.Thread) - 1; i >= 0; i-- {
-		m := w.Thread[i]
-		if m.Role == RoleAgent && m.Draft != nil {
-			if m.Hidden {
-				return -1
-			}
-			return i
+		if !w.IsDraftReviewRequest(i) {
+			continue
 		}
+		if w.Thread[i].Hidden {
+			return -1
+		}
+		j, ok := w.replies()[w.TurnKey(i)]
+		if !ok || w.Thread[j].Hidden || w.Thread[j].Draft == nil {
+			return -1
+		}
+		return j
 	}
 	return -1
+}
+
+// OfferedDraft returns the position of the draft turn key names if it is the draft
+// the thread offers now (LatestDraft), its digest is digest, and it is pinned to the
+// item's pull request as it stands (DraftReview.For). A receipt on it does not
+// matter here: the caller decides what a confirmed draft means.
+func (w WorkItem) OfferedDraft(key, digest string) (int, bool) {
+	i := w.LatestDraft()
+	if i < 0 || w.TurnKey(i) != key || w.Thread[i].Draft.Digest() != digest || !w.Thread[i].Draft.For(w) {
+		return 0, false
+	}
+	return i, true
+}
+
+// ErrDraftNotOffered is a confirmation of a draft the thread no longer offers: the
+// item is gone or off the radar, the draft was replaced, hidden or cleared, or the
+// item's pull request is no longer the one the draft is pinned to.
+var ErrDraftNotOffered = errors.New("the draft is no longer offered")
+
+// ClaimDraft claims ownerID's draft (item itemID, turn key, digest) for creation at
+// at, in one Store.Update: it records a DraftCreating receipt unless the draft
+// already has a receipt, which it returns instead (prior), with nothing written. It
+// returns the item as stored (with the claim when claimed) so the caller creates the
+// review from the stored draft. ErrDraftNotOffered when the draft is not offered or
+// the item is off the radar.
+func ClaimDraft(ctx context.Context, store Store, ownerID, itemID, key, digest string, at time.Time) (item WorkItem, prior *DraftReceipt, err error) {
+	err = store.Update(ctx, ownerID, func(current []WorkItem) ([]WorkItem, error) {
+		item, prior = WorkItem{}, nil
+		for n := range current {
+			if current[n].ID != itemID {
+				continue
+			}
+			if !current[n].OnRadar() {
+				return nil, ErrDraftNotOffered
+			}
+			i, ok := current[n].OfferedDraft(key, digest)
+			if !ok {
+				return nil, ErrDraftNotOffered
+			}
+			if r := current[n].Thread[i].DraftReceipt; r != nil {
+				cp := *r
+				prior, item = &cp, current[n]
+				return nil, nil
+			}
+			current[n].Thread[i].DraftReceipt = &DraftReceipt{State: DraftCreating, At: at}
+			item = current[n]
+			return current[n : n+1], nil
+		}
+		return nil, ErrDraftNotOffered
+	})
+	return item, prior, err
+}
+
+// SettleDraft records what happened to a claim ClaimDraft made at claimedAt:
+// receipt (DraftCreated or DraftUnknown), or nil to release the claim when GitHub
+// certainly created nothing. It changes nothing unless the turn still carries that
+// very claim, so it never overwrites another confirmation's receipt.
+func SettleDraft(ctx context.Context, store Store, ownerID, itemID, key string, claimedAt time.Time, receipt *DraftReceipt) error {
+	return store.Update(ctx, ownerID, func(current []WorkItem) ([]WorkItem, error) {
+		for n := range current {
+			if current[n].ID != itemID {
+				continue
+			}
+			i, ok := current[n].TurnIndex(key)
+			if !ok {
+				return nil, nil
+			}
+			r := current[n].Thread[i].DraftReceipt
+			if r == nil || r.State != DraftCreating || !r.At.Equal(claimedAt) {
+				return nil, nil
+			}
+			current[n].Thread[i].DraftReceipt = receipt
+			return current[n : n+1], nil
+		}
+		return nil, nil
+	})
+}
+
+// RedactDrafts returns items with every turn's draft and receipt removed, for a
+// run's read: a run reads a draft's summary (its Content), never the structured
+// draft. The items' threads are copied, never changed in place.
+func RedactDrafts(items []WorkItem) []WorkItem {
+	out := make([]WorkItem, len(items))
+	for n, it := range items {
+		if hasDraftData(it.Thread) {
+			th := make([]Message, len(it.Thread))
+			copy(th, it.Thread)
+			for i := range th {
+				th[i].Draft, th[i].DraftReceipt = nil, nil
+			}
+			it.Thread = th
+		}
+		out[n] = it
+	}
+	return out
+}
+
+func hasDraftData(th []Message) bool {
+	for _, m := range th {
+		if m.Draft != nil || m.DraftReceipt != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // DraftInput is what a ReviewDrafter reads: the pull request, the review

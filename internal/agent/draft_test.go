@@ -39,7 +39,7 @@ func draftGitHub(t *testing.T, state string) string {
 		case "/repos/o/r/pulls/1":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"state": state, "head": map[string]any{"sha": draftHead},
-				"base": map[string]any{"repo": map[string]any{"full_name": "o/r"}},
+				"base": map[string]any{"ref": "main", "repo": map[string]any{"full_name": "o/r"}},
 			})
 		case "/repos/o/r/pulls/1/files":
 			_ = json.NewEncoder(w).Encode([]map[string]any{
@@ -77,6 +77,7 @@ func TestRunConverseDraftsReview(t *testing.T) {
 		Comments: []worklist.DraftComment{
 			{Path: "a.go", Line: 11, Side: "RIGHT", Body: "Rename `new1`."},
 			{Path: "a.go", Line: 11, Side: "LEFT", Body: "Why drop `old`?"},
+			{Path: "a.go", Line: 10, Side: "LEFT", Body: "Context is not a removed line."},
 			{Path: "a.go", Line: 99, Side: "RIGHT", Body: "Off the diff."},
 			{Path: "logo.png", Line: 1, Body: "Binary file."},
 		},
@@ -111,18 +112,18 @@ func TestRunConverseDraftsReview(t *testing.T) {
 		t.Fatalf("reply = %+v", reply)
 	}
 	d := reply.Draft
-	if d.Commit != draftHead || len(d.Comments) != 2 {
+	if d.Commit != draftHead || d.Repo != "o/r" || d.Number != 1 || d.BaseRef != "main" || len(d.Comments) != 2 {
 		t.Fatalf("draft = %+v", d)
 	}
 	if d.Comments[0].Side != worklist.SideRight || d.Comments[1].Side != worklist.SideLeft {
 		t.Errorf("comments = %+v", d.Comments)
 	}
-	for _, want := range []string{"Add a test.", "`a.go` line 99: Off the diff.", "`logo.png` line 1: Binary file."} {
+	for _, want := range []string{"Add a test.", "`a.go` line 99: Off the diff.", "`logo.png` line 1: Binary file.", "`a.go` line 10: Context is not a removed line."} {
 		if !strings.Contains(d.Body, want) {
 			t.Errorf("summary lacks %q: %q", want, d.Body)
 		}
 	}
-	for _, want := range []string{"Drafted 2 inline review comments", "Rename `new1`.", "Left out — no consensus yet", "m1 and m2 disagree", "2 comments pointed at a line the diff does not show", "1 file had no patch"} {
+	for _, want := range []string{"Drafted 2 inline review comments", "Rename `new1`.", "Left out — no consensus yet", "m1 and m2 disagree", "3 comments pointed at a line the diff does not show", "1 file had no patch"} {
 		if !strings.Contains(reply.Content, want) {
 			t.Errorf("reply lacks %q:\n%s", want, reply.Content)
 		}
@@ -174,16 +175,23 @@ func TestRunConverseDraftWithoutGitHub(t *testing.T) {
 	}
 }
 
-// Hunk parsing: added lines are RIGHT, removed LEFT, context both, across hunks.
+// Hunk parsing, as GitHub anchors: added and unchanged context lines are RIGHT,
+// removed lines LEFT, across hunks. A context line's base number is no anchor: the
+// model is never shown it.
 func TestPatchAnchors(t *testing.T) {
-	a, _ := patchAnchors("@@ -1,2 +1,2 @@\n a\n-b\n+B\n@@ -20 +20,2 @@ x\n c\n+d\n\\ No newline at end of file")
-	for _, want := range []anchor{{"RIGHT", 1}, {"LEFT", 1}, {"LEFT", 2}, {"RIGHT", 2}, {"RIGHT", 20}, {"LEFT", 20}, {"RIGHT", 21}} {
+	a, text := patchAnchors("@@ -1,2 +1,2 @@\n a\n-b\n+B\n@@ -20 +20,2 @@ x\n c\n+d\n\\ No newline at end of file")
+	for _, want := range []anchor{{"RIGHT", 1}, {"LEFT", 2}, {"RIGHT", 2}, {"RIGHT", 20}, {"RIGHT", 21}} {
 		if !a[want] {
 			t.Errorf("missing anchor %+v", want)
 		}
 	}
-	if a[anchor{"LEFT", 21}] || a[anchor{"RIGHT", 3}] {
-		t.Errorf("unexpected anchors: %+v", a)
+	for _, not := range []anchor{{"LEFT", 1}, {"LEFT", 20}, {"LEFT", 21}, {"RIGHT", 3}} {
+		if a[not] {
+			t.Errorf("unexpected anchor %+v", not)
+		}
+	}
+	if len(a) != 5 || strings.Count(text, "[R") != 4 || strings.Count(text, "[L") != 1 {
+		t.Errorf("anchors %v do not match what the model is shown:\n%s", a, text)
 	}
 }
 
@@ -200,5 +208,15 @@ func TestRenderDiffBudget(t *testing.T) {
 	}
 	if !strings.Contains(text, "big.go (modified) — patch left out") || len(text) > 300 {
 		t.Errorf("text (%d bytes):\n%s", len(text), text)
+	}
+	// Files without patches count against the budget too, and every one is still
+	// counted once the notices stop fitting.
+	var binaries []github.DiffFile
+	for range 10 {
+		binaries = append(binaries, github.DiffFile{Path: "assets/image.png", Status: "added"})
+	}
+	text, _, omitted = renderDiff(binaries, 128)
+	if len(text) > 128 || omitted != 10 {
+		t.Errorf("binary-heavy diff: %d bytes of a 128-byte budget, %d omitted", len(text), omitted)
 	}
 }

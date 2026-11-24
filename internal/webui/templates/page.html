@@ -89,9 +89,10 @@
       <div class="zz-comment-page">
         {{with .DraftResult}}
         <h1>{{if .Created}}Pending review created{{else if .Unknown}}Pending review: unknown{{else}}No pending review created{{end}}</h1>
+        {{if .Repeat}}<p class="zz-meta">This draft was already confirmed, so gofer sent nothing to GitHub now. This is what the earlier confirmation did.</p>{{end}}
         <p class="zz-meta"><a href="{{.Item.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.Item.GitHub.Repo}} #{{.Item.GitHub.Number}}</a> {{.Item.GitHub.Title}}</p>
         {{if .Created}}
-        <p>gofer created a pending review with {{.Comments}} inline comment{{if ne .Comments 1}}s{{end}}{{if .Summary}} and a summary{{end}}. It is a draft only you can see: open it on GitHub to edit, submit or discard it.</p>
+        <p>{{if .Repeat}}gofer created a pending review from this draft.{{else}}gofer created a pending review with {{.Comments}} inline comment{{if ne .Comments 1}}s{{end}}{{if .Summary}} and a summary{{end}}.{{end}} It is a draft only you can see until you submit it: open it on GitHub to edit, submit or discard it.</p>
         <div class="zz-actions"><a class="btn btn-primary" href="{{with .URL}}{{.}}{{else}}{{$.Item.GitHub.URL}}/files{{end}}" target="_blank" rel="noopener noreferrer">Open on GitHub</a></div>
         {{else}}
         <p class="zz-stalled" role="alert">{{.Error}}</p>
@@ -165,21 +166,40 @@
           <div class="zz-msg zz-msg--{{$m.Role}}">
             {{if eq $m.Role "agent"}}{{markdown $m.Content}}{{else}}{{$m.Content}}{{end}}
             {{if and $.Draft $m.Draft (eq $i $.Draft.Index)}}
-            {{/* The newest draft: choose what goes into the pending review. The server reads the draft itself from the store; the form only names it (msg, digest) and what to leave out. */}}
+            {{with $.Draft.Receipt}}
+            {{/* Already confirmed: say what happened; never offer to create it again. */}}
+            <div class="zz-draft-receipt">
+              {{if eq .State "created"}}
+              <p>Pending review created on GitHub{{with .URL}} &middot; <a href="{{.}}" target="_blank" rel="noopener noreferrer">open it</a>{{end}}. Submit or discard it there. To start over, draft the comments again.</p>
+              {{else}}
+              <p role="alert">{{if and (eq .State "creating") (not $.Draft.Interrupted)}}gofer is creating this pending review; reload in a moment.{{else}}gofer may have created this pending review (its answer was lost, or the request was interrupted). Check the pull request on GitHub; gofer will not create another from this draft. To start over, draft the comments again.{{end}}</p>
+              {{end}}
+            </div>
+            {{else}}
+            {{/* The offered draft: choose what goes into the pending review. Each checkbox shows the exact text it sends. The server reads the draft itself from the store; the form only names it (msg, digest) and what to leave out. */}}
             <form class="zz-draft-form" method="post" action="/items/draft-review/create">
               <input type="hidden" name="id" value="{{$.Item.ID}}">
               <input type="hidden" name="msg" value="{{$.Item.TurnKey $i}}">
               <input type="hidden" name="digest" value="{{$.Draft.Digest}}">
               <fieldset>
-                <legend>Include in the pending review</legend>
+                <legend>Pending review on {{$m.Draft.Repo}} #{{$m.Draft.Number}}, at commit <code>{{shortSHA $m.Draft.Commit}}</code> against <code>{{$m.Draft.BaseRef}}</code>. Exactly this text is sent:</legend>
                 {{range $j, $c := $m.Draft.Comments}}
-                <label class="zz-draft-pick"><input type="checkbox" name="c" value="{{$j}}" checked> {{add1 $j}}. <code>{{$c.Path}}</code> line {{$c.Line}}{{if eq $c.Side "LEFT"}} (removed line){{end}}</label>
+                <div class="zz-draft-pick">
+                  <label><input type="checkbox" name="c" value="{{$j}}" checked> {{add1 $j}}. <code>{{$c.Path}}</code> line {{$c.Line}}{{if eq $c.Side "LEFT"}} (removed line){{end}}</label>
+                  <pre class="zz-draft-text">{{$c.Body}}</pre>
+                </div>
                 {{end}}
-                {{if $m.Draft.Body}}<label class="zz-draft-pick"><input type="checkbox" name="summary" value="1" checked> Review summary</label>{{end}}
+                {{if $m.Draft.Body}}
+                <div class="zz-draft-pick">
+                  <label><input type="checkbox" name="summary" value="1" checked> Review summary</label>
+                  <pre class="zz-draft-text">{{$m.Draft.Body}}</pre>
+                </div>
+                {{end}}
               </fieldset>
               <button class="btn btn-sm btn-primary" type="submit" title="Creates a pending review on GitHub as you. It is a draft only you can see until you submit it on GitHub.">Create pending review on GitHub</button>
-              <p class="zz-meta">gofer creates the review as a draft (pending) on GitHub, as you{{with userHandle $.User}} ({{.}}){{end}}. Nothing is submitted: open the pull request on GitHub to edit, submit or discard it.</p>
+              <p class="zz-meta">gofer creates the review as a draft (pending) on GitHub, as you{{with userHandle $.User}} ({{.}}){{end}}, once per draft. Nothing is submitted: open the pull request on GitHub to edit, submit or discard it.</p>
             </form>
+            {{end}}
             {{end}}
             <div class="zz-msgfoot">
               {{if $m.Model}}<span class="zz-model">via {{$m.Model}}</span>{{end}}

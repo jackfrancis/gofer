@@ -235,10 +235,14 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 	if _, done := item.replies()[replyTo]; done {
 		return false, nil // the turn already has its answer
 	}
-	// Only a draft-review request is answered with a draft, and a stored draft is
-	// always within its bounds, whatever the run sent.
+	// Only a draft-review request is answered with a draft, pinned to this item's
+	// pull request, and a stored draft is always within its bounds, whatever the run
+	// sent. A run never writes a receipt: that is the owner's confirmation.
+	reply.DraftReceipt = nil
 	if i, _ := item.TurnIndex(replyTo); item.IsDraftReviewRequest(i) && reply.Notice == "" {
-		reply.Draft = BoundDraft(reply.Draft)
+		if reply.Draft = BoundDraft(reply.Draft); !reply.Draft.For(*item) {
+			reply.Draft = nil
+		}
 	} else {
 		reply.Draft = nil
 	}

@@ -71,7 +71,8 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 	if err != nil {
 		return fmt.Errorf("draft review: %w", err)
 	}
-	draft, moved := anchorDraft(prop, anchors, diff.HeadSHA)
+	pin := worklist.DraftReview{Repo: item.GitHub.Repo, Number: item.GitHub.Number, Commit: diff.HeadSHA, BaseRef: diff.BaseRef}
+	draft, moved := anchorDraft(prop, anchors, pin)
 	return reply(draftContent(draft, prop.Excluded, moved, omitted, diff.Complete), draft)
 }
 
@@ -83,11 +84,12 @@ type anchor struct {
 
 var hunkHeader = regexp.MustCompile(`^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
 
-// patchAnchors returns the lines of a unified-diff patch a comment may anchor to:
-// added and context lines on the RIGHT (the pull request's version), removed and
-// context lines on the LEFT (the base). It also returns the patch annotated with
-// those numbers for the model: "[R<n>]" before an added or context line, "[L<n>]"
-// before a removed one.
+// patchAnchors returns the lines of a unified-diff patch a comment may anchor to,
+// as GitHub defines them: added and unchanged context lines on the RIGHT (the pull
+// request's version), removed lines on the LEFT (the base). It also returns the
+// patch annotated with exactly those anchors for the model: "[R<n>]" before an added
+// or context line, "[L<n>]" before a removed one. A context line's base number is
+// not an anchor: the model is never shown it, and GitHub names context lines RIGHT.
 func patchAnchors(patch string) (map[anchor]bool, string) {
 	anchors := map[anchor]bool{}
 	var b strings.Builder
@@ -114,7 +116,6 @@ func patchAnchors(patch string) (map[anchor]bool, string) {
 			oldLine++
 		case ' ':
 			anchors[anchor{worklist.SideRight, newLine}] = true
-			anchors[anchor{worklist.SideLeft, oldLine}] = true
 			fmt.Fprintf(&b, "[R%d] %s\n", newLine, line)
 			oldLine++
 			newLine++
@@ -125,44 +126,47 @@ func patchAnchors(patch string) (map[anchor]bool, string) {
 	return anchors, b.String()
 }
 
-// renderDiff annotates the files' patches for the model, within budget bytes, and
-// returns each rendered file's anchors by path. omitted counts files listed without
-// a patch: GitHub sent none, or it did not fit.
+// renderDiff annotates the files' patches for the model and returns each rendered
+// file's anchors by path. Every write is checked against budget bytes, notices
+// included: a file whose text does not fit is left out, with a notice only while the
+// notice fits. omitted counts every file listed without its patch (GitHub sent none,
+// or it did not fit), whether or not its notice was written.
 func renderDiff(files []github.DiffFile, budget int) (string, map[string]map[anchor]bool, int) {
 	var b strings.Builder
 	anchors := map[string]map[anchor]bool{}
 	omitted := 0
+	write := func(s string) bool {
+		if b.Len()+len(s) > budget {
+			return false
+		}
+		b.WriteString(s)
+		return true
+	}
 	for _, f := range files {
-		header := fmt.Sprintf("### %s (%s)\n", f.Path, f.Status)
 		if f.Patch == "" {
 			omitted++
-			fmt.Fprintf(&b, "### %s (%s) — no patch from GitHub (binary or too large); no comment can anchor here\n\n", f.Path, f.Status)
+			write(fmt.Sprintf("### %s (%s) — no patch from GitHub (binary or too large); no comment can anchor here\n\n", f.Path, f.Status))
 			continue
 		}
 		a, annotated := patchAnchors(f.Patch)
-		if b.Len()+len(header)+len(annotated) > budget {
+		if !write(fmt.Sprintf("### %s (%s)\n%s\n", f.Path, f.Status, annotated)) {
 			omitted++
-			line := fmt.Sprintf("### %s (%s) — patch left out to fit; no comment can anchor here\n\n", f.Path, f.Status)
-			if b.Len()+len(line) <= budget {
-				b.WriteString(line)
-			}
+			write(fmt.Sprintf("### %s (%s) — patch left out to fit; no comment can anchor here\n\n", f.Path, f.Status))
 			continue
 		}
-		b.WriteString(header)
-		b.WriteString(annotated)
-		b.WriteString("\n")
 		anchors[f.Path] = a
 	}
 	return b.String(), anchors, omitted
 }
 
-// anchorDraft builds the draft from the model's proposal: a comment stays inline
+// anchorDraft builds the draft, pinned to pin's pull request, head and base, from the
+// model's proposal: a comment stays inline
 // only if its line is one the diff showed it (anchors); any other, and any past
 // MaxDraftComments, moves into the review summary with its location, so an agreed
 // point is never lost to a bad anchor. moved counts those. It returns nil when there
 // is nothing to post.
-func anchorDraft(prop worklist.DraftProposal, anchors map[string]map[anchor]bool, commit string) (*worklist.DraftReview, int) {
-	d := &worklist.DraftReview{Commit: commit}
+func anchorDraft(prop worklist.DraftProposal, anchors map[string]map[anchor]bool, pin worklist.DraftReview) (*worklist.DraftReview, int) {
+	d := &worklist.DraftReview{Repo: pin.Repo, Number: pin.Number, Commit: pin.Commit, BaseRef: pin.BaseRef}
 	general := append([]string(nil), prop.General...)
 	moved := 0
 	for _, c := range prop.Comments {

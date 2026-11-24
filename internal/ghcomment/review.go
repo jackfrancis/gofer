@@ -15,8 +15,9 @@ import (
 // which GitHub keeps PENDING, visible only to its author until they submit it on
 // GitHub. It adds three calls to the client, on a public repository only:
 //
-//   - GET /repos/{repo}/pulls/{n}, for the head commit and state;
 //   - GET /repos/{repo}/pulls/{n}/reviews, to find a pending review already there;
+//   - GET /repos/{repo}/pulls/{n}, for its state, head commit and base branch, read
+//     last, right before the write;
 //   - POST /repos/{repo}/pulls/{n}/reviews, with no event.
 
 // Bounds on a pending review.
@@ -31,8 +32,9 @@ const (
 // Errors a caller distinguishes.
 var (
 	// ErrHeadMoved means the pull request's head is no longer the commit the
-	// comments are anchored to: a push moved the lines.
-	ErrHeadMoved = errors.New("the pull request's head changed")
+	// comments are anchored to, or its base branch is not the one they were drafted
+	// against: a push or a retarget changed what the lines mean.
+	ErrHeadMoved = errors.New("the pull request's head or base changed")
 	// ErrNotOpen means the pull request is closed or merged.
 	ErrNotOpen = errors.New("the pull request is not open")
 	// ErrPendingExists means the user already has a pending review on the pull
@@ -49,16 +51,18 @@ type ReviewComment struct {
 }
 
 // PendingReview creates a PENDING review on repo's pull request number, anchored to
-// commit, with body and comments, after checking the repository is public, the pull
-// request is open, its head is still commit, and the user has no pending review on
-// it already. It returns the review's web URL when GitHub gave one. A POST whose
-// answer was lost is ErrOutcomeUnknown.
-func (c *Client) PendingReview(ctx context.Context, token, repo string, number int, commit, body string, comments []ReviewComment) (string, error) {
+// commit, with body and comments, after checking the repository is public, the user
+// has no pending review on it already, and then, as close to the write as the API
+// allows, that the pull request is open, its head is still commit and its base
+// branch still baseRef. GitHub takes commit_id as an anchor, not a precondition (it
+// accepts an older commit), so these checks are gofer's. It returns the review's web
+// URL when GitHub gave one. A POST whose answer was lost is ErrOutcomeUnknown.
+func (c *Client) PendingReview(ctx context.Context, token, repo string, number int, commit, baseRef, body string, comments []ReviewComment) (string, error) {
 	if number <= 0 {
 		return "", errors.New("github: no pull request number")
 	}
-	if commit == "" {
-		return "", errors.New("github: no commit to anchor the review to")
+	if commit == "" || baseRef == "" {
+		return "", errors.New("github: no commit and base branch to anchor the review to")
 	}
 	if strings.TrimSpace(body) == "" && len(comments) == 0 {
 		return "", errors.New("github: an empty review")
@@ -76,6 +80,15 @@ func (c *Client) PendingReview(ctx context.Context, token, repo string, number i
 		return "", err
 	}
 	pull := "/repos/" + canon + "/pulls/" + strconv.Itoa(number)
+	pending, err := c.hasPendingReview(ctx, token, pull)
+	if err != nil {
+		return "", err
+	}
+	if pending {
+		return "", ErrPendingExists
+	}
+	// The pull request is read after the review list is paged, right before the
+	// POST, so its state, head and base are as fresh as the API lets gofer check.
 	raw, err := c.do(ctx, token, http.MethodGet, pull, nil, http.StatusOK)
 	if err != nil {
 		return "", err
@@ -85,6 +98,9 @@ func (c *Client) PendingReview(ctx context.Context, token, repo string, number i
 		Head  struct {
 			SHA string `json:"sha"`
 		} `json:"head"`
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
 	}
 	if err := json.Unmarshal(raw, &pr); err != nil {
 		return "", errors.New("github: unreadable pull request")
@@ -92,15 +108,8 @@ func (c *Client) PendingReview(ctx context.Context, token, repo string, number i
 	if !strings.EqualFold(pr.State, "open") {
 		return "", ErrNotOpen
 	}
-	if !strings.EqualFold(pr.Head.SHA, commit) {
+	if !strings.EqualFold(pr.Head.SHA, commit) || pr.Base.Ref != baseRef {
 		return "", ErrHeadMoved
-	}
-	pending, err := c.hasPendingReview(ctx, token, pull)
-	if err != nil {
-		return "", err
-	}
-	if pending {
-		return "", ErrPendingExists
 	}
 	// No "event": GitHub creates the review PENDING.
 	payload, err := json.Marshal(struct {

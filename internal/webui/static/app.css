@@ -349,3 +349,7 @@ body {
 .zz-draft-form legend { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
 .zz-draft-pick { font-size: 13px; overflow-wrap: anywhere; }
 .zz-draft-form .zz-meta { margin: 6px 0 0; font-size: 12px; }
+.zz-draft-pick { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
+.zz-draft-text { margin: 0 0 0 22px; padding: 6px 8px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; background: var(--bg-subtle); border-radius: 6px; }
+.zz-draft-receipt { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); font-size: 13px; }
+.zz-draft-receipt a { color: var(--accent); }

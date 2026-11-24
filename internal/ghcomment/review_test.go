@@ -15,6 +15,8 @@ const reviewHead = "0123456789abcdef0123456789abcdef01234567"
 type reviewAPI struct {
 	state   string
 	head    string
+	base    string // the base branch; "" = main
+	calls   []string
 	reviews []map[string]string
 	created map[string]any // the last review POST body
 	answer  int            // the POST's status; 0 = 200
@@ -27,11 +29,16 @@ func (a *reviewAPI) server(t *testing.T) *httptest.Server {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		a.calls = append(a.calls, r.Method+" "+r.URL.Path)
 		switch {
 		case r.URL.Path == "/repos/org/public":
 			_, _ = w.Write([]byte(`{"full_name":"Org/Public","private":false}`))
 		case r.URL.Path == "/repos/Org/Public/pulls/7" && r.Method == http.MethodGet:
-			_ = json.NewEncoder(w).Encode(map[string]any{"state": a.state, "head": map[string]any{"sha": a.head}})
+			base := a.base
+			if base == "" {
+				base = "main"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": a.state, "head": map[string]any{"sha": a.head}, "base": map[string]any{"ref": base}})
 		case r.URL.Path == "/repos/Org/Public/pulls/7/reviews" && r.Method == http.MethodGet:
 			_ = json.NewEncoder(w).Encode(a.reviews)
 		case r.URL.Path == "/repos/Org/Public/pulls/7/reviews" && r.Method == http.MethodPost:
@@ -57,9 +64,13 @@ var reviewComments = []ReviewComment{{Path: "a.go", Line: 3, Side: "RIGHT", Body
 func TestPendingReviewCreatesWithoutEvent(t *testing.T) {
 	api := &reviewAPI{state: "open", head: reviewHead, reviews: []map[string]string{{"state": "COMMENTED"}}}
 	c := New(api.server(t).URL, nil)
-	link, err := c.PendingReview(context.Background(), token, "org/public", 7, reviewHead, "Summary.", reviewComments)
+	link, err := c.PendingReview(context.Background(), token, "org/public", 7, reviewHead, "main", "Summary.", reviewComments)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The pull request is read last, right before the write.
+	if n := len(api.calls); n < 3 || api.calls[n-2] != "GET /repos/Org/Public/pulls/7" || api.calls[n-1] != "POST /repos/Org/Public/pulls/7/reviews" {
+		t.Errorf("calls = %v", api.calls)
 	}
 	if link != "https://github.com/Org/Public/pull/7#pullrequestreview-1" {
 		t.Errorf("link = %q", link)
@@ -88,6 +99,7 @@ func TestPendingReviewRefusals(t *testing.T) {
 		want error
 	}{
 		"head moved":     {reviewAPI{state: "open", head: "ffffffffffffffffffffffffffffffffffffffff"}, "org/public", ErrHeadMoved},
+		"retargeted":     {reviewAPI{state: "open", head: reviewHead, base: "release-1.0"}, "org/public", ErrHeadMoved},
 		"closed":         {reviewAPI{state: "closed", head: reviewHead}, "org/public", ErrNotOpen},
 		"pending exists": {reviewAPI{state: "open", head: reviewHead, reviews: []map[string]string{{"state": "PENDING"}}}, "org/public", ErrPendingExists},
 		"not public":     {reviewAPI{state: "open", head: reviewHead}, "org/gone", ErrNotPublic},
@@ -95,7 +107,7 @@ func TestPendingReviewRefusals(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			api := tc.api
 			c := New(api.server(t).URL, nil)
-			_, err := c.PendingReview(context.Background(), token, tc.repo, 7, reviewHead, "", reviewComments)
+			_, err := c.PendingReview(context.Background(), token, tc.repo, 7, reviewHead, "main", "", reviewComments)
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("err = %v, want %v", err, tc.want)
 			}
@@ -111,11 +123,11 @@ func TestPendingReviewRefusals(t *testing.T) {
 		"no line":    {{Path: "a.go", Side: "RIGHT", Body: "x"}},
 		"empty body": {{Path: "a.go", Line: 1, Side: "RIGHT"}},
 	} {
-		if _, err := c.PendingReview(context.Background(), token, "org/public", 7, reviewHead, "", comments); err == nil {
+		if _, err := c.PendingReview(context.Background(), token, "org/public", 7, reviewHead, "main", "", comments); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
-	if _, err := c.PendingReview(context.Background(), token, "org/public", 7, reviewHead, " ", nil); err == nil {
+	if _, err := c.PendingReview(context.Background(), token, "org/public", 7, reviewHead, "main", " ", nil); err == nil {
 		t.Error("an empty review was accepted")
 	}
 	if api.created != nil {
@@ -128,7 +140,7 @@ func TestPendingReviewRefusals(t *testing.T) {
 func TestPendingReviewUnprocessable(t *testing.T) {
 	api := &reviewAPI{state: "open", head: reviewHead, answer: http.StatusUnprocessableEntity}
 	c := New(api.server(t).URL, nil)
-	_, err := c.PendingReview(context.Background(), token, "org/public", 7, reviewHead, "", reviewComments)
+	_, err := c.PendingReview(context.Background(), token, "org/public", 7, reviewHead, "main", "", reviewComments)
 	var se *StatusError
 	if !errors.As(err, &se) || se.Status != http.StatusUnprocessableEntity || se.Message != "Unprocessable Entity" {
 		t.Fatalf("err = %v", err)

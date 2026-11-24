@@ -94,7 +94,10 @@ type Message struct {
 	// carries (draft.go). AppendReply bounds it, and drops it from a reply to any
 	// other turn. Runs never read it back (ThreadWindow leaves it out).
 	Draft *DraftReview `json:"draft,omitempty"`
-	At    time.Time    `json:"at"`
+	// DraftReceipt records the owner's confirmation of Draft (draft.go): written by
+	// the web tier only (ClaimDraft, SettleDraft), never by a run.
+	DraftReceipt *DraftReceipt `json:"draft_receipt,omitempty"`
+	At           time.Time     `json:"at"`
 }
 
 // ParseVerdict extracts the leading verdict token the consensus synthesis is asked to

@@ -582,15 +582,24 @@ Wired on the web-tier side; they define what a runtime must respect:
   points the visible conversation agrees on (the user's own messages decide; an
   unsettled disagreement is left out and listed), keeps inline only comments on a line
   the diff showed (others move into the summary), and replies with a
-  `worklist.DraftReview` on `Message.Draft`. `AppendReply` bounds it (`BoundDraft`)
-  and drops it from a reply to any other turn; `ThreadWindow` never sends it back to a
-  run. Under the newest draft the thread offers a selection; `webui.CreateDraftReview`
-  (same-origin only) reads the draft from the store, never the form (which names the
-  turn, the draft's `Digest` and the positions to keep), and
-  `comment.Service.PendingReview` creates it with the write grant only while the pull
-  request is open, its head is still the draft's commit, and the user has no pending
-  review there; the POST has no `event`, so GitHub keeps it pending. gofer never
-  submits a review.
+  `worklist.DraftReview` on `Message.Draft`, pinned to the repository, number, head
+  commit and base branch it was anchored to. Context lines anchor RIGHT only, as
+  GitHub defines them, and the annotated diff stays within its byte budget, notices
+  included. `AppendReply` bounds the draft (`BoundDraft`) and drops it from a reply to
+  any other turn or when pinned to another pull request; no agent read sends a draft
+  or receipt back to a run (`ThreadWindow`, and `RedactDrafts` on the whole-list
+  read). The thread offers only the newest draft request's reply
+  (`WorkItem.LatestDraft`; an empty redraft retires the previous draft), only while
+  its pin matches the item, and shows the exact stored text beside each checkbox.
+  `webui.CreateDraftReview` (same-origin only) reads the draft from the store, never
+  the form (which names the turn, the draft's `Digest`, covering the pin, and the
+  positions to keep), claims a durable `DraftReceipt` on the turn
+  (`worklist.ClaimDraft`) before calling GitHub, and settles or releases it
+  (`SettleDraft`): a draft creates at most one review, and a replayed confirmation
+  shows the receipt and sends nothing. `comment.Service.PendingReview` creates it with
+  the write grant only while the user has no pending review there and, checked last,
+  the pull request is open with the draft's head and base branch; the POST has no
+  `event`, so GitHub keeps it pending. gofer never submits a review.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

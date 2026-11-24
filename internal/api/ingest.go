@@ -251,7 +251,9 @@ func (h *IngestHandler) List(w http.ResponseWriter, r *http.Request) {
 	// Classify by the current bot list, so a run ranks by the same classification
 	// its write-back will store.
 	h.policy.Classify(items)
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	// A run reads a draft review's summary, never the structured draft (ThreadWindow
+	// leaves it out of the bounded reads too).
+	writeJSON(w, http.StatusOK, map[string]any{"items": worklist.RedactDrafts(items)})
 }
 
 // Select handles GET /agent/worklist/select: a bounded selection of the acting

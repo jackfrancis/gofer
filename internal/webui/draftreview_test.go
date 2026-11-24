@@ -20,9 +20,13 @@ type fakeReviewCommenter struct {
 	fakeCommenter
 	result  comment.ReviewResult
 	reviews []comment.Review
+	during  func() // when set, PendingReview calls it first (to look at the store mid-request)
 }
 
 func (f *fakeReviewCommenter) PendingReview(_ context.Context, _ string, rv comment.Review) (comment.ReviewResult, error) {
+	if f.during != nil {
+		f.during()
+	}
 	f.reviews = append(f.reviews, rv)
 	return f.result, nil
 }
@@ -35,7 +39,7 @@ func draftedThread(at time.Time) []worklist.Message {
 		{ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "Rename x.", Model: "m1", At: at},
 		{ID: "d", Role: worklist.RoleUser, Content: draftReviewPrompt, Kind: worklist.KindDraftReviewRequest, At: at},
 		{ID: "a", ReplyTo: "d", Role: worklist.RoleAgent, Content: "Drafted 2.", At: at, Draft: &worklist.DraftReview{
-			Commit: draftCommit, Body: "- Add a test.",
+			Repo: "o/r", Number: 1, Commit: draftCommit, BaseRef: "main", Body: "- Add a test.",
 			Comments: []worklist.DraftComment{
 				{Path: "a.go", Line: 3, Side: "RIGHT", Body: "Rename x."},
 				{Path: "b.go", Line: 9, Side: "LEFT", Body: "Why remove this?"},
@@ -121,6 +125,9 @@ func TestThreadShowsDraftSelection(t *testing.T) {
 		`action="/items/draft-review/create"`, `name="msg" value="a"`, `name="digest" value="` + th[3].Draft.Digest() + `"`,
 		`name="c" value="0" checked`, `name="c" value="1" checked`, `<code>b.go</code> line 9 (removed line)`, `name="summary" value="1" checked`,
 		"asked for draft review comments",
+		// The exact stored text each checkbox sends, and where it goes.
+		`<pre class="zz-draft-text">Rename x.</pre>`, `<pre class="zz-draft-text">Why remove this?</pre>`, `<pre class="zz-draft-text">- Add a test.</pre>`,
+		`Pending review on o/r #1, at commit <code>0123456</code> against <code>main</code>`,
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("thread lacks %s", want)
@@ -186,7 +193,7 @@ func TestCreateDraftReviewSendsTheStoredSelection(t *testing.T) {
 		t.Fatalf("status %d, reviews %+v\n%s", rec.Code, c.reviews, rec.Body.String())
 	}
 	rv := c.reviews[0]
-	if rv.Repo != "o/r" || rv.Number != 1 || rv.Commit != draftCommit || rv.Body != "" || len(rv.Comments) != 1 {
+	if rv.Repo != "o/r" || rv.Number != 1 || rv.Commit != draftCommit || rv.BaseRef != "main" || rv.Body != "" || len(rv.Comments) != 1 {
 		t.Fatalf("review = %+v", rv)
 	}
 	if got := rv.Comments[0]; got.Path != "b.go" || got.Line != 9 || got.Side != "LEFT" || got.Body != "Why remove this?" {
@@ -229,7 +236,7 @@ func TestCreateDraftReviewRefusals(t *testing.T) {
 	}
 	// A newer draft supersedes the one the page showed.
 	newer := append(th, worklist.Message{ID: "d2", Role: worklist.RoleUser, Content: draftReviewPrompt, Kind: worklist.KindDraftReviewRequest},
-		worklist.Message{ID: "a2", ReplyTo: "d2", Role: worklist.RoleAgent, Content: "Drafted 1.", Draft: &worklist.DraftReview{Commit: draftCommit, Body: "- x"}})
+		worklist.Message{ID: "a2", ReplyTo: "d2", Role: worklist.RoleAgent, Content: "Drafted 1.", Draft: &worklist.DraftReview{Repo: "o/r", Number: 1, Commit: draftCommit, BaseRef: "main", Body: "- x"}})
 	_ = store.Update(context.Background(), "github:42", func(cur []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		cur[0].Thread = newer
 		return cur, nil
@@ -261,5 +268,94 @@ func TestCreateDraftReviewShowsRefusal(t *testing.T) {
 	}
 	if len(c.reviews) != 1 || c.reviews[0].Body != "- Add a test." || len(c.reviews[0].Comments) != 0 {
 		t.Errorf("reviews = %+v", c.reviews)
+	}
+}
+
+func draftConfirmForm(th []worklist.Message) url.Values {
+	return url.Values{"id": {draftItemID}, "msg": {"a"}, "digest": {th[3].Draft.Digest()}, "c": {"0"}}
+}
+
+// A confirmation is recorded before GitHub is asked, so replaying the POST, even
+// after the review was submitted or discarded on GitHub, never creates a second
+// review: it shows what the first did, and the thread shows the receipt instead of
+// the form.
+func TestCreateDraftReviewReplayIsSafe(t *testing.T) {
+	th := draftedThread(time.Now().Add(-time.Hour))
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true, URL: "https://github.com/o/r/pull/1#pullrequestreview-9"}}
+	h, _, store := draftFixture(t, c, th)
+	c.during = func() {
+		it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+		if r := it.Thread[3].DraftReceipt; r == nil || r.State != worklist.DraftCreating {
+			t.Errorf("GitHub was asked before the confirmation was claimed: %+v", r)
+		}
+	}
+	if rec := postCreate(h, draftConfirmForm(th), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusOK {
+		t.Fatalf("first: %d", rec.Code)
+	}
+	c.during = nil
+	rec := postCreate(h, draftConfirmForm(th), "Sec-Fetch-Site", "same-origin")
+	if rec.Code != http.StatusOK || len(c.reviews) != 1 || !strings.Contains(rec.Body.String(), "already confirmed") || !strings.Contains(rec.Body.String(), "pullrequestreview-9") {
+		t.Fatalf("replay: %d, %d reviews\n%s", rec.Code, len(c.reviews), rec.Body.String())
+	}
+	page, _ := threadPage(t, h)
+	if strings.Contains(page, `action="/items/draft-review/create"`) || !strings.Contains(page, "Pending review created on GitHub") {
+		t.Error("the thread still offers a confirmed draft")
+	}
+}
+
+// An unknown outcome is recorded too: a replay creates nothing. A definite failure
+// releases the claim, so the owner can try again.
+func TestCreateDraftReviewUnknownAndFailure(t *testing.T) {
+	th := draftedThread(time.Now().Add(-time.Hour))
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Unknown: true, Error: "lost"}}
+	h, _, _ := draftFixture(t, c, th)
+	postCreate(h, draftConfirmForm(th), "Sec-Fetch-Site", "same-origin")
+	rec := postCreate(h, draftConfirmForm(th), "Sec-Fetch-Site", "same-origin")
+	if len(c.reviews) != 1 || !strings.Contains(rec.Body.String(), "may have created a pending review") {
+		t.Fatalf("replay after unknown: %d reviews\n%s", len(c.reviews), rec.Body.String())
+	}
+	if page, _ := threadPage(t, h); !strings.Contains(page, "gofer may have created this pending review") {
+		t.Error("the thread does not say the outcome is unknown")
+	}
+
+	c = &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Error: "The pull request has new commits"}}
+	h, _, _ = draftFixture(t, c, th)
+	postCreate(h, draftConfirmForm(th), "Sec-Fetch-Site", "same-origin")
+	postCreate(h, draftConfirmForm(th), "Sec-Fetch-Site", "same-origin")
+	if len(c.reviews) != 2 {
+		t.Errorf("a definite failure did not release the claim: %d attempts", len(c.reviews))
+	}
+}
+
+// A write-back that points the item at another pull request retires its draft: the
+// thread stops offering it and a confirmation from the old page is refused.
+func TestCreateDraftReviewPinsTheDestination(t *testing.T) {
+	th := draftedThread(time.Now().Add(-time.Hour))
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	h, _, store := draftFixture(t, c, th)
+	_ = store.Update(context.Background(), "github:42", func(cur []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		cur[0].GitHub.Repo, cur[0].GitHub.Number = "o/other", 7
+		return cur, nil
+	})
+	if page, _ := threadPage(t, h); strings.Contains(page, `action="/items/draft-review/create"`) {
+		t.Error("the thread offers a draft pinned to another pull request")
+	}
+	if rec := postCreate(h, draftConfirmForm(th), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusConflict || len(c.reviews) != 0 {
+		t.Errorf("status %d, reviews %+v", rec.Code, c.reviews)
+	}
+}
+
+// A redraft that found nothing to draft retires the draft before it.
+func TestEmptyRedraftRetiresTheDraft(t *testing.T) {
+	th := append(draftedThread(time.Now().Add(-time.Hour)),
+		worklist.Message{ID: "d2", Role: worklist.RoleUser, Content: draftReviewPrompt, Kind: worklist.KindDraftReviewRequest, At: time.Now().Add(-time.Hour)},
+		worklist.Message{ID: "a2", ReplyTo: "d2", Role: worklist.RoleAgent, Content: "Nothing to draft.", At: time.Now().Add(-time.Hour)})
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	h, _, _ := draftFixture(t, c, th)
+	if page, _ := threadPage(t, h); strings.Contains(page, `action="/items/draft-review/create"`) {
+		t.Error("the thread still offers the draft an empty redraft replaced")
+	}
+	if rec := postCreate(h, draftConfirmForm(th), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusConflict || len(c.reviews) != 0 {
+		t.Errorf("status %d, reviews %+v", rec.Code, c.reviews)
 	}
 }

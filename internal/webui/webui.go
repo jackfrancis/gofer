@@ -1221,8 +1221,14 @@ var funcs = template.FuncMap{
 	"isSynthesisRequest":     isSynthesisRequest,
 	"isDraftReviewRequest":   isDraftReviewRequest,
 	"add1":                   func(i int) int { return i + 1 },
-	"userHandle":             userHandle,
-	"avatarURL":              avatarURL,
+	"shortSHA": func(s string) string {
+		if len(s) > 7 {
+			return s[:7]
+		}
+		return s
+	},
+	"userHandle": userHandle,
+	"avatarURL":  avatarURL,
 }
 
 // AvatarOrigin serves GitHub avatars. It is the one third-party origin the page

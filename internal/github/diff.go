@@ -15,10 +15,11 @@ const (
 	maxDiffPages = 30
 )
 
-// PullDiff is a pull request's head commit, whether it is open, and its changed
-// files with their patches, read for drafting review comments.
+// PullDiff is a pull request's head commit, base branch, whether it is open, and its
+// changed files with their patches, read for drafting review comments.
 type PullDiff struct {
 	HeadSHA string
+	BaseRef string
 	Open    bool
 	Files   []DiffFile
 	// Complete is false when the file list was cut at maxDiffPages.
@@ -50,14 +51,17 @@ func (c *Client) PullDiff(ctx context.Context, token, repo string, number int) (
 		Head  struct {
 			SHA string `json:"sha"`
 		} `json:"head"`
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
 	}
 	if err := json.Unmarshal(body, &pr); err != nil {
 		return PullDiff{}, err
 	}
-	if pr.Head.SHA == "" {
-		return PullDiff{}, errors.New("pull request has no head commit")
+	if pr.Head.SHA == "" || pr.Base.Ref == "" {
+		return PullDiff{}, errors.New("pull request has no head commit or base branch")
 	}
-	d := PullDiff{HeadSHA: pr.Head.SHA, Open: strings.EqualFold(pr.State, "open")}
+	d := PullDiff{HeadSHA: pr.Head.SHA, BaseRef: pr.Base.Ref, Open: strings.EqualFold(pr.State, "open")}
 	for page := 1; page <= maxDiffPages; page++ {
 		body, hdr, err := c.getHeader(ctx, token, fmt.Sprintf("/repos/%s/pulls/%d/files?per_page=100&page=%d", repo, number, page))
 		if err != nil {
