@@ -95,7 +95,7 @@ func TestThreadRetryFinishesTheOriginalTurnOnce(t *testing.T) {
 	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/items/thread?id=pr1" {
 		t.Fatalf("retry must redirect back to the thread, got %d %q", rec.Code, rec.Header().Get("Location"))
 	}
-	if len(pipe.turns) != 1 || pipe.turns[0] != (worklist.TurnRef{Item: "pr1", Turn: "t1"}) {
+	if len(pipe.turns) != 1 || pipe.turns[0].Item != "pr1" || pipe.turns[0].Turn != "t1" || pipe.turns[0].Attempt != storedItem(t, store, "pr1").Thread[0].Attempt || pipe.turns[0].Attempt == "" {
 		t.Fatalf("retry must dispatch the original turn once, got %+v", pipe.turns)
 	}
 	if pipe.converseModels[0] != "alt" || pipe.converseEndpoints[0] != "https://alt" {
@@ -243,7 +243,7 @@ func TestThreadRetryReviewPanelTurn(t *testing.T) {
 		t.Fatalf("the stalled review-panel request must offer Retry, got:\n%s", page)
 	}
 	postRetry(h, url.Values{"id": {"pr1"}, "turn": {"so1"}, "choice": {"c0|default"}})
-	if len(pipe.converses) != 0 || len(pipe.secondOpinions) != 1 || pipe.turns[0] != (worklist.TurnRef{Item: "pr1", Turn: "so1"}) {
+	if len(pipe.converses) != 0 || len(pipe.secondOpinions) != 1 || pipe.turns[0].Item != "pr1" || pipe.turns[0].Turn != "so1" || pipe.turns[0].Attempt == "" {
 		t.Fatalf("want one blind review of so1, got converses=%v secondOpinions=%v turns=%+v", pipe.converses, pipe.secondOpinions, pipe.turns)
 	}
 	if pipe.soModels[0] != "alt" {

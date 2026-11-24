@@ -305,3 +305,53 @@ func TestFirstReviewModelIsTheFirstVisible(t *testing.T) {
 		t.Fatalf("with a's request hidden, FirstReviewModel = %q, want b", got)
 	}
 }
+
+// A legacy synthesis (no recorded reviews) names its comparison from the whole thread
+// before the read is trimmed: when one of six large reviews does not fit, the read
+// still names all six, so it is not ready and the run declines rather than compare
+// five.
+func TestThreadWindowNamesLegacyReviewsBeforeTrimming(t *testing.T) {
+	big := strings.Repeat("r", 750<<10)
+	var th []Message
+	for i := range 6 {
+		q := "q" + string(rune('0'+i))
+		th = append(th,
+			Message{ID: q, Role: RoleUser, Kind: KindReviewRequest, Content: "Can you review this PR?", At: t0},
+			Message{ID: "r" + q, ReplyTo: q, Role: RoleAgent, Content: big, At: t0})
+	}
+	th = append(th, Message{ID: "s1", Role: RoleUser, Kind: KindSynthesisRequest, Content: SynthesisPrompt, At: t1})
+	w := WorkItem{ID: "a", Type: TypePullRequest, Thread: th}
+	if !w.SynthesisReady("s1") {
+		t.Fatal("the stored thread holds all six reviews")
+	}
+	win := ThreadWindow(w, "s1", MaxItemBytes)
+	if got := win.Thread[len(win.Thread)-1].Reviews; len(got) != 6 {
+		t.Fatalf("the read must name all six reviews, got %v", got)
+	}
+	if win.SynthesisReady("s1") || w.SynthesisFits("s1") {
+		t.Fatal("five of six reviews must not pass as the comparison")
+	}
+	w.Thread = append(slices.Clone(th[2:12]), th[12]) // five reviews fit
+	if !w.SynthesisFits("s1") {
+		t.Fatal("five reviews that fit are a comparison")
+	}
+	if w.Thread[len(w.Thread)-1].Reviews != nil {
+		t.Fatal("the read names the reviews on its copy; the stored turn is unchanged")
+	}
+}
+
+// A retry that shared a run already in flight puts the earlier attempt back and keeps
+// the new time; a later attempt, or an answer, wins.
+func TestRevertAttempt(t *testing.T) {
+	now := t2.Add(time.Hour)
+	w := WorkItem{ID: "i", Thread: []Message{{ID: "t1", Role: RoleUser, Content: "q", Attempt: "a0", At: t0}}}
+	s := w.Restamp(0, now)
+	if !w.RevertAttempt(s) || w.Thread[0].Attempt != "a0" || !w.Thread[0].At.Equal(now) {
+		t.Fatalf("RevertAttempt must restore the attempt and keep the time, got %+v", w.Thread[0])
+	}
+	s = w.Restamp(0, now)
+	w.Restamp(0, now)
+	if w.RevertAttempt(s) {
+		t.Fatal("RevertAttempt must leave a later attempt alone")
+	}
+}

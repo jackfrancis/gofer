@@ -558,12 +558,15 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, back, http.StatusSeeOther)
 		return
 	}
-	ref := worklist.TurnRef{Item: id, Turn: turn}
+	ref := worklist.TurnRef{Item: id, Turn: turn, Attempt: stamp.Attempt}
 	if independent {
 		err = h.pipeline.SecondOpinion(r.Context(), user.ID, ref, opt.Endpoint, opt.Model)
 	} else {
 		err = h.pipeline.Converse(r.Context(), user.ID, ref, opt.Endpoint, opt.Model)
 	}
+	// A run for the turn was still in flight, and the retry shares it: the turn keeps
+	// that run's attempt, so its notice still ends the wait.
+	h.revertShared(r.Context(), user.ID, err, []worklist.RetryStamp{stamp})
 	if errors.Is(err, ingest.ErrNotAccepted) {
 		// The backend certainly holds no run for this attempt, so the turn is not in
 		// flight: put its time back, so the page offers Retry again at once, and say
@@ -844,7 +847,10 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	at := h.now().UTC()
-	var refs []worklist.TurnRef
+	var (
+		refs    []worklist.TurnRef
+		retries []worklist.RetryStamp // turns retried, not added: a shared run reverts them
+	)
 	selected, ok := formSelection(r)
 	if !ok {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
@@ -853,7 +859,7 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 	// Choose and stamp the PRs in one atomic update, against the threads as stored.
 	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		var changed []worklist.WorkItem
-		refs = refs[:0]
+		refs, retries = refs[:0], retries[:0]
 		for _, it := range current {
 			if it.Type != worklist.TypePullRequest || !it.Actionable() || !inScope(selected, it) {
 				continue // off the radar (hidden or closed), waiting on someone else, or outside the page's projects: never review it in bulk
@@ -867,14 +873,17 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 			// If the last request's run has finished or failed, retry it — reusing the
 			// prompt (refresh its timestamp) rather than stacking a second one. This is
 			// what makes the button self-healing after a rate-limited batch.
-			turn, retry := it.RetryStalled(at, reviewStaleAfter)
-			if !retry {
+			ref := worklist.TurnRef{Item: it.ID}
+			if stamp, retry := it.RetryStalled(at, reviewStaleAfter); retry {
+				ref.Turn, ref.Attempt = stamp.Key, stamp.Attempt
+				retries = append(retries, stamp)
+			} else {
 				msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, At: at}
 				it.Thread = append(it.Thread, msg)
-				turn = msg.ID
+				ref.Turn = msg.ID
 			}
 			changed = append(changed, it)
-			refs = append(refs, worklist.TurnRef{Item: it.ID, Turn: turn})
+			refs = append(refs, ref)
 		}
 		return changed, nil
 	})
@@ -883,9 +892,44 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		// request from the stored thread; then launch the runs concurrently with the
 		// model picked from the button's dropdown (an empty choice uses the default).
 		opt, _ := h.resolveOption(strings.TrimSpace(r.FormValue("choice")))
-		_ = h.pipeline.ReviewAll(r.Context(), user.ID, refs, opt.Endpoint, opt.Model)
+		err := h.pipeline.ReviewAll(r.Context(), user.ID, refs, opt.Endpoint, opt.Model)
+		h.revertShared(r.Context(), user.ID, err, retries)
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// revertShared puts back the earlier attempt on each retried turn (stamps) whose
+// dispatch shared a run already in flight instead of starting one (ingest.SharedRuns
+// of err): that run was dispatched as the earlier attempt, so only its notice can end
+// the wait (worklist.RevertAttempt). It runs detached from the request, under
+// undoRetryTimeout; a failure only logs, and the turn then waits out reviewStaleAfter.
+func (h *Handler) revertShared(ctx context.Context, ownerID string, err error, stamps []worklist.RetryStamp) {
+	shared := map[worklist.TurnRef]bool{}
+	for _, ref := range ingest.SharedRuns(err) {
+		shared[worklist.TurnRef{Item: ref.Item, Turn: ref.Turn}] = true
+	}
+	if len(shared) == 0 || len(stamps) == 0 {
+		return
+	}
+	byItem := map[string]worklist.RetryStamp{}
+	for _, s := range stamps {
+		byItem[s.Item] = s
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoRetryTimeout)
+	defer cancel()
+	uerr := h.store.Update(ctx, ownerID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		var changed []worklist.WorkItem
+		for _, it := range current {
+			s, ok := byItem[it.ID]
+			if ok && shared[worklist.TurnRef{Item: it.ID, Turn: s.Key}] && it.RevertAttempt(s) {
+				changed = append(changed, it)
+			}
+		}
+		return changed, nil
+	})
+	if uerr != nil {
+		slog.WarnContext(ctx, "retry shared a run in flight, and restoring its attempt failed", "user", ownerID, "err", uerr)
+	}
 }
 
 // SecondOpinion handles POST /items/second-opinion — the "Review panel" action. It

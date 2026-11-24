@@ -280,6 +280,13 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 			ask := truncateMessage(th[anchor], left/2)
 			window = []Message{ask, truncateMessage(th[reply], left-messageSize(ask))}
 		} else {
+			if th[anchor].Kind == KindSynthesisRequest && len(th[anchor].Reviews) == 0 {
+				// A synthesis request stored before it named its reviews: name the ones it
+				// compares now, from the whole thread, before the budget trims it, so a
+				// review that does not fit makes the run decline (SynthesisInputs)
+				// instead of leaving a smaller comparison it cannot tell from the whole.
+				th[anchor].Reviews = keyed.synthesisReviews(anchor, keyed.replies())
+			}
 			ask := th[anchor]
 			if messageSize(ask) > left {
 				ask = truncateMessage(ask, left/2)

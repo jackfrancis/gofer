@@ -78,6 +78,7 @@ func work(ctx context.Context, rt *aeiruntime.Runtime) error {
 		ItemID:      spec.Parameters["item"],
 		Turn:        strings.TrimSpace(spec.Parameters["turn"]),
 		Independent: strings.TrimSpace(spec.Parameters["independent"]) == "true",
+		Attempt:     strings.TrimSpace(spec.Parameters["attempt"]),
 		Bots:        splitBots(spec.Parameters["bots"]),
 		Logger:      log,
 	}

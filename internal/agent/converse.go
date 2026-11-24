@@ -52,9 +52,11 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	// The turn's kind tells us whether this reply is a consensus synthesis, whose
 	// leading verdict token we record as structured metadata.
 	triggerKind := trigger.Kind
-	// A notice this run posts ends only the attempt it read (Message.Attempt), so a
-	// late run of an earlier attempt cannot end a retry still in flight.
-	attempt := trigger.Attempt
+	// A notice this run posts ends only the attempt it was dispatched as (run
+	// parameter "attempt", Message.Attempt), never whatever the stored turn says when
+	// it starts: a run queued before a retry reads the retry's attempt, and must not
+	// end it.
+	attempt := p.Attempt
 	var reviews []worklist.Message // a synthesis's comparison: its review pairs, nothing else
 	if triggerKind == worklist.KindSynthesisRequest {
 		var ready bool
@@ -237,8 +239,8 @@ func postReconnect(ctx context.Context, sink Sink, itemID, triggerKey, attempt s
 }
 
 // postNotice saves a system notice (worklist.Message.Notice) with text in reply to
-// the turn: the run ended without answering the attempt it read (attempt, the turn's
-// Message.Attempt when the run read it).
+// the turn: the run ended without answering the attempt it was dispatched as
+// (attempt, Params.Attempt).
 func postNotice(ctx context.Context, sink Sink, itemID, triggerKey, attempt, notice, text string) error {
 	msg := worklist.Message{
 		ID:      worklist.NewMessageID(),

@@ -198,9 +198,9 @@ func TestUndoRetry(t *testing.T) {
 	}
 
 	it := stalled()
-	key, ok := it.RetryStalled(now, 5*time.Minute)
-	if !ok || key != "t1" || !it.Thread[0].At.Equal(now) || it.Thread[0].Attempt == "a0" || it.Thread[0].Attempt == "" {
-		t.Fatalf("RetryStalled = %q %v, turn %+v: want a new attempt", key, ok, it.Thread[0])
+	st, ok := it.RetryStalled(now, 5*time.Minute)
+	if !ok || st.Key != "t1" || st.Item != "i" || !it.Thread[0].At.Equal(now) || it.Thread[0].Attempt == "a0" || it.Thread[0].Attempt == "" {
+		t.Fatalf("RetryStalled = %+v %v, turn %+v: want a new attempt", st, ok, it.Thread[0])
 	}
 	it = stalled()
 	stamp := it.Restamp(0, now)

@@ -96,17 +96,18 @@ func TestConverseSynthesisSendsOnlyItsReviews(t *testing.T) {
 	}
 }
 
-// A notice names the attempt the run read; a legacy synthesis (no recorded reviews)
-// with only one visible review declines too.
+// A notice names the attempt the run was dispatched as, not the one the stored turn
+// shows when it starts (a retry may have replaced it since it was queued); a legacy
+// synthesis (no recorded reviews) with only one visible review declines too.
 func TestConverseSynthesisNoticeNamesItsAttempt(t *testing.T) {
 	now := time.Now().UTC()
 	item := synthesisItem(now)
-	item.Thread[4].Reviews = nil // stored before reviews were recorded
-	item.Thread[4].Attempt = "attempt-2"
+	item.Thread[4].Reviews = nil         // stored before reviews were recorded
+	item.Thread[4].Attempt = "attempt-3" // a retry started after this run was queued
 	item.Thread[3].Hidden = true
 	sink := &memSink{items: []worklist.WorkItem{item}}
 	fc := &fakeConverser{reply: "AGREEMENT\nOne review agrees with itself."}
-	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: item.ID, Turn: "s1", Converser: fc}, fakeVendor{token: "t"}, sink); err != nil {
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: item.ID, Turn: "s1", Attempt: "attempt-2", Converser: fc}, fakeVendor{token: "t"}, sink); err != nil {
 		t.Fatal(err)
 	}
 	last := sink.items[0].Thread[len(sink.items[0].Thread)-1]

@@ -251,3 +251,49 @@ func TestSynthesisTooLargeOffersNoRetry(t *testing.T) {
 		t.Fatalf("a comparison that cannot fit must not be dispatched, got %v", pipe.turns)
 	}
 }
+
+// A retry that shares a run still in flight (the gate submitted nothing) keeps that
+// run's attempt on the turn, and the new time, so the run's own notice still ends the
+// wait; Review all's retries do the same.
+func TestRetrySharingARunKeepsItsAttempt(t *testing.T) {
+	now := retryNow
+	old := now.Add(-time.Hour)
+	seed := func(store *worklist.MemoryStore) {
+		store.Seed("u1", worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, State: "open"}, Thread: []worklist.Message{
+			{ID: "t1", Role: worklist.RoleUser, Kind: worklist.KindReviewRequest, Content: reviewPrompt, Attempt: "a0", At: old},
+		}})
+	}
+	check := func(t *testing.T, store *worklist.MemoryStore, pipe *recordPipeline) {
+		t.Helper()
+		if len(pipe.turns) != 1 || pipe.turns[0].Attempt == "" || pipe.turns[0].Attempt == "a0" {
+			t.Fatalf("the retry dispatches a new attempt, got %+v", pipe.turns)
+		}
+		m := storedItem(t, store, "pr1").Thread[0]
+		if m.Attempt != "a0" || !m.At.Equal(now) {
+			t.Fatalf("a shared run keeps the turn's attempt (a0) and the retry's time, got %+v", m)
+		}
+		// The shared run's notice (dispatched as a0) ends the wait.
+		_ = worklist.ApplyReply(context.Background(), store, "u1", "pr1", "t1", worklist.Message{ID: "n1", Notice: worklist.NoticeReconnect, Content: worklist.ReconnectNotice, Attempt: "a0", At: now})
+		if storedItem(t, store, "pr1").ReplyPending(now, reviewStaleAfter) {
+			t.Fatal("the shared run's notice must end the wait")
+		}
+	}
+	t.Run("thread retry", func(t *testing.T) {
+		store := worklist.NewMemoryStore()
+		seed(store)
+		pipe := &recordPipeline{shared: true}
+		h := retryHandler(store, pipe, &now)
+		postRetry(h, url.Values{"id": {"pr1"}, "turn": {"t1"}})
+		check(t, store, pipe)
+	})
+	t.Run("review all", func(t *testing.T) {
+		store := worklist.NewMemoryStore()
+		seed(store)
+		pipe := &recordPipeline{shared: true}
+		h := retryHandler(store, pipe, &now)
+		req := httptest.NewRequest(http.MethodPost, "/items/review-all", strings.NewReader(""))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		h.ReviewAllPRs(httptest.NewRecorder(), req)
+		check(t, store, pipe)
+	})
+}

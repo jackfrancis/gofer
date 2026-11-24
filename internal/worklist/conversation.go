@@ -96,9 +96,11 @@ type Message struct {
 	// (SynthesisReady). Empty on every other turn, and on synthesis requests stored
 	// before it was recorded.
 	Reviews []string `json:"reviews,omitempty"`
-	// Attempt identifies the current attempt at answering a user turn: a retry gives
-	// the turn a new one (Restamp). A system notice carries the attempt of the turn
-	// it read, and ends only that attempt (noticed), so a run of an earlier attempt
+	// Attempt identifies the current attempt at answering a user turn: a retry that
+	// starts a new run gives the turn a new one (Restamp; a retry that shares a run
+	// already in flight puts the earlier one back, RevertAttempt). A system notice
+	// carries the attempt its run was dispatched as (TurnRef.Attempt, a run
+	// parameter), and ends only that attempt (noticed), so a run of an earlier attempt
 	// that finishes late cannot stop the page watching the retry. Empty on a turn
 	// never retried, and on every other agent turn.
 	Attempt string `json:"attempt,omitempty"`
@@ -206,6 +208,10 @@ func (w WorkItem) turnPosition(key string) int {
 type TurnRef struct {
 	Item string
 	Turn string
+	// Attempt is the attempt a retry dispatches (Message.Attempt, from Restamp),
+	// carried to the run as a parameter so its notices name it; empty for a turn's
+	// first attempt.
+	Attempt string
 }
 
 // NewMessageID returns a random id for a new thread turn.
@@ -544,23 +550,24 @@ func (w WorkItem) RetryableTurn(now time.Time, staleAfter time.Duration) (int, b
 
 // RetryStalled prepares the RetryableTurn for a retry under its existing key: it
 // re-stamps the turn's time to now, so the turn is pending again and a second retry
-// within staleAfter finds nothing to do, and returns the key a dispatch must name.
+// within staleAfter finds nothing to do, and returns the stamp (RetryStamp), whose key
+// and attempt a dispatch must name.
 // It changes nothing and reports false when there is no such turn. The caller
 // persists the item in the same Store.Update that read it. A retry never adds a
 // turn, and the store keeps one answer per turn (AppendReply), so a first run that
 // answers late and its retry leave one reply.
-func (w *WorkItem) RetryStalled(now time.Time, staleAfter time.Duration) (string, bool) {
+func (w *WorkItem) RetryStalled(now time.Time, staleAfter time.Duration) (RetryStamp, bool) {
 	i, ok := w.RetryableTurn(now, staleAfter)
 	if !ok {
-		return "", false
+		return RetryStamp{}, false
 	}
-	return w.Restamp(i, now).Key, true
+	return w.Restamp(i, now), true
 }
 
 // RetryStamp records one retry of a turn (Restamp): the turn, the time and attempt it
 // was given, and the ones it had before, which UndoRetry puts back.
 type RetryStamp struct {
-	Key                  string
+	Item, Key            string
 	At, PrevAt           time.Time
 	Attempt, PrevAttempt string
 }
@@ -572,9 +579,24 @@ type RetryStamp struct {
 func (w *WorkItem) Restamp(i int, now time.Time) RetryStamp {
 	w.Thread = slices.Clone(w.Thread)
 	m := &w.Thread[i]
-	s := RetryStamp{Key: w.TurnKey(i), At: now, PrevAt: m.At, Attempt: NewMessageID(), PrevAttempt: m.Attempt}
+	s := RetryStamp{Item: w.ID, Key: w.TurnKey(i), At: now, PrevAt: m.At, Attempt: NewMessageID(), PrevAttempt: m.Attempt}
 	m.At, m.Attempt = s.At, s.Attempt
 	return s
+}
+
+// RevertAttempt puts back the attempt Restamp's stamp s replaced, keeping the new
+// time, when the retry started no run of its own but shares one already in flight
+// for the turn: that run was dispatched as the earlier attempt, so only its notice
+// can end the wait. It changes nothing, and reports false, unless the turn still
+// carries exactly that attempt and is unanswered.
+func (w *WorkItem) RevertAttempt(s RetryStamp) bool {
+	i, ok := w.TurnIndex(s.Key)
+	if !ok || w.Thread[i].Role != RoleUser || w.Thread[i].Attempt != s.Attempt || w.Answered(s.Key) {
+		return false
+	}
+	w.Thread = slices.Clone(w.Thread)
+	w.Thread[i].Attempt = s.PrevAttempt
+	return true
 }
 
 // UndoRetry reverses Restamp's stamp s, restoring the turn's earlier time and

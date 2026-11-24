@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/jackfrancis/gofer/internal/worklist"
@@ -28,5 +29,41 @@ func TestSynthesizeDispatchesDefaultModelConverse(t *testing.T) {
 	}
 	if _, blind := p["independent"]; blind {
 		t.Fatalf("the synthesis must read the thread, got %+v", p)
+	}
+}
+
+// runningDispatcher records submissions and reports every run still running.
+type runningDispatcher struct{ recordDispatcher }
+
+func (d *runningDispatcher) Status(context.Context, string) (RunStatus, error) {
+	return RunStatus{Phase: "Running"}, nil
+}
+
+// A retry's attempt rides to the run as a parameter, and a dispatch that shares a run
+// already in flight says so (ErrRunShared, naming the turn), so the web tier keeps
+// that run's attempt on the turn.
+func TestConverseAttemptAndSharedRun(t *testing.T) {
+	d := &runningDispatcher{}
+	ig := New(d, "gofer-agent", "http://gofer/sink", nil, "https://api.example/chat", "model-x")
+	first := worklist.TurnRef{Item: "item-7", Turn: "t1"}
+	if err := ig.Converse(context.Background(), "github:1", first, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := d.specs[0].Parameters["attempt"]; ok {
+		t.Fatalf("a first attempt carries no attempt parameter, got %+v", d.specs[0].Parameters)
+	}
+	retry := worklist.TurnRef{Item: "item-7", Turn: "t1", Attempt: "a2"}
+	err := ig.Converse(context.Background(), "github:1", retry, "", "")
+	if !errors.Is(err, ErrRunShared) || len(d.specs) != 1 {
+		t.Fatalf("a retry while the run is in flight must share it and say so, got %v and %d submissions", err, len(d.specs))
+	}
+	if got := SharedRuns(errors.Join(errors.New("other"), err)); len(got) != 1 || got[0] != retry {
+		t.Fatalf("SharedRuns = %+v, want the retried turn", got)
+	}
+	if err := ig.Converse(context.Background(), "github:1", worklist.TurnRef{Item: "item-8", Turn: "t9", Attempt: "a2"}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.specs[1].Parameters["attempt"]; got != "a2" {
+		t.Fatalf("attempt parameter = %q, want a2", got)
 	}
 }

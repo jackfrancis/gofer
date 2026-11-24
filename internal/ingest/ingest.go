@@ -60,6 +60,46 @@ type Dispatcher interface {
 // ErrNotAccepted marks a Submit error after which the backend certainly holds no run.
 var ErrNotAccepted = errors.New("the backend did not accept the run")
 
+// ErrRunShared marks a converse dispatch that submitted no run because one for the
+// same turn is already in flight (the in-flight gate): the request shares that run.
+// It is not a failure; it tells a retry that no run of its own started, so the turn
+// keeps the earlier run's attempt (worklist.WorkItem.RevertAttempt). Errors that
+// match it are *RunSharedError.
+var ErrRunShared = errors.New("ingest: a run for this turn is already in flight")
+
+// RunSharedError reports that the dispatch for Ref shared a run already in flight
+// (ErrRunShared).
+type RunSharedError struct{ Ref worklist.TurnRef }
+
+func (e *RunSharedError) Error() string {
+	return fmt.Sprintf("%v: item %s, turn %s", ErrRunShared, e.Ref.Item, e.Ref.Turn)
+}
+
+// Is matches ErrRunShared.
+func (e *RunSharedError) Is(target error) bool { return target == ErrRunShared }
+
+// SharedRuns returns the turns err reports as sharing a run already in flight: err
+// may be one dispatch's error or a batch's joined errors.
+func SharedRuns(err error) []worklist.TurnRef {
+	var out []worklist.TurnRef
+	var walk func(error)
+	walk = func(err error) {
+		switch e := err.(type) {
+		case nil:
+		case *RunSharedError:
+			out = append(out, e.Ref)
+		case interface{ Unwrap() []error }:
+			for _, inner := range e.Unwrap() {
+				walk(inner)
+			}
+		case interface{ Unwrap() error }:
+			walk(e.Unwrap())
+		}
+	}
+	walk(err)
+	return out
+}
+
 // NoopDispatcher is the default backend: it accepts every run and does nothing (no-op,
 // always success). With it selected nothing executes, so no work is fetched and no
 // reply is written back — selecting a concrete backend is what brings the worklist to
@@ -589,7 +629,9 @@ func (i *Ingestor) dispatchEach(ctx context.Context, ownerID string, refs []work
 
 // dispatchConverse submits one github-converse run answering ref, unless a run for
 // the same owner, item and turn is already in flight (see runKey): a double submit,
-// or a retry while the first run is still working, then shares that run. A non-empty
+// or a retry while the first run is still working, then shares that run, and the
+// error is a *RunSharedError (ErrRunShared). ref.Attempt rides to the run as its
+// "attempt" parameter. A non-empty
 // endpoint/model overrides the default connection for this turn; independent carries a
 // blind-review flag so a runtime answers without the prior thread.
 func (i *Ingestor) dispatchConverse(ctx context.Context, ownerID string, ref worklist.TurnRef, endpoint, model string, independent bool) error {
@@ -605,10 +647,15 @@ func (i *Ingestor) dispatchConverse(ctx context.Context, ownerID string, ref wor
 	if independent {
 		params["independent"] = "true"
 	}
+	if ref.Attempt != "" {
+		params["attempt"] = ref.Attempt // the run's notices name it
+	}
 	key := runKey{owner: ownerID, task: taskConverse, item: ref.Item, turn: ref.Turn}
 	mine, ok := i.reserve(ctx, key, converseGate, nil)
 	if !ok {
-		return nil // a run for this turn is already in flight
+		// A run for this turn is already in flight: share it, and say so, so a retry
+		// keeps that run's attempt.
+		return &RunSharedError{Ref: ref}
 	}
 	id, err := i.d.Submit(ctx, RunSpec{
 		TaskRef:    taskConverse,
@@ -693,7 +740,7 @@ func (i *Ingestor) converseInFlight(ownerID, itemID string) bool {
 func (i *Ingestor) Synthesize(ctx context.Context, ownerID string, ref worklist.TurnRef) {
 	sctx, cancel := context.WithTimeout(ctx, submitTimeout)
 	defer cancel()
-	if err := i.dispatchConverse(sctx, ownerID, ref, "", "", false); err != nil {
+	if err := i.dispatchConverse(sctx, ownerID, ref, "", "", false); err != nil && !errors.Is(err, ErrRunShared) {
 		i.log.Warn("review-panel synthesis dispatch failed; the thread offers a retry", "owner", ownerID, "item", ref.Item, "turn", ref.Turn, "err", err)
 	}
 }

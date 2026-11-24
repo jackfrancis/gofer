@@ -95,6 +95,7 @@ type Params struct {
 	Model         string                     // chat-model identifier stamped on agent replies (converse)
 	Converser     worklist.Conversationalist // github-converse assistant; required for that job
 	Independent   bool                       // converse: answer blind — omit prior thread turns (independent review)
+	Attempt       string                     // converse: the attempt this run is (worklist.Message.Attempt); its notices name it, whatever the stored turn says by then
 	Researcher    worklist.ResearchRanker    // github-research re-ranker; required for that job
 	TurnReader    worklist.TurnReader        // reads the user's last word on waiting items; nil leaves the timeline to decide
 	Bots          []string                   // logins whose comments are automated (BOT_REVIEWERS): never the last word
