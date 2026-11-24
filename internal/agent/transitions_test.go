@@ -357,3 +357,27 @@ func TestRefreshEditDoesNotJumpAReply(t *testing.T) {
 		t.Fatal("an edit to my comment took the last word from the author's reply")
 	}
 }
+
+// A fresh hit after another team is asked does not replace the confirmation of my
+// team's request with a vaguer one of both teams: the requester and the date stand,
+// and so they do when the other team is withdrawn during a partial search.
+func TestRefreshFreshHitKeepsTheStandingConfirmation(t *testing.T) {
+	for _, stage := range []string{"fresh hit", "other team withdrawn"} {
+		t.Run(stage, func(t *testing.T) {
+			store := worklist.NewMemoryStore()
+			s, before := confirmedTeamRequest(t, store)
+			s.timeline = append(s.timeline, `{"event":"review_requested","actor":{"login":"other-lead"},"requested_team":{"slug":"other-team"},"created_at":"2026-01-08T10:00:00Z"}`)
+			it := s.refresh(t, store, "2026-01-08T10:00:00Z")
+			if stage == "other team withdrawn" {
+				s.reviewHit, s.reviewSearchIncomplete = false, true
+				s.timeline = append(s.timeline, `{"event":"review_request_removed","actor":{"login":"other-lead"},"requested_team":{"slug":"other-team"},"created_at":"2026-01-09T10:00:00Z"}`)
+				it = s.refresh(t, store, "2026-01-09T10:00:00Z")
+			}
+			c := it.Signals.TeamConfirmed
+			if !it.Actionable() || it.Signals.ReviewRequestedBy != "lead" || !it.Signals.AwaitingMeSince.Equal(before.Signals.AwaitingMeSince) ||
+				c == nil || len(c.Requests) != 1 || c.Requests[0].Team != "my-team" {
+				t.Errorf("actionable %t, requester %q, awaiting me since %v, confirmation %+v", it.Actionable(), it.Signals.ReviewRequestedBy, it.Signals.AwaitingMeSince, c)
+			}
+		})
+	}
+}

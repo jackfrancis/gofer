@@ -245,7 +245,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   enrich) it stands while every one of those requests is still outstanding
   (`ActivityOptions.Confirmed`, `TeamConfirmation.StillOutstanding`), covering only
   them: a partial search neither confirms a new request nor cancels an unchanged one,
-  and another team asked since neither ends it nor joins it. Which team names them is unknown when several are outstanding, so the item
+  and another team asked since neither ends it nor joins it. While it stands it wins
+  over a fresh hit too, which it already explains more specifically, so asking (and
+  later withdrawing) another team never resets the requester or the date. Which team names them is unknown when several are outstanding, so the item
   awaits them only if every outstanding team request was made since their last
   comment or review (since the latest), and the requester (`ReviewRequestedBy`, so a
   bot's team request scores as a bot's) is named only if those requests share an

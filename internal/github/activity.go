@@ -63,11 +63,12 @@ type ActivityOptions struct {
 	// awaits no one in particular.
 	ReviewRequested bool
 	// Confirmed is the team requests an earlier refresh's search confirmed
-	// (worklist.Signals.TeamConfirmed), passed when no complete search this refresh
-	// says otherwise: the review search was cut short or did not run. It is evidence
-	// as ReviewRequested is, but only while every one of those requests is still
-	// outstanding (the same team, the same request event), and it covers only them: a
-	// partial search neither confirms a new request nor cancels an unchanged one.
+	// (worklist.Signals.TeamConfirmed), passed unless this refresh's review search was
+	// walked whole without returning the item. It is evidence as ReviewRequested is,
+	// but only while every one of those requests is still outstanding (the same team,
+	// the same request event), and it covers only them: a partial search neither
+	// confirms a new request nor cancels an unchanged one. While it stands it is used
+	// even on a fresh hit, which it already explains more specifically.
 	Confirmed *worklist.TeamConfirmation
 	// PullRequest says the item is a pull request, whose head commit says whether the
 	// author pushed since login's last word.
@@ -305,21 +306,23 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 	if !requestedAt.IsZero() && requestedAt.After(myLastActivityAt) {
 		meSince = requestedAt
 	}
-	// The team requests the evidence covers: every outstanding one on a fresh search
-	// hit, or the ones an earlier search confirmed while each is still outstanding (the
-	// same team, the same request event). A request made since is not covered.
+	// The team requests the evidence covers: the ones an earlier search confirmed,
+	// while each is still outstanding (the same team, the same request event), or else
+	// every outstanding one on a fresh search hit. The earlier confirmation is the more
+	// specific, and a fresh hit cannot narrow it, so it wins while it stands: a team
+	// asked since joins nothing, and its withdrawal ends nothing.
 	var covered []worklist.ConfirmedRequest
 	switch {
 	case personalPending || len(teamRequests) == 0:
-	case opts.ReviewRequested:
-		for team, tr := range teamRequests {
-			covered = append(covered, worklist.ConfirmedRequest{Team: team, At: tr.at})
-		}
 	case opts.Confirmed != nil && opts.Confirmed.StillOutstanding(func(team string) (time.Time, bool) {
 		tr, ok := teamRequests[team]
 		return tr.at, ok
 	}):
 		covered = opts.Confirmed.Requests
+	case opts.ReviewRequested:
+		for team, tr := range teamRequests {
+			covered = append(covered, worklist.ConfirmedRequest{Team: team, At: tr.at})
+		}
 	}
 	if len(covered) > 0 {
 		// The search hit is otherwise unexplained: one of the covered team requests

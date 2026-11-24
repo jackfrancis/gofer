@@ -49,7 +49,8 @@ const (
 // for a standalone enrich, which ran none). Only a fresh hit is new evidence that a
 // team request names the user (github.ActivityOptions.ReviewRequested); a request
 // carried over is none. What an earlier search confirmed (Signals.TeamConfirmed)
-// stands unless this one was walked whole without returning the item.
+// stands, on a fresh hit too, unless this one was walked whole without returning
+// the item.
 func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried map[string]bool, reviews reviewSearch) error {
 	provider := p.Provider
 	if provider == "" {
@@ -104,9 +105,10 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 			ReviewRequested: reviews.hits[items[i].ID],
 			PullRequest:     items[i].Type == worklist.TypePullRequest,
 			Prior:           items[i].Signals.LastWord}
-		if !reviews.complete {
+		if reviews.hits[items[i].ID] || !reviews.complete {
 			// No complete search says the request is gone: what an earlier one confirmed
-			// stands while those team requests are outstanding.
+			// stands while those team requests are outstanding, and a fresh hit does not
+			// replace it with a vaguer confirmation of every team asked.
 			opts.Confirmed = items[i].Signals.TeamConfirmed
 		}
 		if slices.Contains(items[i].Signals.Reasons, worklist.ReasonAuthor) {
