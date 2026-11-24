@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -151,5 +152,22 @@ func TestCredentialContractWithRuntime(t *testing.T) {
 	vc, err := plane.VendCredential(context.Background(), "github", "v8")
 	if err != nil || vc.AccessToken != "ghu_x" || vc.Version != "v9" || src.req.Rejected != "v8" {
 		t.Fatalf("vend = %+v, %v; broker got %+v", vc, err, src.req)
+	}
+}
+
+// The write grant (ADR 0009) never reaches a run: the broker refuses it by name,
+// without even asking the source, which would answer anything.
+func TestCredentialNeverVendsWriteGrant(t *testing.T) {
+	src := &fakeSource{cred: vault.Credential{Provider: auth.WriteProvider, AccessToken: "gho_write"}}
+	rec := httptest.NewRecorder()
+	NewCredentialHandler(src, "").Vend(rec, authedGet("/agent/credential?provider="+auth.WriteProvider))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if src.provider != "" {
+		t.Errorf("the broker asked the source for %q", src.provider)
+	}
+	if body := rec.Body.String(); strings.Contains(body, "gho_write") {
+		t.Errorf("the write token left the web tier: %s", body)
 	}
 }

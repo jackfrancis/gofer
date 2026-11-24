@@ -28,11 +28,11 @@ import (
 // it read. It is a GitHub field, so a hidden item keeps it (enrich skips hidden
 // items, so it is the last one read).
 //
-// The two model-derived signals are the exception to "the run owns its signals": a
+// The model-derived signals are the exception to "the run owns its signals": a
 // GitHub fetch cannot produce them, so a refresh sends none, and a scoring pass that
 // failed for an item sends none either. A write-back that carries no model proposal
-// (Signals.Proposed) or no research adjustment (Signals.Research) keeps the stored
-// one; a write-back that carries one replaces it. A run that only re-derives the
+// (Signals.Proposed), research adjustment (Signals.Research) or turn reading
+// (Signals.Turn) keeps the stored one; a write-back that carries one replaces it. A run that only re-derives the
 // research adjustment writes it alone, through ApplyResearch, so it never carries the
 // rest of an item it read before a refresh. Every workload pass sends only the
 // model signal it derived (or none), so it never restores a stale copy it read.
@@ -94,14 +94,17 @@ func KeepCI(incoming *WorkItem, stored WorkItem) {
 }
 
 // KeepModelSignals fills in the model-derived signals an incoming write-back does not
-// carry — the model proposal and the research adjustment — from the stored signals.
-// A value the write-back carries wins.
+// carry — the model proposal, the research adjustment and the turn reading — from the
+// stored signals. A value the write-back carries wins.
 func KeepModelSignals(incoming *Signals, stored Signals) {
 	if incoming.Proposed == nil {
 		incoming.Proposed = stored.Proposed
 	}
 	if incoming.Research == nil {
 		incoming.Research = stored.Research
+	}
+	if incoming.Turn == nil {
+		incoming.Turn = stored.Turn
 	}
 }
 

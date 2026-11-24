@@ -79,6 +79,7 @@ type planeFixture struct {
 	ingest   http.Handler
 	reply    http.Handler
 	research http.Handler
+	turn     http.Handler
 	mint     func(scopes ...string) string
 }
 
@@ -100,6 +101,7 @@ func newPlane(t *testing.T) planeFixture {
 		ingest:   auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Ingest)),
 		reply:    auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Reply)),
 		research: auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Research)),
+		turn:     auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Turns)),
 		mint: func(scopes ...string) string {
 			tok, err := authority.Mint(identity.Claims{RunID: "run", Subject: "u1", Scopes: scopes})
 			if err != nil {
@@ -458,5 +460,42 @@ func TestAgentResearchLongThread(t *testing.T) {
 	}
 	if got, _ := f.store.List(context.Background(), "u1"); got[0].Signals.Research == nil || len(got[0].Signals.Research.Turns) != len(turns) {
 		t.Fatal("the long thread's research must land with all its turns")
+	}
+}
+
+// POST /agent/worklist/turns writes the turn readings alone, each only for its item's
+// current last word.
+func TestAgentTurns(t *testing.T) {
+	f := newPlane(t)
+	at := time.Date(2026, 11, 19, 22, 0, 0, 0, time.UTC)
+	lw := worklist.NewLastWord("review:1", at, false, []string{"author"}, "@author can you downscope?")
+	f.store.Seed("u1", worklist.WorkItem{
+		ID:      "a",
+		GitHub:  worklist.GitHubRef{Repo: "o/r", Number: 1, Title: "Stored title"},
+		Signals: worklist.Signals{AwaitingOthersSince: at, LastWord: lw},
+	})
+	full := f.mint("signals:read", "metadata:write")
+	srv := httptest.NewServer(f.turn)
+	defer srv.Close()
+	plane := agent.NewPlaneClient(srv.URL, full, srv.Client())
+
+	if err := plane.Turns(context.Background(), []worklist.ItemTurn{{ItemID: "a", Reading: worklist.TurnReading{LastWord: "review:1#old", Outcome: worklist.TurnMine}}}); err != nil {
+		t.Fatalf("Turn (stale): %v", err)
+	}
+	if got, _ := f.store.List(context.Background(), "u1"); got[0].Signals.Turn != nil {
+		t.Fatal("a reading of another last word was stored")
+	}
+	if err := plane.Turns(context.Background(), []worklist.ItemTurn{{ItemID: "a", Reading: worklist.TurnReading{LastWord: lw.Key(), Outcome: worklist.TurnWaitingOn, WaitingOn: "author"}}, {ItemID: "gone", Reading: worklist.TurnReading{LastWord: lw.Key()}}}); err != nil {
+		t.Fatalf("Turn: %v", err)
+	}
+	got, _ := f.store.List(context.Background(), "u1")
+	if r := got[0].Signals.CurrentTurnReading(); r == nil || r.WaitingOn != "author" || got[0].GitHub.Title != "Stored title" {
+		t.Fatalf("reading %+v, title %q", got[0].Signals.Turn, got[0].GitHub.Title)
+	}
+	if code := f.post(t, f.turn, "/agent/worklist/turns", full, map[string]any{"readings": []map[string]any{{"item_id": "a"}}}); code != http.StatusBadRequest {
+		t.Fatalf("a reading naming no last word: want 400, got %d", code)
+	}
+	if code := f.post(t, f.turn, "/agent/worklist/turns", f.mint("signals:read"), map[string]any{"readings": []map[string]any{{"item_id": "a", "reading": map[string]any{"last_word": lw.Key()}}}}); code == http.StatusOK {
+		t.Fatal("a run without metadata:write wrote a turn reading")
 	}
 }

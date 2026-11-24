@@ -33,6 +33,9 @@ type worklistResponse struct {
 	Sort    string              `json:"sort"`
 	Order   string              `json:"order"`
 	Items   []worklist.WorkItem `json:"items"`
+	// Waiting are the items on the radar waiting on someone else
+	// (worklist.WorkItem.Waiting), ranked the same way and not in Items.
+	Waiting []worklist.WorkItem `json:"waiting"`
 }
 
 // List handles GET /api/worklist. It returns the authenticated owner's work items
@@ -69,12 +72,17 @@ func (h *WorklistHandler) List(w http.ResponseWriter, r *http.Request) {
 	if items == nil {
 		items = []worklist.WorkItem{}
 	}
+	waiting := res.Waiting
+	if waiting == nil {
+		waiting = []worklist.WorkItem{}
+	}
 	writeJSON(w, http.StatusOK, worklistResponse{
 		Status:  res.Status,
 		Message: res.Message,
 		Sort:    string(key),
 		Order:   orderString(desc),
 		Items:   items,
+		Waiting: waiting,
 	})
 }
 

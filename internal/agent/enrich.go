@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -19,9 +20,10 @@ const (
 )
 
 // runEnrich reads the user's persisted work and augments each item with per-item
-// timeline signals (AwaitingMeSince, participants, inbound refs, other reviewers,
-// review-requested-by), and each pull request with a summary of its head commit's
-// CI (GitHubRef.CI), fetched directly from GitHub with the vended credential.
+// timeline signals (AwaitingMeSince, AwaitingOthersSince and the user's last word,
+// participants, inbound refs, other reviewers, review-requested-by), and each pull
+// request with a summary of its head commit's CI (GitHubRef.CI), fetched directly
+// from GitHub with the vended credential.
 // It writes back only the items it changed, so a read-time rescore reflects the
 // fresher signals. Per-item enrichment is best-effort and bounded in concurrency
 // so the fan-out does not blow the run deadline.
@@ -42,7 +44,14 @@ const (
 // (Activity.RequestEnded: no personal or team request still outstanding, since the
 // user may be on any requested team). A request the search itself showed is never
 // removed here: the timeline cannot tell whether a team request includes the user.
-func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried map[string]bool) error {
+//
+// reviews is what this refresh's review-requested:@me search showed (the zero value
+// for a standalone enrich, which ran none). Only a fresh hit is new evidence that a
+// team request names the user (github.ActivityOptions.ReviewRequested); a request
+// carried over is none. What an earlier search confirmed (Signals.TeamConfirmed)
+// stands, on a fresh hit too, unless this one was walked whole without returning
+// the item.
+func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried map[string]bool, reviews reviewSearch) error {
 	provider := p.Provider
 	if provider == "" {
 		provider = "github"
@@ -90,7 +99,22 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 		// reserve-adjusted deadline too, not just start before it, or one slow item
 		// holds the batch past the time kept for writing every result back.
 		actx, cancel := reserveContext(ctx, enrichReserve)
-		act, err := gh.ItemActivity(actx, token, items[i].GitHub.Repo, items[i].GitHub.Number, login)
+		opts := github.ActivityOptions{Author: items[i].GitHub.Author, Bots: p.Bots,
+			// This refresh's review-requested:@me search returned the item: a team
+			// request may be ours. A carried request is no such evidence.
+			ReviewRequested: reviews.hits[items[i].ID],
+			PullRequest:     items[i].Type == worklist.TypePullRequest,
+			Prior:           items[i].Signals.LastWord}
+		if reviews.hits[items[i].ID] || !reviews.complete {
+			// No complete search says the request is gone: what an earlier one confirmed
+			// stands while those team requests are outstanding, and a fresh hit does not
+			// replace it with a vaguer confirmation of every team asked.
+			opts.Confirmed = items[i].Signals.TeamConfirmed
+		}
+		if slices.Contains(items[i].Signals.Reasons, worklist.ReasonAuthor) {
+			opts.Author = login // an item stored before its author was recorded
+		}
+		act, err := gh.ItemActivityFor(actx, token, items[i].GitHub.Repo, items[i].GitHub.Number, login, opts)
 		cancel()
 		// best-effort: an unreadable timeline leaves the item's signals unchanged
 		if err == nil && applyActivity(&items[i].Signals, act, carried[items[i].ID]) {
@@ -197,14 +221,15 @@ func applyActivity(s *worklist.Signals, act github.Activity, carried bool) bool 
 	}
 	// Only a whole timeline says who requested the review; a partial one leaves
 	// what the store knows in place rather than reading as "nobody".
-	requester := act.RequestedByLogin
+	requester, confirmed := act.RequestedByLogin, act.TeamConfirmed
 	if !act.TimelineComplete {
-		requester = s.ReviewRequestedBy
+		requester, confirmed = s.ReviewRequestedBy, s.TeamConfirmed
 	}
 	if !reasonChanged &&
 		act.Participants == s.Participants && act.InboundRefs == s.InboundRefs &&
 		act.OtherReviewers == s.OtherReviewers && requester == s.ReviewRequestedBy &&
-		act.AwaitingMeSince.Equal(s.AwaitingMeSince) && act.AwaitingOthersSince.Equal(s.AwaitingOthersSince) {
+		act.AwaitingMeSince.Equal(s.AwaitingMeSince) && act.AwaitingOthersSince.Equal(s.AwaitingOthersSince) &&
+		reflect.DeepEqual(act.LastWord, s.LastWord) && reflect.DeepEqual(confirmed, s.TeamConfirmed) {
 		return false
 	}
 	s.Reasons = reasons
@@ -212,8 +237,12 @@ func applyActivity(s *worklist.Signals, act github.Activity, carried bool) bool 
 	s.InboundRefs = act.InboundRefs
 	s.OtherReviewers = act.OtherReviewers
 	s.ReviewRequestedBy = requester
+	s.TeamConfirmed = confirmed
 	s.AwaitingMeSince = act.AwaitingMeSince
 	s.AwaitingOthersSince = act.AwaitingOthersSince
+	// A turn reading of a replaced last word no longer applies (CurrentTurnReading),
+	// and the reading pass that follows enrich reads the new one.
+	s.LastWord = act.LastWord
 	return true
 }
 

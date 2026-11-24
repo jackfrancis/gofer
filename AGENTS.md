@@ -62,6 +62,8 @@ internal/checkout/   unpack a repo tarball safely; search/list/read it (workload
 internal/prow/       read a Prow job's public logs/artifacts from GCS, allowlisted (workload-only)
 internal/llm/        LLM ranking / converse (workload-only)
 internal/markdown/   render + sanitize assistant Markdown
+internal/comment/    bulk comment: post the user's comment with the write grant; @ suggestions (web tier, ADR 0009)
+internal/ghcomment/  the web tier's only GitHub client: public check, post a comment, list assignees
 internal/metrics/    Prometheus metrics
 Dockerfile           web-tier image
 Dockerfile.runtime   agent-runtime image (AEI launches it per run)
@@ -120,13 +122,11 @@ The stored GitHub state never moves back in time: a hit older than it
 ready copy can neither reopen a draft nor roll back the time a later draft result is
 judged against. Which searches matched is current even when a payload is not, so a
 stale hit of a live item still carries its review-request membership onto the stored
-item (`agent.withReviewMembership`), reconciled as any hit's is: a confirmed removal
-also clears the stored `AwaitingMeSince` (`agent.settlePins`), a partial search keeps
-both. A stale hit that changes nothing is not written, but the run still goes on to
-enrich (CI can move on the same commit, and a request kept by a partial search needs
-the timeline read): an empty write-back never means nothing to enrich. A stale hit of a retired item writes
-nothing. A
-draft result never retires a stored ready PR GitHub updated strictly later
+item (`agent.withReviewMembership`), reconciled as any hit's is. A stale hit that
+changes nothing is not written, but the run still goes on to enrich (CI can move on
+the same commit, and a request kept by a partial search needs the timeline read): an
+empty write-back never means nothing to enrich. A stale hit of a retired item writes
+nothing. A draft result never retires a stored ready PR GitHub updated strictly later
 (`agent.readyAfterDraft`): the search index lagged it. Draft observations pass the
 public-only gate like hits, so one from a repository not confirmed public is
 evidence of nothing.
@@ -143,7 +143,8 @@ Wired on the web-tier side; they define what a runtime must respect:
 - **Credentials vended on demand.** Downstream provider tokens come from
   `GET /agent/credential` (behind RequireScope) and are held by the workload for the
   run only — never a standing secret, never logged, never persisted. gofer core
-  packages import no provider client; only the workload (`internal/agent`) does.
+  packages import no provider client; only the workload (`internal/agent`) does,
+  apart from the web tier's narrow `internal/ghcomment` (ADR 0009).
   The broker vends through `auth.Handler.Credential`, which refreshes expiring
   (GitHub App) tokens; the refresh token never leaves the web tier.
 - **The chat-model token is the same class.** The web tier holds only the non-secret
@@ -151,7 +152,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   In the optional model-gateway profile (`AI_GATEWAY_URL`, ADR 0008) neither holds
   it: agentgateway does, runs present their run credential (`ai_auth=gateway`), and
   the gateway asks gofer (`/agent/model-access`) before attaching the key.
-- **Least privilege.** Source scopes are READ; only gofer metadata is WRITE.
+- **Least privilege.** Tokens vended to runs are READ; only gofer metadata is WRITE.
+  The one write-capable credential is the opt-in write grant (ADR 0009, vault
+  provider `github-write`, a separate classic OAuth app with `public_repo`), and it
+  never leaves the web tier: `auth.Handler.Credential` and the broker each refuse it,
+  independently. It posts only the user's own comment, from their confirmed
+  submission, with no model involved.
 
 ## Conventions & gotchas
 
@@ -242,6 +248,73 @@ Wired on the web-tier side; they define what a runtime must respect:
   pressure, low floors) unless the user is also an assignee. The web and runtime images must ship together: a runtime
   from before these rules posts its reply inside the item, where it is now ignored,
   and a web tier from before them has no research route.
+- An item is WAITING (`WorkItem.Waiting`, `internal/worklist/waiting.go`) when the
+  ball is in someone else's court; the radar lists waiting items in their own section
+  after the rest and above the hidden section, ranked the same way
+  (`Resolution.Waiting`; the JSON worklist's `waiting`). It is not a score: it says
+  whose turn it is, not how much the item matters. Enrich decides it from the
+  timeline (`github.ItemActivityFor`): the last human word is the user's own comment
+  or review (recorded as `Signals.LastWord`, text cut to `MaxLastWordBytes`, mentions
+  parsed outside quotes and code, never a team or an `@name[bot]` account), or an
+  approving or changes-requested review on an item the user did not author. A bot's
+  comment never takes the last word (GitHub type `Bot`, a `[bot]` login, or
+  `BOT_REVIEWERS`, sent to every run as run parameter `bots`). A review request still
+  awaiting the user outranks any later word: their personal request with no comment
+  or review by them since, or a team request attributed to them. A team request is
+  the user's only on evidence: THIS refresh's `review-requested:@me` search returned
+  the item (`ActivityOptions.ReviewRequested`, from `freshRequests`; a request carried
+  over from an earlier search is no evidence of who made a later one, and a
+  standalone enrich attributes none), and no personal request of theirs explains the
+  hit. The confirmation is recorded (`Signals.TeamConfirmed`: each team request it
+  covered, by team and request time), and unless this refresh's review search was
+  walked whole without returning the item (cut short, or none ran, as in a standalone
+  enrich) it stands while every one of those requests is still outstanding
+  (`ActivityOptions.Confirmed`, `TeamConfirmation.StillOutstanding`), covering only
+  them: a partial search neither confirms a new request nor cancels an unchanged one,
+  and another team asked since neither ends it nor joins it. While it stands it wins
+  over a fresh hit too, which it already explains more specifically, so asking (and
+  later withdrawing) another team never resets the requester or the date. Which team names them is unknown when several are outstanding, so the item
+  awaits them only if every outstanding team request was made since their last
+  comment or review (since the latest), and the requester (`ReviewRequestedBy`, so a
+  bot's team request scores as a bot's) is named only if those requests share an
+  actor. On a pull request the user did not author, a push or
+  ready-for-review is the author's answer. A commit's date is never its push time
+  (commits are pushed late, clocks drift), so pushes are judged by the head
+  (`ActivityOptions.PullRequest`): a review's last word stands while the head is its
+  `commit_id` (an unreadable head ends the wait); a comment's last word stands while
+  the head is the one first seen with it (`LastWord.Head`, passed back as
+  `ActivityOptions.Prior`). Once a push answers a last word, `LastWord.Answered`
+  records it, and no later read undoes it, not even one that cannot read the head.
+  Both apply only to the same version of the last word (`LastWord.Key`: the ID and a
+  digest of the whole body taken before the text is cut, so an edited comment is a
+  new question, anchored afresh). The last word is kept whoever's turn
+  it is (a review request may outrank it for a while) and across every refresh. Force-push and
+  ready-for-review events, which GitHub dates, answer a comment too. Words are
+  ordered among themselves by when they were made, so an edit never jumps a reply;
+  against those events, for the wait's date, and, when it is the last word, as the
+  user's engagement (a review request made before the edit no longer outranks it), a
+  comment counts from its last edit (`updated_at`). A review with no
+  summary is read through its inline comments, up to `reviewCommentPages` pages; one
+  longer than that has no text. On the user's own item a reviewer's decisive review is the
+  user's turn, and a wait with no recorded last word (stored before `LastWord`
+  existed) is not trusted; an undecisive last word with no text never waits. With a
+  chat model, a reading pass between enrich and rank (`runReadTurns`, at most
+  `turnReadLimit` calls a pass) asks the model to read a non-decisive last word
+  (`Signals.NeedsTurnReading`) and writes the pass's readings alone, in one store
+  transaction, through `POST /agent/worklist/turns` (`worklist.ApplyTurns`), never the
+  items it read: a reading is dropped unless the stored last word is still the one it read (keyed by
+  the last word's ID and text) and the item is not hidden. It is a model signal kept
+  like the proposal (`KeepModelSignals`) and applied only while current
+  (`CurrentTurnReading`): `my_turn` keeps the item with the user, `nothing_pending`
+  and `waiting_on` keep it waiting, and a `waiting_on` login counts only if the last
+  word mentions it or it is the author. New activity always wins over a reading. A
+  refresh keeps the waiting timestamps only for an item whose GitHub `updated_at` is
+  unchanged, and the last word always (`carryTurnSignals`); `AwaitingMeSince` dates
+  the review request, so it goes whenever the reconciliation leaves no request (a
+  complete search confirmed it removed; a partial one keeps both). The rank selection leaves waiting
+  items out before its top-N cutoff (`Selection.Top`), and Review all PRs and Get 2nd
+  Opinion skip them (`WorkItem.Actionable`); Reset Conversations still covers them.
+  `RunPolicy.Apply` bounds the last word and reading on every write-back.
 - A run never reads the whole worklist: its threads grow without bound and the agent
   plane caps a response at 8 MiB. `agent.Sink` has only bounded reads, served by the
   same `internal/worklist/select.go` functions in process and on the plane:
@@ -453,6 +526,33 @@ Wired on the web-tier side; they define what a runtime must respect:
   does not match. A retired or hidden item's CI (enrich reads neither) is labeled as
   the last known result; hiding keeps it, since it is a GitHub field, and unhiding
   marks it `Stale` (labeled as from before the hide) until enrich reads the head. It is display-only: nothing scores on it.
+- The bulk comment (ADR 0009) is on only with `GITHUB_WRITE_CLIENT_ID`/`_SECRET`,
+  which config requires to name a different OAuth app from sign-in (a classic grant
+  accumulates scopes per user and app, which would put `public_repo` on the token runs
+  hold). The grant is connected under its own cookie (`session.StartGrant`, path
+  `/auth/github-write`), so the session survives, and only by the GitHub account the
+  session belongs to. Logout records the write grant's pending revocation in the same
+  commit as the session's end (`beginSessionLogout`), whether or not commenting is
+  still configured. The flow is bound to the session that began it
+  (`OAuthFlow.SessionKey`), and the callback re-checks that session under the write
+  grant's marker lock before storing, so an in-flight connection cannot outlive a
+  logout. Storing a write grant is strict, and every failed connection revokes the
+  token it was issued, that token only (`discardToken`), never the authorization. The web tier posts with it
+  (`internal/comment` over `internal/ghcomment`, which checks `"private": false`
+  first and follows no redirect). The preview registers the comment and the destinations
+  it showed as eligible (item, repository and number) under a one-time nonce;
+  confirming drops one whose item left the radar or now names another destination,
+  and never adds or redirects one. A same-origin confirm consumes it, and a nonce
+  gofer does not hold is refused, so nothing posts twice from one preview, across a
+  restart included. A confirmed batch's results are its owner's to read without a
+  live grant; only starting one needs it.
+  Same-origin trusts `Sec-Fetch-Site: same-origin`, since `Referrer-Policy:
+  no-referrer` makes a form's `Origin` "null". Posts are serial, a second apart; a
+  rate limit stops the batch, the grant is re-read before each post (a disconnect,
+  or a grant of another version, stops it), and a POST whose answer was lost is "unknown", never "not posted". Targets are items on the radar only (`WorkItem.OnRadar`), waiting items included (a nudge to whoever has the turn), and the Waiting section's rows carry the same checkbox (the shared `item` template). @
+  suggestions are each repository's assignees, read with the user's read credential
+  and cached in memory, counted against every selected repository (unchecked ones are
+  unknown). `reload.js` does not reload while items are checked.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

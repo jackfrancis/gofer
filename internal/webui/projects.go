@@ -63,10 +63,11 @@ func (o ProjectOption) PullsURL() string {
 	return "https://github.com/" + o.Name + "/pulls"
 }
 
-// listedItems returns every item the radar lists: the ranked items and the hidden
-// section. The project filter offers their repositories and narrows both.
+// listedItems returns every item the radar lists: the ranked items, the waiting
+// section and the hidden section. The project filter offers their repositories and
+// narrows all three.
 func listedItems(res worklist.Resolution) []worklist.WorkItem {
-	return append(slices.Clip(res.Items), res.Hidden...)
+	return slices.Concat(res.Items, res.Waiting, res.Hidden)
 }
 
 // listed reports whether the radar lists it, ranked or in the hidden section.

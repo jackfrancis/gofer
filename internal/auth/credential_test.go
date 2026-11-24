@@ -909,7 +909,7 @@ func logoutNow(t *testing.T, h *Handler) logoutResult {
 // failingCommitVault refuses to commit a logout.
 type failingCommitVault struct{ vault.Vault }
 
-func (failingCommitVault) MarkLogoutEndingSession(context.Context, string, string, string) error {
+func (failingCommitVault) MarkLogoutEndingSession(context.Context, string, string, string, ...string) error {
 	return errors.New("database is locked")
 }
 

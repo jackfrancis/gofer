@@ -19,6 +19,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -109,6 +110,8 @@ type Handler struct {
 	convEnabled bool
 	options     []ModelOption // model picker options, default first (options[0]); nil when AI is disabled
 	reconnect   Reconnector   // nil: never prompt to sign in again
+	commenter   Commenter     // nil: no bulk comment (comment.go)
+	batches     batches       // confirmed bulk comments, by nonce
 	now         func() time.Time
 }
 
@@ -256,6 +259,7 @@ type pageData struct {
 	User                     *session.User
 	Providers                []string
 	Items                    []worklist.WorkItem
+	Waiting                  []worklist.WorkItem // worklist: items waiting on someone else, after Items (same filter)
 	HiddenItems              []worklist.WorkItem // worklist: the hidden section, most recently hidden first, unscored
 	ItemHidden               bool                // thread: the item is hidden, so its thread is read-only until it is unhidden
 	Assistant                bool                // thread: the assistant is configured (ConvEnabled is off on a hidden item's page)
@@ -292,6 +296,10 @@ type pageData struct {
 	TotalItems               int                 // items on the whole radar, before the project filter
 	ProjectScope             string              // the shown selection, posted back by each bulk form ("" = every project)
 	ProjectsError            string              // why the last project selection was not saved
+	CommentEnabled           bool                // worklist: the deployment offers bulk comments (ADR 0009)
+	CommentConnected         bool                // worklist: the user connected the write grant
+	CommentNotice            string              // worklist: the outcome of the last connect/disconnect, for the user
+	Comment                  *commentView        // comment-preview / comment-results views
 }
 
 // Index handles GET /. It renders the sign-in view for anonymous visitors, the
@@ -800,8 +808,8 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		var changed []worklist.WorkItem
 		refs = refs[:0]
 		for _, it := range current {
-			if it.Type != worklist.TypePullRequest || !it.OnRadar() || !inScope(selected, it) {
-				continue // off the radar (hidden or closed) or outside the page's projects: never review it in bulk
+			if it.Type != worklist.TypePullRequest || !it.Actionable() || !inScope(selected, it) {
+				continue // off the radar (hidden or closed), waiting on someone else, or outside the page's projects: never review it in bulk
 			}
 			if it.HasReview() {
 				continue // already reviewed at least once — a first-review is no longer needed
@@ -897,7 +905,7 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 		var eligible []worklist.WorkItem
 		firstModels := map[string]struct{}{}
 		for _, it := range current {
-			if it.OnRadar() && inScope(selected, it) && it.NeedsSecondOpinion(now, reviewStaleAfter) {
+			if inScope(selected, it) && it.NeedsSecondOpinion(now, reviewStaleAfter) {
 				eligible = append(eligible, it)
 				firstModels[it.FirstReviewModel()] = struct{}{}
 			}
@@ -1025,6 +1033,7 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		selected := savedSelection(r, user.ID)
 		projects := projectOptions(listedItems(res), selected)
 		shown := filterProjects(res.Items, selected)
+		shownWaiting := filterProjects(res.Waiting, selected)
 		shownHidden := filterProjects(res.Hidden, selected)
 		scope := shownSelection(selected, projects)
 		selectedCount := 0
@@ -1047,6 +1056,13 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 				resetCount++
 			}
 		}
+		// Waiting items are no review action's to take (Actionable), but Reset clears
+		// their threads too.
+		for _, it := range shownWaiting {
+			if hasConversation(it) {
+				resetCount++
+			}
+		}
 		// The radar ranks only items on it, but Reset clears every stored thread in the
 		// selected projects the checklist names, hidden and closed items' included,
 		// from Resolve's same read (res.OffRadar).
@@ -1056,12 +1072,16 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 			}
 		}
 		data := pageData{
-			View: "worklist", User: user, Items: shown, HiddenItems: shownHidden, ConvEnabled: h.convEnabled,
+			View: "worklist", User: user, Items: shown, Waiting: shownWaiting, HiddenItems: shownHidden, ConvEnabled: h.convEnabled,
 			ReviewCount: reviewCount, SecondOpinionEnabled: h.secondOpinionEnabled(), SecondOpinionCount: secondCount,
 			ResetCount: resetCount,
 			Projects:   projects, ProjectsFiltered: selected != nil, SelectedProjects: selectedCount, TotalItems: len(res.Items),
 		}
-		data.LabelCSS = labelStylesheet(shown)
+		data.LabelCSS = labelStylesheet(slices.Concat(shown, shownWaiting))
+		data.CommentEnabled, data.CommentConnected = h.commentState(r.Context(), user)
+		if data.CommentEnabled {
+			data.CommentNotice = commentNotices[r.URL.Query().Get("commenting")]
+		}
 		if scope != nil {
 			data.ProjectScope = encodeSelection(scope)
 		}
@@ -1085,6 +1105,14 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		}
 		return data, http.StatusOK
 	}
+}
+
+// commentNotices are the radar's words for the commenting query parameter, set by
+// the redirects that end a connect, disconnect or refused bulk comment.
+var commentNotices = map[string]string{
+	"connect":     "Connect GitHub for commenting first; gofer posts only with that separate grant.",
+	"unconfirmed": "Commenting is disconnected in gofer, but GitHub did not confirm the grant was revoked. Revoke it in GitHub's settings (Settings, Applications, Authorized OAuth Apps) to be sure.",
+	"error":       "gofer could not disconnect commenting right now. Try again in a moment.",
 }
 
 // refreshCheck is the query parameter of the no-script fallback's reload: that render
@@ -1148,6 +1176,9 @@ var funcs = template.FuncMap{
 	"markdown":               markdown.ToSafeHTML,
 	"discussBadge":           discussBadge,
 	"discussTitle":           discussTitle,
+	"row":                    newItemRow,
+	"waitingBadge":           waitingBadge,
+	"waitingTitle":           waitingTitle,
 	"isSecondOpinionRequest": isSecondOpinionRequest,
 	"isSynthesisRequest":     isSynthesisRequest,
 	"userHandle":             userHandle,
@@ -1290,4 +1321,64 @@ func titleProvider(s string) string {
 		}
 		return strings.ToUpper(s[:1]) + s[1:]
 	}
+}
+
+// itemRow is what the radar's item template renders: one item, whether the
+// Discuss action is offered, and whether it can be selected for a bulk comment.
+type itemRow struct {
+	Item             worklist.WorkItem
+	ConvEnabled      bool
+	CommentConnected bool
+}
+
+func newItemRow(it worklist.WorkItem, convEnabled, commentConnected bool) itemRow {
+	return itemRow{Item: it, ConvEnabled: convEnabled, CommentConnected: commentConnected}
+}
+
+// waitingBadge labels an item waiting on someone else: who, and for how long ("" for
+// an item that is not waiting).
+func waitingBadge(it worklist.WorkItem) string {
+	w, ok := it.Waiting()
+	if !ok {
+		return ""
+	}
+	var who string
+	switch {
+	case w.NothingPending:
+		who = "Nothing pending"
+	case w.On != "":
+		who = "Waiting on @" + w.On
+	default:
+		who = "Waiting on others"
+	}
+	return who + " · " + waitedFor(w.Since, time.Now())
+}
+
+// waitingTitle explains why an item is waiting, for the badge's tooltip.
+func waitingTitle(it worklist.WorkItem) string {
+	w, ok := it.Waiting()
+	if !ok {
+		return ""
+	}
+	since := w.Since.Format("Jan 2")
+	lw := it.Signals.LastWord
+	switch {
+	case w.NothingPending:
+		return "Your last word, on " + since + ", asks nothing of anyone"
+	case lw != nil && lw.Decisive:
+		return "You reviewed it on " + since + "; nobody has answered since"
+	case lw != nil:
+		return "You had the last word on " + since + "; nobody has answered since"
+	default:
+		return "A review on " + since + " left the next step to the author"
+	}
+}
+
+// waitedFor is a short age: "today", "1d", "12d".
+func waitedFor(since, now time.Time) string {
+	d := int(now.Sub(since).Hours() / 24)
+	if d < 1 {
+		return "today"
+	}
+	return strconv.Itoa(d) + "d"
 }

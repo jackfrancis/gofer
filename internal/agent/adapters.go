@@ -154,6 +154,11 @@ func (s *StoreSink) Research(ctx context.Context, itemID string, adj worklist.Re
 	return worklist.ApplyResearch(ctx, s.store, s.ownerID, itemID, adj)
 }
 
+// Turns sets the owner's items' turn readings in one update (worklist.ApplyTurns).
+func (s *StoreSink) Turns(ctx context.Context, turns []worklist.ItemTurn) error {
+	return worklist.ApplyTurns(ctx, s.store, s.ownerID, turns)
+}
+
 // PlaneClient is the out-of-process Vendor and Sink: it reaches gofer's agent plane
 // over HTTP, authenticating every call with the run credential (the audience-bound
 // token the runtime carries). The owner is implied by that credential, so — unlike
@@ -320,6 +325,23 @@ type ReplyRequest struct {
 // undo a later result.
 func (c *PlaneClient) Research(ctx context.Context, itemID string, adj worklist.ResearchAdjustment) error {
 	return c.post(ctx, "/agent/worklist/research", "research", ResearchRequest{ItemID: itemID, Adjustment: adj})
+}
+
+// Turns writes items' turn readings alone, in batches of worklist.MaxTurnBatch: POST
+// /agent/worklist/turns.
+func (c *PlaneClient) Turns(ctx context.Context, turns []worklist.ItemTurn) error {
+	for start := 0; start < len(turns); start += worklist.MaxTurnBatch {
+		batch := turns[start:min(start+worklist.MaxTurnBatch, len(turns))]
+		if err := c.post(ctx, "/agent/worklist/turns", "turn readings", TurnsRequest{Readings: batch}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// TurnsRequest is the body of POST /agent/worklist/turns.
+type TurnsRequest struct {
+	Readings []worklist.ItemTurn `json:"readings"`
 }
 
 // ResearchRequest is the body of POST /agent/worklist/research.

@@ -185,6 +185,51 @@ func (h *IngestHandler) Research(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// turnsRequest is the body of POST /agent/worklist/turns.
+type turnsRequest struct {
+	Readings []worklist.ItemTurn `json:"readings"`
+}
+
+// maxTurnsBody bounds a turn-readings request: up to worklist.MaxTurnBatch readings,
+// each an item ID, a last-word key, an outcome and a login.
+const maxTurnsBody = 2 << 20
+
+// Turns handles POST /agent/worklist/turns. A reading pass writes the turn readings
+// it derived here, in one update (worklist.ApplyTurns), and only those: the rest of
+// each item stays as stored now, so a reading the model took a while over never
+// restores the item it read. A reading for an item that is gone or hidden, or of a
+// last word that is no longer current, is accepted and dropped.
+func (h *IngestHandler) Turns(w http.ResponseWriter, r *http.Request) {
+	p, ok := principal.FromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	var body turnsRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxTurnsBody)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if len(body.Readings) > worklist.MaxTurnBatch {
+		writeError(w, http.StatusBadRequest, "too many readings in one request")
+		return
+	}
+	for _, t := range body.Readings {
+		if t.ItemID == "" || t.Reading.LastWord == "" {
+			writeError(w, http.StatusBadRequest, "every reading needs an item_id and the last_word it read")
+			return
+		}
+	}
+	if err := worklist.ApplyTurns(r.Context(), h.store, p.ActingUserID, body.Readings); err != nil {
+		writeError(w, http.StatusBadGateway, "could not persist turn readings")
+		return
+	}
+	if h.noter != nil && p.JobID != "" {
+		h.noter.NoteWriteback(p.JobID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // List handles GET /agent/worklist: the acting user's whole worklist, threads
 // included. No current run reads it (it outgrows the agent plane's response limit);
 // a run reads one item (Item) or a bounded selection (Select). It stays for a

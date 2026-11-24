@@ -378,6 +378,10 @@ func (it searchItem) workItem(reasons []worklist.Reason, now time.Time) worklist
 		merged = it.PullRequest.MergedAt != nil
 	}
 	repo := it.repo()
+	var author string
+	if it.User != nil {
+		author = it.User.Login
+	}
 
 	sig := worklist.Signals{
 		Reasons:        reasons,
@@ -419,6 +423,7 @@ func (it searchItem) workItem(reasons []worklist.Reason, now time.Time) worklist
 			Draft:       it.Draft && itemType == worklist.TypePullRequest,
 			Merged:      merged,
 			StateReason: it.StateReason,
+			Author:      author,
 		},
 		Signals: sig,
 		Meta:    worklist.Metadata{Origin: worklist.OriginAgent},

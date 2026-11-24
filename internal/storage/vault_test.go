@@ -514,3 +514,36 @@ func TestMarkLogoutEndingSessionConsumesOnce(t *testing.T) {
 		t.Error("the second logout recorded a marker")
 	}
 }
+
+// Every provider named is recorded in the one commit that ends the session (the
+// sign-in credential and the write grant, ADR 0009), or none is.
+func TestMarkLogoutEndingSessionRecordsEveryProvider(t *testing.T) {
+	db := open(t, t.TempDir())
+	v := db.Vault(keyring(t, testKey(1)))
+	sessions := db.Sessions()
+	if err := sessions.Save(ctx, "sess-hash", session.User{ID: "alice"}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.sql.ExecContext(ctx, `CREATE TRIGGER no_session_delete BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.MarkLogoutEndingSession(ctx, "sess-hash", "alice", "github", "github-write"); err == nil {
+		t.Fatal("commit succeeded although the session delete failed")
+	}
+	for _, p := range []string{"github", "github-write"} {
+		if pending, _ := v.LogoutPending(ctx, "alice", p); pending {
+			t.Errorf("%s marker survived a failed commit", p)
+		}
+	}
+	if _, err := db.sql.ExecContext(ctx, `DROP TRIGGER no_session_delete`); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.MarkLogoutEndingSession(ctx, "sess-hash", "alice", "github", "github-write"); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"github", "github-write"} {
+		if pending, _ := v.LogoutPending(ctx, "alice", p); !pending {
+			t.Errorf("no %s marker after the commit", p)
+		}
+	}
+}

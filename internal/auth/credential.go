@@ -184,7 +184,7 @@ func (h *Handler) SignInRequired(ctx context.Context, userID, providerName strin
 // only: it takes no credential lock and refreshes nothing; the run's own vend does.
 func (h *Handler) ScheduledRunAllowed(ctx context.Context, userID, providerName string) (bool, error) {
 	p, ok := h.providers[providerName]
-	if !ok || h.vault == nil {
+	if !ok || p.grant || h.vault == nil {
 		return false, nil
 	}
 	pending, err := h.logoutPending(ctx, userID, providerName)
@@ -228,9 +228,18 @@ func (h *Handler) ScheduledRunAllowed(ctx context.Context, userID, providerName 
 // vends only the access token.
 func (h *Handler) Credential(ctx context.Context, userID, providerName string, req VendRequest) (vault.Credential, error) {
 	p, ok := h.providers[providerName]
-	if !ok {
-		return vault.Credential{}, vault.ErrNotFound // not a provider gofer signs in with
+	if !ok || p.grant {
+		// Not a provider gofer signs in with, or the write grant, which never leaves
+		// the web tier: the broker must never vend it to a run (ADR 0009).
+		return vault.Credential{}, vault.ErrNotFound
 	}
+	return h.vend(ctx, userID, p, req)
+}
+
+// vend is Credential's work for a provider the caller has already chosen: under the
+// credential lock, and checked against a pending logout before and after.
+func (h *Handler) vend(ctx context.Context, userID string, p *provider, req VendRequest) (vault.Credential, error) {
+	providerName := p.name
 	if h.vault == nil {
 		return vault.Credential{}, vault.ErrSignInRequired
 	}
@@ -627,7 +636,7 @@ func (h *Handler) storeSignIn(ctx context.Context, p *provider, userID, login st
 		return false, err
 	}
 	defer unlock()
-	if p.name == "github" {
+	if p.github() {
 		valid, err := h.checkToken(ctx, p, tok.AccessToken)
 		if err != nil {
 			return false, err

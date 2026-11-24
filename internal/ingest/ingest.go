@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,7 +28,7 @@ import (
 // runtime consumes this; NoopDispatcher discards it.
 type RunSpec struct {
 	TaskRef    string            // github-ingest | github-converse | github-research
-	Parameters map[string]string // owner, gofer_url, ai_endpoint, ai_model, ai_auth, item, independent
+	Parameters map[string]string // owner, gofer_url, ai_endpoint, ai_model, ai_auth, bots, item, independent
 	Subject    string            // the acting user id
 	Scopes     []string          // capability scopes the run is authorized for
 	Audience   string            // binds the run credential to gofer's agent plane
@@ -98,7 +99,8 @@ type Ingestor struct {
 	sinkURL    string
 	aiEndpoint string
 	aiModel    string
-	aiGateway  bool // the model is reached through gofer's model gateway (run parameter ai_auth)
+	aiGateway  bool   // the model is reached through gofer's model gateway (run parameter ai_auth)
+	bots       string // BOT_REVIEWERS, comma-separated (run parameter bots)
 	log        *slog.Logger
 
 	mu   sync.Mutex
@@ -144,6 +146,19 @@ func New(d Dispatcher, audience, sinkURL string, log *slog.Logger, aiEndpoint, a
 // Call it once, before the first dispatch.
 func (i *Ingestor) UseModelGateway() { i.aiGateway = true }
 
+// UseBots names the logins whose comments are automated (BOT_REVIEWERS) to every run
+// this Ingestor dispatches (run parameter bots): enrich never takes one's comment for
+// the last human word on an item. Call it once, before the first dispatch.
+func (i *Ingestor) UseBots(bots []string) {
+	var keep []string
+	for _, b := range bots {
+		if b = strings.TrimSpace(b); b != "" && !strings.Contains(b, ",") {
+			keep = append(keep, b)
+		}
+	}
+	i.bots = strings.Join(keep, ",")
+}
+
 // runParams builds the parameters shared by every dispatched run: the owner, the sink
 // URL a runtime calls back on (gofer_url), and — when configured — the non-secret
 // chat-model coordinates. The model token is never a parameter; a runtime would vend
@@ -159,6 +174,9 @@ func (i *Ingestor) runParams(ownerID string) map[string]string {
 	}
 	if i.aiGateway {
 		p["ai_auth"] = AIAuthGateway
+	}
+	if i.bots != "" {
+		p["bots"] = i.bots
 	}
 	return p
 }
