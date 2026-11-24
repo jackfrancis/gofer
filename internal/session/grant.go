@@ -23,6 +23,17 @@ func (m *Manager) StartGrant(w http.ResponseWriter, path string, flow *OAuthFlow
 	m.setGrantCookie(w, path, m.sign(id), int(flowMaxAge.Seconds()))
 }
 
+// SessionKey is the hashed id of the session the request's cookie names (what a
+// Store keys it by), or "" for none. It says which session, not whether it is
+// still valid: pair it with Lookup.
+func (m *Manager) SessionKey(r *http.Request) string {
+	id := m.id(r)
+	if id == "" {
+		return ""
+	}
+	return storeKey(id)
+}
+
 // GrantFlow returns the request's in-progress grant flow, or nil.
 func (m *Manager) GrantFlow(r *http.Request) *OAuthFlow {
 	id := m.grantID(r)

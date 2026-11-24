@@ -52,8 +52,14 @@ classic scope that can comment on a public repository.
   point is recorded anyway (fail closed), and a commit failure changes nothing for
   either credential (503). If GitHub does not confirm revocation, logout's existing
   "unconfirmed" answer links GitHub's OAuth-app settings page.
-- **A connection in flight cannot undo a logout.** The callback stores the grant only
-  after re-checking the initiating session, under the write grant's marker lock.
+- **Logout does not depend on configuration.** A write grant stored while commenting
+  was configured is deleted at logout even after the write client is removed, with
+  its revocation reported unconfirmed, so configuring the client again never revives
+  it.
+- **A connection in flight cannot undo a logout.** The flow is bound to the session
+  that began it (its hashed id), not only to the user, so a session signed in again
+  in another tab cannot finish it. The callback stores the grant only after
+  re-checking that same session, under the write grant's marker lock.
   Logout holds the same lock while it decides what to revoke and commits the
   session's end. Either the grant is stored first, and logout sees and revokes it, or
   the session has ended first, and the callback revokes the token it was issued and
@@ -61,7 +67,12 @@ classic scope that can comment on a public repository.
 - **Storing it is strict.** Unlike sign-in, where a vault failure is logged and login
   continues, a write grant gofer could not save is revoked, and the user is told,
   including when GitHub did not confirm the revocation. A grant gofer has not saved is
-  one it could not revoke at logout.
+  one it could not revoke at logout. Every way out of the callback after the code
+  exchange (profile unreadable, wrong account, refused login, save failure, session
+  ended) revokes the token it was issued, detached from the browser and on its own
+  deadline. That cleanup revokes **that token only**
+  (`DELETE /applications/{client_id}/token`), never the whole authorization, so a
+  connection that succeeded meanwhile in another tab keeps working.
 
 ### Posting happens in the web tier, never in a run
 
@@ -90,13 +101,16 @@ The client keeps the workload's guard rules (ADR 0007, "public-only guard"):
 2. Submitting renders a **preview**: the exact comment and every target, with any
    items it will skip (gone, hidden or closed since the page rendered, since bulk
    actions never act on items off the radar). Nothing is posted yet. The preview
-   registers the comment and its items, for its owner, under a one-time nonce (in
-   memory, bounded per owner and in all, for 30 minutes).
+   registers the comment and the items it showed as eligible (never those it listed
+   as skipped), for its owner, under a one-time nonce (in memory, bounded per owner
+   and in all, for 30 minutes).
 3. **Confirm** sends only that nonce. It atomically consumes the registered preview
-   and posts its comment to each of its items still on the radar, in order, one at a
-   time, at least a second apart: GitHub asks for serial content creation, spaced
+   and posts its comment to each of its items still on the radar (confirming may drop
+   an item, never add one), in order, one at a time, at least a second apart: GitHub asks for serial content creation, spaced
    out. A nonce gofer does not hold (never issued, expired, or from before a web-pod
-   restart) is refused, never posted, so no resubmit can post a second time. A nonce
+   restart) is refused, never posted, so no resubmit can post a second time. The
+   refusal says gofer cannot tell what an earlier confirmation did, and to check the
+   items on GitHub before previewing again. A nonce
    already confirmed shows that batch's results again (kept for an hour). A batch
    that attempted nothing (no grant, the worklist unreadable) reopens its preview.
 4. The confirm request must be same-origin, in addition to SameSite=Lax. A browser
@@ -112,7 +126,9 @@ The client keeps the workload's guard rules (ADR 0007, "public-only guard"):
    have been posted, and the page says to check before posting again. A 401 confirmed
    by GitHub's check-token deletes the stored grant. A rate limit (429, or 403 with
    GitHub's rate-limit signals) stops the batch, says when to try again, and leaves
-   the rest unattempted.
+   the rest unattempted. The grant is read again before every post after the first,
+   so a disconnect or logout mid-batch stops it even before GitHub confirms the
+   revocation.
 
 Posting is detached from the browser request, under an overall deadline, so a closed
 tab does not leave a batch half-reported.

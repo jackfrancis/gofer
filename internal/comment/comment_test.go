@@ -16,11 +16,15 @@ import (
 )
 
 type fakeCreds struct {
-	writeErr  error
-	readErr   error
-	rejected  []string
-	readCalls int
-	mu        sync.Mutex
+	writeErr error
+	// disconnectAfter, when > 0, makes WriteCredential answer "sign-in required"
+	// from that call on (a disconnect mid-batch).
+	disconnectAfter int
+	writeCalls      int
+	readErr         error
+	rejected        []string
+	readCalls       int
+	mu              sync.Mutex
 }
 
 func (f *fakeCreds) CommentingState(context.Context, string) auth.CommentingState {
@@ -28,6 +32,13 @@ func (f *fakeCreds) CommentingState(context.Context, string) auth.CommentingStat
 }
 
 func (f *fakeCreds) WriteCredential(context.Context, string) (vault.Credential, error) {
+	f.mu.Lock()
+	f.writeCalls++
+	disconnected := f.disconnectAfter > 0 && f.writeCalls > f.disconnectAfter
+	f.mu.Unlock()
+	if disconnected {
+		return vault.Credential{}, vault.ErrSignInRequired
+	}
 	if f.writeErr != nil {
 		return vault.Credential{}, f.writeErr
 	}
@@ -324,4 +335,21 @@ type truncating struct {
 func (g *truncating) Assignees(ctx context.Context, token, repo string) ([]string, bool, error) {
 	l, _, err := g.fakeGH.Assignees(ctx, token, repo)
 	return l, repo != g.cut, err
+}
+
+// Review P2 (second round): a disconnect mid-batch stops the remaining posts, even
+// though the batch holds a copy of the token GitHub may not yet have revoked.
+func TestPostStopsWhenDisconnected(t *testing.T) {
+	gh := &fakeGH{}
+	s := newTestService(&fakeCreds{disconnectAfter: 2}, gh)
+	res, err := s.Post(context.Background(), "u", targets("a/one", "b/two", "c/three"), "hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.posts) != 2 {
+		t.Errorf("posts = %v; want two, then stop", gh.posts)
+	}
+	if res[2].Posted || !strings.Contains(res[2].Error, "disconnected") {
+		t.Errorf("the post after the disconnect = %+v", res[2])
+	}
 }

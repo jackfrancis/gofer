@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"net/http"
@@ -111,10 +112,11 @@ func (h *Handler) ConnectWrite(w http.ResponseWriter, r *http.Request) {
 	state := session.NewToken()
 	verifier := oauth2.GenerateVerifier()
 	h.sessions.StartGrant(w, writePath, &session.OAuthFlow{
-		Provider: p.name,
-		State:    state,
-		Verifier: verifier,
-		UserID:   user.ID,
+		Provider:   p.name,
+		State:      state,
+		Verifier:   verifier,
+		UserID:     user.ID,
+		SessionKey: h.sessions.SessionKey(r),
 	})
 	http.Redirect(w, r, p.oauth.AuthCodeURL(state, oauth2.S256ChallengeOption(verifier)), http.StatusFound)
 }
@@ -132,7 +134,8 @@ func (h *Handler) ConnectWriteCallback(w http.ResponseWriter, r *http.Request) {
 	flow := h.sessions.GrantFlow(r)
 	h.sessions.EndGrant(w, r, writePath) // a grant flow completes at most once
 	user := h.sessions.CurrentUser(r)
-	if flow == nil || flow.Provider != p.name || user == nil || flow.UserID != user.ID {
+	if flow == nil || flow.Provider != p.name || user == nil || flow.UserID != user.ID ||
+		flow.SessionKey == "" || flow.SessionKey != h.sessions.SessionKey(r) {
 		http.Error(w, "no connection in progress for this session", http.StatusBadRequest)
 		return
 	}
@@ -156,55 +159,49 @@ func (h *Handler) ConnectWriteCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "token exchange failed", http.StatusBadGateway)
 		return
 	}
+	// From here GitHub has issued a token: every way out but a stored grant discards
+	// it (failConnect), so no authorization is left behind that logout could not find.
 	raw, err := h.fetchUser(ctx, p, token)
 	if err != nil {
 		slog.WarnContext(ctx, "write grant: user fetch failed", "user", user.ID, "err", err)
-		http.Error(w, "failed to fetch user profile", http.StatusBadGateway)
+		h.failConnect(ctx, w, p, token, user.ID, http.StatusBadGateway, "gofer could not read your GitHub profile, so the grant was not saved")
 		return
 	}
 	granted, err := p.mapUser(raw)
 	switch {
 	case err != nil:
-		h.refuseGrant(ctx, w, p, token, user.ID, "write grant: invalid user profile", "GitHub returned an unexpected profile.")
+		slog.WarnContext(ctx, "write grant: invalid user profile", "user", user.ID, "err", err)
+		h.failConnect(ctx, w, p, token, user.ID, http.StatusBadGateway, "GitHub returned an unexpected profile, so the grant was not saved")
 		return
 	case granted.ID != user.ID:
-		h.refuseGrant(ctx, w, p, token, user.ID, "write grant: granted by a different GitHub account",
-			"Connect with the same GitHub account you signed in to gofer with ("+user.Login+").")
+		slog.WarnContext(ctx, "write grant: granted by a different GitHub account", "user", user.ID)
+		h.failConnect(ctx, w, p, token, user.ID, http.StatusForbidden,
+			"the grant came from a different GitHub account; connect with the one you signed in to gofer with ("+html.EscapeString(user.Login)+")")
 		return
 	case h.cfg != nil && !h.cfg.SignInAllowed("github", granted.Login):
-		h.refuseGrant(ctx, w, p, token, user.ID, "write grant: account not in ALLOWED_GITHUB_LOGINS",
-			"This account is not allowed to use this gofer.")
+		slog.WarnContext(ctx, "write grant: account not in ALLOWED_GITHUB_LOGINS", "user", user.ID)
+		h.failConnect(ctx, w, p, token, user.ID, http.StatusForbidden, "this account is not allowed to use this gofer")
 		return
-	}
-	if h.vault == nil {
-		http.Error(w, "gofer has nowhere to keep the grant", http.StatusInternalServerError)
+	case h.vault == nil:
+		h.failConnect(ctx, w, p, token, user.ID, http.StatusInternalServerError, "gofer has nowhere to keep the grant")
 		return
 	}
 	// The session is checked again when the grant is stored, under the lock logout
 	// holds while it records what to revoke: a logout that ends this session while the
-	// code is being exchanged must not be followed by a grant stored for it.
+	// code is being exchanged must not be followed by a grant stored for it. It must be
+	// the very session that began the flow, not one signed in again since.
 	sessionValid := func(ctx context.Context) (bool, error) {
 		u, err := h.sessions.Lookup(r.WithContext(ctx))
-		return u != nil && u.ID == user.ID, err
+		return u != nil && u.ID == user.ID && h.sessions.SessionKey(r) == flow.SessionKey, err
 	}
 	outcome, err := h.storeWriteGrant(ctx, p, user.ID, granted.Login, token, sessionValid)
 	switch {
-	case err != nil || outcome == grantSessionEnded:
-		why := "gofer could not save the grant"
-		if outcome == grantSessionEnded {
-			why = "you signed out of gofer while connecting, so the grant was not saved"
-		}
-		slog.WarnContext(ctx, "write grant: not stored; revoking it", "user", user.ID, "session_ended", outcome == grantSessionEnded, "err", err)
-		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), exchangeTimeout)
-		rerr := h.revokeGrant(rctx, p, token.AccessToken)
-		rcancel()
-		msg := `<p>` + why + `, and GitHub confirmed the grant is revoked.</p>`
-		if rerr != nil {
-			slog.WarnContext(ctx, "write grant: revoking an unsaved grant failed", "user", user.ID, "err", rerr)
-			msg = `<p>` + why + `, and GitHub did not confirm the grant was revoked. ` +
-				`Revoke it in <a href="` + oauthAppsSettings + `">GitHub's settings</a> (Authorized OAuth Apps) to be sure.</p>`
-		}
-		writeGrantPage(w, http.StatusBadGateway, msg+`<p><a href="/">Back to radar</a></p>`)
+	case err != nil:
+		slog.WarnContext(ctx, "write grant: not stored", "user", user.ID, "err", err)
+		h.failConnect(ctx, w, p, token, user.ID, http.StatusBadGateway, "gofer could not save the grant")
+		return
+	case outcome == grantSessionEnded:
+		h.failConnect(ctx, w, p, token, user.ID, http.StatusConflict, "you signed out of gofer while connecting, so the grant was not saved")
 		return
 	case outcome == grantRevokedMidFlow:
 		writeGrantPage(w, http.StatusConflict, `<p>The grant was revoked while you were connecting it, so it was not saved.</p>`+
@@ -280,15 +277,47 @@ func (h *Handler) storeWriteGrant(ctx context.Context, p *provider, userID, logi
 	return grantStored, nil
 }
 
-// refuseGrant revokes a grant gofer will not keep and tells the user why.
-func (h *Handler) refuseGrant(ctx context.Context, w http.ResponseWriter, p *provider, token *oauth2.Token, userID, logMsg, userMsg string) {
-	slog.WarnContext(ctx, logMsg, "user", userID)
-	if token.AccessToken != "" {
-		if err := h.revokeGrant(ctx, p, token.AccessToken); err != nil {
-			slog.WarnContext(ctx, "write grant: revoking a refused grant failed", "user", userID, "err", err)
-		}
+// failConnect discards the token a failed connection was issued (discardToken) and
+// tells the user why nothing was saved, and whether GitHub confirmed the token is
+// gone.
+func (h *Handler) failConnect(ctx context.Context, w http.ResponseWriter, p *provider, token *oauth2.Token, userID string, status int, why string) {
+	msg := `<p>` + why + `. GitHub confirmed the token it issued is revoked.</p>`
+	if !h.discardToken(ctx, p, token, userID) {
+		msg = `<p>` + why + `. GitHub did not confirm the token it issued is revoked: check ` +
+			`<a href="` + oauthAppsSettings + `">GitHub's settings</a> (Authorized OAuth Apps) and revoke gofer's commenting app if it is there.</p>`
 	}
-	http.Error(w, userMsg, http.StatusForbidden)
+	writeGrantPage(w, status, msg+`<p><a href="/">Back to radar</a></p>`)
+}
+
+// discardToken revokes one token a failed connection was issued, and reports whether
+// GitHub confirmed it. It revokes that token only (DELETE /applications/{id}/token),
+// never the whole authorization: a connection that succeeded meanwhile, in another
+// tab, holds a different token of the same authorization, which must survive. It
+// runs detached from the browser request, on its own deadline.
+func (h *Handler) discardToken(ctx context.Context, p *provider, token *oauth2.Token, userID string) bool {
+	if token == nil || token.AccessToken == "" {
+		return true
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), exchangeTimeout)
+	defer cancel()
+	if err := h.revokeToken(rctx, p, token.AccessToken); err != nil {
+		slog.WarnContext(ctx, "write grant: revoking an unsaved token failed", "user", userID, "err", err)
+		return false
+	}
+	return true
+}
+
+// revokeToken revokes one access token of p's client
+// (DELETE /applications/{client_id}/token). Anything but a 2xx is unconfirmed.
+func (h *Handler) revokeToken(ctx context.Context, p *provider, accessToken string) error {
+	status, err := h.applicationCall(ctx, p, http.MethodDelete, "/token", accessToken)
+	if err != nil {
+		return err
+	}
+	if status/100 != 2 {
+		return fmt.Errorf("github token revocation: status %d", status)
+	}
+	return nil
 }
 
 // DisconnectWrite handles POST /auth/github-write/disconnect: the user withdraws the

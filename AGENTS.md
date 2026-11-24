@@ -439,18 +439,21 @@ Wired on the web-tier side; they define what a runtime must respect:
   hold). The grant is connected under its own cookie (`session.StartGrant`, path
   `/auth/github-write`), so the session survives, and only by the GitHub account the
   session belongs to. Logout records the write grant's pending revocation in the same
-  commit as the session's end (`beginSessionLogout`), and the callback re-checks the
-  session under the write grant's marker lock before storing, so an in-flight
-  connection cannot outlive a logout; storing a write grant is strict (a vault
-  failure revokes it and tells the user). The web tier posts with it
+  commit as the session's end (`beginSessionLogout`), whether or not commenting is
+  still configured. The flow is bound to the session that began it
+  (`OAuthFlow.SessionKey`), and the callback re-checks that session under the write
+  grant's marker lock before storing, so an in-flight connection cannot outlive a
+  logout. Storing a write grant is strict, and every failed connection revokes the
+  token it was issued, that token only (`discardToken`), never the authorization. The web tier posts with it
   (`internal/comment` over `internal/ghcomment`, which checks `"private": false`
-  first and follows no redirect). The preview registers the comment and items under a
-  one-time nonce; a same-origin confirm consumes it, and a nonce gofer does not hold
+  first and follows no redirect). The preview registers the comment and the items it
+  showed as eligible under a one-time nonce (confirming may drop an item, never add
+  one); a same-origin confirm consumes it, and a nonce gofer does not hold
   is refused, so nothing posts twice from one preview, across a restart included.
   Same-origin trusts `Sec-Fetch-Site: same-origin`, since `Referrer-Policy:
   no-referrer` makes a form's `Origin` "null". Posts are serial, a second apart; a
-  rate limit stops the batch, and a POST whose answer was lost is "unknown", never
-  "not posted". Targets are items on the radar only (`WorkItem.OnRadar`). @
+  rate limit stops the batch, the grant is re-read before each post (a disconnect
+  stops it), and a POST whose answer was lost is "unknown", never "not posted". Targets are items on the radar only (`WorkItem.OnRadar`). @
   suggestions are each repository's assignees, read with the user's read credential
   and cached in memory, counted against every selected repository (unchecked ones are
   unknown). `reload.js` does not reload while items are checked.

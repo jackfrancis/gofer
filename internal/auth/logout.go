@@ -123,17 +123,19 @@ func (h *Handler) beginLogout(ctx context.Context, sessionKey, userID, providerN
 }
 
 // beginSessionLogout is beginLogout for an interactive logout: when the session is a
-// GitHub one and commenting is configured, the write grant's logout (ADR 0009) is
-// recorded in the same commit as the sign-in credential's and the session's end, if
+// GitHub one, the write grant's logout (ADR 0009) is recorded in the same commit as the sign-in credential's and the session's end, if
 // a write grant is held, its logout is already pending, or that cannot be read
 // (fail closed). The check and the commit run under the write grant's marker lock,
 // which the connect callback also holds while it re-checks the session and stores a
 // grant, so a grant is either stored before this check sees it, or refused because
-// the session has ended. writeLo is nil when no write grant was recorded.
+// the session has ended. writeLo is nil when no write grant was recorded. It does not
+// depend on commenting being configured now: a grant stored while it was is deleted
+// all the same (its revocation then unconfirmed), so configuring the write client
+// again later never revives it.
 func (h *Handler) beginSessionLogout(ctx context.Context, sessionKey, userID, providerName string) (lo, writeLo *localLogout, err error) {
 	defer h.locks.markerLock(userID, providerName)()
 	providers := []string{providerName}
-	if _, ok := h.providers[WriteProvider]; ok && providerName == "github" {
+	if providerName == "github" {
 		defer h.locks.markerLock(userID, WriteProvider)()
 		held, herr := h.writeGrantHeldLocked(ctx, userID)
 		if herr != nil {
@@ -482,7 +484,7 @@ func (h *Handler) revokeLocked(ctx context.Context, userID, providerName string)
 		slog.WarnContext(ctx, "reading a credential on logout failed", "user", userID, "provider", providerName, "err", err)
 		return h.unconfirmed(providerName, p, nil)
 	case !ok:
-		slog.InfoContext(ctx, "logout: github sign-in is not configured; revocation unconfirmed", "user", userID)
+		slog.InfoContext(ctx, "logout: the credential's client is not configured; revocation unconfirmed", "user", userID, "provider", providerName)
 		return h.unconfirmed(providerName, nil, &cred)
 	case !fromConfiguredClient(p, cred):
 		// Issued by another client (before a cutover or rollback): this client's

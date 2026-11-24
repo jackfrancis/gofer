@@ -47,9 +47,12 @@ type OAuthFlow struct {
 	Provider string
 	State    string
 	Verifier string // PKCE code verifier
-	// UserID binds a grant flow (StartGrant) to the signed-in user who began it; the
-	// callback refuses to complete it for anyone else. Empty for a sign-in flow.
-	UserID string
+	// UserID and SessionKey bind a grant flow (StartGrant) to the signed-in user who
+	// began it and to that very session (SessionKey, its hashed id): the callback
+	// refuses to complete it for anyone else, or from another session of the same
+	// user (one signed in again after a logout). Empty for a sign-in flow.
+	UserID     string
+	SessionKey string
 }
 
 // pendingFlow is a pre-auth session: an OAuth handshake in progress.

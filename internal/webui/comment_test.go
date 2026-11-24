@@ -419,3 +419,50 @@ func TestCommentResultsShowUnknown(t *testing.T) {
 		t.Errorf("results page:\n%s", out)
 	}
 }
+
+// Review P1 (second round): confirming never adds an item the preview listed as
+// skipped, even if it is back on the radar by then; it may only drop one.
+func TestCommentConfirmNeverAddsTargets(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	rec := postComment(h, commentForm("/lgtm", "github:a/one#1", "github:a/one#3", "github:b/two#2"))
+	page := rec.Body.String()
+	if !strings.Contains(page, "Post to 2 items") || !strings.Contains(page, "hidden") {
+		t.Fatalf("preview:\n%s", page)
+	}
+	nonce := previewNonce(t, page)
+
+	// Between preview and confirm: the hidden item is unhidden, and b/two#2 is hidden.
+	err := h.store.Update(context.Background(), "github:42", func(items []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		var out []worklist.WorkItem
+		for _, it := range items {
+			switch it.ID {
+			case "github:a/one#3":
+				it.Meta.HiddenAt = time.Time{}
+				out = append(out, it)
+			case "github:b/two#2":
+				it.Meta.HiddenAt = time.Now()
+				out = append(out, it)
+			}
+		}
+		return out, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin")
+	if c.postCount() != 1 || len(c.posts[0]) != 1 || c.posts[0][0].ID != "github:a/one#1" {
+		t.Fatalf("posted to %+v; want only a/one#1 (previewed, still on the radar)", c.posts)
+	}
+}
+
+// Review P2 (second round): an unknown confirmation does not claim nothing was ever
+// posted from it.
+func TestCommentUnknownConfirmationIsHonest(t *testing.T) {
+	h := commentFixture(t, &fakeCommenter{enabled: true, connected: true})
+	rec := postComment(h, confirmForm(newNonce()), "Sec-Fetch-Site", "same-origin")
+	body := rec.Body.String()
+	if !strings.Contains(body, "cannot tell whether an earlier confirmation") || !strings.Contains(body, "check the items on GitHub") {
+		t.Errorf("page:\n%s", body)
+	}
+}

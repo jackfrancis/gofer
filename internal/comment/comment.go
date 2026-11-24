@@ -129,8 +129,11 @@ func (s *Service) State(ctx context.Context, userID string) (enabled, connected 
 // apart (GitHub asks for serial content creation, a second apart). ErrNotConnected
 // means nothing was attempted. The batch stops, leaving the remaining targets
 // unattempted, on a 401 (which GitHub's check-token confirms before the grant is
-// deleted: WriteRejected), on a rate limit, or when ctx ends. A post whose answer was
-// lost is Unknown, never reported as not posted.
+// deleted: WriteRejected), on a rate limit, when ctx ends, or when the grant is no
+// longer usable locally: it is read again before every post after the first, so a
+// disconnect (or logout) mid-batch stops the batch even if GitHub has not yet
+// confirmed the revocation. A post whose answer was lost is Unknown, never reported
+// as not posted.
 func (s *Service) Post(ctx context.Context, userID string, targets []Target, body string) ([]Result, error) {
 	cred, err := s.creds.WriteCredential(ctx, userID)
 	if errors.Is(err, vault.ErrSignInRequired) || errors.Is(err, vault.ErrNotFound) {
@@ -151,6 +154,17 @@ func (s *Service) Post(ctx context.Context, userID string, targets []Target, bod
 		}
 		if stopped == "" && ctx.Err() != nil {
 			stopped = "Not attempted: gofer ran out of time."
+		}
+		if stopped == "" && i > 0 {
+			fresh, err := s.creds.WriteCredential(ctx, userID)
+			switch {
+			case errors.Is(err, vault.ErrSignInRequired) || errors.Is(err, vault.ErrNotFound):
+				stopped = "Not attempted: commenting was disconnected."
+			case err != nil:
+				stopped = "Not attempted: gofer could not confirm commenting is still connected."
+			default:
+				cred = fresh // the same grant, or one reconnected meanwhile
+			}
 		}
 		if stopped != "" {
 			out[i].Error = stopped

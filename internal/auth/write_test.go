@@ -190,8 +190,8 @@ func TestConnectWriteRefusesAnotherAccount(t *testing.T) {
 	if _, ok := writeStored(t, vlt); ok {
 		t.Error("another account's grant was stored")
 	}
-	if gh.revokedOther.Load() != 1 {
-		t.Errorf("write-grant revocations = %d, want 1", gh.revokedOther.Load())
+	if gh.tokensRevoked.Load() != 1 || gh.revokedOther.Load() != 0 {
+		t.Errorf("token revocations = %d, grant revocations = %d; want the one token only", gh.tokensRevoked.Load(), gh.revokedOther.Load())
 	}
 }
 
@@ -384,6 +384,7 @@ func TestLogoutCommitsWriteGrantMarkerWithSession(t *testing.T) {
 		req.AddCookie(c)
 	}
 	h.Logout(httptest.NewRecorder(), req)
+	oldLogouts := []*localLogout{h.locks.currentLogout(user, "github"), h.locks.currentLogout(user, WriteProvider)}
 
 	for _, p := range []string{"github", WriteProvider} {
 		if pending, err := db.Vault(keys).LogoutPending(bg, user, p); err != nil || !pending {
@@ -392,8 +393,22 @@ func TestLogoutCommitsWriteGrantMarkerWithSession(t *testing.T) {
 	}
 	// A new process over the same database (the old one's locks stay held, as if
 	// it had died) refuses the grant and finishes its revocation.
-	defer u1()
-	defer u2()
+	defer func() {
+		// Let the old process's deferred revocations wake and finish before the
+		// database goes away.
+		u1()
+		u2()
+		for _, lo := range oldLogouts {
+			if lo == nil {
+				continue
+			}
+			select {
+			case <-lo.done:
+			case <-time.After(5 * time.Second):
+				t.Error("the old process's deferred logout did not finish")
+			}
+		}
+	}()
 	h2, _, _, _ := newWriteHandler(t, gh)
 	h2.vault, h2.ledger = db.Vault(keys), db.Vault(keys)
 	if _, err := h2.WriteCredential(bg, user); !errors.Is(err, vault.ErrSignInRequired) {
@@ -463,14 +478,14 @@ func TestConnectAfterLogoutStoresNothing(t *testing.T) {
 		h.Logout(httptest.NewRecorder(), req)
 	})
 	rec, _, _ := connectWrite(t, h, signedIn)
-	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "signed out") {
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "signed out") || !strings.Contains(rec.Body.String(), "confirmed") {
 		t.Fatalf("callback after logout = %d %s", rec.Code, rec.Body)
 	}
 	if _, ok := writeStored(t, vlt); ok {
 		t.Error("the callback stored a grant after logout")
 	}
-	if gh.revokedOther.Load() != 1 {
-		t.Errorf("write-grant revocations = %d, want 1 (the unsaved grant)", gh.revokedOther.Load())
+	if gh.tokensRevoked.Load() != 1 {
+		t.Errorf("token revocations = %d, want 1 (the unsaved token)", gh.tokensRevoked.Load())
 	}
 }
 
@@ -492,8 +507,8 @@ func TestConnectWriteReportsVaultFailure(t *testing.T) {
 	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "could not save") {
 		t.Fatalf("callback = %d %s", rec.Code, rec.Body)
 	}
-	if gh.revokedOther.Load() != 1 {
-		t.Errorf("write-grant revocations = %d, want 1", gh.revokedOther.Load())
+	if gh.tokensRevoked.Load() != 1 {
+		t.Errorf("token revocations = %d, want 1", gh.tokensRevoked.Load())
 	}
 	h.vault = vlt
 	if st := h.CommentingState(bg, user); st.Connected {
@@ -517,5 +532,102 @@ func TestDisconnectWithoutGrant(t *testing.T) {
 	}
 	if p, _ := vlt.(*vault.MemoryVault).LogoutPending(bg, user, WriteProvider); p {
 		t.Error("recorded a pending revocation of nothing")
+	}
+}
+
+// Review P2 (second round): a grant flow completes only from the session that began
+// it, not from another session of the same user (one signed in again after a logout
+// in another tab).
+func TestConnectWriteBoundToStartingSession(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newWriteHandler(t, gh)
+	_, first := signIn(t, h)
+	req := httptest.NewRequest(http.MethodGet, writePath+"/login", nil)
+	for _, c := range first.Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.ConnectWrite(rec, req)
+	loc, _ := url.Parse(rec.Header().Get("Location"))
+
+	_, second := signIn(t, h) // the same account, a new session
+	cb := httptest.NewRequest(http.MethodGet, writePath+"/callback?code=c&state="+url.QueryEscape(loc.Query().Get("state")), nil)
+	for _, c := range second.Cookies() {
+		cb.AddCookie(c)
+	}
+	for _, c := range rec.Result().Cookies() {
+		cb.AddCookie(c)
+	}
+	out := httptest.NewRecorder()
+	h.ConnectWriteCallback(out, cb)
+	if out.Code != http.StatusBadRequest {
+		t.Fatalf("callback from another session = %d, want 400", out.Code)
+	}
+	if _, ok := writeStored(t, vlt); ok {
+		t.Error("another session completed the flow")
+	}
+}
+
+// Review P2 (second round): a write grant stored while commenting was configured is
+// deleted at logout even after the write client is removed, so configuring it again
+// never revives the grant; its revocation is reported unconfirmed.
+func TestLogoutDeletesWriteGrantWithoutConfig(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newWriteHandler(t, gh)
+	_, signedIn := signIn(t, h)
+	connectWrite(t, h, signedIn)
+	delete(h.providers, WriteProvider) // the write client is no longer configured
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	for _, c := range signedIn.Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.Logout(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), oauthAppsSettings) {
+		t.Fatalf("logout = %d %s; want unconfirmed, linking the OAuth-app settings", rec.Code, rec.Body)
+	}
+	if _, ok := writeStored(t, vlt); ok {
+		t.Error("the write grant survived logout with commenting unconfigured")
+	}
+}
+
+// Review P2 (second round): a token issued before the profile lookup failed is
+// revoked, and the user is told.
+func TestConnectWriteProfileFailureRevokesToken(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newWriteHandler(t, gh)
+	_, signedIn := signIn(t, h)
+	gh.userFails.Store(true)
+	rec, _, _ := connectWrite(t, h, signedIn)
+	if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "confirmed the token it issued is revoked") {
+		t.Fatalf("callback = %d %s", rec.Code, rec.Body)
+	}
+	if gh.tokensRevoked.Load() != 1 {
+		t.Errorf("token revocations = %d, want 1", gh.tokensRevoked.Load())
+	}
+	if _, ok := writeStored(t, vlt); ok {
+		t.Error("stored a grant whose profile could not be read")
+	}
+}
+
+// Review P2 (second round): cleaning up a failed connection revokes only its own
+// token, so a connection that succeeded (another tab) keeps working.
+func TestFailedConnectKeepsOtherConnection(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newWriteHandler(t, gh)
+	_, signedIn := signIn(t, h)
+	connectWrite(t, h, signedIn)
+	good, _ := writeStored(t, vlt)
+
+	gh.userID.Store(43) // the second attempt comes back from another account and fails
+	if rec, _, _ := connectWrite(t, h, signedIn); rec.Code != http.StatusForbidden {
+		t.Fatalf("second connect = %d", rec.Code)
+	}
+	if !gh.isValid(good.AccessToken) {
+		t.Error("cleaning up the failed connection revoked the stored grant's token")
+	}
+	if c, ok := writeStored(t, vlt); !ok || c.AccessToken != good.AccessToken {
+		t.Errorf("stored grant = %+v (ok=%v)", c, ok)
 	}
 }

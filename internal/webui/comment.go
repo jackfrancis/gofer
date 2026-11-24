@@ -205,7 +205,10 @@ func (h *Handler) commentState(ctx context.Context, user *session.User) (enabled
 	return h.commenter.State(ctx, user.ID)
 }
 
-const expiredPreview = "That preview has expired, or gofer restarted since it was shown; nothing was posted. Go back to the radar and preview the comment again."
+// expiredPreview answers a confirmation gofer does not hold. gofer knows only that it
+// posted nothing for this request, not what an earlier confirmation of the same
+// preview did (its results are gone after resultTTL or a restart).
+const expiredPreview = "gofer no longer has this preview: it expired, or gofer restarted since it was shown. Nothing was posted for this request, but gofer cannot tell whether an earlier confirmation of it posted. If you confirmed it before, check the items on GitHub before previewing the comment again."
 
 // Comment handles POST /items/comment. Without confirm=1 it renders the preview:
 // the comment and every item it will go to, registered under a one-time nonce, and
@@ -261,7 +264,13 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 	if len(targets) == 0 {
 		view.Error = "None of the selected items can take a comment now."
 	} else {
-		view.Nonce = h.batches.register(user.ID, body, ids, h.now())
+		// Only the items shown as eligible are registered: confirming may drop one
+		// that left the radar since, but never adds one the preview listed as skipped.
+		eligible := make([]string, len(targets))
+		for i, t := range targets {
+			eligible[i] = t.ID
+		}
+		view.Nonce = h.batches.register(user.ID, body, eligible, h.now())
 	}
 	// The page's default policy (no-referrer) makes a form POST from it send
 	// "Origin: null"; same-origin lets the Confirm button send its real origin, which

@@ -33,6 +33,7 @@ type fakeGitHub struct {
 	valid     map[string]bool   // live access tokens
 	issuer    map[string]string // access token -> the client that issued it ("" = cid)
 	userID    atomic.Int64      // the id /user answers with
+	userFails atomic.Bool       // /user answers 502
 	refresh   map[string]string // live refresh token -> the access token issued with it
 	n         int
 	killNext  bool // the next issued token is dead on arrival (a grant revoked mid-flow)
@@ -47,11 +48,12 @@ type fakeGitHub struct {
 	// onRevoke runs when a grant revocation arrives, with the token it carries.
 	onRevoke func(token string)
 
-	refreshes    atomic.Int32
-	checks       atomic.Int32
-	revoked      atomic.Int32 // grant revocations
-	revokedOther atomic.Int32 // grant revocations of a client other than cid (the write grant)
-	revokedWith  atomic.Value // string: the access token the last revocation carried
+	refreshes     atomic.Int32
+	checks        atomic.Int32
+	revoked       atomic.Int32 // grant revocations
+	revokedOther  atomic.Int32 // grant revocations of a client other than cid (the write grant)
+	tokensRevoked atomic.Int32 // single-token revocations
+	revokedWith   atomic.Value // string: the access token the last revocation carried
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
@@ -90,6 +92,10 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 			}
 			_ = json.NewEncoder(w).Encode(resp)
 		case r.URL.Path == "/user":
+			if f.userFails.Load() {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"id":` + strconv.FormatInt(f.userID.Load(), 10) + `,"login":"` + f.login.Load().(string) + `","email":"u@example.test"}`))
 		case appPath(r, "/token") != "" && r.Method == http.MethodPost:
@@ -111,6 +117,19 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 				return
 			}
 			http.NotFound(w, r)
+		case appPath(r, "/token") != "" && r.Method == http.MethodDelete:
+			// Revoking one token leaves the rest of the authorization alone.
+			client := appPath(r, "/token")
+			tok := bodyToken(r)
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if !f.valid[tok] || !f.basicAuthOK(r) || f.issuedByLocked(tok) != client {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			delete(f.valid, tok)
+			f.tokensRevoked.Add(1)
+			w.WriteHeader(http.StatusNoContent)
 		case appPath(r, "/grant") != "" && r.Method == http.MethodDelete:
 			client := appPath(r, "/grant")
 			f.revoked.Add(1)
