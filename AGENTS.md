@@ -306,6 +306,15 @@ Wired on the web-tier side; they define what a runtime must respect:
   rule `worklist.Resolve` applies); Reset Conversations also clears hidden and
   completed items in scope, and its count includes them (`Resolution.OffRadar`, from
   the same read).
+- The radar's label filter (`internal/webui/labelfilter.go`) applies after the project
+  filter, under the same rules: a view preference in its own account-bound cookie
+  (`gofer_labels`), dropping items without re-sorting, the hidden section included. Its
+  checklist offers every label on the radar (ranked or hidden) in every project,
+  whatever the project filter selects, merged by name ignoring case, plus "No label";
+  counts follow the project filter. An item shows when it carries any selected label.
+  Each bulk form posts the page's label selection (`labels`, narrowed to the labels the
+  checklist names) beside `scope`, and the actions cover only items both select
+  (`viewScope`, read by `formScope`); a garbled `labels` acts on nothing.
 - A user turn keeps one answer: `worklist.AppendReply` drops any reply to a turn that
   already has a substantive one (a notice such as `NoticeReconnect` is not an answer),
   so the first answer stored wins. That store rule is what makes retrying a turn safe,

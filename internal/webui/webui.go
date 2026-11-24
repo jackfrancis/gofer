@@ -291,9 +291,15 @@ type pageData struct {
 	Projects                 []ProjectOption     // the project filter's checklist, by name (worklist view)
 	ProjectsFiltered         bool                // some project is deselected: Items is a subset of the radar
 	SelectedProjects         int                 // projects shown, for the filter's label
-	TotalItems               int                 // items on the whole radar, before the project filter
+	TotalItems               int                 // items on the whole radar, before the project and label filters
 	ProjectScope             string              // the shown selection, posted back by each bulk form ("" = every project)
 	ProjectsError            string              // why the last project selection was not saved
+	Labels                   []LabelOption       // the label filter's checklist: every label on the radar, by name (worklist view)
+	LabelsFiltered           bool                // some label is deselected: Items is a subset of the project-filtered radar
+	SelectedLabels           int                 // label options shown, for the filter's label
+	LabelScope               string              // the shown label selection, posted back by each bulk form ("" = every label)
+	LabelsError              string              // why the last label selection was not saved
+	Filtered                 bool                // the project or the label filter narrows the radar
 	CommentEnabled           bool                // worklist: the deployment offers bulk comments (ADR 0009)
 	CommentConnected         bool                // worklist: the user connected the write grant
 	CommentNotice            string              // worklist: the outcome of the last connect/disconnect, for the user
@@ -603,8 +609,8 @@ func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 //
 // This is a demo and development affordance: with the threads gone every PR is
 // unreviewed again, so "Review all PRs" and the review panel can be exercised end to
-// end without rebuilding the environment. It clears every item in the projects the
-// submitting page was filtered to (form "scope"; every project without one), including
+// end without rebuilding the environment. It clears every item in the projects and labels
+// the submitting page was filtered to (forms "scope" and "labels"; every one without them), including
 // items hidden or completed on the radar — the page's count and tooltip say so. The
 // conversations are not recoverable.
 // SameSite=Lax cookies give baseline CSRF protection.
@@ -616,7 +622,7 @@ func (h *Handler) ResetConversations(w http.ResponseWriter, r *http.Request) {
 	}
 	// One atomic update, so a run's write-back cannot restore a thread mid-clear. Only
 	// items that actually carry conversation state are written back.
-	selected, ok := formSelection(r)
+	scope, ok := formScope(r)
 	if !ok {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
@@ -624,8 +630,8 @@ func (h *Handler) ResetConversations(w http.ResponseWriter, r *http.Request) {
 	_ = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		var cleared []worklist.WorkItem
 		for _, it := range current {
-			if !inScope(selected, it) || !hasConversation(it) {
-				continue // outside the submitting page's projects, or nothing to clear
+			if !scope.includes(it) || !hasConversation(it) {
+				continue // outside the submitting page's projects and labels, or nothing to clear
 			}
 			it.Thread = nil
 			it.ThreadReadAt = time.Time{}
@@ -784,7 +790,7 @@ const (
 )
 
 // ReviewAllPRs handles POST /items/review-all. For every pull request the submitting
-// page showed (on the radar, in its projects: form "scope"), it appends the review prompt to the item's thread and, in one
+// page showed (on the radar, in its projects and labels: forms "scope" and "labels"), it appends the review prompt to the item's thread and, in one
 // concurrent batch, schedules an assistant review turn for each — then redirects
 // back to the radar (Post/Redirect/Get). A PR already awaiting a reply is skipped,
 // so a double submit does not stack duplicate reviews.
@@ -796,7 +802,7 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 	}
 	at := h.now().UTC()
 	var refs []worklist.TurnRef
-	selected, ok := formSelection(r)
+	scope, ok := formScope(r)
 	if !ok {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
@@ -806,8 +812,8 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		var changed []worklist.WorkItem
 		refs = refs[:0]
 		for _, it := range current {
-			if it.Type != worklist.TypePullRequest || !it.OnRadar() || !inScope(selected, it) {
-				continue // off the radar (hidden or closed) or outside the page's projects: never review it in bulk
+			if it.Type != worklist.TypePullRequest || !it.OnRadar() || !scope.includes(it) {
+				continue // off the radar (hidden or closed) or outside the page's projects and labels: never review it in bulk
 			}
 			if it.HasReview() {
 				continue // already reviewed at least once — a first-review is no longer needed
@@ -868,7 +874,7 @@ func (h *Handler) SecondOpinion(w http.ResponseWriter, r *http.Request) {
 }
 
 // SecondOpinionAllPRs handles POST /items/second-opinion-all. For every pull request
-// the submitting page showed (on the radar, in its projects: form "scope") reviewed once but without a consensus synthesis yet, it appends an independent-review
+// the submitting page showed (on the radar, in its projects and labels: forms "scope" and "labels") reviewed once but without a consensus synthesis yet, it appends an independent-review
 // prompt and runs the review panel (blind review + chained synthesis) by a model that
 // differs from that PR's first review, then redirects back to the radar (Post/Redirect/
 // Get). When the eligible PRs' first reviews are homogeneous the user picks the model
@@ -880,7 +886,7 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	selected, ok := formSelection(r)
+	scope, ok := formScope(r)
 	if !ok {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
@@ -903,7 +909,7 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 		var eligible []worklist.WorkItem
 		firstModels := map[string]struct{}{}
 		for _, it := range current {
-			if it.OnRadar() && inScope(selected, it) && it.NeedsSecondOpinion(now, reviewStaleAfter) {
+			if it.OnRadar() && scope.includes(it) && it.NeedsSecondOpinion(now, reviewStaleAfter) {
 				eligible = append(eligible, it)
 				firstModels[it.FirstReviewModel()] = struct{}{}
 			}
@@ -1025,14 +1031,25 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		return pageData{View: "error", User: user, Message: res.Message}, http.StatusOK
 	default:
 		now := h.now()
-		// The project filter narrows what is shown. The bulk actions' counts below, and
-		// the scope each bulk form posts back (ProjectScope), cover only the selected
-		// projects the checklist names, so an action acts on what this page shows.
+		// The project filter, then the label filter, narrow what is shown. The bulk
+		// actions' counts below, and the scope each bulk form posts back (ProjectScope,
+		// LabelScope), cover only the selected projects and labels the checklists name,
+		// so an action acts on what this page shows. The label checklist offers every
+		// label on the radar, in any project; its counts follow the project filter.
 		selected := savedSelection(r, user.ID)
-		projects := projectOptions(listedItems(res), selected)
-		shown := filterProjects(res.Items, selected)
-		shownHidden := filterProjects(res.Hidden, selected)
-		scope := shownSelection(selected, projects)
+		labelSel := savedLabels(r, user.ID)
+		listedAll := listedItems(res)
+		projects := projectOptions(listedAll, selected)
+		labels := labelOptions(listedAll, filterProjects(listedAll, selected), labelSel)
+		shown := filterLabels(filterProjects(res.Items, selected), labelSel)
+		shownHidden := filterLabels(filterProjects(res.Hidden, selected), labelSel)
+		scope := viewScope{projects: shownSelection(selected, projects), labels: shownLabelSelection(labelSel, labels)}
+		selectedLabels := 0
+		for _, l := range labels {
+			if l.Selected {
+				selectedLabels++
+			}
+		}
 		selectedCount := 0
 		for _, p := range projects {
 			if p.Selected {
@@ -1054,10 +1071,10 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 			}
 		}
 		// The radar ranks only items on it, but Reset clears every stored thread in the
-		// selected projects the checklist names, hidden and closed items' included,
-		// from Resolve's same read (res.OffRadar).
+		// selected projects and labels the checklists name, hidden and closed items'
+		// included, from Resolve's same read (res.OffRadar).
 		for _, it := range res.OffRadar {
-			if inScope(scope, it) && hasConversation(it) {
+			if scope.includes(it) && hasConversation(it) {
 				resetCount++
 			}
 		}
@@ -1066,17 +1083,27 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 			ReviewCount: reviewCount, SecondOpinionEnabled: h.secondOpinionEnabled(), SecondOpinionCount: secondCount,
 			ResetCount: resetCount,
 			Projects:   projects, ProjectsFiltered: selected != nil, SelectedProjects: selectedCount, TotalItems: len(res.Items),
+			Labels: labels, LabelsFiltered: labelSel != nil, SelectedLabels: selectedLabels,
+			Filtered: selected != nil || labelSel != nil,
 		}
-		data.LabelCSS = labelStylesheet(shown)
+		// The checklist draws every label on the radar in its color, so the stylesheet
+		// covers every listed item, not only the shown ones.
+		data.LabelCSS = labelStylesheet(listedAll)
 		data.CommentEnabled, data.CommentConnected = h.commentState(r.Context(), user)
 		if data.CommentEnabled {
 			data.CommentNotice = commentNotices[r.URL.Query().Get("commenting")]
 		}
-		if scope != nil {
-			data.ProjectScope = encodeSelection(scope)
+		if scope.projects != nil {
+			data.ProjectScope = encodeSelection(scope.projects)
+		}
+		if scope.labels != nil {
+			data.LabelScope = encodeLabels(scope.labels)
 		}
 		if r.URL.Query().Get("projects") == projectsTooMany {
 			data.ProjectsError = "Too many projects selected to save. Choose fewer, or Select all; your previous filter is unchanged."
+		}
+		if r.URL.Query().Get("labels") == projectsTooMany {
+			data.LabelsError = "Too many labels selected to save. Choose fewer, or Select all; your previous filter is unchanged."
 		}
 		// "Review all PRs" offers every model when more than one is configured; a
 		// single-model setup keeps the plain button.

@@ -33,8 +33,9 @@ import (
 // projectsCookie names the cookie that holds the saved selection.
 const projectsCookie = "gofer_projects"
 
-// maxProjectsCookie bounds the encoded cookie. Browsers drop a cookie past ~4 KB, so
-// a selection that would not fit is refused and the previous filter is kept.
+// maxProjectsCookie bounds an encoded filter cookie (the project filter's or the label
+// filter's). Browsers drop a cookie past ~4 KB, so a selection that would not fit is
+// refused and the previous filter is kept.
 const maxProjectsCookie = 3800
 
 // projectsTooMany is the query value Index reads to explain a refused selection.
@@ -261,19 +262,7 @@ func (h *Handler) FilterProjects(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	c := &http.Cookie{
-		Name:     projectsCookie,
-		Value:    value,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   isHTTPS(r),
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   365 * 24 * 60 * 60,
-	}
-	if clear {
-		c.Value, c.MaxAge = "", -1
-	}
-	http.SetCookie(w, c)
+	setFilterCookie(w, r, projectsCookie, value, clear)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
