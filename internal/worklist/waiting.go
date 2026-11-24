@@ -38,6 +38,9 @@ type LastWord struct {
 	// Text is the body, at most MaxLastWordBytes: a longer one keeps its start and its
 	// end, where a closing question usually is.
 	Text string `json:"text,omitempty"`
+	// Digest identifies the whole body, taken before Text is cut, so an edit anywhere
+	// in a long comment (its cut middle too) is a new version (Key).
+	Digest string `json:"digest,omitempty"`
 	// Head is the pull request's head commit when the last word was made: the commit a
 	// review names, or for a comment the head enrich first saw with it. A later head
 	// means the author pushed since, which answers it (AwaitingOthersSince unset). It
@@ -60,9 +63,18 @@ const (
 
 // NewLastWord returns a LastWord held to its bounds.
 func NewLastWord(id string, at time.Time, decisive bool, mentions []string, text string) *LastWord {
-	lw := &LastWord{ID: id, At: at, Decisive: decisive, Mentions: mentions, Text: text}
+	lw := &LastWord{ID: id, At: at, Decisive: decisive, Mentions: mentions, Text: text, Digest: digest(text)}
 	lw.bound()
 	return lw
+}
+
+// digestLen is the length of LastWord.Digest in hex digits.
+const digestLen = 24
+
+// digest returns a LastWord.Digest of text.
+func digest(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:digestLen/2])
 }
 
 // bound holds lw to MaxLastWordBytes and MaxMentions, keeping only well-formed logins.
@@ -71,6 +83,9 @@ func (lw *LastWord) bound() {
 	lw.Text = headTail(lw.Text, MaxLastWordBytes)
 	if !validSHA(lw.Head) {
 		lw.Head = ""
+	}
+	if len(lw.Digest) != digestLen || !validSHA(lw.Digest) { // hex
+		lw.Digest = ""
 	}
 	var ms []string
 	for _, m := range lw.Mentions {
@@ -84,12 +99,30 @@ func (lw *LastWord) bound() {
 	lw.Mentions = ms
 }
 
-// Key identifies the last word as read: its ID and its text, so an edited comment
-// reads as a new last word.
+// Key identifies the last word as read: its ID and its whole body (Digest), so an
+// edited comment reads as a new last word. One stored without a digest is keyed by
+// its text.
 func (lw LastWord) Key() string {
-	sum := sha256.Sum256([]byte(lw.Text))
-	return lw.ID + "#" + hex.EncodeToString(sum[:6])
+	d := lw.Digest
+	if d == "" {
+		d = digest(lw.Text)
+	}
+	return lw.ID + "#" + d
 }
+
+// TeamConfirmation records the team review requests outstanding when a refresh's
+// review-requested:@me search confirmed one of them names the user (enrich: the hit
+// had no other explanation): how many there were and when the latest was made. While
+// exactly those requests are outstanding (the same count, none made after Latest), a
+// later search that was cut short and did not return the item leaves the
+// confirmation standing; a request made since is not covered.
+type TeamConfirmation struct {
+	Latest time.Time `json:"latest"`
+	Count  int       `json:"count"`
+}
+
+// maxTeamRequests bounds TeamConfirmation.Count.
+const maxTeamRequests = 1000
 
 // Outcomes of a TurnReading.
 const (
@@ -137,6 +170,9 @@ func (r *TurnReading) bound() {
 // BoundTurnSignals holds an item's LastWord and TurnReading to their bounds, in place,
 // whatever a run sent. RunPolicy.Apply calls it on every write-back.
 func BoundTurnSignals(s *Signals) {
+	if c := s.TeamConfirmed; c != nil && (c.Latest.IsZero() || c.Count <= 0 || c.Count > maxTeamRequests) {
+		s.TeamConfirmed = nil
+	}
 	if s.LastWord != nil {
 		lw := *s.LastWord
 		lw.Mentions = slices.Clone(lw.Mentions)

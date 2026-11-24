@@ -18,6 +18,7 @@ type timelineEvent struct {
 	State             string    `json:"state"`     // for "reviewed": approved | changes_requested | commented | dismissed
 	CommitID          string    `json:"commit_id"` // for "reviewed": the head commit the review was made on
 	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"` // for "commented": the last edit, or its creation
 	SubmittedAt       time.Time `json:"submitted_at"`
 	RequestedReviewer *struct {
 		Login string `json:"login"`
@@ -61,6 +62,12 @@ type ActivityOptions struct {
 	// only if they share one. Otherwise team membership is unknown and a team request
 	// awaits no one in particular.
 	ReviewRequested bool
+	// Confirmed is the team requests an earlier refresh's search confirmed
+	// (worklist.Signals.TeamConfirmed), passed when this refresh's search was cut short
+	// and kept the item's request without returning it. It is evidence as
+	// ReviewRequested is, but only while exactly those requests are outstanding: a
+	// partial search neither confirms a new request nor cancels an unchanged one.
+	Confirmed *worklist.TeamConfirmation
 	// PullRequest says the item is a pull request, whose head commit says whether the
 	// author pushed since login's last word.
 	PullRequest bool
@@ -97,6 +104,11 @@ type Activity struct {
 	// withdrawn or login reviews after it. A timeline with no request event and no
 	// review by login is not evidence, so RequestEnded is false there.
 	RequestEnded bool
+	// TeamConfirmed records the outstanding team requests when the evidence
+	// (ActivityOptions.ReviewRequested or Confirmed) attributes one of them to login,
+	// for the next refresh's Confirmed; nil otherwise. Unset, like RequestedByLogin,
+	// when the timeline is incomplete.
+	TeamConfirmed *worklist.TeamConfirmation
 }
 
 // The timeline is read oldest first, a page at a time, so the latest events, which
@@ -178,11 +190,15 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 	// evidence at all — a request event, or login's own review.
 	var lastActivityDecisive, personalPending, sawRequest bool
 	teamRequests := make(map[string]teamRequest)
-	// answered records a force-push or ready-for-review, which GitHub dates, on an item
-	// login did not author: the author's answer, which takes the last word.
+	// answeredAt is the latest force-push or ready-for-review, which GitHub dates, on
+	// an item login did not author: the author's answer, which takes the last word from
+	// any word it follows. Words are ordered among themselves by when they were made,
+	// so editing a comment never jumps it past someone's reply to it; against an
+	// answer, a comment counts from its last edit, which may ask something new.
+	var answeredAt time.Time
 	answered := func(at time.Time) {
-		if !isAuthor && at.After(lastActivityAt) {
-			lastActivityAt, lastActor, lastActivityDecisive, lastEvent = at, "", false, nil
+		if !isAuthor && at.After(answeredAt) {
+			answeredAt = at
 		}
 	}
 	for i := range events {
@@ -259,6 +275,12 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 			}
 		}
 	}
+	if lastEvent != nil && lastEvent.Event == "commented" && lastEvent.UpdatedAt.After(lastActivityAt) {
+		lastActivityAt = lastEvent.UpdatedAt // an edit: the comment as it reads now
+	}
+	if answeredAt.After(lastActivityAt) {
+		lastActivityAt, lastActor, lastActivityDecisive, lastEvent = answeredAt, "", false, nil
+	}
 	a := Activity{Participants: len(participants), InboundRefs: inbound, OtherReviewers: len(otherReviewers)}
 	a.Commented = !myLastActivityAt.IsZero()
 	if !complete {
@@ -277,20 +299,24 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 	if !requestedAt.IsZero() && requestedAt.After(myLastActivityAt) {
 		meSince = requestedAt
 	}
-	if opts.ReviewRequested && !personalPending && len(teamRequests) > 0 {
+	var earliest, latest time.Time
+	actors := map[string]bool{}
+	for _, tr := range teamRequests {
+		if earliest.IsZero() || tr.at.Before(earliest) {
+			earliest = tr.at
+		}
+		if tr.at.After(latest) {
+			latest = tr.at
+		}
+		actors[tr.actor] = true
+	}
+	// An earlier search's confirmation stands only for exactly the requests it saw:
+	// none withdrawn (the count) and none made since (the latest).
+	confirmed := opts.Confirmed != nil && opts.Confirmed.Count == len(teamRequests) && opts.Confirmed.Latest.Equal(latest)
+	if (opts.ReviewRequested || confirmed) && !personalPending && len(teamRequests) > 0 {
 		// The search hit is otherwise unexplained: one of the outstanding team requests
 		// names login, though which is unknown when there are several.
-		var earliest, latest time.Time
-		actors := map[string]bool{}
-		for _, tr := range teamRequests {
-			if earliest.IsZero() || tr.at.Before(earliest) {
-				earliest = tr.at
-			}
-			if tr.at.After(latest) {
-				latest = tr.at
-			}
-			actors[tr.actor] = true
-		}
+		a.TeamConfirmed = &worklist.TeamConfirmation{Latest: latest, Count: len(teamRequests)}
 		if len(actors) == 1 {
 			for actor := range actors {
 				a.RequestedByLogin = actor

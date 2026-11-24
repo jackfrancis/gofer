@@ -436,6 +436,12 @@ func carryPendingRequest(fetched *worklist.Signals, stored worklist.Signals, rev
 		fetched.ReviewRequestedBy = stored.ReviewRequestedBy
 		fetched.ReviewRequestedByBot = stored.ReviewRequestedByBot
 	}
+	// So is an earlier search's confirmation that a team request names the user:
+	// enrich honours it only after a partial search, and only while the same team
+	// requests are outstanding (github.ActivityOptions.Confirmed).
+	if fetched.TeamConfirmed == nil {
+		fetched.TeamConfirmed = stored.TeamConfirmed
+	}
 	return inferred
 }
 

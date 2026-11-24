@@ -293,3 +293,28 @@ func TestWaitingAnsweredLastWord(t *testing.T) {
 		t.Fatal("an answered last word made the item wait")
 	}
 }
+
+// The key covers the whole body, including the part a long one loses when cut.
+func TestLastWordKeyCoversTheCutMiddle(t *testing.T) {
+	long := func(middle string) string {
+		return strings.Repeat("a", MaxLastWordBytes) + middle + strings.Repeat("z", MaxLastWordBytes)
+	}
+	a := NewLastWord("comment:1", time.Time{}, false, nil, long("first"))
+	b := NewLastWord("comment:1", time.Time{}, false, nil, long("second"))
+	if a.Text != b.Text {
+		t.Fatal("setup: the cut texts should be equal")
+	}
+	if a.Key() == b.Key() {
+		t.Error("two versions differing only in the cut middle share a key")
+	}
+	legacy := LastWord{ID: "comment:1", Text: "short"}
+	if legacy.Key() != NewLastWord("comment:1", time.Time{}, false, nil, "short").Key() {
+		t.Error("a last word stored without a digest keys differently from a new one of the same text")
+	}
+	bad := LastWord{ID: "comment:1", Text: "short", Digest: "not hex"}
+	s := Signals{LastWord: &bad, TeamConfirmed: &TeamConfirmation{Count: -1, Latest: time.Now()}}
+	BoundTurnSignals(&s)
+	if s.LastWord.Digest != "" || s.TeamConfirmed != nil {
+		t.Errorf("bounds kept digest %q, confirmation %+v", s.LastWord.Digest, s.TeamConfirmed)
+	}
+}

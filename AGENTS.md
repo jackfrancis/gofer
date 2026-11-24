@@ -231,7 +231,11 @@ Wired on the web-tier side; they define what a runtime must respect:
   the item (`ActivityOptions.ReviewRequested`, from `freshRequests`; a request carried
   over from an earlier search is no evidence of who made a later one, and a
   standalone enrich attributes none), and no personal request of theirs explains the
-  hit. Which team names them is unknown when several are outstanding, so the item
+  hit. The confirmation is recorded (`Signals.TeamConfirmed`: how many team requests
+  were outstanding, and the latest), and after a search that was cut short and kept
+  the request without returning the item it stands while exactly those requests are
+  outstanding (`ActivityOptions.Confirmed`): a partial search neither confirms a new
+  request nor cancels an unchanged one. Which team names them is unknown when several are outstanding, so the item
   awaits them only if every outstanding team request was made since their last
   comment or review (since the latest), and the requester (`ReviewRequestedBy`, so a
   bot's team request scores as a bot's) is named only if those requests share an
@@ -243,10 +247,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   the head is the one first seen with it (`LastWord.Head`, passed back as
   `ActivityOptions.Prior`). Once a push answers a last word, `LastWord.Answered`
   records it, and no later read undoes it, not even one that cannot read the head.
-  Both apply only to the same version of the last word (`LastWord.Key`: an edited
-  comment is a new question, anchored afresh). The last word is kept whoever's turn
+  Both apply only to the same version of the last word (`LastWord.Key`: the ID and a
+  digest of the whole body taken before the text is cut, so an edited comment is a
+  new question, anchored afresh). The last word is kept whoever's turn
   it is (a review request may outrank it for a while) and across every refresh. Force-push and
-  ready-for-review events, which GitHub dates, answer a comment too. A review with no
+  ready-for-review events, which GitHub dates, answer a comment too. Words are
+  ordered among themselves by when they were made, so an edit never jumps a reply;
+  against those events, and for the wait's date, a comment counts from its last edit
+  (`updated_at`). A review with no
   summary is read through its inline comments, up to `reviewCommentPages` pages; one
   longer than that has no text. On the user's own item a reviewer's decisive review is the
   user's turn, and a wait with no recorded last word (stored before `LastWord`

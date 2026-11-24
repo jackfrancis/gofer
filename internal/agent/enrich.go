@@ -103,6 +103,11 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried,
 			ReviewRequested: requested[items[i].ID],
 			PullRequest:     items[i].Type == worklist.TypePullRequest,
 			Prior:           items[i].Signals.LastWord}
+		if carried[items[i].ID] {
+			// The search was cut short before it reached the item: what an earlier one
+			// confirmed stands while the same team requests are outstanding.
+			opts.Confirmed = items[i].Signals.TeamConfirmed
+		}
 		if slices.Contains(items[i].Signals.Reasons, worklist.ReasonAuthor) {
 			opts.Author = login // an item stored before its author was recorded
 		}
@@ -213,15 +218,15 @@ func applyActivity(s *worklist.Signals, act github.Activity, carried bool) bool 
 	}
 	// Only a whole timeline says who requested the review; a partial one leaves
 	// what the store knows in place rather than reading as "nobody".
-	requester := act.RequestedByLogin
+	requester, confirmed := act.RequestedByLogin, act.TeamConfirmed
 	if !act.TimelineComplete {
-		requester = s.ReviewRequestedBy
+		requester, confirmed = s.ReviewRequestedBy, s.TeamConfirmed
 	}
 	if !reasonChanged &&
 		act.Participants == s.Participants && act.InboundRefs == s.InboundRefs &&
 		act.OtherReviewers == s.OtherReviewers && requester == s.ReviewRequestedBy &&
 		act.AwaitingMeSince.Equal(s.AwaitingMeSince) && act.AwaitingOthersSince.Equal(s.AwaitingOthersSince) &&
-		reflect.DeepEqual(act.LastWord, s.LastWord) {
+		reflect.DeepEqual(act.LastWord, s.LastWord) && reflect.DeepEqual(confirmed, s.TeamConfirmed) {
 		return false
 	}
 	s.Reasons = reasons
@@ -229,6 +234,7 @@ func applyActivity(s *worklist.Signals, act github.Activity, carried bool) bool 
 	s.InboundRefs = act.InboundRefs
 	s.OtherReviewers = act.OtherReviewers
 	s.ReviewRequestedBy = requester
+	s.TeamConfirmed = confirmed
 	s.AwaitingMeSince = act.AwaitingMeSince
 	s.AwaitingOthersSince = act.AwaitingOthersSince
 	// A turn reading of a replaced last word no longer applies (CurrentTurnReading),

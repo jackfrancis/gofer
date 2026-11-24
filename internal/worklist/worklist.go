@@ -321,9 +321,13 @@ type Signals struct {
 	AwaitingOthersSince time.Time `json:"awaiting_others_since"`
 	DeadlineAt          time.Time `json:"deadline_at"`
 	Reopened            bool      `json:"reopened"`
-	// LastWord is the user's own comment or review when it is the last human word, so
-	// the reason AwaitingOthersSince is set; nil otherwise (see WorkItem.Waiting).
+	// LastWord is the user's own comment or review when it is the last human word,
+	// whoever's turn it is (see WorkItem.Waiting); nil otherwise.
 	LastWord *LastWord `json:"last_word,omitempty"`
+	// TeamConfirmed records the team review requests a refresh's
+	// review-requested:@me search confirmed as the user's, so a later partial search
+	// does not undo that while the same requests are outstanding.
+	TeamConfirmed *TeamConfirmation `json:"team_confirmed,omitempty"`
 
 	// Strategic context.
 	RepoTier      int      `json:"repo_tier"`
