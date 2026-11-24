@@ -20,10 +20,13 @@ const (
 // read, so a caller that also needs them (the radar's Reset count) does not read the
 // store a second time and cannot see the two halves disagree. Hidden is the subset of
 // OffRadar the radar lists in its hidden section (WorkItem.InHiddenList), most
-// recently hidden first, unscored.
+// recently hidden first, unscored. Waiting carries the items on the radar that are
+// waiting on someone else (WorkItem.Waiting), ranked the same way and left out of
+// Items, so the radar lists them after the rest and above the hidden section.
 type Resolution struct {
 	Status   string
 	Items    []WorkItem
+	Waiting  []WorkItem
 	OffRadar []WorkItem
 	Hidden   []WorkItem
 	Message  string
@@ -63,7 +66,8 @@ type BackfillCompleter interface {
 //     run returns StatusReady with no items, because the radar is genuinely empty
 //     rather than still being discovered;
 //   - otherwise rescores agent-derived items against now (time-dependent axes
-//     decay between writes), preserving human overrides (OriginUser), sorts by
+//     decay between writes), preserving human overrides (OriginUser), splits off
+//     the items waiting on someone else (Resolution.Waiting), sorts both by
 //     key/desc, and returns StatusReady.
 //
 // Rescoring at read time keeps urgency/engagement fresh without re-fetching from
@@ -98,25 +102,33 @@ func Resolve(ctx context.Context, store Store, ingestor Ingestor, now time.Time,
 	}
 	// Hidden items (user-set) and completed items (closed/merged, agent-set) stay
 	// in the store, but are dropped from the ranked list. Hidden items still open
-	// are listed apart (Hidden), for the owner to unhide.
+	// are listed apart (Hidden), for the owner to unhide. Items waiting on someone
+	// else stay on the radar, listed after the rest (Waiting).
 	visible := items[:0]
-	var off, hidden []WorkItem
+	var off, hidden, waiting []WorkItem
 	for _, it := range items {
-		if it.OnRadar() {
-			visible = append(visible, it)
-		} else {
+		_, wait := it.Waiting()
+		switch {
+		case !it.OnRadar():
 			off = append(off, it)
 			if it.InHiddenList() {
 				hidden = append(hidden, it)
 			}
+		case wait:
+			waiting = append(waiting, it)
+		default:
+			visible = append(visible, it)
 		}
 	}
 	items = visible
 	if err := Sort(items, key, desc); err != nil {
 		return Resolution{}, err
 	}
+	if err := Sort(waiting, key, desc); err != nil {
+		return Resolution{}, err
+	}
 	sortHidden(hidden)
-	return Resolution{Status: StatusReady, Items: items, OffRadar: off, Hidden: hidden}, nil
+	return Resolution{Status: StatusReady, Items: items, Waiting: waiting, OffRadar: off, Hidden: hidden}, nil
 }
 
 // OnRadar reports whether the item belongs on the owner's radar: it is neither
@@ -124,4 +136,16 @@ func Resolve(ctx context.Context, store Store, ingestor Ingestor, now time.Time,
 // and every bulk action (Review all, the second-opinion batch) draws only from them.
 func (w WorkItem) OnRadar() bool {
 	return w.Meta.HiddenAt.IsZero() && w.Meta.CompletedAt.IsZero()
+}
+
+// Actionable reports whether the item is on the radar (OnRadar) and not waiting on
+// someone else (Waiting): the pool the bulk review actions (Review all, the
+// second-opinion batch) draw from. A waiting item has nothing new for the user to act
+// on until someone answers.
+func (w WorkItem) Actionable() bool {
+	if !w.OnRadar() {
+		return false
+	}
+	_, waiting := w.Waiting()
+	return !waiting
 }

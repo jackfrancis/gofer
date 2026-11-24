@@ -319,41 +319,18 @@
       <p class="zz-compose-connect"><a href="/auth/github-write/login">Connect GitHub for commenting</a> to post one comment (such as <code>/assign</code>) to several items at once. It is a separate permission from sign-in, and you can disconnect it at any time.</p>
       {{end}}{{end}}
       {{range .Items}}
-        <div class="zz-item">
-          <div class="zz-item-head">
-            {{if $.CommentConnected}}<input class="zz-select" type="checkbox" name="item" value="{{.ID}}" form="zz-bulk-comment" data-comment-item data-repo="{{.GitHub.Repo}}" aria-label="Select {{.GitHub.Repo}} #{{.GitHub.Number}} for a comment">{{end}}
-            <div class="zz-title">{{stateIcon .}}<a href="{{.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.GitHub.Title}}</a></div>
-            <div class="zz-item-actions">
-              {{if $.ConvEnabled}}
-              <a class="btn btn-sm zz-discuss{{if .HasUnreadReply}} zz-discuss--unread{{end}}" href="/items/thread?id={{.ID | urlquery}}"{{with discussTitle .}} title="{{.}}"{{end}}>{{with discussBadge .}}{{.}} {{end}}Discuss</a>
-              {{end}}
-              <form method="post" action="/items/hide">
-                <input type="hidden" name="id" value="{{.ID}}">
-                <button class="btn btn-sm" type="submit" title="Move this item to the hidden section at the bottom of your radar until you unhide it">Hide</button>
-              </form>
-            </div>
-          </div>
-          <div class="zz-meta">
-            <span>{{.GitHub.Repo}} #{{.GitHub.Number}}</span>
-            <span class="Label zz-priority {{priorityClass .Meta.Priority}}">{{with .Meta.Priority}}{{.}}{{else}}unranked{{end}}</span>
-            {{with ghLabels .}}<span class="zz-labels">{{range .}}<span class="Label zz-ghlabel{{with .Class}} {{.}}{{end}}">{{.Name}}</span>{{end}}</span>{{end}}
-          </div>
-          {{template "ci" ciSummary .}}
-          {{if .Meta.AwaitingRefresh}}
-          <div class="zz-rationale zz-awaiting">Waiting for the next refresh</div>
-          {{else}}
-          <div class="zz-bar"><span class="zz-w-{{pctBucket .Meta.Rank}}"></span></div>
-          <div class="zz-axes">
-            <span>Relevance <b>{{axis2 .Meta.Relevance}}</b></span>
-            <span>Impact <b>{{axis2 .Meta.Impact}}</b></span>
-            <span>Engagement <b>{{axis2 .Meta.Engagement}}</b></span>
-            <span>Urgency <b>{{axis2 .Meta.Urgency}}</b></span>
-          </div>
-          {{with .Meta.Rationale}}<div class="zz-rationale">{{.}}</div>{{end}}
-          {{end}}
-        </div>
+        {{template "item" (row . $.ConvEnabled $.CommentConnected)}}
       {{else}}
-        <div class="zz-empty"><p>{{if .ProjectsFiltered}}No items in the selected projects.{{else}}Nothing on your radar right now.{{end}}</p></div>
+        <div class="zz-empty"><p>{{if .Waiting}}Nothing{{if .ProjectsFiltered}} in the selected projects{{end}} needs you right now.{{else if .ProjectsFiltered}}No items in the selected projects.{{else}}Nothing on your radar right now.{{end}}</p></div>
+      {{end}}
+      {{with .Waiting}}
+      <section class="zz-waiting" aria-labelledby="zz-waiting-head">
+        <h2 id="zz-waiting-head" class="zz-section-head">Waiting on others <span class="zz-section-count">{{len .}}</span></h2>
+        <p class="zz-meta">Your last word is the latest, or a review left the next step to the author. These come back up when someone answers.</p>
+        {{range .}}
+          {{template "item" (row . $.ConvEnabled $.CommentConnected)}}
+        {{end}}
+      </section>
       {{end}}
       {{with .HiddenItems}}
       <section class="zz-hidden-list" aria-labelledby="zz-hidden-head">
@@ -384,6 +361,43 @@
   </div>
 </body>
 </html>
+{{define "projectScope"}}{{if .ProjectsFiltered}}<input type="hidden" name="scope" value="{{.ProjectScope}}">{{end}}{{end}}
+{{define "item"}}{{with .Item}}
+        <div class="zz-item">
+          <div class="zz-item-head">
+            {{if $.CommentConnected}}<input class="zz-select" type="checkbox" name="item" value="{{.ID}}" form="zz-bulk-comment" data-comment-item data-repo="{{.GitHub.Repo}}" aria-label="Select {{.GitHub.Repo}} #{{.GitHub.Number}} for a comment">{{end}}
+            <div class="zz-title">{{stateIcon .}}<a href="{{.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.GitHub.Title}}</a></div>
+            <div class="zz-item-actions">
+              {{if $.ConvEnabled}}
+              <a class="btn btn-sm zz-discuss{{if .HasUnreadReply}} zz-discuss--unread{{end}}" href="/items/thread?id={{.ID | urlquery}}"{{with discussTitle .}} title="{{.}}"{{end}}>{{with discussBadge .}}{{.}} {{end}}Discuss</a>
+              {{end}}
+              <form method="post" action="/items/hide">
+                <input type="hidden" name="id" value="{{.ID}}">
+                <button class="btn btn-sm" type="submit" title="Move this item to the hidden section at the bottom of your radar until you unhide it">Hide</button>
+              </form>
+            </div>
+          </div>
+          <div class="zz-meta">
+            <span>{{.GitHub.Repo}} #{{.GitHub.Number}}</span>
+            <span class="Label zz-priority {{priorityClass .Meta.Priority}}">{{with .Meta.Priority}}{{.}}{{else}}unranked{{end}}</span>{{with waitingBadge .}}
+            <span class="Label zz-waiting-badge" title="{{waitingTitle $.Item}}">{{.}}</span>{{end}}
+            {{with ghLabels .}}<span class="zz-labels">{{range .}}<span class="Label zz-ghlabel{{with .Class}} {{.}}{{end}}">{{.Name}}</span>{{end}}</span>{{end}}
+          </div>
+          {{template "ci" ciSummary .}}
+          {{if .Meta.AwaitingRefresh}}
+          <div class="zz-rationale zz-awaiting">Waiting for the next refresh</div>
+          {{else}}
+          <div class="zz-bar"><span class="zz-w-{{pctBucket .Meta.Rank}}"></span></div>
+          <div class="zz-axes">
+            <span>Relevance <b>{{axis2 .Meta.Relevance}}</b></span>
+            <span>Impact <b>{{axis2 .Meta.Impact}}</b></span>
+            <span>Engagement <b>{{axis2 .Meta.Engagement}}</b></span>
+            <span>Urgency <b>{{axis2 .Meta.Urgency}}</b></span>
+          </div>
+          {{with .Meta.Rationale}}<div class="zz-rationale">{{.}}</div>{{end}}
+          {{end}}
+        </div>
+{{end}}{{end}}
 {{/* A pull request's CI summary (ciView), or nothing for nil. */}}
 {{define "ci"}}{{with .}}<ul class="zz-ci" aria-label="CI results">
             {{if .Historical}}<li class="zz-ci-note">Last known CI results; no longer updated since this item left your radar.</li>{{else if .Stale}}<li class="zz-ci-note">Last known CI results, from before you hid this item; the next refresh checks them again.</li>{{end}}
@@ -393,7 +407,6 @@
             {{with .More}}<li class="zz-ci-fail">{{.}}</li>{{end}}
             {{if .Partial}}<li class="zz-ci-note">Some CI results could not be read.</li>{{end}}
           </ul>{{end}}{{end}}
-{{define "projectScope"}}{{if .ProjectsFiltered}}<input type="hidden" name="scope" value="{{.ProjectScope}}">{{end}}{{end}}
 {{define "skipped"}}{{with .}}<h2>Skipped</h2>
         <ul class="zz-targets zz-skipped">
           {{range .}}<li><span>{{.Label}}</span> <span class="zz-target-status">{{.Reason}}</span></li>{{end}}

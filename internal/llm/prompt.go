@@ -53,9 +53,11 @@ func userPrompt(item worklist.WorkItem) string {
 	if !item.Signals.AwaitingMeSince.IsZero() && !item.Signals.ReviewRequestedByBot {
 		summary["awaiting_me_days"] = daysSince(item.Signals.AwaitingMeSince, now)
 	}
-	if !item.Signals.AwaitingOthersSince.IsZero() {
+	// Waiting, not the raw timeline signal: a reading that the user still owes the
+	// next step ("I'll look tomorrow") keeps the item theirs.
+	if w, ok := item.Waiting(); ok {
 		summary["waiting_on_others"] = true
-		summary["awaiting_others_days"] = daysSince(item.Signals.AwaitingOthersSince, now)
+		summary["awaiting_others_days"] = daysSince(w.Since, now)
 	}
 	if item.Signals.OtherReviewers > 0 {
 		summary["others_reviewing"] = item.Signals.OtherReviewers

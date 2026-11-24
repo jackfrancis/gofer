@@ -26,6 +26,15 @@ func NewRunPolicy(botReviewers []string) RunPolicy {
 	return RunPolicy{bots: bots}
 }
 
+// Bots returns the policy's bot logins, lowercased, in no particular order.
+func (p RunPolicy) Bots() []string {
+	out := make([]string, 0, len(p.bots))
+	for b := range p.bots {
+		out = append(out, b)
+	}
+	return out
+}
+
 // IsBot reports whether login is one of the policy's bot reviewers.
 func (p RunPolicy) IsBot(login string) bool {
 	if login == "" {
@@ -41,9 +50,11 @@ func (p RunPolicy) IsBot(login string) bool {
 //     whatever the run sent, so a run cannot claim the human override (OriginUser)
 //     that Resolve leaves unrescored.
 //   - Signals.ReviewRequestedByBot is re-derived (Classify).
+//   - The last word and turn reading are held to their bounds (BoundTurnSignals).
 func (p RunPolicy) Apply(items []WorkItem) {
 	for i := range items {
 		items[i].Meta.Origin = OriginAgent
+		BoundTurnSignals(&items[i].Signals)
 	}
 	p.Classify(items)
 }

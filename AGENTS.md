@@ -222,6 +222,71 @@ Wired on the web-tier side; they define what a runtime must respect:
   pressure, low floors) unless the user is also an assignee. The web and runtime images must ship together: a runtime
   from before these rules posts its reply inside the item, where it is now ignored,
   and a web tier from before them has no research route.
+- An item is WAITING (`WorkItem.Waiting`, `internal/worklist/waiting.go`) when the
+  ball is in someone else's court; the radar lists waiting items in their own section
+  after the rest and above the hidden section, ranked the same way
+  (`Resolution.Waiting`; the JSON worklist's `waiting`). It is not a score: it says
+  whose turn it is, not how much the item matters. Enrich decides it from the
+  timeline (`github.ItemActivityFor`): the last human word is the user's own comment
+  or review (recorded as `Signals.LastWord`, text cut to `MaxLastWordBytes`, mentions
+  parsed outside quotes and code, never a team or an `@name[bot]` account), or an
+  approving or changes-requested review on an item the user did not author. A bot's
+  comment never takes the last word (GitHub type `Bot`, a `[bot]` login, or
+  `BOT_REVIEWERS`, sent to every run as run parameter `bots`). A review request still
+  awaiting the user outranks any later word: their personal request with no comment
+  or review by them since, or a team request attributed to them. A team request is
+  the user's only on evidence: THIS refresh's `review-requested:@me` search returned
+  the item (`ActivityOptions.ReviewRequested`, from `freshRequests`; a request carried
+  over from an earlier search is no evidence of who made a later one, and a
+  standalone enrich attributes none), and no personal request of theirs explains the
+  hit. The confirmation is recorded (`Signals.TeamConfirmed`: each team request it
+  covered, by team and request time), and unless this refresh's review search was
+  walked whole without returning the item (cut short, or none ran, as in a standalone
+  enrich) it stands while every one of those requests is still outstanding
+  (`ActivityOptions.Confirmed`, `TeamConfirmation.StillOutstanding`), covering only
+  them: a partial search neither confirms a new request nor cancels an unchanged one,
+  and another team asked since neither ends it nor joins it. While it stands it wins
+  over a fresh hit too, which it already explains more specifically, so asking (and
+  later withdrawing) another team never resets the requester or the date. Which team names them is unknown when several are outstanding, so the item
+  awaits them only if every outstanding team request was made since their last
+  comment or review (since the latest), and the requester (`ReviewRequestedBy`, so a
+  bot's team request scores as a bot's) is named only if those requests share an
+  actor. On a pull request the user did not author, a push or
+  ready-for-review is the author's answer. A commit's date is never its push time
+  (commits are pushed late, clocks drift), so pushes are judged by the head
+  (`ActivityOptions.PullRequest`): a review's last word stands while the head is its
+  `commit_id` (an unreadable head ends the wait); a comment's last word stands while
+  the head is the one first seen with it (`LastWord.Head`, passed back as
+  `ActivityOptions.Prior`). Once a push answers a last word, `LastWord.Answered`
+  records it, and no later read undoes it, not even one that cannot read the head.
+  Both apply only to the same version of the last word (`LastWord.Key`: the ID and a
+  digest of the whole body taken before the text is cut, so an edited comment is a
+  new question, anchored afresh). The last word is kept whoever's turn
+  it is (a review request may outrank it for a while) and across every refresh. Force-push and
+  ready-for-review events, which GitHub dates, answer a comment too. Words are
+  ordered among themselves by when they were made, so an edit never jumps a reply;
+  against those events, for the wait's date, and, when it is the last word, as the
+  user's engagement (a review request made before the edit no longer outranks it), a
+  comment counts from its last edit (`updated_at`). A review with no
+  summary is read through its inline comments, up to `reviewCommentPages` pages; one
+  longer than that has no text. On the user's own item a reviewer's decisive review is the
+  user's turn, and a wait with no recorded last word (stored before `LastWord`
+  existed) is not trusted; an undecisive last word with no text never waits. With a
+  chat model, a reading pass between enrich and rank (`runReadTurns`, at most
+  `turnReadLimit` calls a pass) asks the model to read a non-decisive last word
+  (`Signals.NeedsTurnReading`) and writes the pass's readings alone, in one store
+  transaction, through `POST /agent/worklist/turns` (`worklist.ApplyTurns`), never the
+  items it read: a reading is dropped unless the stored last word is still the one it read (keyed by
+  the last word's ID and text) and the item is not hidden. It is a model signal kept
+  like the proposal (`KeepModelSignals`) and applied only while current
+  (`CurrentTurnReading`): `my_turn` keeps the item with the user, `nothing_pending`
+  and `waiting_on` keep it waiting, and a `waiting_on` login counts only if the last
+  word mentions it or it is the author. New activity always wins over a reading. A
+  refresh keeps the waiting timestamps only for an item whose GitHub `updated_at` is
+  unchanged, and the last word always (`carryTurnSignals`). The rank selection leaves waiting
+  items out before its top-N cutoff (`Selection.Top`), and Review all PRs and Get 2nd
+  Opinion skip them (`WorkItem.Actionable`); Reset Conversations still covers them.
+  `RunPolicy.Apply` bounds the last word and reading on every write-back.
 - A run never reads the whole worklist: its threads grow without bound and the agent
   plane caps a response at 8 MiB. `agent.Sink` has only bounded reads, served by the
   same `internal/worklist/select.go` functions in process and on the plane:
@@ -456,7 +521,7 @@ Wired on the web-tier side; they define what a runtime must respect:
   Same-origin trusts `Sec-Fetch-Site: same-origin`, since `Referrer-Policy:
   no-referrer` makes a form's `Origin` "null". Posts are serial, a second apart; a
   rate limit stops the batch, the grant is re-read before each post (a disconnect,
-  or a grant of another version, stops it), and a POST whose answer was lost is "unknown", never "not posted". Targets are items on the radar only (`WorkItem.OnRadar`). @
+  or a grant of another version, stops it), and a POST whose answer was lost is "unknown", never "not posted". Targets are items on the radar only (`WorkItem.OnRadar`), waiting items included (a nudge to whoever has the turn), and the Waiting section's rows carry the same checkbox (the shared `item` template). @
   suggestions are each repository's assignees, read with the user's read credential
   and cached in memory, counted against every selected repository (unchecked ones are
   unknown). `reload.js` does not reload while items are checked.

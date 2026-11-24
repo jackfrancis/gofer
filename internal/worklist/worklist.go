@@ -79,6 +79,11 @@ type GitHubRef struct {
 	Merged      bool   `json:"merged,omitempty"`
 	StateReason string `json:"state_reason,omitempty"`
 
+	// Author is the login that opened the item. The radar names it as who a waiting
+	// item waits on (WorkItem.Waiting); an item stored before it was recorded has
+	// none until the next refresh.
+	Author string `json:"author,omitempty"`
+
 	// LabelColors maps each of the item's labels (Signals.Labels) to its GitHub
 	// color, six hex digits without '#', for display only. Read a color through
 	// LabelColor, which refuses anything but six hex digits.
@@ -316,6 +321,13 @@ type Signals struct {
 	AwaitingOthersSince time.Time `json:"awaiting_others_since"`
 	DeadlineAt          time.Time `json:"deadline_at"`
 	Reopened            bool      `json:"reopened"`
+	// LastWord is the user's own comment or review when it is the last human word,
+	// whoever's turn it is (see WorkItem.Waiting); nil otherwise.
+	LastWord *LastWord `json:"last_word,omitempty"`
+	// TeamConfirmed records the team review requests a refresh's
+	// review-requested:@me search confirmed as the user's, so a later partial search
+	// does not undo that while the same requests are outstanding.
+	TeamConfirmed *TeamConfirmation `json:"team_confirmed,omitempty"`
 
 	// Strategic context.
 	RepoTier      int      `json:"repo_tier"`
@@ -336,6 +348,11 @@ type Signals struct {
 	// multiplies the foundation axes by these factors; nil when no research pass
 	// has run.
 	Research *ResearchAdjustment `json:"research,omitempty"`
+
+	// Turn holds a model's reading of LastWord: whether the user still owes the next
+	// step. Like Proposed and Research it is model-derived (KeepModelSignals); read it
+	// through CurrentTurnReading, which drops a reading of a replaced last word.
+	Turn *TurnReading `json:"turn,omitempty"`
 
 	ObservedAt time.Time `json:"observed_at"` // freshness of this measurement
 }

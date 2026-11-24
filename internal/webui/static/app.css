@@ -170,6 +170,15 @@ body {
 .zz-ci-fail::before { content: "\2717"; color: var(--danger); }
 .zz-ci-note { font-style: italic; }
 .zz-ci-note::before { content: ""; }
+/* Items waiting on someone else: their own section after the radar, quieter than the
+   items that need the user. */
+.zz-waiting { margin-top: 32px; padding-top: 16px; border-top: 1px solid var(--border); }
+.zz-section-head { font-size: 16px; margin: 0; display: flex; align-items: center; gap: 8px; }
+.zz-section-count { color: var(--muted); font-weight: 500; font-size: 13px; }
+.zz-waiting > .zz-meta { margin: 2px 0 12px; }
+.zz-waiting .zz-item { background: var(--bg-subtle); }
+.zz-waiting .zz-bar span { background: var(--muted); }
+.zz-waiting-badge { color: var(--attention); border-color: var(--attention); white-space: nowrap; }
 
 .zz-bar { height: 6px; background: var(--bg-subtle); border-radius: 3px; overflow: hidden; margin: 12px 0 8px; }
 .zz-bar span { display: block; height: 100%; background: var(--accent); }

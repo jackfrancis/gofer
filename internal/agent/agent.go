@@ -75,6 +75,11 @@ type Sink interface {
 	// writes back its older GitHub fields. It is dropped, without error, if the item
 	// is gone.
 	Research(ctx context.Context, itemID string, adj worklist.ResearchAdjustment) error
+	// Turns sets items' turn readings and nothing else, in one write (see
+	// worklist.ApplyTurns), so a reading the model took a while over never writes back
+	// the item it read. A reading is dropped, without error, if its item is gone,
+	// hidden, or its last word is no longer the one the reading names.
+	Turns(ctx context.Context, turns []worklist.ItemTurn) error
 }
 
 // Params configures a single runtime invocation.
@@ -91,6 +96,8 @@ type Params struct {
 	Converser     worklist.Conversationalist // github-converse assistant; required for that job
 	Independent   bool                       // converse: answer blind — omit prior thread turns (independent review)
 	Researcher    worklist.ResearchRanker    // github-research re-ranker; required for that job
+	TurnReader    worklist.TurnReader        // reads the user's last word on waiting items; nil leaves the timeline to decide
+	Bots          []string                   // logins whose comments are automated (BOT_REVIEWERS): never the last word
 	EnrichLimit   int                        // optional cap on items to enrich; 0 enriches every item
 	ReadPageSize  int                        // items per worklist page read (readAll); 0 uses the default
 	Logger        *slog.Logger               // phase logger; nil uses slog.Default()
@@ -207,7 +214,13 @@ func Run(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	case JobIngest:
 		return runIngest(ctx, p, vendor, sink)
 	case JobEnrich:
-		return runEnrich(ctx, p, vendor, sink, nil)
+		if err := runEnrich(ctx, p, vendor, sink, nil, reviewSearch{}); err != nil {
+			return err
+		}
+		if err := runReadTurns(ctx, p, sink); err != nil {
+			p.logger().Warn("turn reading failed", "err", err)
+		}
+		return nil
 	case JobRank:
 		return runRank(ctx, p, sink)
 	case JobConverse:
@@ -258,6 +271,7 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 		return fmt.Errorf("ingest: read existing items: %w", lerr)
 	}
 	items, carried := reconcileFetched(items, existing, fetch.ReviewRequestsComplete)
+	reviews := reviewSearch{hits: freshRequests(items, carried), complete: fetch.ReviewRequestsComplete} // before retired items join the write
 	// Retire what left the open set. Only a COMPLETE fetch proves an item is gone: a
 	// partial walk (time budget, rate limit, result ceiling) simply may not have
 	// reached it, and retiring it then would hide open work.
@@ -276,17 +290,21 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	if err := writeBack(ctx, sink, items); err != nil {
 		return fmt.Errorf("ingest: %w", err)
 	}
-	// The backfill continues into enrich (per-item timeline signals) then rank
-	// (the model proposal), so one pass yields a fully scored radar. Both are
-	// best-effort: a failure leaves the baseline-scored items in place. The
+	// The backfill continues into enrich (per-item timeline signals), the turn
+	// reading (whether the user's last word leaves the next step to someone else),
+	// then rank (the model proposal), so one pass yields a fully scored radar. Each
+	// is best-effort: a failure leaves the baseline-scored items in place. The
 	// separate JobEnrich / JobRank exist for an independent scheduled refresh.
-	if err := runEnrich(ctx, p, vendor, sink, carried); err != nil {
+	if err := runEnrich(ctx, p, vendor, sink, carried, reviews); err != nil {
 		// The user's access is gone: stop here, and say so, rather than rank and
 		// report success. The items already written keep their baseline scores.
 		if isSignInRequired(err) {
 			return fmt.Errorf("backfill enrich: %w", err)
 		}
 		log.Warn("backfill enrich failed", "err", err)
+	}
+	if err := runReadTurns(ctx, p, sink); err != nil {
+		log.Warn("backfill turn reading failed", "err", err)
 	}
 	if err := runRank(ctx, p, sink); err != nil {
 		log.Warn("backfill rank failed", "err", err)
@@ -334,6 +352,7 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 		// the copy read above, which a discussion may have replaced since. The
 		// chained enrich and rank read the store again.
 		clearModelSignals(&fetched[i].Signals)
+		carryTurnSignals(&fetched[i], old)
 		if old.Meta.CompletedAt.IsZero() {
 			// A retired item's request ended with it; a resurfaced item's request is new.
 			if carryPendingRequest(&fetched[i].Signals, old.Signals, reviewsComplete) {
@@ -350,6 +369,27 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 		}
 	}
 	return fetched, carried
+}
+
+// reviewSearch is what a refresh's review-requested:@me search showed: the items it
+// returned, and whether it was walked whole, so an item it did not return has no
+// request. The zero value is a search that did not run.
+type reviewSearch struct {
+	hits     map[string]bool
+	complete bool
+}
+
+// freshRequests names the fetched items this refresh's review-requested search
+// returned: those carrying ReasonReviewRequested that reconcileFetched did not carry
+// over from the store.
+func freshRequests(fetched []worklist.WorkItem, carried map[string]bool) map[string]bool {
+	fresh := make(map[string]bool)
+	for _, it := range fetched {
+		if !carried[it.ID] && slices.Contains(it.Signals.Reasons, worklist.ReasonReviewRequested) {
+			fresh[it.ID] = true
+		}
+	}
+	return fresh
 }
 
 // retireMissing returns the persisted GitHub items that are absent from a complete
@@ -404,16 +444,40 @@ func carryPendingRequest(fetched *worklist.Signals, stored worklist.Signals, rev
 		fetched.ReviewRequestedBy = stored.ReviewRequestedBy
 		fetched.ReviewRequestedByBot = stored.ReviewRequestedByBot
 	}
+	// So is an earlier search's confirmation that a team request names the user:
+	// enrich honours it only after a partial search, and only while the same team
+	// requests are outstanding (github.ActivityOptions.Confirmed).
+	if fetched.TeamConfirmed == nil {
+		fetched.TeamConfirmed = stored.TeamConfirmed
+	}
 	return inferred
 }
 
-// clearModelSignals drops the model proposal and research adjustment from a
-// write-back that did not derive them. A write-back that carries neither leaves the
-// stored values in place (worklist.MergeRunItems), so a pass never restores the
+// clearModelSignals drops the model proposal, research adjustment and turn reading
+// from a write-back that did not derive them. A write-back that carries none leaves
+// the stored values in place (worklist.MergeRunItems), so a pass never restores the
 // copy it read over a newer one written meanwhile.
 func clearModelSignals(s *worklist.Signals) {
 	s.Proposed = nil
 	s.Research = nil
+	s.Turn = nil
+}
+
+// carryTurnSignals keeps what a refresh cannot re-derive about whose turn it is. The
+// stored last word always carries over: it holds the head first seen with it
+// (LastWord.Head), which the chained enrich compares with the head now to tell
+// whether the author pushed since, and which a push (it updates the item) must not
+// erase. The waiting timestamps carry over only for an item GitHub has not updated
+// since: its timeline is unchanged, so the item keeps its place on the radar
+// (worklist.WorkItem.Waiting) until enrich reads the timeline again. An item GitHub
+// updated (a comment, a push, a review request) is not shown as waiting until then.
+func carryTurnSignals(fetched *worklist.WorkItem, stored worklist.WorkItem) {
+	fetched.Signals.LastWord = stored.Signals.LastWord
+	if fetched.GitHub.UpdatedAt.IsZero() || !fetched.GitHub.UpdatedAt.Equal(stored.GitHub.UpdatedAt) {
+		return
+	}
+	fetched.Signals.AwaitingMeSince = stored.Signals.AwaitingMeSince
+	fetched.Signals.AwaitingOthersSince = stored.Signals.AwaitingOthersSince
 }
 
 // runRank reads the user's persisted work, asks the AxisRanker to propose the
@@ -445,6 +509,9 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 	if err != nil {
 		return fmt.Errorf("list worklist: %w", err)
 	}
+	// The selection leaves out items waiting on someone else (WorkItem.Waiting) before
+	// its cutoff: they are listed apart from the ranking, so their slots go to items
+	// that are the user's turn.
 	log.Info("rank: proposing axes", "items", len(items), "stub", stub)
 
 	var (
@@ -472,8 +539,10 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 			// it changes (worklist.Signals.CurrentProposal).
 			prop.ReviewRequestedByBot = items[i].Signals.ReviewRequestedByBot
 			items[i].Signals.Proposed = &prop
-			// Rank derives only the proposal; the stored research adjustment stays.
+			// Rank derives only the proposal; the stored research adjustment and turn
+			// reading stay.
 			items[i].Signals.Research = nil
+			items[i].Signals.Turn = nil
 			// Nor does it read CI: the summary it read may have been replaced by an
 			// enrich that landed while the model worked (worklist.KeepCI keeps the
 			// stored one).
