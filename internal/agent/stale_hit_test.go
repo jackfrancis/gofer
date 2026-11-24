@@ -116,3 +116,63 @@ func TestRunIngestPartialSearchKeepsRequestDate(t *testing.T) {
 			got.Signals.Reasons, got.Signals.AwaitingMeSince, first.Signals.AwaitingMeSince)
 	}
 }
+
+// ciRun runs one ingest against PR #8, served by the involves: search at 12:<minute>
+// (and by the review-request search at 12:09 when review is set), with a single
+// commit status in state ci. It returns the stored item and the status reads.
+func ciRun(t *testing.T, store *worklist.MemoryStore, minute int, review bool, ci string) (worklist.WorkItem, int32) {
+	t.Helper()
+	var checks atomic.Int32
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		switch {
+		case r.URL.Path == "/user":
+			fmt.Fprint(w, `{"login":"me"}`)
+		case r.URL.Path == "/search/issues" && strings.Contains(q, "is:pr") && strings.Contains(q, "involves:@me"):
+			fmt.Fprintf(w, `{"total_count":1,"items":[%s]}`, lifecycleHit(8, false, minute))
+		case r.URL.Path == "/search/issues" && strings.Contains(q, "review-requested:@me") && review:
+			fmt.Fprintf(w, `{"total_count":1,"items":[%s]}`, lifecycleHit(8, false, 9))
+		case r.URL.Path == "/search/issues":
+			fmt.Fprint(w, `{"total_count":0,"items":[]}`)
+		case r.URL.Path == "/repos/o/r/issues/8/timeline":
+			fmt.Fprint(w, `[]`)
+		case r.URL.Path == "/repos/o/r/pulls/8":
+			fmt.Fprint(w, `{"head":{"ref":"branch","sha":"sha1"}}`)
+		case r.URL.Path == "/repos/o/r/commits/sha1/status":
+			checks.Add(1)
+			fmt.Fprintf(w, `{"sha":"sha1","total_count":1,"statuses":[{"context":"unit","state":%q}]}`, ci)
+		case r.URL.Path == "/repos/o/r/commits/sha1/check-runs":
+			fmt.Fprint(w, `{"total_count":0,"check_runs":[]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	if err := Run(ctx, Params{JobType: JobIngest, GitHubBaseURL: srv.URL, Client: srv.Client(), Ranker: failRanker{}}, fakeVendor{token: "tok"}, NewStoreSink(store, "owner")); err != nil {
+		t.Fatal(err)
+	}
+	it, ok, err := store.Get(ctx, "owner", "github:o/r#8")
+	if err != nil || !ok {
+		t.Fatalf("missing item: %v", err)
+	}
+	return it, checks.Load()
+}
+
+// A live PR the search finds only as a copy older than the stored state writes
+// nothing when nothing about it changed (settlePins), but the run still goes on to
+// enrich, so CI that moved on the same commit is refreshed.
+func TestRunIngestStaleHitStillRefreshesCI(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	if it, _ := ciRun(t, store, 0, true, "pending"); it.GitHub.CI == nil || it.GitHub.CI.Pending != 1 {
+		t.Fatalf("setup: CI %+v, want one pending", it.GitHub.CI)
+	}
+	ciRun(t, store, 0, false, "pending") // the request goes; the 12:09 state stays
+	it, calls := ciRun(t, store, 0, false, "failure")
+	if it.GitHub.UpdatedAt.Minute() != 9 || !it.OnRadar() {
+		t.Fatal("the newer 12:09 state was lost")
+	}
+	if it.GitHub.CI == nil || it.GitHub.CI.Pending != 0 || len(it.GitHub.CI.Failed) != 1 {
+		t.Fatalf("CI not refreshed: %+v, status reads %d", it.GitHub.CI, calls)
+	}
+}

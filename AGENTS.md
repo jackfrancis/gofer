@@ -122,8 +122,9 @@ judged against. Which searches matched is current even when a payload is not, so
 stale hit of a live item still carries its review-request membership onto the stored
 item (`agent.withReviewMembership`), reconciled as any hit's is: a confirmed removal
 also clears the stored `AwaitingMeSince` (`agent.settlePins`), a partial search keeps
-both, and a request kept that way still sends the run on to enrich's timeline read
-even when the ingest has nothing to write. A stale hit of a retired item writes
+both. A stale hit that changes nothing is not written, but the run still goes on to
+enrich (CI can move on the same commit, and a request kept by a partial search needs
+the timeline read): an empty write-back never means nothing to enrich. A stale hit of a retired item writes
 nothing. A
 draft result never retires a stored ready PR GitHub updated strictly later
 (`agent.readyAfterDraft`): the search index lagged it. Draft observations pass the

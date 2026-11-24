@@ -284,10 +284,12 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 		log.Info("ingest: retired other contributors' drafts", "count", len(drafts))
 		items = append(items, drafts...)
 	}
-	// A request kept only because the review-request search was partial (carried)
-	// still needs enrich's timeline read to confirm it, even when nothing changed to
-	// write (settlePins dropped the item as stored).
-	if len(items) == 0 && len(carried) == 0 {
+	// An empty write-back does not mean there is nothing to enrich: a live item the
+	// search found as an older copy is left out when nothing about it changed
+	// (settlePins), yet its CI may have moved on the same commit, and a request kept
+	// only because the review-request search was partial (carried) still needs the
+	// timeline read to confirm it. Every pinned ID is such a live item.
+	if len(items) == 0 && len(pinned) == 0 {
 		return nil
 	}
 	if len(items) > 0 {
