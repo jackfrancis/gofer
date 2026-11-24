@@ -1,0 +1,383 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackfrancis/gofer/internal/github/githubtest"
+	"github.com/jackfrancis/gofer/internal/worklist"
+)
+
+// githubSnapshot is one state of GitHub for a pull request. Each refresh runs the
+// whole ingest pipeline (search, ingest, enrich, reading, rank) against it, and the
+// store survives between refreshes, as it does for an owner in production.
+type githubSnapshot struct {
+	timeline               []string
+	head                   string // empty: the pull request lookup fails
+	reviewHit              bool   // the review-requested:@me search returns the PR
+	reviewSearchIncomplete bool
+}
+
+const (
+	snapOwner    = "github:16"
+	snapHeadA    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	snapHeadB    = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	snapQuestion = `{"event":"commented","id":19,"actor":{"login":"me"},"body":"@author please add a test","created_at":"2026-01-01T10:00:00Z"}`
+	snapRequest  = `{"event":"review_requested","actor":{"login":"author"},"requested_reviewer":{"login":"me"},"created_at":"2026-01-04T10:00:00Z"}`
+	snapRemoved  = `{"event":"review_request_removed","actor":{"login":"author"},"requested_reviewer":{"login":"me"},"created_at":"2026-01-05T10:00:00Z"}`
+)
+
+func (snap githubSnapshot) refresh(t *testing.T, store worklist.Store, updated string) worklist.WorkItem {
+	t.Helper()
+	hit := fmt.Sprintf(`{"number":7,"title":"Changes","state":"open","updated_at":%q,"repository_url":"https://api.github.com/repos/o/r","user":{"login":"author"},"pull_request":{"url":"x"}}`, updated)
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		switch {
+		case r.URL.Path == "/user":
+			fmt.Fprint(w, `{"login":"me"}`)
+		case r.URL.Path == "/search/issues" && strings.Contains(q, "review-requested:@me"):
+			if snap.reviewHit {
+				fmt.Fprintf(w, `{"total_count":1,"items":[%s]}`, hit)
+			} else {
+				fmt.Fprintf(w, `{"total_count":0,"incomplete_results":%t,"items":[]}`, snap.reviewSearchIncomplete)
+			}
+		case r.URL.Path == "/search/issues" && strings.Contains(q, "is:pr") && strings.Contains(q, "involves:@me"):
+			fmt.Fprintf(w, `{"total_count":1,"items":[%s]}`, hit)
+		case r.URL.Path == "/search/issues":
+			fmt.Fprint(w, `{"total_count":0,"items":[]}`)
+		case r.URL.Path == "/repos/o/r/issues/7/timeline":
+			fmt.Fprintf(w, "[%s]", strings.Join(snap.timeline, ","))
+		case r.URL.Path == "/repos/o/r/pulls/7" && snap.head != "":
+			fmt.Fprintf(w, `{"head":{"sha":%q}}`, snap.head)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	if err := Run(ctx, Params{JobType: JobIngest, GitHubBaseURL: srv.URL, Client: srv.Client()}, fakeVendor{token: "test"}, NewStoreSink(store, snapOwner)); err != nil {
+		t.Fatal(err)
+	}
+	it, ok, err := store.Get(ctx, snapOwner, "github:o/r#7")
+	if err != nil || !ok {
+		t.Fatalf("read back item: found=%v, err=%v", ok, err)
+	}
+	return it
+}
+
+// answeredByPush refreshes once while my question waits, then once after the author
+// pushes (a commit dated before the question), and returns that second snapshot.
+func answeredByPush(t *testing.T, store worklist.Store) githubSnapshot {
+	t.Helper()
+	s := githubSnapshot{timeline: []string{snapQuestion}, head: snapHeadA}
+	if _, waiting := s.refresh(t, store, "2026-01-01T10:00:00Z").Waiting(); !waiting {
+		t.Fatal("setup: my question should wait on the author")
+	}
+	s.head = snapHeadB
+	s.timeline = append(s.timeline, `{"event":"committed","sha":"`+snapHeadB+`","committer":{"date":"2026-01-02T10:00:00Z"}}`)
+	if _, waiting := s.refresh(t, store, "2026-01-02T10:00:00Z").Waiting(); waiting {
+		t.Fatal("setup: the push should answer my question")
+	}
+	return s
+}
+
+// A failed head lookup does not revive a question a push already answered.
+func TestRefreshAnsweredStaysAnsweredWithoutAHead(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	s := answeredByPush(t, store)
+	s.head = ""
+	if _, waiting := s.refresh(t, store, "2026-01-02T10:00:00Z").Waiting(); waiting {
+		t.Fatal("a failed head lookup revived a wait a push had answered")
+	}
+}
+
+// A review request that comes and goes does not revive an answered question either.
+func TestRefreshAnsweredStaysAnsweredAcrossARequest(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	s := answeredByPush(t, store)
+	s.timeline, s.reviewHit = append(s.timeline, snapRequest), true
+	if _, waiting := s.refresh(t, store, "2026-01-04T10:00:00Z").Waiting(); waiting {
+		t.Fatal("setup: a direct request should be actionable")
+	}
+	s.timeline, s.reviewHit = append(s.timeline, snapRemoved), false
+	if _, waiting := s.refresh(t, store, "2026-01-05T10:00:00Z").Waiting(); waiting {
+		t.Fatal("withdrawing the request revived the answered question")
+	}
+}
+
+// Editing the question after the push asks something new: it waits again.
+func TestRefreshEditedQuestionWaitsAgain(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	s := answeredByPush(t, store)
+	s.timeline[0] = `{"event":"commented","id":19,"actor":{"login":"me"},"body":"@author thanks for the test; can you add a release note too?","created_at":"2026-01-01T10:00:00Z","updated_at":"2026-01-03T10:00:00Z"}`
+	if _, waiting := s.refresh(t, store, "2026-01-03T10:00:00Z").Waiting(); !waiting {
+		t.Fatal("an edited question after the push was treated as already answered")
+	}
+}
+
+// A fresh search hit and two team requests since my review: I owe a review whichever
+// team names me, so the PR stays actionable, with no requester named.
+func TestRefreshConfirmedAmbiguousTeamRequest(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	s := githubSnapshot{head: snapHeadA, reviewHit: true, timeline: []string{
+		`{"event":"reviewed","id":11,"state":"changes_requested","user":{"login":"me"},"commit_id":"` + snapHeadA + `","submitted_at":"2026-01-01T10:00:00Z"}`,
+		`{"event":"review_requested","actor":{"login":"lead1"},"requested_team":{"slug":"red"},"created_at":"2026-01-02T10:00:00Z"}`,
+		`{"event":"review_requested","actor":{"login":"lead2"},"requested_team":{"slug":"blue"},"created_at":"2026-01-03T10:00:00Z"}`,
+	}}
+	it := s.refresh(t, store, "2026-01-03T10:00:00Z")
+	if !it.Actionable() || it.Signals.ReviewRequestedBy != "" {
+		t.Fatalf("actionable %v, requester %q", it.Actionable(), it.Signals.ReviewRequestedBy)
+	}
+}
+
+// A request carried over from an earlier search (this one was incomplete) is no
+// evidence that a later team request names me.
+func TestRefreshCarriedRequestIsNoTeamEvidence(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	s := githubSnapshot{head: snapHeadA, reviewHit: true, timeline: []string{
+		`{"event":"review_requested","requested_reviewer":{"login":"me"},"actor":{"login":"author"},"created_at":"2026-01-01T10:00:00Z"}`,
+	}}
+	if got := s.refresh(t, store, "2026-01-01T10:00:00Z").Signals.ReviewRequestedBy; got != "author" {
+		t.Fatalf("setup: requester %q", got)
+	}
+	s.reviewHit, s.reviewSearchIncomplete = false, true
+	s.timeline = append(s.timeline,
+		`{"event":"reviewed","id":11,"state":"changes_requested","user":{"login":"me"},"commit_id":"`+snapHeadA+`","submitted_at":"2026-01-02T10:00:00Z"}`,
+		`{"event":"review_requested","actor":{"login":"another-lead"},"requested_team":{"slug":"not-my-team"},"created_at":"2026-01-03T10:00:00Z"}`)
+	it := s.refresh(t, store, "2026-01-03T10:00:00Z")
+	if !it.Signals.AwaitingMeSince.IsZero() || it.Signals.ReviewRequestedBy == "another-lead" {
+		t.Fatalf("a carried request attributed a team's: requester %q, awaiting me since %v", it.Signals.ReviewRequestedBy, it.Signals.AwaitingMeSince)
+	}
+}
+
+// confirmedTeamRequest refreshes once with the review-requested search returning the
+// PR, after my review and one team request since: the search confirms it names me.
+func confirmedTeamRequest(t *testing.T, store worklist.Store) (githubSnapshot, worklist.WorkItem) {
+	t.Helper()
+	s := githubSnapshot{head: snapHeadA, reviewHit: true, timeline: []string{
+		`{"event":"reviewed","id":11,"state":"changes_requested","user":{"login":"me"},"commit_id":"` + snapHeadA + `","submitted_at":"2026-01-03T10:00:00Z"}`,
+		`{"event":"review_requested","id":12,"actor":{"login":"lead"},"requested_team":{"slug":"my-team"},"created_at":"2026-01-04T10:00:00Z"}`}}
+	it := s.refresh(t, store, "2026-01-04T10:00:00Z")
+	if !it.Actionable() || it.Signals.AwaitingMeSince.IsZero() || it.Signals.ReviewRequestedBy != "lead" {
+		t.Fatalf("setup: awaiting me since %v, requester %q", it.Signals.AwaitingMeSince, it.Signals.ReviewRequestedBy)
+	}
+	return s, it
+}
+
+// A partial search that misses the PR does not undo a confirmed team request while
+// nothing changed on it.
+func TestRefreshConfirmedTeamSurvivesPartialSearch(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	s, before := confirmedTeamRequest(t, store)
+	s.reviewHit, s.reviewSearchIncomplete = false, true
+	after := s.refresh(t, store, "2026-01-04T10:00:00Z")
+	if !after.Actionable() || !after.Signals.AwaitingMeSince.Equal(before.Signals.AwaitingMeSince) || after.Signals.ReviewRequestedBy != "lead" {
+		t.Errorf("actionable %t, requester %q, awaiting me since %v", after.Actionable(), after.Signals.ReviewRequestedBy, after.Signals.AwaitingMeSince)
+	}
+}
+
+// The confirmation covers only the requests it saw. After a partial search, a team
+// request made since neither ends it nor joins it, and withdrawing a confirmed
+// request ends it.
+func TestRefreshConfirmationCoversOnlyThoseRequests(t *testing.T) {
+	t.Run("another team asked", func(t *testing.T) {
+		store := worklist.NewMemoryStore()
+		s, before := confirmedTeamRequest(t, store)
+		s.reviewHit, s.reviewSearchIncomplete = false, true
+		s.timeline = append(s.timeline, `{"event":"review_requested","actor":{"login":"other-lead"},"requested_team":{"slug":"other-team"},"created_at":"2026-01-05T10:00:00Z"}`)
+		it := s.refresh(t, store, "2026-01-05T10:00:00Z")
+		c := it.Signals.TeamConfirmed
+		if !it.Actionable() || !it.Signals.AwaitingMeSince.Equal(before.Signals.AwaitingMeSince) || it.Signals.ReviewRequestedBy != "lead" ||
+			c == nil || len(c.Requests) != 1 || c.Requests[0].Team != "my-team" {
+			t.Errorf("actionable %t, awaiting me since %v, requester %q, confirmation %+v", it.Actionable(), it.Signals.AwaitingMeSince, it.Signals.ReviewRequestedBy, c)
+		}
+	})
+	t.Run("withdrawn", func(t *testing.T) {
+		store := worklist.NewMemoryStore()
+		s, _ := confirmedTeamRequest(t, store)
+		s.reviewHit, s.reviewSearchIncomplete = false, true
+		s.timeline = append(s.timeline, `{"event":"review_request_removed","actor":{"login":"lead"},"requested_team":{"slug":"my-team"},"created_at":"2026-01-05T10:00:00Z"}`)
+		it := s.refresh(t, store, "2026-01-05T10:00:00Z")
+		if !it.Signals.AwaitingMeSince.IsZero() || it.Signals.TeamConfirmed != nil {
+			t.Errorf("awaiting me since %v, confirmation %+v", it.Signals.AwaitingMeSince, it.Signals.TeamConfirmed)
+		}
+	})
+	t.Run("complete search without it", func(t *testing.T) {
+		store := worklist.NewMemoryStore()
+		s, _ := confirmedTeamRequest(t, store)
+		s.reviewHit = false // a complete search that no longer returns the PR
+		it := s.refresh(t, store, "2026-01-05T10:00:00Z")
+		if !it.Signals.AwaitingMeSince.IsZero() || it.Signals.TeamConfirmed != nil {
+			t.Errorf("awaiting me since %v, confirmation %+v", it.Signals.AwaitingMeSince, it.Signals.TeamConfirmed)
+		}
+	})
+}
+
+// A partial refresh can miss the PR in every search while finding other work, and a
+// standalone enrich runs no search: neither undoes an unchanged confirmed request.
+func TestRefreshConfirmationSurvivesNoSearchHit(t *testing.T) {
+	for _, job := range []string{JobIngest, JobEnrich} {
+		t.Run(job, func(t *testing.T) {
+			store := worklist.NewMemoryStore()
+			s, before := confirmedTeamRequest(t, store)
+			srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+				q := r.URL.Query().Get("q")
+				switch {
+				case r.URL.Path == "/user":
+					fmt.Fprint(w, `{"login":"me"}`)
+				case r.URL.Path == "/search/issues" && strings.Contains(q, "is:issue"):
+					fmt.Fprint(w, `{"total_count":1,"items":[{"number":8,"title":"other issue","state":"open","repository_url":"https://api.github.com/repos/o/r","user":{"login":"me"}}]}`)
+				case r.URL.Path == "/search/issues":
+					fmt.Fprint(w, `{"total_count":0,"incomplete_results":true,"items":[]}`)
+				case r.URL.Path == "/repos/o/r/issues/7/timeline":
+					fmt.Fprintf(w, "[%s]", strings.Join(s.timeline, ","))
+				case r.URL.Path == "/repos/o/r/issues/8/timeline":
+					fmt.Fprint(w, `[]`)
+				case r.URL.Path == "/repos/o/r/pulls/7":
+					fmt.Fprintf(w, `{"head":{"sha":%q}}`, s.head)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			ctx := context.Background()
+			if err := Run(ctx, Params{JobType: job, GitHubBaseURL: srv.URL, Client: srv.Client()}, fakeVendor{token: "test"}, NewStoreSink(store, snapOwner)); err != nil {
+				t.Fatal(err)
+			}
+			if job == JobIngest {
+				if _, found, err := store.Get(ctx, snapOwner, "github:o/r#8"); err != nil || !found {
+					t.Fatalf("setup: the other hit was not ingested: found %v, err %v", found, err)
+				}
+			}
+			it, _, err := store.Get(ctx, snapOwner, before.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !it.Actionable() || it.Signals.TeamConfirmed == nil || !it.Signals.AwaitingMeSince.Equal(before.Signals.AwaitingMeSince) || it.Signals.ReviewRequestedBy != "lead" {
+				t.Errorf("actionable %t, confirmation %+v, requester %q", it.Actionable(), it.Signals.TeamConfirmed, it.Signals.ReviewRequestedBy)
+			}
+		})
+	}
+}
+
+// After a re-review request, editing my last comment to ask the author something
+// hands them the turn as posting it would, from the edit.
+func TestRefreshEditAfterRequestMatchesPosting(t *testing.T) {
+	const at = "2026-01-05T10:00:00Z"
+	const body = "@author can you add the missing test before I re-review?"
+	for _, form := range []string{"post", "edit"} {
+		t.Run(form, func(t *testing.T) {
+			store := worklist.NewMemoryStore()
+			s := githubSnapshot{head: snapHeadA, timeline: []string{snapQuestion, snapRequest}, reviewHit: true}
+			if !s.refresh(t, store, "2026-01-04T10:00:00Z").Actionable() {
+				t.Fatal("setup: the re-review request should be actionable")
+			}
+			if form == "post" {
+				s.timeline = append(s.timeline, `{"event":"commented","id":20,"actor":{"login":"me"},"created_at":"`+at+`","body":"`+body+`"}`)
+			} else {
+				s.timeline[0] = `{"event":"commented","id":19,"actor":{"login":"me"},"created_at":"2026-01-01T10:00:00Z","updated_at":"` + at + `","body":"` + body + `"}`
+			}
+			it := s.refresh(t, store, at)
+			w, waiting := it.Waiting()
+			if !waiting || w.Since.Format(time.RFC3339) != at {
+				t.Errorf("waiting %t since %v, awaiting me since %v; want the author's turn from %s", waiting, w.Since, it.Signals.AwaitingMeSince, at)
+			}
+		})
+	}
+}
+
+// Editing the question after the author pushed asks something new: it waits again,
+// from the edit, whether the push shows as a new head or a force-push GitHub dates.
+func TestRefreshEditedQuestionWaitsFromTheEdit(t *testing.T) {
+	const edited = "2026-01-09T10:00:00Z"
+	for _, kind := range []string{"committed", "head_ref_force_pushed"} {
+		t.Run(kind, func(t *testing.T) {
+			store := worklist.NewMemoryStore()
+			s := githubSnapshot{head: snapHeadA, timeline: []string{snapQuestion}}
+			if _, waiting := s.refresh(t, store, "2026-01-01T10:00:00Z").Waiting(); !waiting {
+				t.Fatal("setup: my question should wait")
+			}
+			s.head = snapHeadB
+			if kind == "committed" {
+				s.timeline = append(s.timeline, `{"event":"committed","sha":"`+snapHeadB+`","committer":{"date":"2026-01-02T10:00:00Z"}}`)
+			} else {
+				s.timeline = append(s.timeline, `{"event":"head_ref_force_pushed","actor":{"login":"author"},"created_at":"2026-01-02T10:00:00Z"}`)
+			}
+			if _, waiting := s.refresh(t, store, "2026-01-02T10:00:00Z").Waiting(); waiting {
+				t.Fatal("setup: the push should answer my question")
+			}
+			s.timeline[0] = `{"event":"commented","id":19,"actor":{"login":"me"},"body":"@author thanks for the test. Can you also add the release note?","created_at":"2026-01-01T10:00:00Z","updated_at":"` + edited + `"}`
+			w, waiting := s.refresh(t, store, edited).Waiting()
+			if !waiting || w.Since.Format(time.RFC3339) != edited {
+				t.Errorf("waiting %t since %v; want since the edit, %s", waiting, w.Since, edited)
+			}
+		})
+	}
+}
+
+// An edit in the middle of a comment too long to store whole is a new version too.
+func TestRefreshEditInTheCutMiddleWaitsAgain(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	comment := func(middle, at string) string {
+		b, _ := json.Marshal(map[string]any{"event": "commented", "id": 123, "actor": map[string]string{"login": "me"},
+			"body":       strings.Repeat("context ", 550) + middle + strings.Repeat(" detail", 650),
+			"created_at": "2026-01-01T10:00:00Z", "updated_at": at})
+		return string(b)
+	}
+	s := githubSnapshot{head: snapHeadA, timeline: []string{comment("please add tests", "2026-01-01T10:00:00Z")}}
+	if _, waiting := s.refresh(t, store, "2026-01-01T10:00:00Z").Waiting(); !waiting {
+		t.Fatal("setup: my question should wait")
+	}
+	s.head = snapHeadB
+	if _, waiting := s.refresh(t, store, "2026-01-02T10:00:00Z").Waiting(); waiting {
+		t.Fatal("setup: the new head should answer my question")
+	}
+	s.timeline[0] = comment("@author please add the release note, too.", "2026-01-03T10:00:00Z")
+	it := s.refresh(t, store, "2026-01-03T10:00:00Z")
+	if _, waiting := it.Waiting(); !waiting || it.Signals.LastWord.Answered {
+		t.Fatalf("waiting %t, answered %t; the edit is a new question", waiting, it.Signals.LastWord.Answered)
+	}
+}
+
+// A reply to my comment keeps the turn with the replier even if I edit my comment
+// afterwards: words are ordered by when they were made.
+func TestRefreshEditDoesNotJumpAReply(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	s := githubSnapshot{head: snapHeadA, timeline: []string{
+		`{"event":"commented","id":19,"actor":{"login":"me"},"body":"@author please add a test","created_at":"2026-01-01T10:00:00Z","updated_at":"2026-01-03T10:00:00Z"}`,
+		`{"event":"commented","id":20,"actor":{"login":"author"},"body":"Added.","created_at":"2026-01-02T10:00:00Z"}`,
+	}}
+	if _, waiting := s.refresh(t, store, "2026-01-03T10:00:00Z").Waiting(); waiting {
+		t.Fatal("an edit to my comment took the last word from the author's reply")
+	}
+}
+
+// A fresh hit after another team is asked does not replace the confirmation of my
+// team's request with a vaguer one of both teams: the requester and the date stand,
+// and so they do when the other team is withdrawn during a partial search.
+func TestRefreshFreshHitKeepsTheStandingConfirmation(t *testing.T) {
+	for _, stage := range []string{"fresh hit", "other team withdrawn"} {
+		t.Run(stage, func(t *testing.T) {
+			store := worklist.NewMemoryStore()
+			s, before := confirmedTeamRequest(t, store)
+			s.timeline = append(s.timeline, `{"event":"review_requested","actor":{"login":"other-lead"},"requested_team":{"slug":"other-team"},"created_at":"2026-01-08T10:00:00Z"}`)
+			it := s.refresh(t, store, "2026-01-08T10:00:00Z")
+			if stage == "other team withdrawn" {
+				s.reviewHit, s.reviewSearchIncomplete = false, true
+				s.timeline = append(s.timeline, `{"event":"review_request_removed","actor":{"login":"other-lead"},"requested_team":{"slug":"other-team"},"created_at":"2026-01-09T10:00:00Z"}`)
+				it = s.refresh(t, store, "2026-01-09T10:00:00Z")
+			}
+			c := it.Signals.TeamConfirmed
+			if !it.Actionable() || it.Signals.ReviewRequestedBy != "lead" || !it.Signals.AwaitingMeSince.Equal(before.Signals.AwaitingMeSince) ||
+				c == nil || len(c.Requests) != 1 || c.Requests[0].Team != "my-team" {
+				t.Errorf("actionable %t, requester %q, awaiting me since %v, confirmation %+v", it.Actionable(), it.Signals.ReviewRequestedBy, it.Signals.AwaitingMeSince, c)
+			}
+		})
+	}
+}

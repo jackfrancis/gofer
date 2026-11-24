@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"slices"
 	"sync"
@@ -75,6 +76,11 @@ type Sink interface {
 	// writes back its older GitHub fields. It is dropped, without error, if the item
 	// is gone.
 	Research(ctx context.Context, itemID string, adj worklist.ResearchAdjustment) error
+	// Turns sets items' turn readings and nothing else, in one write (see
+	// worklist.ApplyTurns), so a reading the model took a while over never writes back
+	// the item it read. A reading is dropped, without error, if its item is gone,
+	// hidden, or its last word is no longer the one the reading names.
+	Turns(ctx context.Context, turns []worklist.ItemTurn) error
 }
 
 // Params configures a single runtime invocation.
@@ -91,6 +97,8 @@ type Params struct {
 	Converser     worklist.Conversationalist // github-converse assistant; required for that job
 	Independent   bool                       // converse: answer blind — omit prior thread turns (independent review)
 	Researcher    worklist.ResearchRanker    // github-research re-ranker; required for that job
+	TurnReader    worklist.TurnReader        // reads the user's last word on waiting items; nil leaves the timeline to decide
+	Bots          []string                   // logins whose comments are automated (BOT_REVIEWERS): never the last word
 	EnrichLimit   int                        // optional cap on items to enrich; 0 enriches every item
 	ReadPageSize  int                        // items per worklist page read (readAll); 0 uses the default
 	Logger        *slog.Logger               // phase logger; nil uses slog.Default()
@@ -207,7 +215,13 @@ func Run(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	case JobIngest:
 		return runIngest(ctx, p, vendor, sink)
 	case JobEnrich:
-		return runEnrich(ctx, p, vendor, sink, nil)
+		if err := runEnrich(ctx, p, vendor, sink, nil, reviewSearch{}); err != nil {
+			return err
+		}
+		if err := runReadTurns(ctx, p, sink); err != nil {
+			p.logger().Warn("turn reading failed", "err", err)
+		}
+		return nil
 	case JobRank:
 		return runRank(ctx, p, sink)
 	case JobConverse:
@@ -257,12 +271,24 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	if lerr != nil {
 		return fmt.Errorf("ingest: read existing items: %w", lerr)
 	}
+	// A hit older than the stored state does not write its GitHub fields
+	// (keepNewerState), only its review-request membership, and it still proves its
+	// item open, so retirement counts every hit.
+	items, pinned := keepNewerState(items, existing)
 	items, carried := reconcileFetched(items, existing, fetch.ReviewRequestsComplete)
+	reviews := reviewSearch{hits: freshRequests(items, carried), complete: fetch.ReviewRequestsComplete} // before retired items join the write
+	// settlePins may leave a stale hit out of the write, after the search it showed is
+	// recorded in reviews.
+	items = settlePins(items, existing, pinned)
 	// Retire what left the open set. Only a COMPLETE fetch proves an item is gone: a
 	// partial walk (time budget, rate limit, result ceiling) simply may not have
 	// reached it, and retiring it then would hide open work.
+	// Another contributor's draft is different: the fetch SAW it, so it is retired
+	// (and its draft state recorded, even with no stored row) by a partial fetch too,
+	// unless the store holds a newer ready state (retireDrafts).
+	now := time.Now().UTC()
 	if complete {
-		retired := retireMissing(items, existing, time.Now().UTC())
+		retired := retireMissing(fetch.Items, existing, fetch.OthersDrafts, now)
 		if len(retired) > 0 {
 			log.Info("ingest: retired items no longer open on GitHub", "count", len(retired))
 			items = append(items, retired...)
@@ -270,23 +296,38 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	} else if len(existing) > 0 {
 		log.Info("ingest: fetch was partial; not retiring items missing from it")
 	}
-	if len(items) == 0 {
+	if drafts := retireDrafts(fetch.OthersDrafts, existing, now); len(drafts) > 0 {
+		log.Info("ingest: retired other contributors' drafts", "count", len(drafts))
+		items = append(items, drafts...)
+	}
+	// An empty write-back does not mean there is nothing to enrich: a live item the
+	// search found as an older copy is left out when nothing about it changed
+	// (settlePins), yet its CI may have moved on the same commit, and a request kept
+	// only because the review-request search was partial (carried) still needs the
+	// timeline read to confirm it. Every pinned ID is such a live item.
+	if len(items) == 0 && len(pinned) == 0 {
 		return nil
 	}
-	if err := writeBack(ctx, sink, items); err != nil {
-		return fmt.Errorf("ingest: %w", err)
+	if len(items) > 0 {
+		if err := writeBack(ctx, sink, items); err != nil {
+			return fmt.Errorf("ingest: %w", err)
+		}
 	}
-	// The backfill continues into enrich (per-item timeline signals) then rank
-	// (the model proposal), so one pass yields a fully scored radar. Both are
-	// best-effort: a failure leaves the baseline-scored items in place. The
+	// The backfill continues into enrich (per-item timeline signals), the turn
+	// reading (whether the user's last word leaves the next step to someone else),
+	// then rank (the model proposal), so one pass yields a fully scored radar. Each
+	// is best-effort: a failure leaves the baseline-scored items in place. The
 	// separate JobEnrich / JobRank exist for an independent scheduled refresh.
-	if err := runEnrich(ctx, p, vendor, sink, carried); err != nil {
+	if err := runEnrich(ctx, p, vendor, sink, carried, reviews); err != nil {
 		// The user's access is gone: stop here, and say so, rather than rank and
 		// report success. The items already written keep their baseline scores.
 		if isSignInRequired(err) {
 			return fmt.Errorf("backfill enrich: %w", err)
 		}
 		log.Warn("backfill enrich failed", "err", err)
+	}
+	if err := runReadTurns(ctx, p, sink); err != nil {
+		log.Warn("backfill turn reading failed", "err", err)
 	}
 	if err := runRank(ctx, p, sink); err != nil {
 		log.Warn("backfill rank failed", "err", err)
@@ -334,11 +375,20 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 		// the copy read above, which a discussion may have replaced since. The
 		// chained enrich and rank read the store again.
 		clearModelSignals(&fetched[i].Signals)
+		carryTurnSignals(&fetched[i], old)
 		if old.Meta.CompletedAt.IsZero() {
 			// A retired item's request ended with it; a resurfaced item's request is new.
 			if carryPendingRequest(&fetched[i].Signals, old.Signals, reviewsComplete) {
 				carried[fetched[i].ID] = true
 			}
+		}
+		// AwaitingMeSince dates the user's review request (github.Activity). With no
+		// request left, shown or kept, the reconciliation confirmed it removed, so a
+		// date carried from the store (carryTurnSignals, or a stale hit's stored copy,
+		// keepNewerState) goes too: it would otherwise score as a request still waiting
+		// on the user until enrich reads the timeline, which it may not manage.
+		if !slices.Contains(fetched[i].Signals.Reasons, worklist.ReasonReviewRequested) {
+			fetched[i].Signals.AwaitingMeSince = time.Time{}
 		}
 		// A search hit carries no CI summary, and none is copied from the read above,
 		// which may be a projection: the plane's merge keeps the stored one
@@ -352,30 +402,231 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 	return fetched, carried
 }
 
+// reviewSearch is what a refresh's review-requested:@me search showed: the items it
+// returned, and whether it was walked whole, so an item it did not return has no
+// request. The zero value is a search that did not run.
+type reviewSearch struct {
+	hits     map[string]bool
+	complete bool
+}
+
+// freshRequests names the fetched items this refresh's review-requested search
+// returned: those carrying ReasonReviewRequested that reconcileFetched did not carry
+// over from the store.
+func freshRequests(fetched []worklist.WorkItem, carried map[string]bool) map[string]bool {
+	fresh := make(map[string]bool)
+	for _, it := range fetched {
+		if !carried[it.ID] && slices.Contains(it.Signals.Reasons, worklist.ReasonReviewRequested) {
+			fresh[it.ID] = true
+		}
+	}
+	return fresh
+}
+
 // retireMissing returns the persisted GitHub items that are absent from a complete
 // fetch and not yet marked completed, each stamped with CompletedAt = now. The fetch
 // covers every open item that involves the user or awaits their review, so absence
 // means the item was merged or closed, or no longer involves them. Retiring rather
 // than deleting keeps the thread: resolve drops completed items from the radar, an
 // agent can still see them, and a reopened item is fetched again and resurfaces.
-func retireMissing(fetched, existing []worklist.WorkItem, now time.Time) []worklist.WorkItem {
+//
+// fetched is every hit the fetch returned, stale copies (keepNewerState) included: a
+// stale copy still proves the item is open. drafts is github.Fetch.OthersDrafts: an
+// item absent because the fetch saw it as another contributor's draft is left to
+// retireDrafts, which records that state.
+func retireMissing(fetched, existing []worklist.WorkItem, drafts map[string]worklist.WorkItem, now time.Time) []worklist.WorkItem {
 	open := make(map[string]bool, len(fetched))
 	for _, it := range fetched {
 		open[it.ID] = true
 	}
 	var retired []worklist.WorkItem
 	for _, it := range existing {
-		if it.Source != "github" || open[it.ID] || !it.Meta.CompletedAt.IsZero() {
+		_, draft := drafts[it.ID]
+		if it.Source != "github" || open[it.ID] || draft || !it.Meta.CompletedAt.IsZero() {
 			continue
 		}
-		it.Meta.CompletedAt = now
-		// Retiring derives no model signals, and reads no CI; leave both to the store
-		// (see reconcileFetched and worklist.KeepCI).
-		clearModelSignals(&it.Signals)
-		it.GitHub.CI = nil
-		retired = append(retired, it)
+		retired = append(retired, retire(it, now))
 	}
 	return retired
+}
+
+// retireDrafts returns the write-backs for the items the fetch saw as another
+// contributor's draft (drafts, github.Fetch.OthersDrafts), from a complete fetch or a
+// partial one: an observation, unlike an absence, is evidence. A live stored item is
+// retired as retireMissing does. Either way the confirmed state is recorded on the
+// item, Draft set and GitHub.UpdatedAt advanced to the draft result's, so a later
+// refresh that returns an older ready copy cannot reopen it (keepNewerState), while a
+// genuinely newer one still does. A draft with no stored row is remembered the same
+// way, as a new row already retired: never on the radar, but there to outrank an
+// older ready copy on a later refresh. An item already recorded at least that new is
+// not written again. A stored ready PR GitHub updated strictly later than the draft
+// result stands (readyAfterDraft).
+func retireDrafts(drafts map[string]worklist.WorkItem, existing []worklist.WorkItem, now time.Time) []worklist.WorkItem {
+	stored := make(map[string]worklist.WorkItem, len(existing))
+	for _, it := range existing {
+		stored[it.ID] = it
+	}
+	ids := slices.Sorted(maps.Keys(drafts))
+	var out []worklist.WorkItem
+	for _, id := range ids {
+		d := drafts[id]
+		it, ok := stored[id]
+		if !ok {
+			out = append(out, retire(d, now))
+			continue
+		}
+		if it.Source != "github" || readyAfterDraft(it, d) {
+			continue
+		}
+		seen := d.GitHub.UpdatedAt
+		if it.Meta.CompletedAt.IsZero() {
+			it = retire(it, now)
+		} else if it.GitHub.Draft && !seen.After(it.GitHub.UpdatedAt) {
+			continue // already retired with this draft state, or a newer one
+		} else {
+			// Retired already (an earlier draft, or closed and since reopened as a
+			// draft): only the recorded state changes, CompletedAt stands.
+			clearModelSignals(&it.Signals)
+			it.GitHub.CI = nil
+		}
+		it.GitHub.Draft = true
+		if seen.After(it.GitHub.UpdatedAt) {
+			it.GitHub.UpdatedAt = seen
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
+// keepNewerState returns the hits of a fetch with the stored GitHub state kept
+// wherever it is newer. The searches are separate snapshots, and one can lag another
+// or an earlier run, so the stored GitHub state never moves back in time: for a hit
+// whose state is older (newerState), the stored GitHub fields stand. That covers a
+// ready copy of a draft retireDrafts recorded (it must not reopen it) and an older
+// ready copy of a ready item (it must not roll back the timestamp a later draft
+// result is judged against).
+//
+// Which searches matched is current even when the payload is not, so for a live
+// item the stale hit is replaced by the stored item carrying the hit's review-request
+// membership (withReviewMembership); reconcileFetched then treats it as any hit, so a
+// complete review-request search without it clears the request and a match adds it.
+// Those IDs are returned in pinned, for settlePins. A stale hit of a retired item
+// is dropped: it must not reopen it, and a retired item carries no request. Either
+// way the hit still proves its item open, so the caller counts it for
+// retireMissing. A new slice is returned; fetched is unchanged.
+func keepNewerState(fetched, existing []worklist.WorkItem) (_ []worklist.WorkItem, pinned map[string]bool) {
+	stored := make(map[string]worklist.WorkItem, len(existing))
+	for _, it := range existing {
+		stored[it.ID] = it
+	}
+	pinned = map[string]bool{}
+	kept := make([]worklist.WorkItem, 0, len(fetched))
+	for _, it := range fetched {
+		old, ok := stored[it.ID]
+		if !ok || old.Source != "github" || !newerState(old, it) {
+			kept = append(kept, it)
+			continue
+		}
+		if !old.Meta.CompletedAt.IsZero() {
+			continue
+		}
+		kept = append(kept, withReviewMembership(old, it))
+		pinned[it.ID] = true
+	}
+	return kept, pinned
+}
+
+// withReviewMembership returns the stored item old with the review-request
+// membership of the search hit, which is older than it. The hit carries
+// ReasonReviewRequested exactly when the review-request search matched it
+// (github.reasonsFor); the other reasons are read from the payload (author,
+// assignee), so the newer stored ones stand. The requester is cleared as on a fresh
+// hit, for reconcileFetched to carry back while a request is shown. The CI summary
+// is dropped as a hit carries none (worklist.KeepCI keeps the stored one).
+func withReviewMembership(old, hit worklist.WorkItem) worklist.WorkItem {
+	it := old
+	it.Signals.Reasons = slices.DeleteFunc(slices.Clone(old.Signals.Reasons), func(r worklist.Reason) bool {
+		return r == worklist.ReasonReviewRequested
+	})
+	if slices.Contains(hit.Signals.Reasons, worklist.ReasonReviewRequested) {
+		it.Signals.Reasons = append(it.Signals.Reasons, worklist.ReasonReviewRequested)
+	}
+	if len(it.Signals.Reasons) == 0 {
+		it.Signals.Reasons = []worklist.Reason{worklist.ReasonInvolved}
+	}
+	it.Signals.ReviewRequestedBy = ""
+	it.Signals.ReviewRequestedByBot = false
+	it.GitHub.CI = nil
+	return it
+}
+
+// settlePins leaves out of the write-back each item keepNewerState pinned to the
+// stored state that came out of reconcileFetched as stored: the write would change
+// nothing. One whose review request was confirmed removed (reconcileFetched clears
+// its AwaitingMeSince with it) or newly shown is written.
+func settlePins(items, existing []worklist.WorkItem, pinned map[string]bool) []worklist.WorkItem {
+	if len(pinned) == 0 {
+		return items
+	}
+	stored := make(map[string]worklist.WorkItem, len(existing))
+	for _, it := range existing {
+		stored[it.ID] = it
+	}
+	kept := items[:0]
+	for _, it := range items {
+		if pinned[it.ID] && !pinChanged(it, stored[it.ID]) {
+			continue
+		}
+		kept = append(kept, it)
+	}
+	return kept
+}
+
+// pinChanged reports whether a pinned item's review request differs from the stored
+// item old's.
+func pinChanged(it, old worklist.WorkItem) bool {
+	return !sameReasons(it.Signals.Reasons, old.Signals.Reasons) ||
+		it.Signals.ReviewRequestedBy != old.Signals.ReviewRequestedBy ||
+		!it.Signals.AwaitingMeSince.Equal(old.Signals.AwaitingMeSince)
+}
+
+// sameReasons reports whether a and b hold the same reasons, in any order.
+func sameReasons(a, b []worklist.Reason) bool {
+	a, b = slices.Clone(a), slices.Clone(b)
+	slices.Sort(a)
+	slices.Sort(b)
+	return slices.Equal(slices.Compact(a), slices.Compact(b))
+}
+
+// newerState reports whether a holds a newer GitHub state of an item than b: a later
+// GitHub update time, or on a tie (GitHub reports timestamps to the second) a draft
+// against a ready copy, as the fetch's own reconciliation decides
+// (github.newerState). Equal states are not newer, so a refresh of the same version
+// is written as usual.
+func newerState(a, b worklist.WorkItem) bool {
+	if c := a.GitHub.UpdatedAt.Compare(b.GitHub.UpdatedAt); c != 0 {
+		return c > 0
+	}
+	return a.GitHub.Draft && !b.GitHub.Draft
+}
+
+// readyAfterDraft reports that the store holds the item the fetch saw as another
+// contributor's draft d as a ready pull request GitHub updated strictly later than
+// d: the search index lagged the item, so d is stale and must neither retire it nor
+// record a draft state on it (retireDrafts). The item is left as stored until a
+// fresh read decides. On a tie the draft wins.
+func readyAfterDraft(it, d worklist.WorkItem) bool {
+	return !it.GitHub.Draft && it.GitHub.UpdatedAt.After(d.GitHub.UpdatedAt)
+}
+
+// retire stamps a stored item completed for write-back.
+func retire(it worklist.WorkItem, now time.Time) worklist.WorkItem {
+	it.Meta.CompletedAt = now
+	// Retiring derives no model signals, and reads no CI; leave both to the store
+	// (see reconcileFetched and worklist.KeepCI).
+	clearModelSignals(&it.Signals)
+	it.GitHub.CI = nil
+	return it
 }
 
 // carryPendingRequest keeps what a refresh cannot re-establish about a review the
@@ -404,16 +655,40 @@ func carryPendingRequest(fetched *worklist.Signals, stored worklist.Signals, rev
 		fetched.ReviewRequestedBy = stored.ReviewRequestedBy
 		fetched.ReviewRequestedByBot = stored.ReviewRequestedByBot
 	}
+	// So is an earlier search's confirmation that a team request names the user:
+	// enrich honours it only after a partial search, and only while the same team
+	// requests are outstanding (github.ActivityOptions.Confirmed).
+	if fetched.TeamConfirmed == nil {
+		fetched.TeamConfirmed = stored.TeamConfirmed
+	}
 	return inferred
 }
 
-// clearModelSignals drops the model proposal and research adjustment from a
-// write-back that did not derive them. A write-back that carries neither leaves the
-// stored values in place (worklist.MergeRunItems), so a pass never restores the
+// clearModelSignals drops the model proposal, research adjustment and turn reading
+// from a write-back that did not derive them. A write-back that carries none leaves
+// the stored values in place (worklist.MergeRunItems), so a pass never restores the
 // copy it read over a newer one written meanwhile.
 func clearModelSignals(s *worklist.Signals) {
 	s.Proposed = nil
 	s.Research = nil
+	s.Turn = nil
+}
+
+// carryTurnSignals keeps what a refresh cannot re-derive about whose turn it is. The
+// stored last word always carries over: it holds the head first seen with it
+// (LastWord.Head), which the chained enrich compares with the head now to tell
+// whether the author pushed since, and which a push (it updates the item) must not
+// erase. The waiting timestamps carry over only for an item GitHub has not updated
+// since: its timeline is unchanged, so the item keeps its place on the radar
+// (worklist.WorkItem.Waiting) until enrich reads the timeline again. An item GitHub
+// updated (a comment, a push, a review request) is not shown as waiting until then.
+func carryTurnSignals(fetched *worklist.WorkItem, stored worklist.WorkItem) {
+	fetched.Signals.LastWord = stored.Signals.LastWord
+	if fetched.GitHub.UpdatedAt.IsZero() || !fetched.GitHub.UpdatedAt.Equal(stored.GitHub.UpdatedAt) {
+		return
+	}
+	fetched.Signals.AwaitingMeSince = stored.Signals.AwaitingMeSince
+	fetched.Signals.AwaitingOthersSince = stored.Signals.AwaitingOthersSince
 }
 
 // runRank reads the user's persisted work, asks the AxisRanker to propose the
@@ -445,6 +720,9 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 	if err != nil {
 		return fmt.Errorf("list worklist: %w", err)
 	}
+	// The selection leaves out items waiting on someone else (WorkItem.Waiting) before
+	// its cutoff: they are listed apart from the ranking, so their slots go to items
+	// that are the user's turn.
 	log.Info("rank: proposing axes", "items", len(items), "stub", stub)
 
 	var (
@@ -472,8 +750,10 @@ func runRank(ctx context.Context, p Params, sink Sink) error {
 			// it changes (worklist.Signals.CurrentProposal).
 			prop.ReviewRequestedByBot = items[i].Signals.ReviewRequestedByBot
 			items[i].Signals.Proposed = &prop
-			// Rank derives only the proposal; the stored research adjustment stays.
+			// Rank derives only the proposal; the stored research adjustment and turn
+			// reading stay.
 			items[i].Signals.Research = nil
+			items[i].Signals.Turn = nil
 			// Nor does it read CI: the summary it read may have been replaced by an
 			// enrich that landed while the model worked (worklist.KeepCI keeps the
 			// stored one).

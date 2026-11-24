@@ -258,6 +258,7 @@ type pageData struct {
 	User                     *session.User
 	Providers                []string
 	Items                    []worklist.WorkItem
+	Waiting                  []worklist.WorkItem // worklist: items waiting on someone else, after Items (same filter)
 	HiddenItems              []worklist.WorkItem // worklist: the hidden section, most recently hidden first, unscored
 	ItemHidden               bool                // thread: the item is hidden, so its thread is read-only until it is unhidden
 	Assistant                bool                // thread: the assistant is configured (ConvEnabled is off on a hidden item's page)
@@ -814,8 +815,8 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		var changed []worklist.WorkItem
 		refs = refs[:0]
 		for _, it := range current {
-			if it.Type != worklist.TypePullRequest || !it.OnRadar() || !scope.includes(it) {
-				continue // off the radar (hidden or closed) or outside the page's projects and labels: never review it in bulk
+			if it.Type != worklist.TypePullRequest || !it.Actionable() || !scope.includes(it) {
+				continue // off the radar (hidden or closed), waiting on someone else, or outside the page's projects and labels: never review it in bulk
 			}
 			if it.HasReview() {
 				continue // already reviewed at least once — a first-review is no longer needed
@@ -911,7 +912,7 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 		var eligible []worklist.WorkItem
 		firstModels := map[string]struct{}{}
 		for _, it := range current {
-			if it.OnRadar() && scope.includes(it) && it.NeedsSecondOpinion(now, reviewStaleAfter) {
+			if scope.includes(it) && it.NeedsSecondOpinion(now, reviewStaleAfter) {
 				eligible = append(eligible, it)
 				firstModels[it.FirstReviewModel()] = struct{}{}
 			}
@@ -1044,6 +1045,7 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		projects := projectOptions(listedAll, selected)
 		labels := labelOptions(listedAll, filterProjects(listedAll, selected), labelSel)
 		shown := filterLabels(filterProjects(res.Items, selected), labelSel)
+		shownWaiting := filterLabels(filterProjects(res.Waiting, selected), labelSel)
 		shownHidden := filterLabels(filterProjects(res.Hidden, selected), labelSel)
 		scope := viewScope{projects: shownSelection(selected, projects), labels: shownLabelSelection(labelSel, labels)}
 		selectedLabels := 0
@@ -1072,6 +1074,13 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 				resetCount++
 			}
 		}
+		// Waiting items are no review action's to take (Actionable), but Reset clears
+		// their threads too.
+		for _, it := range shownWaiting {
+			if hasConversation(it) {
+				resetCount++
+			}
+		}
 		// The radar ranks only items on it, but Reset clears every stored thread in the
 		// selected projects and labels the checklists name, hidden and closed items'
 		// included, from Resolve's same read (res.OffRadar).
@@ -1081,7 +1090,7 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 			}
 		}
 		data := pageData{
-			View: "worklist", User: user, Items: shown, HiddenItems: shownHidden, ConvEnabled: h.convEnabled,
+			View: "worklist", User: user, Items: shown, Waiting: shownWaiting, HiddenItems: shownHidden, ConvEnabled: h.convEnabled,
 			ReviewCount: reviewCount, SecondOpinionEnabled: h.secondOpinionEnabled(), SecondOpinionCount: secondCount,
 			ResetCount: resetCount,
 			Projects:   projects, ProjectsOffered: offeredProjects(projects), ProjectsFiltered: selected != nil, SelectedProjects: selectedCount, TotalItems: len(res.Items),
@@ -1195,6 +1204,9 @@ var funcs = template.FuncMap{
 	"markdown":               markdown.ToSafeHTML,
 	"discussBadge":           discussBadge,
 	"discussTitle":           discussTitle,
+	"row":                    newItemRow,
+	"waitingBadge":           waitingBadge,
+	"waitingTitle":           waitingTitle,
 	"isSecondOpinionRequest": isSecondOpinionRequest,
 	"isSynthesisRequest":     isSynthesisRequest,
 	"userHandle":             userHandle,
@@ -1337,4 +1349,64 @@ func titleProvider(s string) string {
 		}
 		return strings.ToUpper(s[:1]) + s[1:]
 	}
+}
+
+// itemRow is what the radar's item template renders: one item, whether the
+// Discuss action is offered, and whether it can be selected for a bulk comment.
+type itemRow struct {
+	Item             worklist.WorkItem
+	ConvEnabled      bool
+	CommentConnected bool
+}
+
+func newItemRow(it worklist.WorkItem, convEnabled, commentConnected bool) itemRow {
+	return itemRow{Item: it, ConvEnabled: convEnabled, CommentConnected: commentConnected}
+}
+
+// waitingBadge labels an item waiting on someone else: who, and for how long ("" for
+// an item that is not waiting).
+func waitingBadge(it worklist.WorkItem) string {
+	w, ok := it.Waiting()
+	if !ok {
+		return ""
+	}
+	var who string
+	switch {
+	case w.NothingPending:
+		who = "Nothing pending"
+	case w.On != "":
+		who = "Waiting on @" + w.On
+	default:
+		who = "Waiting on others"
+	}
+	return who + " · " + waitedFor(w.Since, time.Now())
+}
+
+// waitingTitle explains why an item is waiting, for the badge's tooltip.
+func waitingTitle(it worklist.WorkItem) string {
+	w, ok := it.Waiting()
+	if !ok {
+		return ""
+	}
+	since := w.Since.Format("Jan 2")
+	lw := it.Signals.LastWord
+	switch {
+	case w.NothingPending:
+		return "Your last word, on " + since + ", asks nothing of anyone"
+	case lw != nil && lw.Decisive:
+		return "You reviewed it on " + since + "; nobody has answered since"
+	case lw != nil:
+		return "You had the last word on " + since + "; nobody has answered since"
+	default:
+		return "A review on " + since + " left the next step to the author"
+	}
+}
+
+// waitedFor is a short age: "today", "1d", "12d".
+func waitedFor(since, now time.Time) string {
+	d := int(now.Sub(since).Hours() / 24)
+	if d < 1 {
+		return "today"
+	}
+	return strconv.Itoa(d) + "d"
 }

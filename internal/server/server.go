@@ -78,6 +78,9 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	if conn.Gateway {
 		ingestor.UseModelGateway()
 	}
+	// Runs read the timeline with the same bot list the web tier classifies review
+	// requests by, so a bot's comment is never taken for the last human word.
+	ingestor.UseBots(cfg.BotReviewers)
 	// The thread's model picker spans every configured connection's models (default
 	// first). A model id offered by more than one connection is disambiguated with the
 	// connection label; the selected option carries the connection endpoint the turn
@@ -224,6 +227,7 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	mux.Handle("POST /agent/worklist/reply", authenticator.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(ingestHandler.Reply)))
 	// A converse or research run writes its research adjustment here, and nothing else.
 	mux.Handle("POST /agent/worklist/research", authenticator.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(ingestHandler.Research)))
+	mux.Handle("POST /agent/worklist/turns", authenticator.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(ingestHandler.Turns)))
 	// The credential broker: a runtime vends the acting user's delegated provider
 	// token here, so it never holds a standing secret.
 	mux.Handle("GET /agent/credential", authenticator.RequireScope(principal.ScopeSignalsRead, http.HandlerFunc(credentialHandler.Vend)))

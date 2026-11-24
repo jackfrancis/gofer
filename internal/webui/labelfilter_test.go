@@ -456,3 +456,30 @@ func TestLabelKeyFoldsUnicodeCase(t *testing.T) {
 		t.Fatalf("selecting %q shows %d items, want 2", opts[0].Key, len(got))
 	}
 }
+
+// The label filter narrows the Waiting on others section too, and the empty state
+// names the label filter when only waiting items match.
+func TestLabelFilterNarrowsWaiting(t *testing.T) {
+	now := time.Now()
+	waiting := func(id, title, label string) worklist.WorkItem {
+		it := waitingPR(id, now.Add(-time.Hour))
+		it.GitHub.Title = title
+		it.Signals.Labels = []string{label}
+		return it
+	}
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", waiting("w-bug", "waiting-bug", "bug"), waiting("w-docs", "waiting-docs", "docs"))
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{}, true, nil)
+	h.now = func() time.Time { return now }
+
+	page := getIndexWith(t, h, labelCookie("bug"))
+	if got := strings.Join(order(page, "waiting-bug", "waiting-docs"), ","); got != "waiting-bug" {
+		t.Fatalf("waiting section shows %s, want waiting-bug", got)
+	}
+	if !strings.Contains(page, "Nothing with the selected labels needs you right now.") {
+		t.Error("expected the empty state to name the label filter")
+	}
+	if !strings.Contains(page, `name="label" value="docs"`) {
+		t.Error("the checklist offers labels from waiting items")
+	}
+}

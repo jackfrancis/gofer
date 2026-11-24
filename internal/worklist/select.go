@@ -53,7 +53,7 @@ type Selection struct {
 	// replaces, which may rest on a classification since changed),
 	// highest first, instead of paging by ID; Limit is ignored. It leaves out items
 	// awaiting their post-unhide refresh (Metadata.AwaitingRefresh), which hold no
-	// signals to rank yet. Equal scores keep the store's first-insertion order. It is clamped to
+	// signals to rank yet, and items waiting on someone else (WorkItem.Waiting). Equal scores keep the store's first-insertion order. It is clamped to
 	// MaxSelectLimit, and its pages are positions in that ranking, so a score that
 	// changes between pages can shift an item across a page boundary: a reader
 	// drops an ID it already has.
@@ -87,6 +87,12 @@ func Select(items []WorkItem, sel Selection, now time.Time) (page []WorkItem, ne
 			// Unhidden, with no GitHub signals yet (a partial fetch may have missed it):
 			// a ranking now would rest on nothing, and outlive the refresh that fills it
 			// in if that pass's ranking fails. It is ranked once a refresh writes it.
+			continue
+		}
+		if _, waiting := it.Waiting(); sel.Top > 0 && waiting {
+			// Listed apart from the ranking (Resolution.Waiting): a model proposal would
+			// refine an order the user is not acting on. Leaving it out here, before
+			// the cutoff, gives its slot to the next item that is the user's turn.
 			continue
 		}
 		out = append(out, it)

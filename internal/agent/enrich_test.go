@@ -370,7 +370,7 @@ func TestRunRankKeepsNewerCI(t *testing.T) {
 func TestRetireMissingSendsNoCI(t *testing.T) {
 	existing := []worklist.WorkItem{{ID: "pr", Source: "github", Type: worklist.TypePullRequest,
 		GitHub: worklist.GitHubRef{CI: &worklist.CISummary{Pending: 1}}}}
-	retired := retireMissing(nil, existing, time.Now())
+	retired := retireMissing(nil, existing, nil, time.Now())
 	if len(retired) != 1 || retired[0].GitHub.CI != nil {
 		t.Fatalf("retired = %+v", retired)
 	}
