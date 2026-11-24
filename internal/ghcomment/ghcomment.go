@@ -72,6 +72,37 @@ func (e *RateLimitError) Error() string {
 	return "github: rate limited"
 }
 
+// AppRestrictedError is GitHub refusing because the organization that owns the
+// repository restricts OAuth apps it has not approved ("OAuth App access
+// restrictions"), and has not approved gofer's commenting app. Org is the
+// organization GitHub named, when it did. A personal access token is not subject to
+// this restriction (ADR 0011).
+type AppRestrictedError struct {
+	Org string
+}
+
+func (e *AppRestrictedError) Error() string {
+	if e.Org != "" {
+		return "github: the " + e.Org + " organization restricts OAuth app access"
+	}
+	return "github: the organization restricts OAuth app access"
+}
+
+// appRestricted recognizes GitHub's OAuth App access restriction refusal (a 403) and
+// the organization it names in backticks.
+func appRestricted(status int, message string) *AppRestrictedError {
+	if status != http.StatusForbidden || !strings.Contains(message, "OAuth App access restrictions") {
+		return nil
+	}
+	e := &AppRestrictedError{}
+	if i := strings.Index(message, "`"); i >= 0 {
+		if j := strings.Index(message[i+1:], "`"); j > 0 && j <= 100 {
+			e.Org = message[i+1 : i+1+j]
+		}
+	}
+	return e
+}
+
 // StatusError is any other non-success answer, with GitHub's message when it gave
 // one (never a token, never a URL).
 type StatusError struct {
@@ -284,6 +315,9 @@ func (c *Client) doLimit(ctx context.Context, token, method, path string, payloa
 	_ = json.Unmarshal(data, &msg)
 	if rl := rateLimit(resp, msg.Message, time.Now()); rl != nil {
 		return nil, rl
+	}
+	if ar := appRestricted(resp.StatusCode, msg.Message); ar != nil {
+		return nil, ar
 	}
 	m := msg.Message
 	if len(m) > 200 {

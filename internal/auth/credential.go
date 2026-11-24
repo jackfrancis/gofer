@@ -148,6 +148,11 @@ func newVersion() string {
 // legacy row (no client recorded) counts only where p accepts legacy rows: never
 // for GitHub under GITHUB_CLIENT_KIND=github-app, since the app never wrote one.
 func fromConfiguredClient(p *provider, cred vault.Credential) bool {
+	if isPersonalToken(cred) {
+		// A personal access token is the write grant's alternative to an OAuth token,
+		// usable only while the deployment allows tokens (ADR 0011).
+		return p.grant && p.tokens
+	}
 	if cred.ClientID == "" {
 		return p.legacyRows
 	}

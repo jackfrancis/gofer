@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,9 @@ type provider struct {
 	// signed-in user connects (the write grant, ADR 0009). It is never offered on the
 	// sign-in page, never served by Login/Callback, and never vended by Credential.
 	grant bool
+	// tokens lets the write grant be a classic personal access token the user pastes
+	// (GITHUB_WRITE_TOKENS, ADR 0011), as well as this client's OAuth grant.
+	tokens bool
 }
 
 // github reports whether p is one of gofer's GitHub clients (sign-in or the write
@@ -160,6 +164,7 @@ func NewHandler(cfg *config.Config, sessions *session.Manager, vlt vault.Vault) 
 				userURL:   "https://api.github.com/user",
 				userAgent: "gofer",
 				mapUser:   mapGitHubUser,
+				tokens:    cfg.Providers.GitHubWriteTokens,
 			}
 		}
 	}
@@ -430,11 +435,20 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	msg := "You are signed out of gofer, but GitHub did not confirm that gofer's access was revoked. Revoke gofer in GitHub's settings to be sure."
+	if slices.Contains(res.settings, tokensSettings) {
+		// The write grant was a personal access token (ADR 0011): gofer deleted its
+		// copy, and only the user can revoke the token itself.
+		msg = "You are signed out of gofer, and gofer deleted its copy of your commenting token. gofer cannot revoke a personal access token: delete it in GitHub's settings if you no longer use it."
+		if len(res.settings) > 1 {
+			msg += " GitHub also did not confirm that gofer's other access was revoked; revoke it there too."
+		}
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"revocation":    "unconfirmed",
-		"message":       "You are signed out of gofer, but GitHub did not confirm that gofer's access was revoked. Revoke gofer in GitHub's settings to be sure.",
+		"message":       msg,
 		"settings_url":  res.settings[0],
 		"settings_urls": res.settings,
 	})

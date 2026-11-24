@@ -159,6 +159,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   independently. It posts only what the user confirmed: their own comment, with no
   model involved, or the comments they kept from a draft review, created as a
   PENDING review that only they see until they submit it on GitHub (ADR 0010).
+  Where the deployment allows it (`GITHUB_WRITE_TOKENS`, ADR 0011), the user may
+  connect with a classic personal access token instead, in the same vault slot:
+  exactly `public_repo`, an expiry within 90 days, the signed-in account, stored only
+  when no grant is connected. gofer cannot revoke a token, so disconnect and logout
+  delete its copy and send the user to GitHub's token settings; a token is never sent
+  to an OAuth app endpoint.
 
 ## Conventions & gotchas
 
@@ -639,6 +645,20 @@ Wired on the web-tier side; they define what a runtime must respect:
   branch), and, checked last, the pull request is open with the draft's head and base
   branch; the POST has no `event`, so GitHub keeps it pending. Any 5xx on a ghcomment
   POST is an unknown outcome, never "not posted". gofer never submits a review.
+- Commenting with a personal access token (ADR 0011, `internal/auth/token.go`) is
+  opt-in (`GITHUB_WRITE_TOKENS=true`, which config refuses without the write
+  client). The token is stored as the write grant (provider `github-write`,
+  `ClientID` = `auth.PersonalTokenClient`), so the lock, versioning, logout ledger and
+  the broker's refusal all apply unchanged. `ConnectWriteToken` checks it with
+  `GET /user` (classic: `X-OAuth-Scopes` present; scopes exactly `public_repo`; an
+  expiry header within `maxTokenLifetime`; the session's account; the allow-list) and
+  stores it only when nothing is connected or pending (`storeWriteToken`). Read
+  through `fromConfiguredClient` (a token counts only while tokens are allowed) and
+  `tokenExpired` (an expired token is not connected and not handed out). A rejection
+  is confirmed with `GET /user` (`tokenAlive`), never check-token, and logout's
+  `revokeLocked` skips revocation for a token (`tokensSettings`). `ghcomment` reads an
+  organization's OAuth App access restriction as `AppRestrictedError`, which the
+  comment service words for the user.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

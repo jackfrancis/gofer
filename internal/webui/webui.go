@@ -314,6 +314,9 @@ type pageData struct {
 	CommentEnabled           bool                // worklist: the deployment offers bulk comments (ADR 0009)
 	CommentConnected         bool                // worklist: the user connected the write grant
 	CommentNotice            string              // worklist: the outcome of the last connect/disconnect, for the user
+	CommentTokensAllowed     bool                // worklist: the user may connect commenting with a personal access token (ADR 0011)
+	CommentToken             bool                // worklist: commenting is connected with a personal access token
+	CommentTokenExpires      time.Time           // worklist: when that token expires
 	Comment                  *commentView        // comment-preview / comment-results views
 	Draft                    *draftThread        // thread: the draft review's button and newest draft (draftreview.go); nil shows neither
 	DraftResult              *draftResult        // draft-review-result view
@@ -324,6 +327,11 @@ type pageData struct {
 // ranked worklist.
 func (h *Handler) Index(w http.ResponseWriter, r *http.Request) {
 	data, status := h.view(r)
+	if data.CommentTokensAllowed && !data.CommentConnected {
+		// The token form posts same-origin only; this lets it send its real Origin on
+		// a browser without fetch metadata (see Comment).
+		w.Header().Set("Referrer-Policy", "same-origin")
+	}
 	h.render(w, status, data)
 }
 
@@ -1231,6 +1239,10 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		data.CommentEnabled, data.CommentConnected = h.commentState(r.Context(), user)
 		if data.CommentEnabled {
 			data.CommentNotice = commentNotices[r.URL.Query().Get("commenting")]
+			if d, ok := h.commenter.(commentDetailer); ok {
+				det := d.Details(r.Context(), user.ID)
+				data.CommentTokensAllowed, data.CommentToken, data.CommentTokenExpires = det.TokensAllowed, det.Token, det.Expires
+			}
 		}
 		if scope.projects != nil {
 			data.ProjectScope = encodeSelection(scope.projects)
@@ -1266,9 +1278,11 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 // commentNotices are the radar's words for the commenting query parameter, set by
 // the redirects that end a connect, disconnect or refused bulk comment.
 var commentNotices = map[string]string{
-	"connect":     "Connect GitHub for commenting first; gofer posts only with that separate grant.",
-	"unconfirmed": "Commenting is disconnected in gofer, but GitHub did not confirm the grant was revoked. Revoke it in GitHub's settings (Settings, Applications, Authorized OAuth Apps) to be sure.",
-	"error":       "gofer could not disconnect commenting right now. Try again in a moment.",
+	"connect":       "Connect GitHub for commenting first; gofer posts only with that separate grant.",
+	"token":         "Commenting is connected with your personal access token. gofer uses it only for the comments and reviews you confirm, and it stops working when the token expires.",
+	"token-deleted": "Commenting is disconnected, and gofer deleted its copy of your token. gofer cannot revoke a personal access token: delete it in GitHub's settings (Settings, Developer settings, Personal access tokens) if you no longer use it.",
+	"unconfirmed":   "Commenting is disconnected in gofer, but GitHub did not confirm the grant was revoked. Revoke it in GitHub's settings (Settings, Applications, Authorized OAuth Apps) to be sure.",
+	"error":         "gofer could not disconnect commenting right now. Try again in a moment.",
 }
 
 // refreshCheck is the query parameter of the no-script fallback's reload: that render

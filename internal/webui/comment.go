@@ -51,6 +51,13 @@ const (
 	maxMentionQuery = comment.MaxTargets
 )
 
+// commentDetailer is a Commenter that also reports the token side of commenting
+// (comment.Service): whether the user may connect with a personal access token, and
+// whether the connected grant is one (ADR 0011).
+type commentDetailer interface {
+	Details(ctx context.Context, userID string) comment.Details
+}
+
 // UseCommenter turns the bulk comment on.
 func (h *Handler) UseCommenter(c Commenter) { h.commenter = c }
 

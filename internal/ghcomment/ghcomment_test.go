@@ -265,3 +265,25 @@ func TestPostOutcomes(t *testing.T) {
 		t.Errorf("unreachable host: %v, want a definite failure", err)
 	}
 }
+
+// An organization's OAuth App access restriction is recognized, with the organization
+// it names, so the user can be told what to do instead of a cut-off message.
+func TestAppRestricted(t *testing.T) {
+	const msg = "Although you appear to have the correct authorization credentials, the `kubernetes` organization has enabled OAuth App access restrictions, meaning that data access to third-parties is limited. For more information on these restrictions, including how to enable this app, visit https://docs.github.com/articles/restricting-access-to-your-organization-s-data/"
+	srv := postServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		b, _ := json.Marshal(map[string]string{"message": msg})
+		_, _ = w.Write(b)
+	})
+	_, err := srv.Comment(context.Background(), token, "o/r", 1, "hi")
+	var ar *AppRestrictedError
+	if !errors.As(err, &ar) || ar.Org != "kubernetes" {
+		t.Fatalf("err = %v, want AppRestrictedError for kubernetes", err)
+	}
+	if e := appRestricted(http.StatusForbidden, "Resource not accessible by personal access token"); e != nil {
+		t.Errorf("an unrelated 403 was read as an app restriction: %v", e)
+	}
+	if e := appRestricted(http.StatusForbidden, "the org has enabled OAuth App access restrictions"); e == nil || e.Org != "" {
+		t.Errorf("no organization named: %+v", e)
+	}
+}

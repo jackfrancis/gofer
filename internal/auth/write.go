@@ -29,10 +29,15 @@ const writePath = "/auth/github-write"
 
 // CommentingState says whether the user can post comments through gofer: Enabled when
 // the deployment configures the write client, Connected when the user has a usable
-// write grant stored (from the configured client, no logout pending).
+// write grant stored (from the configured client or, where allowed, an unexpired
+// personal access token; no logout pending). TokensAllowed says the deployment lets
+// users connect with a token (ADR 0011); Token and Expires describe a connected one.
 type CommentingState struct {
-	Enabled   bool
-	Connected bool
+	Enabled       bool
+	Connected     bool
+	TokensAllowed bool
+	Token         bool
+	Expires       time.Time
 }
 
 // CommentingState reports the user's write-grant state. It reads only; a dead grant
@@ -42,12 +47,15 @@ func (h *Handler) CommentingState(ctx context.Context, userID string) Commenting
 	if !ok || h.vault == nil {
 		return CommentingState{}
 	}
-	st := CommentingState{Enabled: true}
+	st := CommentingState{Enabled: true, TokensAllowed: p.tokens}
 	if pending, err := h.logoutPending(ctx, userID, WriteProvider); err != nil || pending {
 		return st
 	}
 	cred, err := h.vault.Get(ctx, userID, WriteProvider)
-	st.Connected = err == nil && fromConfiguredClient(p, cred)
+	st.Connected = err == nil && fromConfiguredClient(p, cred) && !tokenExpired(cred, h.now())
+	if st.Connected && isPersonalToken(cred) {
+		st.Token, st.Expires = true, cred.Expiry
+	}
 	return st
 }
 
@@ -66,13 +74,19 @@ func (h *Handler) WriteCredential(ctx context.Context, userID string) (vault.Cre
 	if h.cfg != nil && !h.cfg.SignInAllowed("github", cred.Login) {
 		return vault.Credential{}, vault.ErrSignInRequired
 	}
+	if tokenExpired(cred, h.now()) {
+		// An expired personal access token: connect again with a new one. The row
+		// stays until then, so a disconnect still tells the user to delete it.
+		return vault.Credential{}, vault.ErrSignInRequired
+	}
 	return cred, nil
 }
 
-// WriteRejected handles a 401 GitHub gave the write grant at version: if GitHub's
-// check-token confirms the token is dead (the user revoked gofer in their settings),
-// the stored grant is deleted so the page asks them to connect again. A 401 that
-// check-token does not confirm changes nothing.
+// WriteRejected handles a 401 GitHub gave the write grant at version: if GitHub
+// confirms the token is dead (check-token for an OAuth grant, the user revoked gofer
+// in their settings; a 401 on GET /user for a personal access token, deleted or
+// expired), the stored grant is deleted so the page asks them to connect again. A 401
+// GitHub does not confirm changes nothing.
 func (h *Handler) WriteRejected(ctx context.Context, userID, version string) {
 	p, ok := h.providers[WriteProvider]
 	if !ok || h.vault == nil || version == "" {
@@ -87,7 +101,12 @@ func (h *Handler) WriteRejected(ctx context.Context, userID, version string) {
 	if err != nil || cred.Version != version {
 		return
 	}
-	valid, err := h.checkToken(ctx, p, cred.AccessToken)
+	var valid bool
+	if isPersonalToken(cred) {
+		valid, err = h.tokenAlive(ctx, cred.AccessToken)
+	} else {
+		valid, err = h.checkToken(ctx, p, cred.AccessToken)
+	}
 	if err != nil || valid {
 		return
 	}
@@ -330,16 +349,23 @@ func (h *Handler) DisconnectWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lo, err := h.beginWriteDisconnect(r.Context(), user.ID)
-	switch {
-	case err != nil:
+	if err != nil {
 		slog.WarnContext(r.Context(), "write grant: recording its disconnect failed", "user", user.ID, "err", err)
 		http.Redirect(w, r, "/?commenting=error", http.StatusSeeOther)
-	case lo == nil:
+		return
+	}
+	if lo == nil {
 		http.Redirect(w, r, "/", http.StatusSeeOther) // nothing was connected
-	case !h.revokeAndDelete(r.Context(), user.ID, WriteProvider, lo).confirmed:
-		http.Redirect(w, r, "/?commenting=unconfirmed", http.StatusSeeOther)
-	default:
+		return
+	}
+	switch res := h.revokeAndDelete(r.Context(), user.ID, WriteProvider, lo); {
+	case res.confirmed:
 		http.Redirect(w, r, "/", http.StatusSeeOther)
+	case len(res.settings) == 1 && res.settings[0] == tokensSettings:
+		// A personal access token: deleted here, and only the user can revoke it.
+		http.Redirect(w, r, "/?commenting=token-deleted", http.StatusSeeOther)
+	default:
+		http.Redirect(w, r, "/?commenting=unconfirmed", http.StatusSeeOther)
 	}
 }
 

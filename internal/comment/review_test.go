@@ -69,3 +69,19 @@ func TestPendingReviewNotConnected(t *testing.T) {
 		t.Fatalf("err %v, attempted %v", err, gh.got)
 	}
 }
+
+// An organization blocking the commenting app is explained, with what to do, for a
+// review ("Not created") and a comment ("Not posted") alike.
+func TestAppRestrictionIsExplained(t *testing.T) {
+	gh := &fakeReviewGH{err: &ghcomment.AppRestrictedError{Org: "kubernetes"}}
+	res, err := New(&fakeCreds{}, gh).PendingReview(context.Background(), "u", testReview)
+	if err != nil || res.Created || !strings.HasPrefix(res.Error, "Not created: The kubernetes organization blocks") || !strings.Contains(res.Error, "personal access token") {
+		t.Errorf("review: %+v %v", res, err)
+	}
+	if got := describe(&ghcomment.AppRestrictedError{}); !strings.HasPrefix(got, "Not posted: This repository's organization blocks") {
+		t.Errorf("comment: %q", got)
+	}
+	if got := describeAs("Not created", &ghcomment.StatusError{Status: 404}); got != "Not created: GitHub could not find the item, or your account cannot comment on it." {
+		t.Errorf("other errors keep their wording under the new outcome: %q", got)
+	}
+}

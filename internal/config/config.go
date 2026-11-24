@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -354,6 +355,11 @@ type Providers struct {
 	// ADR 0009). Its token never leaves the web tier and is never vended to a run.
 	// Unset: commenting is off.
 	GitHubWrite OAuthApp
+	// GitHubWriteTokens lets a user connect commenting with a classic personal access
+	// token instead of the write client's OAuth grant (GITHUB_WRITE_TOKENS=true; ADR
+	// 0011): for organizations that block unapproved OAuth apps. Off by default, and
+	// only with the write client configured, which stays the default way to connect.
+	GitHubWriteTokens bool
 }
 
 // CommentingEnabled reports whether gofer can post comments for users who connect
@@ -366,6 +372,9 @@ func (p Providers) CommentingEnabled() bool { return p.GitHub.Enabled() && p.Git
 func validateGitHubWrite(p Providers) error {
 	w := p.GitHubWrite
 	if w.ClientID == "" && w.ClientSecret == "" {
+		if p.GitHubWriteTokens {
+			return fmt.Errorf("GITHUB_WRITE_TOKENS needs commenting configured (GITHUB_WRITE_CLIENT_ID/SECRET): a token is an alternative to the write client's grant, not a replacement (ADR 0011)")
+		}
 		return nil
 	}
 	if !w.Enabled() {
@@ -470,6 +479,13 @@ func Load() (*Config, error) {
 			ClientID:     strings.TrimSpace(os.Getenv("GITHUB_WRITE_CLIENT_ID")),
 			ClientSecret: strings.TrimSpace(os.Getenv("GITHUB_WRITE_CLIENT_SECRET")),
 		},
+	}
+	if v := strings.TrimSpace(os.Getenv("GITHUB_WRITE_TOKENS")); v != "" {
+		on, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("GITHUB_WRITE_TOKENS must be true or false, not %q", v)
+		}
+		providers.GitHubWriteTokens = on
 	}
 	if err := validateGitHubWrite(providers); err != nil {
 		return nil, err

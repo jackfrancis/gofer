@@ -85,5 +85,5 @@ func (s *Service) PendingReview(ctx context.Context, userID string, rv Review) (
 		}
 		return ReviewResult{Error: msg + ". Nothing was created."}, nil
 	}
-	return ReviewResult{Error: describe(err)}, nil
+	return ReviewResult{Error: describeAs("Not created", err)}, nil
 }

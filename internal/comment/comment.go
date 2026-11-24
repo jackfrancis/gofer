@@ -125,6 +125,21 @@ func (s *Service) State(ctx context.Context, userID string) (enabled, connected 
 	return st.Enabled, st.Connected
 }
 
+// Details is the rest of the commenting state the radar shows: whether the user may
+// connect with a personal access token, and whether the connected grant is one, with
+// its expiry (ADR 0011).
+type Details struct {
+	TokensAllowed bool
+	Token         bool
+	Expires       time.Time
+}
+
+// Details reports the user's commenting details.
+func (s *Service) Details(ctx context.Context, userID string) Details {
+	st := s.creds.CommentingState(ctx, userID)
+	return Details{TokensAllowed: st.TokensAllowed, Token: st.Token, Expires: st.Expires}
+}
+
 // Post posts body to every target, in order, one at a time and at least spacing
 // apart (GitHub asks for serial content creation, a second apart). ErrNotConnected
 // means nothing was attempted. The batch stops, leaving the remaining targets
@@ -204,7 +219,31 @@ func (s *Service) Post(ctx context.Context, userID string, targets []Target, bod
 }
 
 // describe turns a posting error into words for the user.
-func describe(err error) string {
+func describe(err error) string { return describeAs("Not posted", err) }
+
+// describeAs is describe with the outcome's own word ("Not posted", "Not created").
+func describeAs(outcome string, err error) string {
+	if msg := describeKnown(err); msg != "" {
+		return outcome + ": " + msg
+	}
+	return outcome + ": " + strings.TrimPrefix(describeStatus(err), "Not posted: ")
+}
+
+// describeKnown words the refusals the user can act on, or "".
+func describeKnown(err error) string {
+	var ar *ghcomment.AppRestrictedError
+	if errors.As(err, &ar) {
+		org := "This repository's organization"
+		if ar.Org != "" {
+			org = "The " + ar.Org + " organization"
+		}
+		return org + " blocks OAuth apps it has not approved, including gofer's commenting app. Disconnect commenting and connect it with a personal access token instead (if this gofer allows tokens), or ask the organization to approve the app."
+	}
+	return ""
+}
+
+// describeStatus words any other posting error.
+func describeStatus(err error) string {
 	var se *ghcomment.StatusError
 	switch {
 	case errors.Is(err, ghcomment.ErrNotPublic):

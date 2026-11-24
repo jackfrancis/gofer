@@ -290,6 +290,9 @@ func TestValidateGitHubWrite(t *testing.T) {
 		{"secret only", Providers{GitHub: signIn, GitHubWrite: OAuthApp{ClientSecret: "wsec"}}, true, false},
 		{"no sign-in", Providers{GitHubWrite: OAuthApp{ClientID: "wcid", ClientSecret: "wsec"}}, true, false},
 		{"same app as sign-in", Providers{GitHub: signIn, GitHubWrite: OAuthApp{ClientID: "cid", ClientSecret: "csec"}}, true, true},
+		// A token is an alternative to the write client's grant, never a replacement.
+		{"tokens with the write client", Providers{GitHub: signIn, GitHubWrite: OAuthApp{ClientID: "wcid", ClientSecret: "wsec"}, GitHubWriteTokens: true}, false, true},
+		{"tokens without the write client", Providers{GitHub: signIn, GitHubWriteTokens: true}, true, false},
 	}
 	for _, tc := range cases {
 		err := validateGitHubWrite(tc.p)

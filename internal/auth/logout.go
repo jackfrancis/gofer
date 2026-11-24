@@ -483,6 +483,11 @@ func (h *Handler) revokeLocked(ctx context.Context, userID, providerName string)
 	case err != nil:
 		slog.WarnContext(ctx, "reading a credential on logout failed", "user", userID, "provider", providerName, "err", err)
 		return h.unconfirmed(providerName, p, nil)
+	case isPersonalToken(cred):
+		// gofer cannot revoke a personal access token (ADR 0011): the row is deleted,
+		// and the user is sent to GitHub's token settings to delete it there.
+		slog.InfoContext(ctx, "logout: a personal access token; gofer deletes its copy and cannot revoke it", "user", userID)
+		return logoutResult{settings: []string{tokensSettings}}
 	case !ok:
 		slog.InfoContext(ctx, "logout: the credential's client is not configured; revocation unconfirmed", "user", userID, "provider", providerName)
 		return h.unconfirmed(providerName, nil, &cred)
@@ -533,7 +538,11 @@ func (h *Handler) unconfirmed(providerName string, p *provider, cred *vault.Cred
 		return logoutResult{confirmed: true}
 	}
 	if providerName == WriteProvider {
-		// The write grant is always a classic OAuth app (ADR 0009).
+		// The write grant is a classic OAuth app's (ADR 0009), or a personal access
+		// token (ADR 0011).
+		if cred != nil && isPersonalToken(*cred) {
+			return logoutResult{settings: []string{tokensSettings}}
+		}
 		return logoutResult{settings: []string{oauthAppsSettings}}
 	}
 	return logoutResult{settings: h.revocationSettings(p, cred)}

@@ -130,6 +130,9 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	if cfg.Providers.CommentingEnabled() {
 		webHandler.UseCommenter(comment.New(authH, ghcomment.New("https://api.github.com", nil)))
 		log.Info("bulk comment enabled (GITHUB_WRITE_CLIENT_ID)")
+		if cfg.Providers.GitHubWriteTokens {
+			log.Info("commenting with a personal access token allowed (GITHUB_WRITE_TOKENS)")
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -196,6 +199,9 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	mux.HandleFunc("GET /auth/github-write/login", authH.ConnectWrite)
 	mux.HandleFunc("GET /auth/github-write/callback", authH.ConnectWriteCallback)
 	mux.HandleFunc("POST /auth/github-write/disconnect", authH.DisconnectWrite)
+	// Connect commenting with a classic personal access token instead (ADR 0011;
+	// only with GITHUB_WRITE_TOKENS).
+	mux.HandleFunc("POST /auth/github-write/token", authH.ConnectWriteToken)
 
 	// Current principal (interactive user today; workloads once gofer mints its
 	// own agent-plane tokens).
