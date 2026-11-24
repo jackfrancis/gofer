@@ -284,3 +284,12 @@ func TestSelectTopSkipsWaiting(t *testing.T) {
 		t.Fatal("a paged read should still include waiting items (enrich reads them)")
 	}
 }
+
+// A last word a push answered never waits, whatever the timestamps say.
+func TestWaitingAnsweredLastWord(t *testing.T) {
+	it := waitingItem("can you add a test?")
+	it.Signals.LastWord.Answered = true
+	if _, waiting := it.Waiting(); waiting {
+		t.Fatal("an answered last word made the item wait")
+	}
+}

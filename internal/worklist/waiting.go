@@ -43,6 +43,10 @@ type LastWord struct {
 	// means the author pushed since, which answers it (AwaitingOthersSince unset). It
 	// is not part of Key: anchoring a last word does not change what it says.
 	Head string `json:"head,omitempty"`
+	// Answered records that a push answered this version of the last word (the head
+	// moved past Head). It stands until the last word changes, whatever a later read
+	// of the head says, so a failed lookup cannot revive the wait.
+	Answered bool `json:"answered,omitempty"`
 }
 
 const (
@@ -203,7 +207,7 @@ func (w WorkItem) Waiting() (Waiting, bool) {
 	if own && lw == nil {
 		return Waiting{}, false
 	}
-	if lw != nil && !lw.Decisive && strings.TrimSpace(lw.Text) == "" {
+	if lw != nil && (lw.Answered || !lw.Decisive && strings.TrimSpace(lw.Text) == "") {
 		return Waiting{}, false
 	}
 	out := Waiting{Since: s.AwaitingOthersSince}

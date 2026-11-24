@@ -214,7 +214,7 @@ func Run(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	case JobIngest:
 		return runIngest(ctx, p, vendor, sink)
 	case JobEnrich:
-		if err := runEnrich(ctx, p, vendor, sink, nil); err != nil {
+		if err := runEnrich(ctx, p, vendor, sink, nil, nil); err != nil {
 			return err
 		}
 		if err := runReadTurns(ctx, p, sink); err != nil {
@@ -271,6 +271,7 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 		return fmt.Errorf("ingest: read existing items: %w", lerr)
 	}
 	items, carried := reconcileFetched(items, existing, fetch.ReviewRequestsComplete)
+	requested := freshRequests(items, carried) // before retired items join the write
 	// Retire what left the open set. Only a COMPLETE fetch proves an item is gone: a
 	// partial walk (time budget, rate limit, result ceiling) simply may not have
 	// reached it, and retiring it then would hide open work.
@@ -294,7 +295,7 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	// then rank (the model proposal), so one pass yields a fully scored radar. Each
 	// is best-effort: a failure leaves the baseline-scored items in place. The
 	// separate JobEnrich / JobRank exist for an independent scheduled refresh.
-	if err := runEnrich(ctx, p, vendor, sink, carried); err != nil {
+	if err := runEnrich(ctx, p, vendor, sink, carried, requested); err != nil {
 		// The user's access is gone: stop here, and say so, rather than rank and
 		// report success. The items already written keep their baseline scores.
 		if isSignInRequired(err) {
@@ -368,6 +369,19 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 		}
 	}
 	return fetched, carried
+}
+
+// freshRequests names the fetched items this refresh's review-requested search
+// returned: those carrying ReasonReviewRequested that reconcileFetched did not carry
+// over from the store.
+func freshRequests(fetched []worklist.WorkItem, carried map[string]bool) map[string]bool {
+	fresh := make(map[string]bool)
+	for _, it := range fetched {
+		if !carried[it.ID] && slices.Contains(it.Signals.Reasons, worklist.ReasonReviewRequested) {
+			fresh[it.ID] = true
+		}
+	}
+	return fresh
 }
 
 // retireMissing returns the persisted GitHub items that are absent from a complete

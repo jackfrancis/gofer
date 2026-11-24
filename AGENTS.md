@@ -226,19 +226,26 @@ Wired on the web-tier side; they define what a runtime must respect:
   comment never takes the last word (GitHub type `Bot`, a `[bot]` login, or
   `BOT_REVIEWERS`, sent to every run as run parameter `bots`). A review request still
   awaiting the user outranks any later word: their personal request with no comment
-  or review by them since, or a team request made since their last one that is
-  attributed to them. A team request is the user's only on evidence: the
-  `review-requested:@me` search shows the item (`ActivityOptions.ReviewRequested`),
-  no personal request of theirs explains that, and exactly one team request is
-  outstanding; its actor is then the requester (`ReviewRequestedBy`, so a bot's team
-  request scores as a bot's). On a pull request the user did not author, a push or
+  or review by them since, or a team request attributed to them. A team request is
+  the user's only on evidence: THIS refresh's `review-requested:@me` search returned
+  the item (`ActivityOptions.ReviewRequested`, from `freshRequests`; a request carried
+  over from an earlier search is no evidence of who made a later one, and a
+  standalone enrich attributes none), and no personal request of theirs explains the
+  hit. Which team names them is unknown when several are outstanding, so the item
+  awaits them only if every outstanding team request was made since their last
+  comment or review (since the latest), and the requester (`ReviewRequestedBy`, so a
+  bot's team request scores as a bot's) is named only if those requests share an
+  actor. On a pull request the user did not author, a push or
   ready-for-review is the author's answer. A commit's date is never its push time
   (commits are pushed late, clocks drift), so pushes are judged by the head
   (`ActivityOptions.PullRequest`): a review's last word stands while the head is its
   `commit_id` (an unreadable head ends the wait); a comment's last word stands while
   the head is the one first seen with it (`LastWord.Head`, passed back as
-  `ActivityOptions.Prior`, and kept on an answered last word, and across every
-  refresh, so the next read still knows the head moved). Force-push and
+  `ActivityOptions.Prior`). Once a push answers a last word, `LastWord.Answered`
+  records it, and no later read undoes it, not even one that cannot read the head.
+  Both apply only to the same version of the last word (`LastWord.Key`: an edited
+  comment is a new question, anchored afresh). The last word is kept whoever's turn
+  it is (a review request may outrank it for a while) and across every refresh. Force-push and
   ready-for-review events, which GitHub dates, answer a comment too. A review with no
   summary is read through its inline comments, up to `reviewCommentPages` pages; one
   longer than that has no text. On the user's own item a reviewer's decisive review is the

@@ -51,19 +51,24 @@ type ActivityOptions struct {
 	// regard to case. An account GitHub types "Bot", or whose login ends in "[bot]",
 	// is a bot too. A bot's comment never takes the last word.
 	Bots []string
-	// ReviewRequested says GitHub's review-requested:@me search shows the item. That
-	// is evidence a team request names login only when nothing else explains the hit:
-	// no personal request of login's is outstanding, and exactly one team request is,
-	// so it is the one. That request is then login's (RequestedByLogin is its actor),
-	// and it awaits login if made since login's last comment or review. Otherwise team
-	// membership is unknown and a team request awaits no one in particular.
+	// ReviewRequested says this refresh's review-requested:@me search returned the
+	// item (a request carried over from an earlier search is no evidence of who made a
+	// later one). The hit is evidence that an outstanding team request names login when
+	// nothing else explains it: no personal request of login's is outstanding. Which
+	// team is unknown when several are outstanding, so the item awaits login only if
+	// every one of them was made since login's last comment or review (since the
+	// latest, which never overstates the wait), and RequestedByLogin names their actor
+	// only if they share one. Otherwise team membership is unknown and a team request
+	// awaits no one in particular.
 	ReviewRequested bool
 	// PullRequest says the item is a pull request, whose head commit says whether the
 	// author pushed since login's last word.
 	PullRequest bool
-	// Prior is the last word stored for the item, if any. A comment names no commit,
-	// so the head first seen with it (LastWord.Head) is kept: a later head means the
-	// author pushed since.
+	// Prior is the last word stored for the item, if any. When it is the same version
+	// of the last word (LastWord.Key: same comment, same text), what it recorded
+	// stands: the head first seen with a comment (LastWord.Head), so a later head means
+	// the author pushed since, and that a push answered it (LastWord.Answered), which no
+	// later read undoes, not even one that cannot read the head.
 	Prior *worklist.LastWord
 }
 
@@ -76,10 +81,11 @@ type Activity struct {
 	AwaitingMeSince     time.Time // when login was asked to review with no engagement since; zero if none
 	AwaitingOthersSince time.Time // when the ball is in others' court; zero if none
 	RequestedByLogin    string    // who requested login's pending review (the actor), personal or attributed team; empty when none pending or unknown
-	// LastWord is login's own comment or review when it is the last human word: why
-	// AwaitingOthersSince is set, or, with it unset, the last word a push to the pull
-	// request has answered since (LastWord.Head is the head it was made on); nil
-	// otherwise.
+	// LastWord is login's own comment or review when it is the last human word,
+	// whoever's turn it is: why AwaitingOthersSince is set, or, with it unset, a last
+	// word a push answered (LastWord.Answered) or one a review request now outranks. It
+	// carries the head it was made on (LastWord.Head) for the next read; nil when
+	// someone else had the last word.
 	LastWord *worklist.LastWord
 	// TimelineComplete reports that every timeline event was read, so
 	// RequestedByLogin is authoritative; when false it is unknown, not "none".
@@ -271,14 +277,27 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 	if !requestedAt.IsZero() && requestedAt.After(myLastActivityAt) {
 		meSince = requestedAt
 	}
-	if opts.ReviewRequested && !personalPending && len(teamRequests) == 1 {
-		// The search hit is otherwise unexplained, and one team request stands: it
-		// names login.
+	if opts.ReviewRequested && !personalPending && len(teamRequests) > 0 {
+		// The search hit is otherwise unexplained: one of the outstanding team requests
+		// names login, though which is unknown when there are several.
+		var earliest, latest time.Time
+		actors := map[string]bool{}
 		for _, tr := range teamRequests {
-			a.RequestedByLogin = tr.actor
-			if tr.at.After(myLastActivityAt) && tr.at.After(meSince) {
-				meSince = tr.at
+			if earliest.IsZero() || tr.at.Before(earliest) {
+				earliest = tr.at
 			}
+			if tr.at.After(latest) {
+				latest = tr.at
+			}
+			actors[tr.actor] = true
+		}
+		if len(actors) == 1 {
+			for actor := range actors {
+				a.RequestedByLogin = actor
+			}
+		}
+		if earliest.After(myLastActivityAt) && latest.After(meSince) {
+			meSince = latest
 		}
 	}
 	switch {
@@ -292,27 +311,47 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 	case lastActivityDecisive && !isAuthor:
 		othersSince = lastActivityAt
 	}
+	// What the stored last word recorded stands only for the same version of it: an
+	// edit is a new question, anchored afresh.
+	var prior *worklist.LastWord
+	if p := opts.Prior; p != nil && lastWord != nil && p.Key() == lastWord.Key() {
+		prior = p
+	}
 	if !othersSince.IsZero() && opts.PullRequest && !isAuthor {
-		head, headErr := c.pullHead(ctx, token, repo, number)
-		switch {
-		case lastEvent != nil && lastEvent.Event == "reviewed" && lastEvent.CommitID != "":
-			// A review names the commit it was made on; it stands while that is the head.
-			if lastWord != nil {
-				lastWord.Head = lastEvent.CommitID
-			}
-			if headErr != nil || !strings.EqualFold(head, lastEvent.CommitID) {
-				othersSince = time.Time{}
-			}
-		case lastWord != nil:
-			// A comment names no commit: it stands while the head is the one first seen
-			// with it. Unread, the head anchors nothing new, and the timeline decides.
-			if p := opts.Prior; p != nil && p.ID == lastWord.ID && p.Head != "" {
-				lastWord.Head = p.Head
-				if headErr == nil && !strings.EqualFold(head, p.Head) {
-					othersSince = time.Time{}
+		if prior != nil && prior.Answered {
+			// A push already answered this version of the last word: nothing undoes that.
+			lastWord.Head, lastWord.Answered = prior.Head, true
+			othersSince = time.Time{}
+		} else {
+			head, headErr := c.pullHead(ctx, token, repo, number)
+			switch {
+			case lastEvent != nil && lastEvent.Event == "reviewed" && lastEvent.CommitID != "":
+				// A review names the commit it was made on; it stands while that is the
+				// head, and an unreadable head leaves it off the waiting list.
+				if lastWord != nil {
+					lastWord.Head = lastEvent.CommitID
 				}
-			} else if headErr == nil {
-				lastWord.Head = head
+				if headErr != nil {
+					othersSince = time.Time{}
+				} else if !strings.EqualFold(head, lastEvent.CommitID) {
+					othersSince = time.Time{}
+					if lastWord != nil {
+						lastWord.Answered = true
+					}
+				}
+			case lastWord != nil:
+				// A comment names no commit: it stands while the head is the one first
+				// seen with it. Unread, the head anchors nothing new, and the timeline
+				// decides.
+				switch {
+				case prior != nil && prior.Head != "":
+					lastWord.Head = prior.Head
+					if headErr == nil && !strings.EqualFold(head, prior.Head) {
+						othersSince, lastWord.Answered = time.Time{}, true
+					}
+				case headErr == nil:
+					lastWord.Head = head
+				}
 			}
 		}
 	}
@@ -321,12 +360,10 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 		a.AwaitingMeSince = meSince
 	case !othersSince.IsZero():
 		a.AwaitingOthersSince = othersSince
-		a.LastWord = lastWord
-	case lastWord != nil && lastWord.Head != "":
-		// A push answered it: keep the head it was made on, so the next read still
-		// knows the head moved since.
-		a.LastWord = lastWord
 	}
+	// Kept whoever's turn it is, so its head and whether a push answered it survive a
+	// review request that outranks it for a while.
+	a.LastWord = lastWord
 	return a, nil
 }
 

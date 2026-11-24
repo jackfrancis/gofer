@@ -44,7 +44,12 @@ const (
 // (Activity.RequestEnded: no personal or team request still outstanding, since the
 // user may be on any requested team). A request the search itself showed is never
 // removed here: the timeline cannot tell whether a team request includes the user.
-func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried map[string]bool) error {
+//
+// requested (optional) names the items this refresh's review-requested:@me search
+// returned, as opposed to a request carried over (carried): only a fresh hit is
+// evidence that a team request names the user (github.ActivityOptions.ReviewRequested).
+// A standalone enrich has run no search, so it attributes no team request.
+func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried, requested map[string]bool) error {
 	provider := p.Provider
 	if provider == "" {
 		provider = "github"
@@ -93,8 +98,9 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried 
 		// holds the batch past the time kept for writing every result back.
 		actx, cancel := reserveContext(ctx, enrichReserve)
 		opts := github.ActivityOptions{Author: items[i].GitHub.Author, Bots: p.Bots,
-			// The review-requested:@me search shows the item: a team request may be ours.
-			ReviewRequested: slices.Contains(items[i].Signals.Reasons, worklist.ReasonReviewRequested),
+			// This refresh's review-requested:@me search returned the item: a team
+			// request may be ours. A carried request is no such evidence.
+			ReviewRequested: requested[items[i].ID],
 			PullRequest:     items[i].Type == worklist.TypePullRequest,
 			Prior:           items[i].Signals.LastWord}
 		if slices.Contains(items[i].Signals.Reasons, worklist.ReasonAuthor) {

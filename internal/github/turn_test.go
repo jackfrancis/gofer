@@ -294,13 +294,26 @@ func TestItemActivityTeamRequestNeedsEvidence(t *testing.T) {
 	if a := activityFor(t, personal, ActivityOptions{Author: "owner", ReviewRequested: true}); a.AwaitingOthersSince.IsZero() || !a.AwaitingMeSince.IsZero() {
 		t.Fatal("my own pending request explains the search hit, yet a team request displaced my question")
 	}
+	// Two team requests, both since my review: which names me is unknown, but either
+	// way I owe a review. Their actors differ, so no requester is named.
 	two := `[
-		{"event":"reviewed","id":1,"state":"approved","user":{"login":"me"},"submitted_at":"2026-01-01T00:00:00Z"},
-		{"event":"review_requested","requested_team":{"slug":"a"},"actor":{"login":"owner"},"created_at":"2026-01-02T00:00:00Z"},
-		{"event":"review_requested","requested_team":{"slug":"b"},"actor":{"login":"owner"},"created_at":"2026-01-03T00:00:00Z"}
+		{"event":"reviewed","id":1,"state":"changes_requested","user":{"login":"me"},"submitted_at":"2026-01-01T00:00:00Z"},
+		{"event":"review_requested","requested_team":{"slug":"a"},"actor":{"login":"lead1"},"created_at":"2026-01-02T00:00:00Z"},
+		{"event":"review_requested","requested_team":{"slug":"b"},"actor":{"login":"lead2"},"created_at":"2026-01-03T00:00:00Z"}
 	]`
-	if a := activityFor(t, two, ActivityOptions{Author: "owner", ReviewRequested: true}); !a.AwaitingMeSince.IsZero() {
-		t.Fatal("two team requests: which one names me is unknown, yet one was attributed")
+	a := activityFor(t, two, ActivityOptions{Author: "owner", ReviewRequested: true})
+	if !a.AwaitingMeSince.Equal(time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC)) || !a.AwaitingOthersSince.IsZero() || a.RequestedByLogin != "" {
+		t.Fatalf("two team requests since my review: awaiting me %v, others %v, requested by %q", a.AwaitingMeSince, a.AwaitingOthersSince, a.RequestedByLogin)
+	}
+	// One team request from before my comment and one after: the one naming me may be
+	// the older, which my comment already answered, so the timeline decides.
+	mixed := `[
+		{"event":"review_requested","requested_team":{"slug":"a"},"actor":{"login":"lead1"},"created_at":"2026-01-01T00:00:00Z"},
+		{"event":"commented","id":2,"actor":{"login":"me"},"body":"@owner why?","created_at":"2026-01-02T00:00:00Z"},
+		{"event":"review_requested","requested_team":{"slug":"b"},"actor":{"login":"lead2"},"created_at":"2026-01-03T00:00:00Z"}
+	]`
+	if a := activityFor(t, mixed, ActivityOptions{Author: "owner", ReviewRequested: true}); !a.AwaitingMeSince.IsZero() || a.AwaitingOthersSince.IsZero() {
+		t.Fatalf("mixed team requests: awaiting me %v, others %v", a.AwaitingMeSince, a.AwaitingOthersSince)
 	}
 	one := `[{"event":"review_requested","requested_team":{"slug":"my-team"},"actor":{"login":"review-bot"},"created_at":"2026-01-02T00:00:00Z"}]`
 	if a := activityFor(t, one, ActivityOptions{Author: "owner", ReviewRequested: true}); a.AwaitingMeSince.IsZero() || a.RequestedByLogin != "review-bot" {
@@ -350,5 +363,31 @@ func TestItemActivityInlineReviewPages(t *testing.T) {
 	}
 	if _, waiting := (worklist.WorkItem{Signals: worklist.Signals{AwaitingOthersSince: time.Now(), LastWord: lw}}).Waiting(); waiting {
 		t.Fatal("a review read only in part made the item wait")
+	}
+}
+
+// A push answered this version of the last word: later reads keep it answered, even
+// without a head, and an edit is a new last word, anchored afresh.
+func TestItemActivityAnsweredLastWord(t *testing.T) {
+	const q = `{"event":"commented","id":1,"actor":{"login":"me"},"body":"@owner can you add the test?","created_at":"2026-01-03T00:00:00Z"}`
+	pr := ActivityOptions{Author: "owner", PullRequest: true, Prior: worklist.NewLastWord("comment:1", time.Date(2026, 1, 3, 0, 0, 0, 0, time.UTC), false, []string{"owner"}, "@owner can you add the test?")}
+	pr.Prior.Head = "aaaaaaa"
+	answered := activityRoutes(t, "["+q+"]", map[string]string{"/repos/o/r/pulls/1": `{"head":{"sha":"bbbbbbb"}}`}, pr)
+	if !answered.AwaitingOthersSince.IsZero() || answered.LastWord == nil || !answered.LastWord.Answered {
+		t.Fatalf("the push should answer the question: %+v", answered.LastWord)
+	}
+	pr.Prior = answered.LastWord
+	if a := activityRoutes(t, "["+q+"]", nil, pr); !a.AwaitingOthersSince.IsZero() || !a.LastWord.Answered {
+		t.Fatal("an unreadable head revived an answered question")
+	}
+	edited := `{"event":"commented","id":1,"actor":{"login":"me"},"body":"@owner and a release note?","created_at":"2026-01-03T00:00:00Z"}`
+	a := activityRoutes(t, "["+edited+"]", map[string]string{"/repos/o/r/pulls/1": `{"head":{"sha":"bbbbbbb"}}`}, pr)
+	if a.AwaitingOthersSince.IsZero() || a.LastWord.Answered || a.LastWord.Head != "bbbbbbb" {
+		t.Fatalf("an edited question should wait, anchored to the head now: %+v", a.LastWord)
+	}
+	// A review request outranking the last word keeps it, answered state and all.
+	req := `{"event":"review_requested","requested_reviewer":{"login":"me"},"actor":{"login":"owner"},"created_at":"2026-01-04T00:00:00Z"}`
+	if a := activityRoutes(t, "["+q+","+req+"]", nil, ActivityOptions{Author: "owner", PullRequest: true, Prior: answered.LastWord}); a.AwaitingMeSince.IsZero() || a.LastWord == nil || !a.LastWord.Answered {
+		t.Fatalf("a pending request dropped the last word: awaiting me %v, last word %+v", a.AwaitingMeSince, a.LastWord)
 	}
 }
