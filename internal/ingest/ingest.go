@@ -536,8 +536,9 @@ func (i *Ingestor) Converse(ctx context.Context, ownerID string, ref worklist.Tu
 }
 
 // SecondOpinion requests an INDEPENDENT (blind) review of one item by an alternative
-// model — the review-panel action. A backend answers without the prior thread; a
-// consensus synthesis is chained once that review writes back.
+// model — the review-panel action. A backend answers without the prior thread. When
+// its answer lands, the agent plane chains the consensus synthesis turn onto the
+// thread (worklist.ApplyReplyAndChain) and dispatches it (Synthesize).
 func (i *Ingestor) SecondOpinion(ctx context.Context, ownerID string, ref worklist.TurnRef, endpoint, model string) error {
 	if model == "" {
 		return errors.New("ingest: second opinion requires a model")
@@ -680,8 +681,22 @@ func (i *Ingestor) converseInFlight(ownerID, itemID string) bool {
 	return false
 }
 
+// Synthesize dispatches the review panel's consensus synthesis: a github-converse run
+// answering ref, the synthesis turn the agent plane chained onto the thread when the
+// panel's blind review landed (worklist.ApplyReplyAndChain). It uses the DEFAULT
+// model (no per-turn override) and is not independent, so it reads every review in
+// the thread. The agent plane calls it off the reply's request, so the dispatch is
+// bounded by submitTimeout and its failure is logged, not returned: the turn then
+// stays pending, and once reviewStaleAfter passes the thread offers to retry it.
+func (i *Ingestor) Synthesize(ctx context.Context, ownerID string, ref worklist.TurnRef) {
+	sctx, cancel := context.WithTimeout(ctx, submitTimeout)
+	defer cancel()
+	if err := i.dispatchConverse(sctx, ownerID, ref, "", "", false); err != nil {
+		i.log.Warn("review-panel synthesis dispatch failed; the thread offers a retry", "owner", ownerID, "item", ref.Item, "turn", ref.Turn, "err", err)
+	}
+}
+
 // NoteWriteback records that a run wrote its result back to gofer's agent plane. The
 // default NoopDispatcher never writes back, so this is a no-op; a backend's write-backs
-// would drive bulk-action timing (the click-to-last-review wall-clock) and the
-// review-panel consensus synthesis.
+// would drive bulk-action timing (the click-to-last-review wall-clock).
 func (i *Ingestor) NoteWriteback(runID string) {}

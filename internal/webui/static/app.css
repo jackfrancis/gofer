@@ -266,6 +266,11 @@ body {
 .zz-msg--user .zz-linkbtn:hover { color: #fff; }
 .zz-hidden { align-self: center; display: flex; gap: 8px; align-items: center; font-size: 12px; font-style: italic; color: var(--muted); }
 .zz-hidden form { margin: 0; }
+/* A reply in flight: the thread page polls until it lands (RefreshSecs), so say so. */
+.zz-pending { color: var(--muted); font-style: italic; display: flex; align-items: center; gap: 8px; }
+.zz-pending-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); animation: zz-pulse 1.2s ease-in-out infinite; }
+@keyframes zz-pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .zz-pending-dot { animation: none; } }
 .zz-notice { align-self: center; margin: 2px 0; font-size: 12px; font-style: italic; color: var(--muted); }
 .zz-notice--reconnect { font-style: normal; color: var(--danger); }
 .zz-reconnect { margin: 0 0 16px; padding: 10px 14px; border: 1px solid var(--danger); border-radius: 6px; color: var(--danger); font-size: 14px; }

@@ -247,7 +247,16 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 // answered turn is gone. The agent plane's reply handler and the in-process sink
 // both use it.
 func ApplyReply(ctx context.Context, store Store, ownerID, itemID, replyTo string, reply Message) error {
-	return store.Update(ctx, ownerID, func(current []WorkItem) ([]WorkItem, error) {
+	_, err := applyReply(ctx, store, ownerID, itemID, replyTo, reply, false, time.Time{})
+	return err
+}
+
+// applyReply is ApplyReply, chaining the review panel's synthesis when chain is set
+// (ApplyReplyAndChain).
+func applyReply(ctx context.Context, store Store, ownerID, itemID, replyTo string, reply Message, chain bool, at time.Time) (string, error) {
+	var synth string
+	err := store.Update(ctx, ownerID, func(current []WorkItem) ([]WorkItem, error) {
+		synth = ""
 		for i := range current {
 			if current[i].ID != itemID {
 				continue
@@ -256,8 +265,15 @@ func ApplyReply(ctx context.Context, store Store, ownerID, itemID, replyTo strin
 			if err != nil || !changed {
 				return nil, err
 			}
+			if chain {
+				synth, _ = ChainSynthesis(&current[i], replyTo, at)
+			}
 			return current[i : i+1], nil
 		}
 		return nil, nil // item gone
 	})
+	if err != nil {
+		return "", err
+	}
+	return synth, nil
 }

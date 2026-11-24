@@ -281,6 +281,7 @@ type pageData struct {
 	Refreshing               bool                // worklist: a refresh was in flight before the items were read
 	PollSecs, IdlePollSecs   int                 // worklist: how often reload.js polls while a refresh runs, and while none does
 	FallbackURL              string              // worklist, no script: where the <noscript> refresh goes while a refresh runs (refreshCheck)
+	ReplyPending             bool                // a reply is plausibly in flight (thread view): shown as working, no new review panel
 	ReplyStalled             bool                // a pending reply has not arrived within reviewStaleAfter (thread view)
 	StalledTurn              string              // the stalled turn's key, which the Retry form names; "" offers no Retry (thread view)
 	RetryOptions             []ModelOption       // the models Retry may use (retryChoices); a picker when more than one
@@ -340,6 +341,7 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 				data.ItemHidden = true
 			} else if it.ReplyPending(now, reviewStaleAfter) {
 				data.RefreshSecs = 3 // a reply is plausibly in flight — poll for it
+				data.ReplyPending = true
 			} else if it.ReplyStalled(now, reviewStaleAfter) {
 				// No reply within the window: stop spinning and offer to retry the turn,
 				// with the models a retry of it may use. A turn the user hid is not
@@ -757,10 +759,8 @@ func (h *Handler) HideItem(w http.ResponseWriter, r *http.Request) {
 const reviewPrompt = "Can you review this PR?"
 
 // independentReviewPrompt is the message posted by the "Review panel" action to the
-// alternative model. It asks for a thorough, blind, independent assessment — the
-// runtime answers without the prior thread — so the model forms its own view before
-// the default model's consensus synthesis weighs every review.
-const independentReviewPrompt = "Give an independent review of this PR. There may be other humans actively reviewing the PR. Your value is to thoroughly review in detail, especially areas of ambiguity, and to make a practical assessment of the PR quality's readiness for acceptance, or if not, some concrete suggestions for next steps."
+// alternative model (worklist.IndependentReviewPrompt).
+const independentReviewPrompt = worklist.IndependentReviewPrompt
 
 // reviewStaleAfter is how long a pending user turn (a review awaiting its reply) is
 // treated as plausibly in-flight. Past it, the converse run has almost certainly
@@ -843,10 +843,13 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 
 // SecondOpinion handles POST /items/second-opinion — the "Review panel" action. It
 // appends an independent-review prompt to the item's thread and dispatches a blind
-// review by the selected alternative model; once that review lands, the ingestor
-// chains a consensus synthesis by the default model onto the same thread. It then
-// redirects to the item's thread (Post/Redirect/Get) where both replies appear
-// attributed to their models. SameSite=Lax cookies give baseline CSRF protection.
+// review by the selected alternative model; once that review lands, the agent plane
+// chains a consensus synthesis by the default model onto the same thread, if there
+// is an earlier review to weigh it against (worklist.ChainSynthesis). It then
+// redirects to the item's thread (Post/Redirect/Get) where the replies appear
+// attributed to their models. While a reply on the item is still pending it adds
+// nothing (a double submit, or a page that predates the pending turn), as the thread
+// view offers no panel then. SameSite=Lax cookies give baseline CSRF protection.
 func (h *Handler) SecondOpinion(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
 	if user == nil || !h.secondOpinionEnabled() {
@@ -861,9 +864,11 @@ func (h *Handler) SecondOpinion(w http.ResponseWriter, r *http.Request) {
 	}
 	// Append the independent-review prompt first (atomically), so the spawned converse
 	// runtime reads it from the stored thread; then dispatch the blind review by the
-	// chosen model. The consensus synthesis is chained by the ingestor after it lands.
-	msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: independentReviewPrompt, Kind: worklist.KindReviewRequest, At: h.now().UTC()}
-	if h.appendTurn(r.Context(), user.ID, id, msg) {
+	// chosen model. The consensus synthesis is chained by the agent plane after it lands.
+	at := h.now().UTC()
+	msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: independentReviewPrompt, Kind: worklist.KindReviewRequest, At: at}
+	idle := func(it worklist.WorkItem) bool { return !it.ReplyPending(at, reviewStaleAfter) }
+	if h.appendTurnIf(r.Context(), user.ID, id, msg, idle) {
 		_ = h.pipeline.SecondOpinion(r.Context(), user.ID, worklist.TurnRef{Item: id, Turn: msg.ID}, opt.Endpoint, opt.Model)
 	}
 	http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
@@ -965,11 +970,18 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 // reporting whether it did. A hidden item takes no new turn: the owner unhides it to
 // discuss it.
 func (h *Handler) appendTurn(ctx context.Context, ownerID, id string, msg worklist.Message) bool {
+	return h.appendTurnIf(ctx, ownerID, id, msg, nil)
+}
+
+// appendTurnIf is appendTurn, appending only if ok (when set) accepts the item as
+// stored, inside the same update.
+func (h *Handler) appendTurnIf(ctx context.Context, ownerID, id string, msg worklist.Message, ok func(worklist.WorkItem) bool) bool {
 	found := false
 	err := h.store.Update(ctx, ownerID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		found = false
 		for i := range current {
 			if current[i].ID == id {
-				if current[i].IsHidden() {
+				if current[i].IsHidden() || (ok != nil && !ok(current[i])) {
 					return nil, nil
 				}
 				current[i].Thread = append(current[i].Thread, msg)
@@ -1219,7 +1231,7 @@ func hasConversation(it worklist.WorkItem) bool {
 // independent-review request the "2nd opinion" action posts. The UI renders it as a
 // small system notice rather than a chat bubble, since the user never typed it.
 func isSecondOpinionRequest(m worklist.Message) bool {
-	return m.Role == worklist.RoleUser && m.Content == independentReviewPrompt
+	return m.IsPanelReview()
 }
 
 // isSynthesisRequest reports whether a thread turn is the programmatic consensus

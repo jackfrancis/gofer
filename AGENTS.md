@@ -378,6 +378,18 @@ Wired on the web-tier side; they define what a runtime must respect:
   gate (`internal/ingest/gate.go`) holds one run per (owner, task, item, turn) and
   only saves the cost of a duplicate run: it is in memory and guarantees nothing.
   A second opinion posts its own user turn, so it is never a duplicate.
+- The review panel (`POST /items/second-opinion`, and Get 2nd Opinion in bulk) posts
+  `worklist.IndependentReviewPrompt` (a turn is a panel review by that text,
+  `Message.IsPanelReview`) for a blind review by an alternative model. When its answer
+  lands on the agent plane, the same store update chains the consensus synthesis turn
+  (`worklist.ApplyReplyAndChain` → `ChainSynthesis`), and the plane hands it to
+  `Ingestor.Synthesize` (default model, reads the thread), off the reply's request.
+  It chains only after a turn's first substantive answer, and only when another
+  visible review is there to weigh; a panel run before any review is the item's first
+  review. Nothing tracks run IDs in memory: a dispatch that fails leaves the turn
+  pending, and the thread offers Retry after `reviewStaleAfter`. The thread page shows
+  a working cue while a reply is pending and offers no panel then; the handler refuses
+  one too.
 - The scheduled refresh (`ingest.Refresher`, `REFRESH_INTERVAL`, off when unset or
   0, at least 1m otherwise) dispatches a github-ingest run per GitHub owner with
   stored work (`worklist.OwnerLister`), and only for owners
