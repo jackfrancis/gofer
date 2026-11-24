@@ -178,19 +178,24 @@ func (h *Handler) resolveOption(value string) (ModelOption, bool) {
 	return h.defaultOption()
 }
 
-// resolveSecondOpinionOption is like resolveOption but over the non-default options,
-// falling back to the first alternative.
-func (h *Handler) resolveSecondOpinionOption(value string) (ModelOption, bool) {
-	alts := h.alternativeOptions()
-	for _, o := range alts {
-		if o.Value == value {
-			return o, true
+// panelChoices returns the models the review panel may use for item it: every
+// configured option whose model differs from the item's first reviewer's
+// (FirstReviewModel), so a panel never compares a model with itself. With no first
+// review yet it is the alternative (non-default) options, as before. The thread view
+// offers these, and SecondOpinion resolves the form's choice against them as the item
+// is stored, inside the update that appends the panel turn.
+func (h *Handler) panelChoices(it worklist.WorkItem) []ModelOption {
+	first := it.FirstReviewModel()
+	if first == "" {
+		return h.alternativeOptions()
+	}
+	var out []ModelOption
+	for _, o := range h.options {
+		if o.Model != first {
+			out = append(out, o)
 		}
 	}
-	if len(alts) > 0 {
-		return alts[0], true
-	}
-	return ModelOption{}, false
+	return out
 }
 
 // pickDifferentModel returns the first configured option whose model id differs from
@@ -280,11 +285,14 @@ type pageData struct {
 	Refreshing               bool                // worklist: a refresh was in flight before the items were read
 	PollSecs, IdlePollSecs   int                 // worklist: how often reload.js polls while a refresh runs, and while none does
 	FallbackURL              string              // worklist, no script: where the <noscript> refresh goes while a refresh runs (refreshCheck)
+	ReplyPending             bool                // a reply is plausibly in flight (thread view): shown as working, no new review panel
 	ReplyStalled             bool                // a pending reply has not arrived within reviewStaleAfter (thread view)
 	StalledTurn              string              // the stalled turn's key, which the Retry form names; "" offers no Retry (thread view)
 	RetryOptions             []ModelOption       // the models Retry may use (retryChoices); a picker when more than one
 	RetryRefused             bool                // the last Retry was refused by the backend, so no run started
 	StalledHidden            bool                // the stalled turn is hidden: unhide it to retry
+	StalledSynthesis         bool                // the turn offered for Retry is a consensus synthesis (thread view)
+	SynthesisTooLarge        bool                // a stalled synthesis's reviews are too large to read together: no Retry (thread view)
 	Message                  string              // failure detail rendered on the error view
 	Failure                  string              // a failed user action, rendered on the error view in place of the discovery wording
 	RetryURL                 string              // where the error view's "Try again" goes; empty = the radar
@@ -338,7 +346,8 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, it := range items {
 		if it.ID == id {
-			data := pageData{View: "thread", User: user, Item: it, ConvEnabled: h.convEnabled, Assistant: h.convEnabled, ModelOptions: h.options, SecondOpinionEnabled: h.secondOpinionEnabled(), SecondOpinionOptions: h.alternativeOptions()}
+			data := pageData{View: "thread", User: user, Item: it, ConvEnabled: h.convEnabled, Assistant: h.convEnabled, ModelOptions: h.options, SecondOpinionOptions: h.panelChoices(it)}
+			data.SecondOpinionEnabled = h.secondOpinionEnabled() && len(data.SecondOpinionOptions) > 0
 			data.SignInRequired = h.signInRequired(r, user)
 			now := h.now().UTC()
 			if it.IsHidden() {
@@ -349,6 +358,7 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 				data.ItemHidden = true
 			} else if it.ReplyPending(now, reviewStaleAfter) {
 				data.RefreshSecs = 3 // a reply is plausibly in flight — poll for it
+				data.ReplyPending = true
 			} else if it.ReplyStalled(now, reviewStaleAfter) {
 				// No reply within the window: stop spinning and offer to retry the turn,
 				// with the models a retry of it may use. A turn the user hid is not
@@ -362,6 +372,32 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 					}
 				} else if i, _ := it.LastUserTurn(); it.Thread[i].Hidden {
 					data.StalledHidden = true
+				}
+			}
+			if !data.ItemHidden && !data.ReplyPending && data.StalledTurn == "" {
+				// A consensus synthesis that failed (or declined for a missing review)
+				// stays retryable even after the owner has written since: it is not
+				// necessarily the last turn (RetryableSynthesis).
+				if i, ok := it.RetryableSynthesis(now, reviewStaleAfter); ok {
+					if choices, _, ok := h.retryChoices(it, i); ok {
+						data.ReplyStalled = true
+						data.StalledHidden = false
+						data.StalledTurn = it.TurnKey(i)
+						data.RetryOptions = choices
+						data.RetryRefused = r.URL.Query().Get("retry") == "refused"
+					}
+				}
+			}
+			if i, ok := it.TurnIndex(data.StalledTurn); ok && data.StalledTurn != "" && isSynthesisRequest(it.Thread[i]) {
+				data.StalledSynthesis = true
+			}
+			if !data.ItemHidden && !data.ReplyPending && data.StalledTurn == "" {
+				// A stalled synthesis no retry can answer: its reviews are all there but
+				// too large to read together. Say so, rather than offer a Retry that would
+				// only decline again.
+				if i, ok := it.StalledSynthesis(now, reviewStaleAfter); ok {
+					key := it.TurnKey(i)
+					data.SynthesisTooLarge = it.SynthesisReady(key) && !it.SynthesisFits(key)
 				}
 			}
 			if !it.IsHidden() {
@@ -477,7 +513,9 @@ func (h *Handler) ThreadPost(w http.ResponseWriter, r *http.Request) {
 // run that is slow rather than lost.
 //
 // A review-panel request is retried as a blind review by a model other than the
-// item's first reviewer; any other turn as a Discuss turn by the chosen model.
+// item's first reviewer; a consensus synthesis by the default model, wherever it sits
+// in the thread, once every review it weighs is visible again (RetryableSynthesis);
+// any other turn as a Discuss turn by the chosen model.
 func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
 	if user == nil || !h.convEnabled {
@@ -495,7 +533,7 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 	choice := strings.TrimSpace(r.FormValue("choice"))
 	var (
 		turn        string
-		prev        time.Time // the turn's time before this attempt re-stamped it
+		stamp       worklist.RetryStamp // this attempt, which a refused dispatch undoes
 		independent bool
 		opt         ModelOption
 	)
@@ -506,6 +544,11 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			i, ok := it.RetryableTurn(at, reviewStaleAfter)
+			if !ok || it.TurnKey(i) != want {
+				// Not the last turn: it may be a consensus synthesis a later Discuss turn
+				// followed (RetryableSynthesis).
+				i, ok = it.RetryableSynthesis(at, reviewStaleAfter)
+			}
 			if !ok || it.TurnKey(i) != want || it.IsHidden() {
 				// Answered, still plausibly in flight, hidden by the user (the turn, or
 				// the whole item), or the page is out of date: that is not a turn
@@ -519,8 +562,11 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 				return nil, nil // no model other than the first reviewer's
 			}
 			opt = pickOption(choices, choice)
-			prev = it.Thread[i].At
-			turn, _ = it.RetryStalled(at, reviewStaleAfter)
+			// Start a new attempt: the turn is pending again, a second retry within
+			// reviewStaleAfter finds nothing to do, and only this attempt's own notice
+			// can end it (worklist.Restamp).
+			stamp = it.Restamp(i, at)
+			turn = want
 			return []worklist.WorkItem{it}, nil
 		}
 		return nil, nil
@@ -529,12 +575,15 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, back, http.StatusSeeOther)
 		return
 	}
-	ref := worklist.TurnRef{Item: id, Turn: turn}
+	ref := worklist.TurnRef{Item: id, Turn: turn, Attempt: stamp.Attempt}
 	if independent {
 		err = h.pipeline.SecondOpinion(r.Context(), user.ID, ref, opt.Endpoint, opt.Model)
 	} else {
 		err = h.pipeline.Converse(r.Context(), user.ID, ref, opt.Endpoint, opt.Model)
 	}
+	// A run for the turn was still in flight, and the retry shares it: the turn keeps
+	// that run's attempt, so its notice still ends the wait.
+	h.revertShared(r.Context(), user.ID, err, []worklist.RetryStamp{stamp})
 	if errors.Is(err, ingest.ErrNotAccepted) {
 		// The backend certainly holds no run for this attempt, so the turn is not in
 		// flight: put its time back, so the page offers Retry again at once, and say
@@ -549,7 +598,7 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 		err := h.store.Update(ctx, user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 			undone = false
 			for _, it := range current {
-				if it.ID == id && it.UndoRetry(turn, at, prev) {
+				if it.ID == id && it.UndoRetry(stamp) {
 					undone = true
 					return []worklist.WorkItem{it}, nil
 				}
@@ -571,20 +620,23 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 // retryChoices returns the models a retry of item turn i may use, which the
 // thread view offers and ThreadRetry resolves the form's choice against. A
 // review-panel request is retried as a blind review (independent), by any
-// configured model other than the item's first reviewer; ok is false when no such
-// model exists, and Retry is then not offered. Any other turn may use every
-// configured model; with none configured the run uses its default.
+// configured model the panel may use (panelChoices); ok is false when no such
+// model exists, and Retry is then not offered. A consensus synthesis is retried by the
+// default model only, and only while every review it weighs is visible and they fit
+// the read its run would get (SynthesisFits). Any other turn may use every configured model; with none
+// configured the run uses its default.
 func (h *Handler) retryChoices(it worklist.WorkItem, i int) (choices []ModelOption, independent, ok bool) {
-	if !isSecondOpinionRequest(it.Thread[i]) {
-		return h.options, false, true
-	}
-	first := it.FirstReviewModel()
-	for _, o := range h.options {
-		if o.Model != first {
-			choices = append(choices, o)
+	switch {
+	case isSecondOpinionRequest(it.Thread[i]):
+		choices = h.panelChoices(it)
+		return choices, true, len(choices) > 0
+	case isSynthesisRequest(it.Thread[i]):
+		if !it.SynthesisFits(it.TurnKey(i)) {
+			return nil, false, false // a review is missing, or they cannot be read together
 		}
+		return nil, false, true // the run's default model, as the chained synthesis uses
 	}
-	return choices, true, len(choices) > 0
+	return h.options, false, true
 }
 
 // pickOption returns the option in choices with the given value, else the first
@@ -774,10 +826,8 @@ func (h *Handler) HideItem(w http.ResponseWriter, r *http.Request) {
 const reviewPrompt = "Can you review this PR?"
 
 // independentReviewPrompt is the message posted by the "Review panel" action to the
-// alternative model. It asks for a thorough, blind, independent assessment — the
-// runtime answers without the prior thread — so the model forms its own view before
-// the default model's consensus synthesis weighs every review.
-const independentReviewPrompt = "Give an independent review of this PR. There may be other humans actively reviewing the PR. Your value is to thoroughly review in detail, especially areas of ambiguity, and to make a practical assessment of the PR quality's readiness for acceptance, or if not, some concrete suggestions for next steps."
+// alternative model (worklist.IndependentReviewPrompt).
+const independentReviewPrompt = worklist.IndependentReviewPrompt
 
 // reviewStaleAfter is how long a pending user turn (a review awaiting its reply) is
 // treated as plausibly in-flight. Past it, the converse run has almost certainly
@@ -814,7 +864,10 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	at := h.now().UTC()
-	var refs []worklist.TurnRef
+	var (
+		refs    []worklist.TurnRef
+		retries []worklist.RetryStamp // turns retried, not added: a shared run reverts them
+	)
 	scope, ok := formScope(r)
 	if !ok {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
@@ -823,7 +876,7 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 	// Choose and stamp the PRs in one atomic update, against the threads as stored.
 	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		var changed []worklist.WorkItem
-		refs = refs[:0]
+		refs, retries = refs[:0], retries[:0]
 		for _, it := range current {
 			if it.Type != worklist.TypePullRequest || !it.Actionable() || !scope.includes(it) {
 				continue // off the radar (hidden or closed), waiting on someone else, or outside the page's projects and labels: never review it in bulk
@@ -837,14 +890,17 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 			// If the last request's run has finished or failed, retry it — reusing the
 			// prompt (refresh its timestamp) rather than stacking a second one. This is
 			// what makes the button self-healing after a rate-limited batch.
-			turn, retry := it.RetryStalled(at, reviewStaleAfter)
-			if !retry {
+			ref := worklist.TurnRef{Item: it.ID}
+			if stamp, retry := it.RetryStalled(at, reviewStaleAfter); retry {
+				ref.Turn, ref.Attempt = stamp.Key, stamp.Attempt
+				retries = append(retries, stamp)
+			} else {
 				msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, At: at}
 				it.Thread = append(it.Thread, msg)
-				turn = msg.ID
+				ref.Turn = msg.ID
 			}
 			changed = append(changed, it)
-			refs = append(refs, worklist.TurnRef{Item: it.ID, Turn: turn})
+			refs = append(refs, ref)
 		}
 		return changed, nil
 	})
@@ -853,17 +909,56 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		// request from the stored thread; then launch the runs concurrently with the
 		// model picked from the button's dropdown (an empty choice uses the default).
 		opt, _ := h.resolveOption(strings.TrimSpace(r.FormValue("choice")))
-		_ = h.pipeline.ReviewAll(r.Context(), user.ID, refs, opt.Endpoint, opt.Model)
+		err := h.pipeline.ReviewAll(r.Context(), user.ID, refs, opt.Endpoint, opt.Model)
+		h.revertShared(r.Context(), user.ID, err, retries)
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
+// revertShared puts back the earlier attempt on each retried turn (stamps) whose
+// dispatch shared a run already in flight instead of starting one (ingest.SharedRuns
+// of err): that run was dispatched as the earlier attempt, so only its notice can end
+// the wait (worklist.RevertAttempt). It runs detached from the request, under
+// undoRetryTimeout; a failure only logs, and the turn then waits out reviewStaleAfter.
+func (h *Handler) revertShared(ctx context.Context, ownerID string, err error, stamps []worklist.RetryStamp) {
+	shared := map[worklist.TurnRef]bool{}
+	for _, ref := range ingest.SharedRuns(err) {
+		shared[worklist.TurnRef{Item: ref.Item, Turn: ref.Turn}] = true
+	}
+	if len(shared) == 0 || len(stamps) == 0 {
+		return
+	}
+	byItem := map[string]worklist.RetryStamp{}
+	for _, s := range stamps {
+		byItem[s.Item] = s
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoRetryTimeout)
+	defer cancel()
+	uerr := h.store.Update(ctx, ownerID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		var changed []worklist.WorkItem
+		for _, it := range current {
+			s, ok := byItem[it.ID]
+			if ok && shared[worklist.TurnRef{Item: it.ID, Turn: s.Key}] && it.RevertAttempt(s) {
+				changed = append(changed, it)
+			}
+		}
+		return changed, nil
+	})
+	if uerr != nil {
+		slog.WarnContext(ctx, "retry shared a run in flight, and restoring its attempt failed", "user", ownerID, "err", uerr)
+	}
+}
+
 // SecondOpinion handles POST /items/second-opinion — the "Review panel" action. It
 // appends an independent-review prompt to the item's thread and dispatches a blind
-// review by the selected alternative model; once that review lands, the ingestor
-// chains a consensus synthesis by the default model onto the same thread. It then
-// redirects to the item's thread (Post/Redirect/Get) where both replies appear
-// attributed to their models. SameSite=Lax cookies give baseline CSRF protection.
+// review by the selected model, which must differ from the item's first reviewer
+// (panelChoices); once reviews to compare have landed, in either order, the agent
+// plane chains a consensus synthesis by the default model onto the same thread
+// (worklist.ChainSynthesis). It then
+// redirects to the item's thread (Post/Redirect/Get) where the replies appear
+// attributed to their models. While a reply on the item is still pending it adds
+// nothing (a double submit, or a page that predates the pending turn), as the thread
+// view offers no panel then. SameSite=Lax cookies give baseline CSRF protection.
 func (h *Handler) SecondOpinion(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
 	if user == nil || !h.secondOpinionEnabled() {
@@ -871,16 +966,32 @@ func (h *Handler) SecondOpinion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.FormValue("id")
-	opt, ok := h.resolveSecondOpinionOption(strings.TrimSpace(r.FormValue("choice")))
-	if id == "" || !ok {
+	if id == "" {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
+	choice := strings.TrimSpace(r.FormValue("choice"))
 	// Append the independent-review prompt first (atomically), so the spawned converse
 	// runtime reads it from the stored thread; then dispatch the blind review by the
-	// chosen model. The consensus synthesis is chained by the ingestor after it lands.
-	msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: independentReviewPrompt, Kind: worklist.KindReviewRequest, At: h.now().UTC()}
-	if h.appendTurn(r.Context(), user.ID, id, msg) {
+	// chosen model. The model is resolved against the item as stored, in the same
+	// update, so it always differs from the first reviewer even if a review landed
+	// since the page rendered (panelChoices). The consensus synthesis is chained by the
+	// agent plane once there are reviews to compare.
+	at := h.now().UTC()
+	msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: independentReviewPrompt, Kind: worklist.KindReviewRequest, At: at}
+	var opt ModelOption
+	ready := func(it worklist.WorkItem) bool {
+		if it.ReplyPending(at, reviewStaleAfter) {
+			return false
+		}
+		choices := h.panelChoices(it)
+		if len(choices) == 0 {
+			return false // no model other than the first reviewer's
+		}
+		opt = pickOption(choices, choice)
+		return true
+	}
+	if h.appendTurnIf(r.Context(), user.ID, id, msg, ready) {
 		_ = h.pipeline.SecondOpinion(r.Context(), user.ID, worklist.TurnRef{Item: id, Turn: msg.ID}, opt.Endpoint, opt.Model)
 	}
 	http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
@@ -982,11 +1093,18 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 // reporting whether it did. A hidden item takes no new turn: the owner unhides it to
 // discuss it.
 func (h *Handler) appendTurn(ctx context.Context, ownerID, id string, msg worklist.Message) bool {
+	return h.appendTurnIf(ctx, ownerID, id, msg, nil)
+}
+
+// appendTurnIf is appendTurn, appending only if ok (when set) accepts the item as
+// stored, inside the same update.
+func (h *Handler) appendTurnIf(ctx context.Context, ownerID, id string, msg worklist.Message, ok func(worklist.WorkItem) bool) bool {
 	found := false
 	err := h.store.Update(ctx, ownerID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		found = false
 		for i := range current {
 			if current[i].ID == id {
-				if current[i].IsHidden() {
+				if current[i].IsHidden() || (ok != nil && !ok(current[i])) {
 					return nil, nil
 				}
 				current[i].Thread = append(current[i].Thread, msg)
@@ -1265,7 +1383,7 @@ func hasConversation(it worklist.WorkItem) bool {
 // independent-review request the "2nd opinion" action posts. The UI renders it as a
 // small system notice rather than a chat bubble, since the user never typed it.
 func isSecondOpinionRequest(m worklist.Message) bool {
-	return m.Role == worklist.RoleUser && m.Content == independentReviewPrompt
+	return m.IsPanelReview()
 }
 
 // isSynthesisRequest reports whether a thread turn is the programmatic consensus

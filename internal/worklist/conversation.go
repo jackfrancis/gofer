@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -35,10 +36,20 @@ const (
 	// NoticeReconnect: gofer could not reach GitHub for the user, who must sign in
 	// again. The UI shows a sign-in prompt with it.
 	NoticeReconnect = "reconnect"
+	// NoticePanelInputs: the consensus synthesis did not run, because a review it
+	// weighs (Message.Reviews) is hidden, gone, or did not fit the run's read. The
+	// thread offers to retry the synthesis once the reviews are back (RetryableSynthesis).
+	NoticePanelInputs = "panel_inputs"
 )
+
+// knownNotice reports whether n is a notice gofer knows, which AppendReply keeps.
+func knownNotice(n string) bool { return n == NoticeReconnect || n == NoticePanelInputs }
 
 // ReconnectNotice is the text of a NoticeReconnect turn.
 const ReconnectNotice = "gofer can't reach GitHub for you: sign in again to reconnect, then ask again."
+
+// PanelInputsNotice is the text of a NoticePanelInputs turn.
+const PanelInputsNotice = "gofer didn't run the consensus: a review it compares is hidden or gone, or the reviews are too large to read together. Unhide the review and retry, or hide some reviews and run the review panel again for a smaller comparison."
 
 // ErrSignInRequired is the error a ToolBox returns (wrapped) when the user's
 // provider credential is gone and only signing in again helps. A Conversationalist
@@ -82,6 +93,20 @@ type Message struct {
 	// synthesis agent reply, parsed from the model's leading verdict token; empty on
 	// every other message.
 	Verdict string `json:"verdict,omitempty"`
+	// Reviews lists the keys (TurnKey) of the review requests a synthesis request
+	// weighs, recorded when it is chained (ChainSynthesis): the run compares exactly
+	// those reviews, and declines (NoticePanelInputs) if any is no longer visible to it
+	// (SynthesisReady). Empty on every other turn, and on synthesis requests stored
+	// before it was recorded.
+	Reviews []string `json:"reviews,omitempty"`
+	// Attempt identifies the current attempt at answering a user turn: a retry that
+	// starts a new run gives the turn a new one (Restamp; a retry that shares a run
+	// already in flight puts the earlier one back, RevertAttempt). A system notice
+	// carries the attempt its run was dispatched as (TurnRef.Attempt, a run
+	// parameter), and ends only that attempt (noticed), so a run of an earlier attempt
+	// that finishes late cannot stop the page watching the retry. Empty on a turn
+	// never retried, and on every other agent turn.
+	Attempt string `json:"attempt,omitempty"`
 	// Hidden marks a turn the user has hidden from the thread view. A hidden turn is
 	// also withheld from the model as future conversation context (see splitThread), so
 	// a long review thread can be pared down to its definitive turns without deleting
@@ -193,6 +218,10 @@ func (w WorkItem) turnPosition(key string) int {
 type TurnRef struct {
 	Item string
 	Turn string
+	// Attempt is the attempt a retry dispatches (Message.Attempt, from Restamp),
+	// carried to the run as a parameter so its notices name it; empty for a turn's
+	// first attempt.
+	Attempt string
 }
 
 // NewMessageID returns a random id for a new thread turn.
@@ -239,12 +268,24 @@ func (w WorkItem) replies() map[string]int {
 	return out
 }
 
-// noticed is the set of user turns a system notice replied to: the run that took
-// the turn finished, without answering it.
+// noticed is the set of user turns whose current attempt a system notice ended: the
+// run that took the turn finished, without answering it. A notice ends only the
+// attempt it read (Message.Attempt): a retry gives the turn a new attempt (Restamp),
+// so the retried turn is pending again until its own run ends, even if the earlier
+// attempt's run posts its notice late.
 func (w WorkItem) noticed() map[string]bool {
+	attempt := make(map[string]string)
+	for i, m := range w.Thread {
+		if m.Role == RoleUser {
+			attempt[w.TurnKey(i)] = m.Attempt
+		}
+	}
 	out := make(map[string]bool)
 	for _, m := range w.Thread {
-		if m.Role == RoleAgent && m.Notice != "" && m.ReplyTo != "" {
+		if m.Role != RoleAgent || m.Notice == "" || m.ReplyTo == "" {
+			continue
+		}
+		if a, ok := attempt[m.ReplyTo]; ok && a == m.Attempt {
 			out[m.ReplyTo] = true
 		}
 	}
@@ -307,16 +348,17 @@ func (w WorkItem) hasCompletedRequest(kind string) bool {
 // request answered by the assistant).
 func (w WorkItem) HasReview() bool { return w.hasCompletedRequest(KindReviewRequest) }
 
-// FirstReviewModel returns the chat model that produced the item's first completed
-// review — the Model stamped on the first agent reply answering the first answered
-// review request. It is "" when there is no completed review, or when the reply
-// predates model stamping. It lets the bulk 2nd-opinion action always pick a
-// different model.
+// FirstReviewModel returns the chat model that produced the item's first visible
+// completed review — the Model stamped on the answer to the first review request
+// that, like its answer, the owner has not hidden. A hidden review is out of the
+// conversation a synthesis compares, so it does not count. It is "" when there is no
+// such review, or when the reply predates model stamping. It lets the review panel
+// and the bulk 2nd-opinion action always pick a different model.
 func (w WorkItem) FirstReviewModel() string {
 	answered := w.replies()
 	for i, m := range w.Thread {
-		if m.Role == RoleUser && m.Kind == KindReviewRequest {
-			if j, ok := answered[w.TurnKey(i)]; ok {
+		if m.Role == RoleUser && m.Kind == KindReviewRequest && !m.Hidden {
+			if j, ok := answered[w.TurnKey(i)]; ok && !w.Thread[j].Hidden {
 				return w.Thread[j].Model
 			}
 		}
@@ -328,15 +370,144 @@ func (w WorkItem) FirstReviewModel() string {
 // second-opinion round has finished and a verdict is available.
 func (w WorkItem) HasSecondOpinion() bool { return w.hasCompletedRequest(KindSynthesisRequest) }
 
-// ReviewVerdict returns the consensus outcome (VerdictAgree / VerdictDisagree) from
-// the most recent synthesis reply, or "" when there is none.
+// ReviewVerdict returns the consensus outcome (VerdictAgree / VerdictDisagree) of the
+// newest answered synthesis request, read from its answer (the reply its ReplyTo
+// links), or "" when there is none or that answer carries no verdict. Replies land
+// out of order, so the newest request decides, not the last reply to arrive: an
+// older round's late answer never replaces a newer round's verdict.
 func (w WorkItem) ReviewVerdict() string {
+	replies := w.replies()
 	for i := len(w.Thread) - 1; i >= 0; i-- {
-		if m := w.Thread[i]; m.Role == RoleAgent && m.Verdict != "" {
-			return m.Verdict
+		if m := w.Thread[i]; m.Role == RoleUser && m.Kind == KindSynthesisRequest {
+			if j, ok := replies[w.TurnKey(i)]; ok {
+				return w.Thread[j].Verdict
+			}
 		}
 	}
 	return ""
+}
+
+// SynthesisInputs returns the turns the synthesis request at key compares: each
+// review request it weighs, in thread order, immediately followed by its answer. Those are the
+// only turns its run sends the model. A request records its reviews
+// (Message.Reviews); for one stored before that, the comparison is rebuilt from the
+// visible answered review requests before it. ok is false, and the run declines
+// without a verdict, unless every named review is a visible review request whose
+// answer is there and visible too, and there are at least two of them: one review
+// cannot agree or disagree with anything.
+//
+// The web tier checks it on the stored item, and on the bounded read the run would
+// get (SynthesisFits); the run checks it on the read it got (ThreadWindow keeps
+// these turns first).
+func (w WorkItem) SynthesisInputs(key string) ([]Message, bool) {
+	i, ok := w.TurnIndex(key)
+	if !ok || w.Thread[i].Role != RoleUser || w.Thread[i].Kind != KindSynthesisRequest {
+		return nil, false
+	}
+	replies := w.replies()
+	keys := w.synthesisReviews(i, replies)
+	if len(keys) < 2 {
+		return nil, false
+	}
+	type pair struct{ ask, answer int }
+	pairs := make([]pair, 0, len(keys))
+	seen := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		j, ok := w.TurnIndex(k)
+		if !ok || w.Thread[j].Role != RoleUser || w.Thread[j].Kind != KindReviewRequest || w.Thread[j].Hidden {
+			return nil, false
+		}
+		a, ok := replies[k]
+		if !ok || w.Thread[a].Hidden {
+			return nil, false
+		}
+		pairs = append(pairs, pair{j, a})
+	}
+	// Each request is followed by its own answer (its reply link), in request order:
+	// reviews that overlapped answer out of position, and a chat endpoint refuses two
+	// user turns in a row.
+	slices.SortFunc(pairs, func(x, y pair) int { return x.ask - y.ask })
+	out := make([]Message, 0, 2*len(pairs))
+	for _, p := range pairs {
+		out = append(out, w.Thread[p.ask], w.Thread[p.answer])
+	}
+	return out, true
+}
+
+// SynthesisReady reports whether the synthesis request at key has the reviews it
+// compares (SynthesisInputs).
+func (w WorkItem) SynthesisReady(key string) bool {
+	_, ok := w.SynthesisInputs(key)
+	return ok
+}
+
+// SynthesisFits reports whether the synthesis request at key is ready
+// (SynthesisReady) in the bounded read its run would get (ThreadWindow at
+// MaxItemBytes), not only in the stored thread: reviews that are each valid can still
+// be too large to read together, and then no retry can succeed.
+func (w WorkItem) SynthesisFits(key string) bool {
+	return ThreadWindow(w, key, MaxItemBytes).SynthesisReady(key)
+}
+
+// synthesisReviews is the keys of the review requests the synthesis request at
+// position i compares: the ones it names, or, for a request stored before it named
+// them, the visible review requests before it whose answers landed before it too (a
+// review answered later was not part of that round).
+func (w WorkItem) synthesisReviews(i int, replies map[string]int) []string {
+	if len(w.Thread[i].Reviews) > 0 {
+		return w.Thread[i].Reviews
+	}
+	var keys []string
+	for k := 0; k < i; k++ {
+		m := w.Thread[k]
+		if m.Role != RoleUser || m.Kind != KindReviewRequest || m.Hidden {
+			continue
+		}
+		if a, ok := replies[w.TurnKey(k)]; ok && a < i && !w.Thread[a].Hidden {
+			keys = append(keys, w.TurnKey(k)) // answered before this round was asked
+		}
+	}
+	return keys
+}
+
+// RetryableSynthesis returns the position of the synthesis request the thread can
+// retry, wherever it sits in the thread: the newest synthesis request
+// (StalledSynthesis), if every review it weighs is still there and fits the read its
+// run would get (SynthesisFits).
+// Unlike RetryableTurn it does not need to be the last user turn, so a Discuss turn
+// posted after a failed synthesis does not strand it: the verdict can be recovered
+// without another blind review.
+func (w WorkItem) RetryableSynthesis(now time.Time, staleAfter time.Duration) (int, bool) {
+	i, ok := w.StalledSynthesis(now, staleAfter)
+	if !ok || !w.SynthesisFits(w.TurnKey(i)) {
+		return 0, false
+	}
+	return i, true
+}
+
+// StalledSynthesis returns the position of the newest synthesis request if it is not
+// hidden, has no answer, and is no longer plausibly in flight (older than staleAfter,
+// or a notice ended its current attempt), whether or not it can be retried.
+func (w WorkItem) StalledSynthesis(now time.Time, staleAfter time.Duration) (int, bool) {
+	for i := len(w.Thread) - 1; i >= 0; i-- {
+		m := w.Thread[i]
+		if m.Role != RoleUser || m.Kind != KindSynthesisRequest {
+			continue
+		}
+		key := w.TurnKey(i)
+		if m.Hidden || w.Answered(key) {
+			return 0, false
+		}
+		if !w.noticed()[key] && now.Sub(m.At) < staleAfter {
+			return 0, false // still plausibly in flight
+		}
+		return i, true
+	}
+	return 0, false
 }
 
 // hasSynthesisRequest reports whether a consensus synthesis has been requested at all
@@ -398,30 +569,66 @@ func (w WorkItem) RetryableTurn(now time.Time, staleAfter time.Duration) (int, b
 
 // RetryStalled prepares the RetryableTurn for a retry under its existing key: it
 // re-stamps the turn's time to now, so the turn is pending again and a second retry
-// within staleAfter finds nothing to do, and returns the key a dispatch must name.
+// within staleAfter finds nothing to do, and returns the stamp (RetryStamp), whose key
+// and attempt a dispatch must name.
 // It changes nothing and reports false when there is no such turn. The caller
 // persists the item in the same Store.Update that read it. A retry never adds a
 // turn, and the store keeps one answer per turn (AppendReply), so a first run that
 // answers late and its retry leave one reply.
-func (w *WorkItem) RetryStalled(now time.Time, staleAfter time.Duration) (string, bool) {
+func (w *WorkItem) RetryStalled(now time.Time, staleAfter time.Duration) (RetryStamp, bool) {
 	i, ok := w.RetryableTurn(now, staleAfter)
 	if !ok {
-		return "", false
+		return RetryStamp{}, false
 	}
-	w.Thread[i].At = now
-	return w.TurnKey(i), true
+	return w.Restamp(i, now), true
 }
 
-// UndoRetry reverses a RetryStalled stamped at, restoring the turn's earlier time
-// prev, when the dispatch it prepared certainly started no run. It changes nothing,
-// and reports false, unless the turn with key still carries exactly that attempt's
-// time and is still unanswered: a later retry, or an answer, wins.
-func (w *WorkItem) UndoRetry(key string, at, prev time.Time) bool {
-	i, ok := w.TurnIndex(key)
-	if !ok || w.Thread[i].Role != RoleUser || !w.Thread[i].At.Equal(at) || w.Answered(key) {
+// RetryStamp records one retry of a turn (Restamp): the turn, the time and attempt it
+// was given, and the ones it had before, which UndoRetry puts back.
+type RetryStamp struct {
+	Item, Key            string
+	At, PrevAt           time.Time
+	Attempt, PrevAttempt string
+}
+
+// Restamp starts a new attempt at the user turn at position i: it re-stamps the turn's
+// time to now and gives it a new attempt ID (Message.Attempt), so the turn is pending
+// again and only this attempt's own notice can end it (noticed). The thread is copied
+// first, so a caller's read of the store is not changed under it.
+func (w *WorkItem) Restamp(i int, now time.Time) RetryStamp {
+	w.Thread = slices.Clone(w.Thread)
+	m := &w.Thread[i]
+	s := RetryStamp{Item: w.ID, Key: w.TurnKey(i), At: now, PrevAt: m.At, Attempt: NewMessageID(), PrevAttempt: m.Attempt}
+	m.At, m.Attempt = s.At, s.Attempt
+	return s
+}
+
+// RevertAttempt puts back the attempt Restamp's stamp s replaced, keeping the new
+// time, when the retry started no run of its own but shares one already in flight
+// for the turn: that run was dispatched as the earlier attempt, so only its notice
+// can end the wait. It changes nothing, and reports false, unless the turn still
+// carries exactly that attempt and is unanswered.
+func (w *WorkItem) RevertAttempt(s RetryStamp) bool {
+	i, ok := w.TurnIndex(s.Key)
+	if !ok || w.Thread[i].Role != RoleUser || w.Thread[i].Attempt != s.Attempt || w.Answered(s.Key) {
 		return false
 	}
-	w.Thread[i].At = prev
+	w.Thread = slices.Clone(w.Thread)
+	w.Thread[i].Attempt = s.PrevAttempt
+	return true
+}
+
+// UndoRetry reverses Restamp's stamp s, restoring the turn's earlier time and
+// attempt, when the dispatch it prepared certainly started no run. It changes
+// nothing, and reports false, unless the turn still carries exactly that attempt and
+// is still unanswered: a later retry, or an answer, wins.
+func (w *WorkItem) UndoRetry(s RetryStamp) bool {
+	i, ok := w.TurnIndex(s.Key)
+	if !ok || w.Thread[i].Role != RoleUser || w.Thread[i].Attempt != s.Attempt || !w.Thread[i].At.Equal(s.At) || w.Answered(s.Key) {
+		return false
+	}
+	w.Thread = slices.Clone(w.Thread)
+	w.Thread[i].At, w.Thread[i].Attempt = s.PrevAt, s.PrevAttempt
 	return true
 }
 

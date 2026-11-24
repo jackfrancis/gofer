@@ -57,7 +57,7 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 	}
 	diff, err := gh.PullDiff(ctx, holder.Token(), item.GitHub.Repo, item.GitHub.Number)
 	if holder.Reconnect() != nil {
-		return postReconnect(ctx, sink, item.ID, triggerKey)
+		return postReconnect(ctx, sink, item.ID, triggerKey, p.Attempt) // the attempt this run was dispatched as
 	}
 	if err != nil {
 		p.logger().Warn("draft review: could not read the pull request diff", "item", item.ID, "err", err)
