@@ -310,11 +310,16 @@ Wired on the web-tier side; they define what a runtime must respect:
   filter, under the same rules: a view preference in its own account-bound cookie
   (`gofer_labels`), dropping items without re-sorting, the hidden section included. Its
   checklist offers every label on the radar (ranked or hidden) in every project,
-  whatever the project filter selects, merged by name ignoring case, plus "No label";
-  counts follow the project filter. An item shows when it carries any selected label.
-  Each bulk form posts the page's label selection (`labels`, narrowed to the labels the
-  checklist names) beside `scope`, and the actions cover only items both select
-  (`viewScope`, read by `formScope`); a garbled `labels` acts on nothing.
+  whatever the project filter selects, merged by name with Unicode case folding
+  (`labelKey`, as `strings.EqualFold` compares), plus "No label"; counts follow the
+  project filter. An item shows when it carries any selected label. Apply clears the
+  filter only for "Select all" or when every option of the checklist the user saw is
+  checked (form `offered`), never by comparing with the store at POST time, where an
+  unchecked label that retired meanwhile would turn the selection into "all". Each bulk
+  form posts the page's label selection (`labels`, narrowed to the labels the checklist
+  names) beside `scope`, and the actions cover only items both select (`viewScope`,
+  read by `formScope`). Only an absent `labels` means every label; a present one that
+  is not exactly one strict encoding (`parseLabels`), empty included, acts on nothing.
 - A user turn keeps one answer: `worklist.AppendReply` drops any reply to a turn that
   already has a substantive one (a notice such as `NoticeReconnect` is not an answer),
   so the first answer stored wins. That store rule is what makes retrying a turn safe,

@@ -238,6 +238,7 @@
           <details class="zz-menu zz-filter">
             <summary class="btn btn-sm" title="Choose which labels to show, within the selected projects">Labels: {{if .LabelsFiltered}}{{.SelectedLabels}} of {{len .Labels}}{{else}}All{{end}} &#9662;</summary>
             <form class="zz-menu-list zz-filter-list" method="post" action="/items/labels">
+              <input type="hidden" name="offered" value="{{.LabelsOffered}}">
               <label class="zz-filter-opt zz-filter-all" hidden><input type="checkbox" name="all" value="1" data-filter-all disabled{{if not .LabelsFiltered}} checked{{end}}> Select all</label>
               <div class="zz-filter-options">
                 {{range .Labels}}
@@ -379,7 +380,7 @@
           {{end}}
         </div>
       {{else}}
-        <div class="zz-empty"><p>{{if .LabelsFiltered}}No items match the selected {{if .ProjectsFiltered}}projects and {{end}}labels.{{else if .ProjectsFiltered}}No items in the selected projects.{{else}}Nothing on your radar right now.{{end}}</p></div>
+        <div class="zz-empty"><p>{{if .LabelsFiltered}}No {{if .HiddenItems}}ranked {{end}}items match the selected {{if .ProjectsFiltered}}projects and {{end}}labels{{if .HiddenItems}}; only hidden ones do{{end}}.{{else if .ProjectsFiltered}}No {{if .HiddenItems}}ranked {{end}}items in the selected projects{{if .HiddenItems}}; only hidden ones{{end}}.{{else}}Nothing on your radar right now.{{end}}</p></div>
       {{end}}
       {{with .HiddenItems}}
       <section class="zz-hidden-list" aria-labelledby="zz-hidden-head">

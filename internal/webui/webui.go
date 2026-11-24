@@ -298,6 +298,7 @@ type pageData struct {
 	LabelsFiltered           bool                // some label is deselected: Items is a subset of the project-filtered radar
 	SelectedLabels           int                 // label options shown, for the filter's label
 	LabelScope               string              // the shown label selection, posted back by each bulk form ("" = every label)
+	LabelsOffered            string              // the label checklist's options, posted back by its Apply (form "offered")
 	LabelsError              string              // why the last label selection was not saved
 	Filtered                 bool                // the project or the label filter narrows the radar
 	CommentEnabled           bool                // worklist: the deployment offers bulk comments (ADR 0009)
@@ -1083,7 +1084,7 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 			ReviewCount: reviewCount, SecondOpinionEnabled: h.secondOpinionEnabled(), SecondOpinionCount: secondCount,
 			ResetCount: resetCount,
 			Projects:   projects, ProjectsFiltered: selected != nil, SelectedProjects: selectedCount, TotalItems: len(res.Items),
-			Labels: labels, LabelsFiltered: labelSel != nil, SelectedLabels: selectedLabels,
+			Labels: labels, LabelsFiltered: labelSel != nil, SelectedLabels: selectedLabels, LabelsOffered: offeredLabels(labels),
 			Filtered: selected != nil || labelSel != nil,
 		}
 		// The checklist draws every label on the radar in its color, so the stylesheet

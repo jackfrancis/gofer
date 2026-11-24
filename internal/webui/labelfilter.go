@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
@@ -35,8 +36,21 @@ type labelSelection struct {
 	none  bool            // items that carry no label
 }
 
-// labelKey is the name a label is compared by: GitHub compares label names ignoring case.
-func labelKey(name string) string { return strings.ToLower(name) }
+// labelKey is the name a label is compared by: GitHub compares label names ignoring
+// case. It folds case the way strings.EqualFold does (Unicode simple folding), so names
+// EqualFold calls equal share one key ("ΟΣ" and "ος" included, which lowercasing alone
+// keeps apart). Each rune maps to the lowercase of the smallest rune in its folding
+// orbit, which every member of the orbit shares, so ASCII keys stay lowercase.
+func labelKey(name string) string { return strings.Map(foldRune, name) }
+
+// foldRune maps r to its case-folding orbit's canonical rune (see labelKey).
+func foldRune(r rune) rune {
+	m := r
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		m = min(m, f)
+	}
+	return unicode.ToLower(m)
+}
 
 // matches reports whether the selection shows it: always with no selection; otherwise
 // when it carries a selected label, or carries none and "No label" is selected.
@@ -141,17 +155,6 @@ func (s *labelSelection) selects(o LabelOption) bool {
 	return s.names[o.Key]
 }
 
-// coversLabels reports whether sel includes every option in opts, i.e. it is no
-// narrower than "Select all".
-func coversLabels(sel *labelSelection, opts []LabelOption) bool {
-	for _, o := range opts {
-		if !sel.selects(o) {
-			return false
-		}
-	}
-	return true
-}
-
 // shownLabelSelection narrows a saved selection to the options the checklist offers,
 // which is what each bulk form posts back. A nil selection stays nil.
 func shownLabelSelection(sel *labelSelection, opts []LabelOption) *labelSelection {
@@ -220,21 +223,53 @@ func savedLabels(r *http.Request, ownerID string) *labelSelection {
 }
 
 // formLabels reads the label selection a bulk form was rendered with (form "labels"),
-// from a form formSelection has already parsed. No field means the page showed every
-// label. A garbled or unrecognized value selects nothing rather than everything.
+// from a form formSelection has already parsed. Only an absent field means the page
+// showed every label: a filtered page always posts a non-empty encoding. Anything else
+// that is not exactly one well-formed encoding (an empty value, repeated fields, a
+// garbled or unrecognized one) selects nothing rather than everything.
 func formLabels(r *http.Request) *labelSelection {
-	raw := r.PostForm.Get("labels")
-	if raw == "" {
+	raws, present := r.PostForm["labels"]
+	if !present {
 		return nil
 	}
-	v, err := url.ParseQuery(raw)
-	if err != nil {
+	if len(raws) != 1 {
 		return &labelSelection{}
 	}
-	if sel := decodeLabels(v); sel != nil {
+	if sel := parseLabels(raws[0]); sel != nil {
 		return sel
 	}
 	return &labelSelection{}
+}
+
+// parseLabels strictly decodes a selection encodeLabels wrote, or returns nil if raw is
+// anything else: exactly one "f=1", at most one "n=1", non-empty "l" values, and no
+// other key.
+func parseLabels(raw string) *labelSelection {
+	v, err := url.ParseQuery(raw)
+	if err != nil {
+		return nil
+	}
+	if f := v["f"]; len(f) != 1 || f[0] != "1" {
+		return nil
+	}
+	n, hasN := v["n"]
+	if hasN && (len(n) != 1 || n[0] != "1") {
+		return nil
+	}
+	for k, vals := range v {
+		switch k {
+		case "f", "n":
+		case "l":
+			for _, l := range vals {
+				if l == "" {
+					return nil
+				}
+			}
+		default:
+			return nil
+		}
+	}
+	return decodeLabels(v)
 }
 
 // viewScope is what a bulk form's page showed: the projects and the labels it was
@@ -261,10 +296,15 @@ func formScope(r *http.Request) (viewScope, bool) {
 
 // FilterLabels handles POST /items/labels, the label filter's Apply. The checked labels
 // (form "label", repeated, by key) and "No label" (form "nolabel") are saved for the
-// signed-in account; checking every option on the radar (at least one), "Select all",
-// or "Show all labels" (both form "all") clears the filter instead. An empty selection
-// is saved too, and shows no items. A selection too large for the cookie is refused and
-// the previous filter kept. It redirects back to the radar (Post/Redirect/Get).
+// signed-in account, narrowed to the labels on the radar now. "Select all" or "Show all
+// labels" (both form "all"), or checking every option the checklist rendered (form
+// "offered", at least one), clears the filter instead. Whether every option was checked
+// is judged against the checklist the user saw, never the store at POST time: an option
+// left unchecked whose last item retired meanwhile must not turn a narrowed selection
+// into "Select all", which would admit the next new label. A form without a readable
+// "offered" never clears. An empty selection is saved too, and shows no items. A
+// selection too large for the cookie is refused and the previous filter kept. It
+// redirects back to the radar (Post/Redirect/Get).
 func (h *Handler) FilterLabels(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
 	if user == nil || r.ParseForm() != nil {
@@ -297,13 +337,17 @@ func (h *Handler) FilterLabels(w http.ResponseWriter, r *http.Request) {
 				offered[o.Key] = true
 			}
 		}
-		chosen := &labelSelection{names: map[string]bool{}, none: noneOffered && r.PostForm.Get("nolabel") != ""}
+		submitted := &labelSelection{names: map[string]bool{}, none: r.PostForm.Get("nolabel") != ""}
 		for _, k := range r.PostForm["label"] {
-			if k = labelKey(k); offered[k] {
+			submitted.names[labelKey(k)] = true
+		}
+		clear = coversRendered(submitted, r.PostForm["offered"])
+		chosen := &labelSelection{names: map[string]bool{}, none: noneOffered && submitted.none}
+		for k := range submitted.names {
+			if offered[k] {
 				chosen.names[k] = true
 			}
 		}
-		clear = len(opts) > 0 && coversLabels(chosen, opts)
 		value = url.Values{"u": {user.ID}}.Encode() + "&" + encodeLabels(chosen)
 		if !clear && len(value) > maxProjectsCookie {
 			http.Redirect(w, r, "/?labels="+projectsTooMany, http.StatusSeeOther)
@@ -312,6 +356,41 @@ func (h *Handler) FilterLabels(w http.ResponseWriter, r *http.Request) {
 	}
 	setFilterCookie(w, r, labelsCookie, value, clear)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// coversRendered reports whether submitted checks every option of the rendered
+// checklist (form "offered": exactly one encodeLabels value naming at least one option).
+func coversRendered(submitted *labelSelection, offered []string) bool {
+	if len(offered) != 1 {
+		return false
+	}
+	rendered := parseLabels(offered[0])
+	if rendered == nil || len(rendered.names) == 0 && !rendered.none {
+		return false
+	}
+	if rendered.none && !submitted.none {
+		return false
+	}
+	for k := range rendered.names {
+		if !submitted.names[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// offeredLabels encodes the options a checklist renders, which its form posts back
+// (form "offered") so Apply can tell whether every rendered option was checked.
+func offeredLabels(opts []LabelOption) string {
+	all := &labelSelection{names: map[string]bool{}}
+	for _, o := range opts {
+		if o.None {
+			all.none = true
+		} else {
+			all.names[o.Key] = true
+		}
+	}
+	return encodeLabels(all)
 }
 
 // setFilterCookie saves a filter's cookie, or deletes it when clear (no filter).

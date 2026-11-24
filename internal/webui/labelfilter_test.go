@@ -184,10 +184,11 @@ func TestLabelFilterDownstreamOfProjects(t *testing.T) {
 // unknown labels are dropped and an empty selection is kept.
 func TestLabelFilterSelectAllAndSanitize(t *testing.T) {
 	h := labelsFixture(t)
+	rendered := encodeLabels(labelSel("area/api", "bug", "docs", "wontfix", ""))
 	for name, form := range map[string]url.Values{
 		"select all":     {"all": {"1"}, "label": {"bug"}},
-		"every option":   {"label": {"bug", "area/api", "docs", "wontfix"}, "nolabel": {"1"}},
-		"every, unknown": {"label": {"Bug", "area/api", "docs", "wontfix", "nope"}, "nolabel": {"1"}},
+		"every option":   {"label": {"bug", "area/api", "docs", "wontfix"}, "nolabel": {"1"}, "offered": {rendered}},
+		"every, unknown": {"label": {"Bug", "area/api", "docs", "wontfix", "nope"}, "nolabel": {"1"}, "offered": {rendered}},
 	} {
 		if c := postLabels(t, h, form); c == nil || c.MaxAge >= 0 {
 			t.Errorf("%s: expected the cookie cleared, got %+v", name, c)
@@ -305,6 +306,14 @@ func TestBulkActionsFollowLabelScope(t *testing.T) {
 		{"empty selection", url.Values{"labels": {"f=1"}}, "", "", ""},
 		{"garbled", url.Values{"labels": {"%zz"}}, "", "", ""},
 		{"unrecognized", url.Values{"labels": {"l=bug"}}, "", "", ""},
+		// Only an absent field means every label: a present but empty or malformed one
+		// must not widen the action.
+		{"present but empty", url.Values{"labels": {""}}, "", "", ""},
+		{"repeated", url.Values{"labels": {encodeLabels(labelSel("bug")), encodeLabels(labelSel("docs"))}}, "", "", ""},
+		{"bad filter marker", url.Values{"labels": {"f=0&l=bug"}}, "", "", ""},
+		{"bad none marker", url.Values{"labels": {"f=1&n=yes"}}, "", "", ""},
+		{"empty label", url.Values{"labels": {"f=1&l="}}, "", "", ""},
+		{"unknown key", url.Values{"labels": {"f=1&l=bug&x=1"}}, "", "", ""},
 	} {
 		pipe := &recordPipeline{}
 		post(seed(), pipe, "/items/review-all", tc.form, (*Handler).ReviewAllPRs)
@@ -365,5 +374,85 @@ func TestLabelFilterReachableWhileSaved(t *testing.T) {
 	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{false}, false, nil)
 	if page := getIndexWith(t, h, labelCookie("bug")); !strings.Contains(page, "Labels: 1 of 1") || !strings.Contains(page, "Show all labels") {
 		t.Fatal("a saved label selection must keep the filter reachable")
+	}
+}
+
+// Whether Apply means "Select all" is judged against the checklist the user saw. An
+// option they left unchecked whose last item retired before Apply keeps the selection
+// narrowed, so the next new label does not join it; a form that names no rendered
+// checklist never clears.
+func TestLabelFilterSelectAllJudgedByRenderedChecklist(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	bug := worklist.WorkItem{ID: "i1", GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, Title: "t-bug"}, Signals: worklist.Signals{Labels: []string{"bug"}}}
+	store.Seed("u1", bug)
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{false}, false, nil)
+
+	// The page offered bug and docs; docs, unchecked, has since left the radar.
+	c := postLabels(t, h, url.Values{"label": {"bug"}, "offered": {encodeLabels(labelSel("bug", "docs"))}})
+	if c == nil || c.MaxAge <= 0 {
+		t.Fatalf("a narrowed selection must stay saved, got %+v", c)
+	}
+	if v, _ := url.ParseQuery(c.Value); strings.Join(v["l"], ",") != "bug" {
+		t.Fatalf("saved %q, want bug", c.Value)
+	}
+	store.Seed("u1", bug, worklist.WorkItem{ID: "i2", GitHub: worklist.GitHubRef{Repo: "o/r", Number: 2, Title: "t-feature"}, Signals: worklist.Signals{Labels: []string{"feature"}}})
+	if got := order(getIndexWith(t, h, c), "t-bug", "t-feature"); strings.Join(got, ",") != "t-bug" {
+		t.Fatalf("a label new since the selection must stay filtered out, radar shows %v", got)
+	}
+
+	for name, offered := range map[string][]string{"no offered": nil, "garbled": {"%zz"}, "empty": {""}, "repeated": {"f=1&l=bug", "f=1&l=bug"}} {
+		form := url.Values{"label": {"bug"}}
+		if offered != nil {
+			form["offered"] = offered
+		}
+		if c := postLabels(t, h, form); c == nil || c.MaxAge <= 0 {
+			t.Errorf("%s: without a readable rendered checklist Apply must save, not clear; got %+v", name, c)
+		}
+	}
+
+	// The radar renders the checklist's options for Apply to post back.
+	page := getIndexWith(t, labelsFixture(t))
+	want := `<input type="hidden" name="offered" value="` + template.HTMLEscapeString(encodeLabels(labelSel("area/api", "bug", "docs", "wontfix", ""))) + `">`
+	if !strings.Contains(page, want) {
+		t.Errorf("label checklist lacks %q", want)
+	}
+}
+
+// When only hidden items match, the radar does not claim nothing matches.
+func TestLabelFilterHiddenOnlyMatch(t *testing.T) {
+	page := getIndexWith(t, labelsFixture(t), labelCookie("wontfix"))
+	if !strings.Contains(page, "No ranked items match the selected labels; only hidden ones do.") || !strings.Contains(page, "Hidden (1)") {
+		t.Fatal("expected the hidden-only wording and the hidden item")
+	}
+	if strings.Contains(page, "No items match") {
+		t.Fatal("must not say no items match while a hidden item does")
+	}
+	projects := getIndexWith(t, labelsFixture(t), filterCookie("b/two"), labelCookie("wontfix"))
+	if !strings.Contains(projects, "No ranked items match the selected projects and labels; only hidden ones do.") {
+		t.Fatal("expected the hidden-only wording with both filters")
+	}
+}
+
+// Labels are merged by Unicode case folding, as strings.EqualFold compares, not just
+// lowercasing: "ΟΣ" and "ος" are one option, and selecting it shows both items.
+func TestLabelKeyFoldsUnicodeCase(t *testing.T) {
+	for _, pair := range [][2]string{{"ΟΣ", "ος"}, {"Bug", "bUG"}, {"K", "\u212a"}, {"straße", "STRAßE"}} {
+		if labelKey(pair[0]) != labelKey(pair[1]) {
+			t.Errorf("labelKey(%q) = %q, labelKey(%q) = %q; want equal", pair[0], labelKey(pair[0]), pair[1], labelKey(pair[1]))
+		}
+	}
+	if labelKey("Bug") != "bug" {
+		t.Errorf("ASCII keys stay lowercase, got %q", labelKey("Bug"))
+	}
+	items := []worklist.WorkItem{
+		{ID: "a", Signals: worklist.Signals{Labels: []string{"ΟΣ"}}},
+		{ID: "b", Signals: worklist.Signals{Labels: []string{"ος"}}},
+	}
+	opts := labelOptions(items, items, nil)
+	if len(opts) != 1 || opts[0].Count != 2 {
+		t.Fatalf("options = %+v, want one option counting both items", opts)
+	}
+	if got := filterLabels(items, labelSel(opts[0].Key)); len(got) != 2 {
+		t.Fatalf("selecting %q shows %d items, want 2", opts[0].Key, len(got))
 	}
 }
