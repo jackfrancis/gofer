@@ -294,6 +294,7 @@ type pageData struct {
 	TotalItems               int                 // items on the whole radar, before the project and label filters
 	ProjectScope             string              // the shown selection, posted back by each bulk form ("" = every project)
 	ProjectsError            string              // why the last project selection was not saved
+	ProjectsOffered          string              // the project checklist's options, posted back by its Apply (form "offered")
 	Labels                   []LabelOption       // the label filter's checklist: every label on the radar, by name (worklist view)
 	LabelsFiltered           bool                // some label is deselected: Items is a subset of the project-filtered radar
 	SelectedLabels           int                 // label options shown, for the filter's label
@@ -1083,7 +1084,7 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 			View: "worklist", User: user, Items: shown, HiddenItems: shownHidden, ConvEnabled: h.convEnabled,
 			ReviewCount: reviewCount, SecondOpinionEnabled: h.secondOpinionEnabled(), SecondOpinionCount: secondCount,
 			ResetCount: resetCount,
-			Projects:   projects, ProjectsFiltered: selected != nil, SelectedProjects: selectedCount, TotalItems: len(res.Items),
+			Projects:   projects, ProjectsOffered: offeredProjects(projects), ProjectsFiltered: selected != nil, SelectedProjects: selectedCount, TotalItems: len(res.Items),
 			Labels: labels, LabelsFiltered: labelSel != nil, SelectedLabels: selectedLabels, LabelsOffered: offeredLabels(labels),
 			Filtered: selected != nil || labelSel != nil,
 		}

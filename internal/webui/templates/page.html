@@ -221,6 +221,7 @@
           <details class="zz-menu zz-filter">
             <summary class="btn btn-sm" title="Choose which projects to show">Projects: {{if .ProjectsFiltered}}{{.SelectedProjects}} of {{len .Projects}}{{else}}All{{end}} &#9662;</summary>
             <form class="zz-menu-list zz-filter-list" method="post" action="/items/projects">
+              <input type="hidden" name="offered" value="{{.ProjectsOffered}}">
               <label class="zz-filter-opt zz-filter-all" hidden><input type="checkbox" name="all" value="1" data-filter-all disabled{{if not .ProjectsFiltered}} checked{{end}}> Select all</label>
               <div class="zz-filter-options">
                 {{range .Projects}}

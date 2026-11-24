@@ -108,17 +108,6 @@ func inScope(selected map[string]bool, it worklist.WorkItem) bool {
 	return selected == nil || selected[it.GitHub.Repo]
 }
 
-// covers reports whether selected includes every repository in opts, i.e. the
-// selection is no narrower than "Select all".
-func covers(selected map[string]bool, opts []ProjectOption) bool {
-	for _, o := range opts {
-		if !selected[o.Name] {
-			return false
-		}
-	}
-	return true
-}
-
 // encodeSelection encodes a selection as repeated "p" values, by name. An empty
 // selection encodes as "p=", distinct from no selection at all.
 func encodeSelection(selected map[string]bool) string {
@@ -163,8 +152,10 @@ func savedSelection(r *http.Request, ownerID string) map[string]bool {
 	return decodeSelection(v)
 }
 
-// formSelection reads the selection a bulk form was rendered with (form "scope"). No
-// scope means the page showed every project. ok is false when the form cannot be read:
+// formSelection reads the selection a bulk form was rendered with (form "scope"). Only
+// an absent scope means the page showed every project: a filtered page always posts a
+// non-empty encoding, so a present scope that is not exactly one strict encoding
+// (parseSelection), empty included, acts on nothing. ok is false when the form cannot be read:
 // the caller must then change nothing, since a lost scope would otherwise read as every
 // project. The page's forms are URL-encoded, and that is the only body accepted: Go's
 // ParseForm leaves any other body (multipart, plain text) unread, which would drop the
@@ -181,18 +172,68 @@ func formSelection(r *http.Request) (selected map[string]bool, ok bool) {
 	if err := r.ParseForm(); err != nil {
 		return nil, false
 	}
-	scope := r.PostForm.Get("scope")
-	if scope == "" {
+	scopes, present := r.PostForm["scope"]
+	if !present {
 		return nil, true
 	}
-	v, err := url.ParseQuery(scope)
-	if err != nil {
-		return map[string]bool{}, true // a garbled scope acts on nothing rather than on everything
+	if len(scopes) == 1 {
+		if sel := parseSelection(scopes[0]); sel != nil {
+			return sel, true
+		}
 	}
-	if sel := decodeSelection(v); sel != nil {
-		return sel, true
+	return map[string]bool{}, true // a malformed scope acts on nothing rather than on everything
+}
+
+// parseSelection strictly decodes a selection encodeSelection wrote, or returns nil if
+// raw is anything else: one or more "p" values and no other key, where an empty value
+// is allowed only as the lone "p=" of an empty selection.
+func parseSelection(raw string) map[string]bool {
+	v, err := url.ParseQuery(raw)
+	if err != nil || len(v) != 1 {
+		return nil
 	}
-	return map[string]bool{}, true
+	names, ok := v["p"]
+	if !ok {
+		return nil
+	}
+	if len(names) == 1 && names[0] == "" {
+		return map[string]bool{}
+	}
+	for _, name := range names {
+		if name == "" {
+			return nil
+		}
+	}
+	return decodeSelection(v)
+}
+
+// coversRenderedProjects reports whether chosen (the submitted names) checks every
+// project the checklist rendered (form "offered": exactly one encodeSelection value
+// naming at least one project).
+func coversRenderedProjects(chosen map[string]bool, offered []string) bool {
+	if len(offered) != 1 {
+		return false
+	}
+	rendered := parseSelection(offered[0])
+	if len(rendered) == 0 {
+		return false
+	}
+	for name := range rendered {
+		if !chosen[name] {
+			return false
+		}
+	}
+	return true
+}
+
+// offeredProjects encodes the projects a checklist renders, which its form posts back
+// (form "offered") so Apply can tell whether every rendered project was checked.
+func offeredProjects(opts []ProjectOption) string {
+	all := make(map[string]bool, len(opts))
+	for _, o := range opts {
+		all[o.Name] = true
+	}
+	return encodeSelection(all)
 }
 
 // shownSelection narrows a saved selection to the projects the checklist offers
@@ -214,9 +255,14 @@ func shownSelection(selected map[string]bool, opts []ProjectOption) map[string]b
 }
 
 // FilterProjects handles POST /items/projects, the project filter's Apply. The checked
-// projects (form "project", repeated) are saved for the signed-in account; checking
-// every project on the radar (at least one), "Select all", or the "Show all projects"
-// button (both form "all") clears the filter instead.
+// projects (form "project", repeated) are saved for the signed-in account, narrowed to
+// the projects on the radar now. "Select all" or the "Show all projects" button (both
+// form "all"), or checking every project the checklist rendered (form "offered", at
+// least one), clears the filter instead. Whether every project was checked is judged
+// against the checklist the user saw, never the store at POST time: a project left
+// unchecked whose last item retired meanwhile must not turn a narrowed selection into
+// "Select all", which would admit the next new project. A form without a readable
+// "offered" never clears.
 // An empty selection is saved too, and shows no items. A selection too large for the
 // cookie is refused and the previous filter kept. It redirects back to the radar
 // (Post/Redirect/Get).
@@ -247,15 +293,18 @@ func (h *Handler) FilterProjects(w http.ResponseWriter, r *http.Request) {
 		for _, o := range opts {
 			present[o.Name] = true
 		}
+		submitted := map[string]bool{}
 		chosen := map[string]bool{}
 		for _, name := range r.PostForm["project"] {
+			submitted[name] = true
 			if present[name] {
 				chosen[name] = true
 			}
 		}
-		// Checking every project means "Select all" — but only when there is a project to
-		// check: on an empty radar an unchanged empty selection must stay saved.
-		clear = len(opts) > 0 && covers(chosen, opts)
+		// Checking every rendered project means "Select all" — but only when the page
+		// rendered a project to check: on an empty radar an unchanged empty selection
+		// must stay saved.
+		clear = coversRenderedProjects(submitted, r.PostForm["offered"])
 		value = url.Values{"u": {user.ID}}.Encode() + "&" + encodeSelection(chosen)
 		if !clear && len(value) > maxProjectsCookie {
 			http.Redirect(w, r, "/?projects="+projectsTooMany, http.StatusSeeOther)

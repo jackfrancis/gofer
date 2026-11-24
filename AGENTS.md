@@ -301,7 +301,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   checklist names, so neither a filter changed in another tab nor a saved repository
   that left the radar can widen it; an unreadable form changes nothing, and only a
   URL-encoded body is read (`ParseForm` leaves multipart unread, which would drop the
-  scope). Review all
+  scope). Only an absent `scope` means every project; a present one that is not exactly
+  one strict encoding (`parseSelection`), empty included, acts on nothing. Apply clears
+  the filter only for "Select all" or when every project of the checklist the user saw
+  is checked (form `offered`), never by comparing with the store at POST time, where an
+  unchecked project that retired meanwhile would turn the selection into "all" and
+  admit the next new project. Review all
   PRs and Get 2nd Opinion act only on items the radar shows (`WorkItem.OnRadar`, the
   rule `worklist.Resolve` applies); Reset Conversations also clears hidden and
   completed items in scope, and its count includes them (`Resolution.OffRadar`, from
@@ -312,14 +317,13 @@ Wired on the web-tier side; they define what a runtime must respect:
   checklist offers every label on the radar (ranked or hidden) in every project,
   whatever the project filter selects, merged by name with Unicode case folding
   (`labelKey`, as `strings.EqualFold` compares), plus "No label"; counts follow the
-  project filter. An item shows when it carries any selected label. Apply clears the
-  filter only for "Select all" or when every option of the checklist the user saw is
-  checked (form `offered`), never by comparing with the store at POST time, where an
-  unchecked label that retired meanwhile would turn the selection into "all". Each bulk
-  form posts the page's label selection (`labels`, narrowed to the labels the checklist
-  names) beside `scope`, and the actions cover only items both select (`viewScope`,
-  read by `formScope`). Only an absent `labels` means every label; a present one that
-  is not exactly one strict encoding (`parseLabels`), empty included, acts on nothing.
+  project filter. An item shows when it carries any selected label. Apply judges
+  "Select all" from the rendered checklist (form `offered`), as the project filter does.
+  Each bulk form posts the page's label selection (`labels`, narrowed to the labels the
+  checklist names) beside `scope`, and the actions cover only items both select
+  (`viewScope`, read by `formScope`). Only an absent `labels` means every label; a
+  present one that is not exactly one strict encoding (`parseLabels`), empty included,
+  acts on nothing.
 - A user turn keeps one answer: `worklist.AppendReply` drops any reply to a turn that
   already has a substantive one (a notice such as `NoticeReconnect` is not an answer),
   so the first answer stored wins. That store rule is what makes retrying a turn safe,
