@@ -258,10 +258,12 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	if lerr != nil {
 		return fmt.Errorf("ingest: read existing items: %w", lerr)
 	}
-	// A hit older than the stored state is not written (dropStale), but it still
-	// proves its item open, so retirement counts every hit.
-	items = dropStale(items, existing)
+	// A hit older than the stored state does not write its GitHub fields
+	// (keepNewerState), only its review-request membership, and it still proves its
+	// item open, so retirement counts every hit.
+	items, pinned := keepNewerState(items, existing)
 	items, carried := reconcileFetched(items, existing, fetch.ReviewRequestsComplete)
+	items = dropUnchangedPins(items, existing, pinned)
 	// Retire what left the open set. Only a COMPLETE fetch proves an item is gone: a
 	// partial walk (time budget, rate limit, result ceiling) simply may not have
 	// reached it, and retiring it then would hide open work.
@@ -371,7 +373,7 @@ func reconcileFetched(fetched, existing []worklist.WorkItem, reviewsComplete boo
 // than deleting keeps the thread: resolve drops completed items from the radar, an
 // agent can still see them, and a reopened item is fetched again and resurfaces.
 //
-// fetched is every hit the fetch returned, stale copies (dropStale) included: a
+// fetched is every hit the fetch returned, stale copies (keepNewerState) included: a
 // stale copy still proves the item is open. drafts is github.Fetch.OthersDrafts: an
 // item absent because the fetch saw it as another contributor's draft is left to
 // retireDrafts, which records that state.
@@ -396,7 +398,7 @@ func retireMissing(fetched, existing []worklist.WorkItem, drafts map[string]work
 // partial one: an observation, unlike an absence, is evidence. A live stored item is
 // retired as retireMissing does. Either way the confirmed state is recorded on the
 // item, Draft set and GitHub.UpdatedAt advanced to the draft result's, so a later
-// refresh that returns an older ready copy cannot reopen it (dropStale), while a
+// refresh that returns an older ready copy cannot reopen it (keepNewerState), while a
 // genuinely newer one still does. A draft with no stored row is remembered the same
 // way, as a new row already retired: never on the radar, but there to outrank an
 // older ready copy on a later refresh. An item already recorded at least that new is
@@ -439,27 +441,95 @@ func retireDrafts(drafts map[string]worklist.WorkItem, existing []worklist.WorkI
 	return out
 }
 
-// dropStale returns the hits of a fetch that are not older than what the store
-// already holds for the same item. The searches are separate snapshots, and one can
-// lag another or an earlier run, so the stored GitHub state never moves back in
-// time: a hit whose state is older (newerState) is left unwritten. That covers a
+// keepNewerState returns the hits of a fetch with the stored GitHub state kept
+// wherever it is newer. The searches are separate snapshots, and one can lag another
+// or an earlier run, so the stored GitHub state never moves back in time: for a hit
+// whose state is older (newerState), the stored GitHub fields stand. That covers a
 // ready copy of a draft retireDrafts recorded (it must not reopen it) and an older
 // ready copy of a ready item (it must not roll back the timestamp a later draft
-// result is judged against). A dropped hit still proves its item open, so the
-// caller counts it for retireMissing. A new slice is returned; fetched is unchanged.
-func dropStale(fetched, existing []worklist.WorkItem) []worklist.WorkItem {
+// result is judged against).
+//
+// Which searches matched is current even when the payload is not, so for a live
+// item the stale hit is replaced by the stored item carrying the hit's review-request
+// membership (withReviewMembership); reconcileFetched then treats it as any hit, so a
+// complete review-request search without it clears the request and a match adds it.
+// Those IDs are returned in pinned, for dropUnchangedPins. A stale hit of a retired item
+// is dropped: it must not reopen it, and a retired item carries no request. Either
+// way the hit still proves its item open, so the caller counts it for
+// retireMissing. A new slice is returned; fetched is unchanged.
+func keepNewerState(fetched, existing []worklist.WorkItem) (_ []worklist.WorkItem, pinned map[string]bool) {
 	stored := make(map[string]worklist.WorkItem, len(existing))
 	for _, it := range existing {
 		stored[it.ID] = it
 	}
+	pinned = map[string]bool{}
 	kept := make([]worklist.WorkItem, 0, len(fetched))
 	for _, it := range fetched {
-		if old, ok := stored[it.ID]; ok && old.Source == "github" && newerState(old, it) {
+		old, ok := stored[it.ID]
+		if !ok || old.Source != "github" || !newerState(old, it) {
+			kept = append(kept, it)
 			continue
 		}
-		kept = append(kept, it)
+		if !old.Meta.CompletedAt.IsZero() {
+			continue
+		}
+		kept = append(kept, withReviewMembership(old, it))
+		pinned[it.ID] = true
 	}
-	return kept
+	return kept, pinned
+}
+
+// withReviewMembership returns the stored item old with the review-request
+// membership of the search hit, which is older than it. The hit carries
+// ReasonReviewRequested exactly when the review-request search matched it
+// (github.reasonsFor); the other reasons are read from the payload (author,
+// assignee), so the newer stored ones stand. The requester is cleared as on a fresh
+// hit, for reconcileFetched to carry back while a request is shown. The CI summary
+// is dropped as a hit carries none (worklist.KeepCI keeps the stored one).
+func withReviewMembership(old, hit worklist.WorkItem) worklist.WorkItem {
+	it := old
+	it.Signals.Reasons = slices.DeleteFunc(slices.Clone(old.Signals.Reasons), func(r worklist.Reason) bool {
+		return r == worklist.ReasonReviewRequested
+	})
+	if slices.Contains(hit.Signals.Reasons, worklist.ReasonReviewRequested) {
+		it.Signals.Reasons = append(it.Signals.Reasons, worklist.ReasonReviewRequested)
+	}
+	if len(it.Signals.Reasons) == 0 {
+		it.Signals.Reasons = []worklist.Reason{worklist.ReasonInvolved}
+	}
+	it.Signals.ReviewRequestedBy = ""
+	it.Signals.ReviewRequestedByBot = false
+	it.GitHub.CI = nil
+	return it
+}
+
+// dropUnchangedPins leaves out of the write-back each item keepNewerState pinned to the
+// stored state whose review request came out of reconcileFetched as stored: the
+// write would change nothing.
+func dropUnchangedPins(items, existing []worklist.WorkItem, pinned map[string]bool) []worklist.WorkItem {
+	if len(pinned) == 0 {
+		return items
+	}
+	stored := make(map[string]worklist.WorkItem, len(existing))
+	for _, it := range existing {
+		stored[it.ID] = it
+	}
+	return slices.DeleteFunc(items, func(it worklist.WorkItem) bool {
+		if !pinned[it.ID] {
+			return false
+		}
+		old := stored[it.ID]
+		return sameReasons(it.Signals.Reasons, old.Signals.Reasons) &&
+			it.Signals.ReviewRequestedBy == old.Signals.ReviewRequestedBy
+	})
+}
+
+// sameReasons reports whether a and b hold the same reasons, in any order.
+func sameReasons(a, b []worklist.Reason) bool {
+	a, b = slices.Clone(a), slices.Clone(b)
+	slices.Sort(a)
+	slices.Sort(b)
+	return slices.Equal(slices.Compact(a), slices.Compact(b))
 }
 
 // newerState reports whether a holds a newer GitHub state of an item than b: a later

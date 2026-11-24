@@ -1203,3 +1203,49 @@ func TestRunIngestOlderReadyCopyKeepsNewerState(t *testing.T) {
 		t.Fatalf("a complete refresh with an older copy: on radar %v, updated %v", got.OnRadar(), got.GitHub.UpdatedAt)
 	}
 }
+
+// Which searches matched is current even when a hit's payload is older than the
+// stored state: the stored GitHub fields stand (keepNewerState), but the review
+// request follows the review-request search. A complete search without the PR clears
+// it, a match adds it, and a partial search without it keeps the stored request.
+func TestRunIngestStaleHitReconcilesReviewRequest(t *testing.T) {
+	const id = "github:o/r#8"
+	old, fresh := lifecycleHit(8, false, 0), lifecycleHit(8, false, 9)
+	requested := func(it worklist.WorkItem) bool {
+		return slices.Contains(it.Signals.Reasons, worklist.ReasonReviewRequested)
+	}
+	check := func(t *testing.T, sink *memSink, wantRequested bool) {
+		t.Helper()
+		it := itemByID(t, sink.items, id)
+		if !it.OnRadar() || it.GitHub.UpdatedAt.Minute() != 9 {
+			t.Fatalf("the newer 12:09 state was lost: on radar %v, updated %v", it.OnRadar(), it.GitHub.UpdatedAt)
+		}
+		if requested(it) != wantRequested {
+			t.Fatalf("review requested = %v, want %v; reasons %v", requested(it), wantRequested, it.Signals.Reasons)
+		}
+	}
+	t.Run("complete search no longer matches", func(t *testing.T) {
+		sink := &memSink{}
+		runLifecycleIngest(t, twoSearchServer(t, old, fresh, false), sink)
+		check(t, sink, true)
+		runLifecycleIngest(t, twoSearchServer(t, old, "", false), sink)
+		check(t, sink, false)
+		if it := itemByID(t, sink.items, id); !slices.Equal(it.Signals.Reasons, []worklist.Reason{worklist.ReasonInvolved}) {
+			t.Fatalf("reasons = %v, want [involved]", it.Signals.Reasons)
+		}
+	})
+	t.Run("search now matches", func(t *testing.T) {
+		sink := &memSink{}
+		runLifecycleIngest(t, twoSearchServer(t, fresh, "", false), sink)
+		check(t, sink, false)
+		runLifecycleIngest(t, twoSearchServer(t, "", old, false), sink)
+		check(t, sink, true)
+	})
+	t.Run("partial search keeps the request", func(t *testing.T) {
+		sink := &memSink{}
+		runLifecycleIngest(t, twoSearchServer(t, old, fresh, false), sink)
+		check(t, sink, true)
+		runLifecycleIngest(t, twoSearchServer(t, old, "", true), sink)
+		check(t, sink, true)
+	})
+}
