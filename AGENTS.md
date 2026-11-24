@@ -423,8 +423,43 @@ Wired on the web-tier side; they define what a runtime must respect:
   so the first answer stored wins. That store rule is what makes retrying a turn safe,
   across a restart or a first run that finishes late. The ingest package's in-flight
   gate (`internal/ingest/gate.go`) holds one run per (owner, task, item, turn) and
-  only saves the cost of a duplicate run: it is in memory and guarantees nothing.
+  only saves the cost of a duplicate run: it is in memory and guarantees nothing. A
+  converse dispatch it turns away returns a `*ingest.RunSharedError`
+  (`ErrRunShared`), not nil, so a retry knows no run of its own started.
   A second opinion posts its own user turn, so it is never a duplicate.
+- The review panel (`POST /items/second-opinion`, and Get 2nd Opinion in bulk) posts
+  `worklist.IndependentReviewPrompt` as a review request (a panel review is
+  `KindReviewRequest` with that text, `Message.IsPanelReview`; the same text typed into
+  Discuss is not one) for a blind review by a model other than the item's first
+  VISIBLE reviewer (`FirstReviewModel` skips a hidden review or answer;
+  `webui.panelChoices`, resolved against the item as stored, inside the update that
+  appends the turn). When any review's answer lands on the agent plane, the same store
+  update may chain the consensus synthesis turn (`worklist.ApplyReplyAndChain` →
+  `ChainSynthesis`): only when a visible answered panel review is not yet covered by a
+  synthesis and at least two visible answered reviews, not all by one known model, are
+  there to compare. Either review can land last. The synthesis records the reviews it
+  weighs (`Message.Reviews`; a legacy request's are rebuilt from the visible reviews
+  asked and answered before it, and `ThreadWindow` writes them onto its copy before trimming, so
+  a review that does not fit makes the run decline); the plane hands it to `Ingestor.Synthesize` (default model), off
+  the reply's request. Its run's read (`ThreadWindow`) keeps those reviews first, the
+  model is sent ONLY those request/answer pairs (`WorkItem.SynthesisInputs`, each
+  request followed by its own answer, since overlapping reviews answer out of
+  position), never the rest of the thread, and the run declines with a `NoticePanelInputs` notice,
+  never a verdict, if any is hidden, gone or did not fit, or fewer than two remain.
+  The radar's verdict is the newest answered synthesis request's, through its reply
+  link (`ReviewVerdict`), never the last reply to arrive. Nothing tracks run IDs in
+  memory: a failed or declined synthesis stays retryable wherever it sits in the
+  thread (`RetryableSynthesis`, by the default model), so a Discuss turn since never
+  strands it, but only while its reviews fit the read its run would get
+  (`SynthesisFits`); otherwise the page says a smaller comparison is needed. A retry
+  starts a new attempt on the turn (`WorkItem.Restamp`, `Message.Attempt`), carried to
+  the run as its `attempt` parameter (`TurnRef.Attempt`), and a notice names the
+  attempt its run was dispatched as (never the stored turn's, which a later retry may
+  have changed), so only that attempt's notice ends it (`noticed`). A retry whose
+  dispatch shares a run already in flight (`ingest.ErrRunShared`) puts the earlier
+  attempt back (`RevertAttempt`, `webui.revertShared`), since that run's notice is
+  the one that will come. The thread page shows a working
+  cue while a reply is pending and offers no panel then; the handler refuses one too.
 - The scheduled refresh (`ingest.Refresher`, `REFRESH_INTERVAL`, off when unset or
   0, at least 1m otherwise) dispatches a github-ingest run per GitHub owner with
   stored work (`worklist.OwnerLister`), and only for owners

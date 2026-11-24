@@ -3,6 +3,7 @@ package webui
 import (
 	"bytes"
 	"context"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackfrancis/gofer/internal/ingest"
 	"github.com/jackfrancis/gofer/internal/session"
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
@@ -37,6 +39,15 @@ type recordPipeline struct {
 	turns             []worklist.TurnRef // every dispatched turn, in order
 	err               error              // what Converse and SecondOpinion return
 	onDispatch        func()             // when set, Converse and SecondOpinion call it first
+	shared            bool               // Converse, SecondOpinion and ReviewAll share a run in flight (ingest.ErrRunShared)
+}
+
+// result is what a dispatch of ref returns: p.err, or a shared run's error.
+func (p *recordPipeline) result(ref worklist.TurnRef) error {
+	if p.shared {
+		return &ingest.RunSharedError{Ref: ref}
+	}
+	return p.err
 }
 
 func (p *recordPipeline) EnsureBackfill(context.Context, string) error { return nil }
@@ -48,16 +59,20 @@ func (p *recordPipeline) Converse(_ context.Context, _ string, ref worklist.Turn
 	p.turns = append(p.turns, ref)
 	p.converseModels = append(p.converseModels, model)
 	p.converseEndpoints = append(p.converseEndpoints, endpoint)
-	return p.err
+	return p.result(ref)
 }
 func (p *recordPipeline) ReviewAll(_ context.Context, _ string, refs []worklist.TurnRef, endpoint, model string) error {
+	var errs []error
 	for _, ref := range refs {
 		p.reviewed = append(p.reviewed, ref.Item)
 		p.turns = append(p.turns, ref)
+		if p.shared {
+			errs = append(errs, p.result(ref))
+		}
 	}
 	p.reviewEndpoint = endpoint
 	p.reviewModel = model
-	return nil
+	return errors.Join(errs...)
 }
 func (p *recordPipeline) Refresh(context.Context, string) error { p.refreshed++; return nil }
 func (p *recordPipeline) RefreshFollowUp(context.Context, string) error {
@@ -72,7 +87,7 @@ func (p *recordPipeline) SecondOpinion(_ context.Context, _ string, ref worklist
 	p.turns = append(p.turns, ref)
 	p.soModels = append(p.soModels, model)
 	p.soEndpoints = append(p.soEndpoints, endpoint)
-	return p.err
+	return p.result(ref)
 }
 func (p *recordPipeline) SecondOpinionAll(_ context.Context, _ string, refs []worklist.TurnRef, endpoint, model string) error {
 	for _, ref := range refs {

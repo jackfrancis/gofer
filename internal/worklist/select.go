@@ -238,7 +238,9 @@ func ReadItem(ctx context.Context, store Store, ownerID, id, turn string) (WorkI
 // needs. If the stored thread already answers it, the window is the turn and its
 // first reply, so the run sees it is done. Otherwise it is the turn and, before it,
 // as many of the visible turns as fit, newest first; turns after it are left out
-// (none of them answers it, and the model sees only what precedes it).
+// (none of them answers it, and the model sees only what precedes it). For a
+// synthesis request, the reviews it weighs (Message.Reviews) are kept before any
+// other turn.
 //
 // LatestUserTurn names the stored thread's newest user turn (a Discuss run
 // dispatched without a turn answers it), resolved here against the whole thread,
@@ -278,24 +280,54 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 			ask := truncateMessage(th[anchor], left/2)
 			window = []Message{ask, truncateMessage(th[reply], left-messageSize(ask))}
 		} else {
+			if th[anchor].Kind == KindSynthesisRequest && len(th[anchor].Reviews) == 0 {
+				// A synthesis request stored before it named its reviews: name the ones it
+				// compares now, from the whole thread, before the budget trims it, so a
+				// review that does not fit makes the run decline (SynthesisInputs)
+				// instead of leaving a smaller comparison it cannot tell from the whole.
+				th[anchor].Reviews = keyed.synthesisReviews(anchor, keyed.replies())
+			}
 			ask := th[anchor]
 			if messageSize(ask) > left {
 				ask = truncateMessage(ask, left/2)
 			}
 			used := messageSize(ask)
-			window = []Message{ask}
+			keep := map[int]bool{}
+			// A synthesis request weighs the reviews it names (Message.Reviews): they
+			// go in first, each request with its answer, so a long discussion since
+			// cannot push them out. One that is hidden, or does not fit, is left out,
+			// and the run declines (SynthesisReady).
+			if th[anchor].Kind == KindSynthesisRequest {
+				replies := keyed.replies()
+				for _, k := range keyed.synthesisReviews(anchor, replies) {
+					q, ok := keyed.TurnIndex(k)
+					a, answered := replies[k]
+					if !ok || !answered || q >= anchor || a >= anchor || th[q].Hidden || th[a].Hidden {
+						continue
+					}
+					if s := messageSize(th[q]) + messageSize(th[a]); used+s <= left {
+						used += s
+						keep[q], keep[a] = true, true
+					}
+				}
+			}
 			for i := anchor - 1; i >= 0; i-- {
-				if th[i].Hidden {
-					continue // withheld from the model
+				if th[i].Hidden || keep[i] {
+					continue // withheld from the model, or already in
 				}
 				s := messageSize(th[i])
 				if used+s > left {
 					break
 				}
 				used += s
-				window = append(window, th[i])
+				keep[i] = true
 			}
-			slices.Reverse(window)
+			for i := 0; i < anchor; i++ {
+				if keep[i] {
+					window = append(window, th[i])
+				}
+			}
+			window = append(window, ask)
 		}
 	} else {
 		used := 0
@@ -334,7 +366,7 @@ func truncateMessage(m Message, budget int) Message {
 	original := len(m.Content)
 	note := fmt.Sprintf(truncationNote, original)
 	content := m.Content
-	n := budget - messageSize(Message{ID: m.ID, ReplyTo: m.ReplyTo, Role: m.Role, Model: m.Model, Kind: m.Kind, Verdict: m.Verdict, Hidden: m.Hidden, Notice: m.Notice, At: m.At}) - len(note)
+	n := budget - messageSize(Message{ID: m.ID, ReplyTo: m.ReplyTo, Role: m.Role, Model: m.Model, Kind: m.Kind, Verdict: m.Verdict, Reviews: m.Reviews, Attempt: m.Attempt, Hidden: m.Hidden, Notice: m.Notice, At: m.At}) - len(note)
 	for range 64 {
 		if n <= 0 {
 			break

@@ -117,19 +117,25 @@ func TestRunConverseExcludesHiddenHistory(t *testing.T) {
 // structured Verdict field and stripped from the displayed content.
 func TestRunConverseSynthesisVerdict(t *testing.T) {
 	sink := &memSink{items: []worklist.WorkItem{{
-		ID:     "github:o/r#1",
-		Thread: []worklist.Message{{Role: worklist.RoleUser, Content: "synthesize", Kind: worklist.KindSynthesisRequest}},
+		ID: "github:o/r#1",
+		Thread: []worklist.Message{
+			{Role: worklist.RoleUser, Content: "review", Kind: worklist.KindReviewRequest},
+			{Role: worklist.RoleAgent, Content: "ready"},
+			{Role: worklist.RoleUser, Content: "review", Kind: worklist.KindReviewRequest},
+			{Role: worklist.RoleAgent, Content: "ready too"},
+			{Role: worklist.RoleUser, Content: "synthesize", Kind: worklist.KindSynthesisRequest},
+		},
 	}}}
 	fc := &fakeConverser{reply: "AGREEMENT\nBoth reviews say it's ready."}
 	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: "github:o/r#1", Converser: fc}, fakeVendor{token: "t"}, sink); err != nil {
 		t.Fatal(err)
 	}
 	th := sink.items[0].Thread
-	if len(th) != 2 || th[1].Verdict != worklist.VerdictAgree {
+	if len(th) != 6 || th[5].Verdict != worklist.VerdictAgree {
 		t.Fatalf("expected the agent reply tagged with the agree verdict, got %+v", th)
 	}
-	if th[1].Content != "Both reviews say it's ready." {
-		t.Fatalf("verdict token should be stripped from content, got %q", th[1].Content)
+	if th[5].Content != "Both reviews say it's ready." {
+		t.Fatalf("verdict token should be stripped from content, got %q", th[5].Content)
 	}
 }
 

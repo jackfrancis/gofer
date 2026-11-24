@@ -76,6 +76,7 @@ func TestAgentIngestWithRunToken(t *testing.T) {
 // planeFixture is an agent plane with a memory store and a minter for run tokens.
 type planeFixture struct {
 	store    *worklist.MemoryStore
+	handler  *IngestHandler
 	ingest   http.Handler
 	reply    http.Handler
 	research http.Handler
@@ -98,6 +99,7 @@ func newPlane(t *testing.T) planeFixture {
 	h := NewIngestHandler(store, nil, worklist.NewRunPolicy(nil))
 	return planeFixture{
 		store:    store,
+		handler:  h,
 		ingest:   auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Ingest)),
 		reply:    auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Reply)),
 		research: auth.RequireScope(principal.ScopeMetadataWrite, http.HandlerFunc(h.Research)),

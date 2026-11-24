@@ -192,7 +192,8 @@ var ErrEmptyReply = errors.New("worklist: reply has no content")
 //
 //   - The reply is always a visible agent turn with no request kind, whatever it
 //     claims, so a run cannot put words in the owner's mouth. It gets an ID if it has
-//     none. It keeps a Notice only if it is one gofer knows (NoticeReconnect).
+//     none. It keeps a Notice only if it is one gofer knows (NoticeReconnect,
+//     NoticePanelInputs). It never carries Reviews, which mark user turns only.
 //   - If the answered turn is no longer in the thread (the owner cleared the
 //     conversation), the reply is dropped.
 //   - A reply already in the thread (same ID, or for a reply without one the same
@@ -212,9 +213,13 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 	}
 	reply.Role = RoleAgent
 	reply.Kind = "" // request kinds mark user turns only
+	reply.Reviews = nil
 	reply.Hidden = false
-	if reply.Notice != NoticeReconnect {
+	if !knownNotice(reply.Notice) {
 		reply.Notice = "" // only notices gofer knows
+	}
+	if reply.Notice == "" {
+		reply.Attempt = "" // only a notice names the attempt it ended
 	}
 	reply.ReplyTo = replyTo
 	found := false // the answered turn is still in the thread
@@ -247,7 +252,16 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 // answered turn is gone. The agent plane's reply handler and the in-process sink
 // both use it.
 func ApplyReply(ctx context.Context, store Store, ownerID, itemID, replyTo string, reply Message) error {
-	return store.Update(ctx, ownerID, func(current []WorkItem) ([]WorkItem, error) {
+	_, err := applyReply(ctx, store, ownerID, itemID, replyTo, reply, false, time.Time{})
+	return err
+}
+
+// applyReply is ApplyReply, chaining the review panel's synthesis when chain is set
+// (ApplyReplyAndChain).
+func applyReply(ctx context.Context, store Store, ownerID, itemID, replyTo string, reply Message, chain bool, at time.Time) (string, error) {
+	var synth string
+	err := store.Update(ctx, ownerID, func(current []WorkItem) ([]WorkItem, error) {
+		synth = ""
 		for i := range current {
 			if current[i].ID != itemID {
 				continue
@@ -256,8 +270,15 @@ func ApplyReply(ctx context.Context, store Store, ownerID, itemID, replyTo strin
 			if err != nil || !changed {
 				return nil, err
 			}
+			if chain {
+				synth, _ = ChainSynthesis(&current[i], replyTo, at)
+			}
 			return current[i : i+1], nil
 		}
 		return nil, nil // item gone
 	})
+	if err != nil {
+		return "", err
+	}
+	return synth, nil
 }

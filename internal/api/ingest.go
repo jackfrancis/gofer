@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -19,7 +20,21 @@ type IngestHandler struct {
 	store  worklist.Store
 	noter  WritebackNoter
 	policy worklist.RunPolicy
+	synth  Synthesizer
+	now    func() time.Time
 }
+
+// Synthesizer dispatches the review panel's consensus synthesis turn, which Reply
+// chains onto the thread when a panel review's answer lands (ingest.Ingestor). Reply
+// calls it off its request, under a context detached from it.
+type Synthesizer interface {
+	Synthesize(ctx context.Context, ownerID string, ref worklist.TurnRef)
+}
+
+// UseSynthesizer turns on the review panel's consensus synthesis: once a panel
+// review is answered, Reply chains the synthesis turn and hands it to s. Without one
+// nothing is chained, since no run would answer the turn.
+func (h *IngestHandler) UseSynthesizer(s Synthesizer) { h.synth = s }
 
 // WritebackNoter is notified when a runtime writes its result back, with the run's
 // id (the token's JobID). The batch tracker uses it to time a Review-all batch by
@@ -32,7 +47,7 @@ type WritebackNoter interface {
 // notified of each write-back so a batch action can be timed to the last review.
 // policy is applied to every write-back before it is merged (worklist.RunPolicy).
 func NewIngestHandler(store worklist.Store, noter WritebackNoter, policy worklist.RunPolicy) *IngestHandler {
-	return &IngestHandler{store: store, noter: noter, policy: policy}
+	return &IngestHandler{store: store, noter: noter, policy: policy, now: time.Now}
 }
 
 type ingestRequest struct {
@@ -85,7 +100,9 @@ const maxReplyBody = 1 << 20
 // Reply handles POST /agent/worklist/reply. A converse run appends its answer to an
 // item's thread here (worklist.ApplyReply): it is added as an agent turn to the thread
 // as stored now, linked to the user turn it answers, only if that turn is still
-// there, and at most once.
+// there, and at most once. With a Synthesizer, the answer to a review panel's blind
+// review also chains the consensus synthesis turn in the same update
+// (worklist.ApplyReplyAndChain), which is then dispatched.
 // A reply to an item or turn that is gone is accepted and dropped.
 func (h *IngestHandler) Reply(w http.ResponseWriter, r *http.Request) {
 	p, ok := principal.FromContext(r.Context())
@@ -102,9 +119,21 @@ func (h *IngestHandler) Reply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "item_id, in_reply_to, message.content and message.at are required")
 		return
 	}
-	if err := worklist.ApplyReply(r.Context(), h.store, p.ActingUserID, body.ItemID, body.InReplyTo, body.Message); err != nil {
+	var synth string
+	var err error
+	if h.synth != nil {
+		synth, err = worklist.ApplyReplyAndChain(r.Context(), h.store, p.ActingUserID, body.ItemID, body.InReplyTo, body.Message, h.now().UTC())
+	} else {
+		err = worklist.ApplyReply(r.Context(), h.store, p.ActingUserID, body.ItemID, body.InReplyTo, body.Message)
+	}
+	if err != nil {
 		writeError(w, http.StatusBadGateway, "could not persist reply")
 		return
+	}
+	if synth != "" {
+		// The answer was a panel review's, and its synthesis turn is stored: dispatch
+		// it without holding up the run that is reporting its reply.
+		go h.synth.Synthesize(context.WithoutCancel(r.Context()), p.ActingUserID, worklist.TurnRef{Item: body.ItemID, Turn: synth})
 	}
 	// The reply is the run's result landing (see Ingest).
 	if h.noter != nil && p.JobID != "" {
