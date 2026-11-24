@@ -20,11 +20,14 @@ type fakeCreds struct {
 	// disconnectAfter, when > 0, makes WriteCredential answer "sign-in required"
 	// from that call on (a disconnect mid-batch).
 	disconnectAfter int
-	writeCalls      int
-	readErr         error
-	rejected        []string
-	readCalls       int
-	mu              sync.Mutex
+	// reconnectAfter, when > 0, answers a grant of another version from that call
+	// on (disconnected and connected again mid-batch).
+	reconnectAfter int
+	writeCalls     int
+	readErr        error
+	rejected       []string
+	readCalls      int
+	mu             sync.Mutex
 }
 
 func (f *fakeCreds) CommentingState(context.Context, string) auth.CommentingState {
@@ -35,7 +38,11 @@ func (f *fakeCreds) WriteCredential(context.Context, string) (vault.Credential, 
 	f.mu.Lock()
 	f.writeCalls++
 	disconnected := f.disconnectAfter > 0 && f.writeCalls > f.disconnectAfter
+	reconnected := f.reconnectAfter > 0 && f.writeCalls > f.reconnectAfter
 	f.mu.Unlock()
+	if reconnected {
+		return vault.Credential{Provider: auth.WriteProvider, AccessToken: "new-token", Version: "v2"}, nil
+	}
 	if disconnected {
 		return vault.Credential{}, vault.ErrSignInRequired
 	}
@@ -351,5 +358,22 @@ func TestPostStopsWhenDisconnected(t *testing.T) {
 	}
 	if res[2].Posted || !strings.Contains(res[2].Error, "disconnected") {
 		t.Errorf("the post after the disconnect = %+v", res[2])
+	}
+}
+
+// Review P2 (third round): a batch never carries on under a grant it did not start
+// with (disconnected and connected again between two posts).
+func TestPostStopsWhenReconnected(t *testing.T) {
+	gh := &fakeGH{}
+	s := newTestService(&fakeCreds{reconnectAfter: 2}, gh)
+	res, err := s.Post(context.Background(), "u", targets("a/one", "b/two", "c/three"), "hi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.posts) != 2 || gh.tokens["comment"] != "write-token" {
+		t.Errorf("posts = %v with %q; want two, both under the starting grant", gh.posts, gh.tokens["comment"])
+	}
+	if res[2].Posted || !strings.Contains(res[2].Error, "reconnected") {
+		t.Errorf("the post after the reconnect = %+v", res[2])
 	}
 }

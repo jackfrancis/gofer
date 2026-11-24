@@ -80,7 +80,7 @@ type skippedTarget struct {
 type commentRecord struct {
 	owner   string
 	body    string
-	ids     []string
+	targets []comment.Target // the destinations the preview showed: item, repo, number
 	created time.Time
 	batch   *batch // set once confirmed
 }
@@ -109,7 +109,7 @@ func (rec *commentRecord) expired(now time.Time) bool {
 // maxPreviewsPerOwner unconfirmed previews per owner and maxRecords in all, dropping
 // the oldest unconfirmed first: a dropped preview can no longer be confirmed, which
 // is safe (the user previews again); a kept result guards a resubmit.
-func (b *batches) register(owner, body string, ids []string, now time.Time) string {
+func (b *batches) register(owner, body string, targets []comment.Target, now time.Time) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.m == nil {
@@ -133,7 +133,7 @@ func (b *batches) register(owner, body string, ids []string, now time.Time) stri
 		}
 	}
 	nonce := newNonce()
-	b.m[nonce] = &commentRecord{owner: owner, body: body, ids: ids, created: now}
+	b.m[nonce] = &commentRecord{owner: owner, body: body, targets: targets, created: now}
 	return nonce
 }
 
@@ -167,6 +167,19 @@ func (b *batches) confirm(nonce, owner string, now time.Time) (rec *commentRecor
 	}
 	rec.batch = &batch{done: make(chan struct{}), confirmed: now}
 	return rec, rec.batch, true, true
+}
+
+// receipt returns the batch of the owner's preview under nonce if it was already
+// confirmed (its results, or a run still going), else nil. Reading a receipt needs no
+// write grant, only the session that owns it.
+func (b *batches) receipt(nonce, owner string, now time.Time) *batch {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	rec := b.m[nonce]
+	if rec == nil || rec.owner != owner || rec.batch == nil || rec.expired(now) {
+		return nil
+	}
+	return rec.batch
 }
 
 // reopen returns a confirmed preview whose batch attempted nothing (no grant, an
@@ -223,17 +236,20 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	if !connected {
-		http.Redirect(w, r, "/?commenting=connect", http.StatusSeeOther)
-		return
-	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxCommentForm)
 	if !parseURLEncoded(r) {
 		h.commentFailure(w, user, http.StatusBadRequest, "gofer could not read that form. Go back and try again.")
 		return
 	}
 	if r.PostForm.Get("confirm") == "1" {
-		h.confirmComment(w, r, user)
+		// A live grant is needed only to start posting: the results of a batch
+		// already confirmed (one a dead grant cut short, say) are the owner's to read
+		// without connecting again.
+		h.confirmComment(w, r, user, connected)
+		return
+	}
+	if !connected {
+		http.Redirect(w, r, "/?commenting=connect", http.StatusSeeOther)
 		return
 	}
 
@@ -264,13 +280,11 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 	if len(targets) == 0 {
 		view.Error = "None of the selected items can take a comment now."
 	} else {
-		// Only the items shown as eligible are registered: confirming may drop one
-		// that left the radar since, but never adds one the preview listed as skipped.
-		eligible := make([]string, len(targets))
-		for i, t := range targets {
-			eligible[i] = t.ID
-		}
-		view.Nonce = h.batches.register(user.ID, body, eligible, h.now())
+		// Only the destinations shown as eligible are registered, each as the item
+		// and the repository and number shown for it: confirming may drop one that
+		// left the radar, or whose destination changed, since, but never adds or
+		// redirects one.
+		view.Nonce = h.batches.register(user.ID, body, targets, h.now())
 	}
 	// The page's default policy (no-referrer) makes a form POST from it send
 	// "Origin: null"; same-origin lets the Confirm button send its real origin, which
@@ -279,8 +293,10 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 	h.render(w, http.StatusOK, pageData{View: "comment-preview", User: user, Comment: &view})
 }
 
-// confirmComment consumes a preview and posts it (Comment, confirm=1).
-func (h *Handler) confirmComment(w http.ResponseWriter, r *http.Request, user *session.User) {
+// confirmComment consumes a preview and posts it (Comment, confirm=1), or shows the
+// results of one already confirmed. Starting a batch needs a live write grant
+// (connected); reading a receipt does not.
+func (h *Handler) confirmComment(w http.ResponseWriter, r *http.Request, user *session.User, connected bool) {
 	if !sameOrigin(r) {
 		http.Error(w, "cross-site request refused", http.StatusForbidden)
 		return
@@ -290,15 +306,27 @@ func (h *Handler) confirmComment(w http.ResponseWriter, r *http.Request, user *s
 		h.commentFailure(w, user, http.StatusBadRequest, expiredPreview)
 		return
 	}
-	rec, bt, mine, ok := h.batches.confirm(nonce, user.ID, h.now())
-	if !ok {
-		h.commentFailure(w, user, http.StatusConflict, expiredPreview)
-		return
-	}
-	if mine {
-		// The items are resolved again: one hidden or closed since the preview is
-		// skipped now.
-		go h.runBatch(context.WithoutCancel(r.Context()), nonce, bt, user.ID, rec.body, rec.ids)
+	var (
+		bt   = h.batches.receipt(nonce, user.ID, h.now())
+		mine bool
+	)
+	if bt == nil {
+		if !connected {
+			http.Redirect(w, r, "/?commenting=connect", http.StatusSeeOther)
+			return
+		}
+		var rec *commentRecord
+		var ok bool
+		rec, bt, mine, ok = h.batches.confirm(nonce, user.ID, h.now())
+		if !ok {
+			h.commentFailure(w, user, http.StatusConflict, expiredPreview)
+			return
+		}
+		if mine {
+			// The destinations are checked again: one hidden, closed or moved since
+			// the preview is skipped now.
+			go h.runBatch(context.WithoutCancel(r.Context()), nonce, bt, user.ID, rec.body, rec.targets)
+		}
 	}
 	select {
 	case <-bt.done:
@@ -316,7 +344,7 @@ func (h *Handler) confirmComment(w http.ResponseWriter, r *http.Request, user *s
 
 // runBatch posts one confirmed preview and records its outcome on bt. A batch that
 // attempted nothing reopens its preview, so it can be confirmed again.
-func (h *Handler) runBatch(ctx context.Context, nonce string, bt *batch, userID, body string, ids []string) {
+func (h *Handler) runBatch(ctx context.Context, nonce string, bt *batch, userID, body string, pinned []comment.Target) {
 	ctx, cancel := context.WithTimeout(ctx, postTimeout)
 	defer cancel()
 	view := commentView{Body: body}
@@ -324,7 +352,7 @@ func (h *Handler) runBatch(ctx context.Context, nonce string, bt *batch, userID,
 		bt.view = view
 		close(bt.done)
 	}()
-	targets, skipped, err := h.commentTargets(ctx, userID, ids)
+	targets, skipped, err := h.pinnedTargets(ctx, userID, pinned)
 	view.Targets, view.Skipped = targets, skipped
 	switch {
 	case err != nil:
@@ -355,6 +383,42 @@ func (h *Handler) runBatch(ctx context.Context, nonce string, bt *batch, userID,
 		}
 	}
 	slog.InfoContext(ctx, "bulk comment", "user", userID, "targets", len(targets), "posted", view.Posted, "unknown", view.Unknown)
+}
+
+// pinnedTargets checks a confirmed preview's destinations against the owner's stored
+// items now. A destination is kept only if its item is still on the radar AND still
+// names the repository and number the preview showed: a write-back may have changed
+// an item's GitHub fields under the same ID, and the user approved the destination,
+// not the row. It never adds a destination, and posts to the pinned one.
+func (h *Handler) pinnedTargets(ctx context.Context, ownerID string, pinned []comment.Target) ([]comment.Target, []skippedTarget, error) {
+	ids := make([]string, len(pinned))
+	for i, p := range pinned {
+		ids[i] = p.ID
+	}
+	current, skipped, err := h.commentTargets(ctx, ownerID, ids)
+	if err != nil {
+		return nil, nil, err
+	}
+	now := make(map[string]comment.Target, len(current))
+	for _, t := range current {
+		now[t.ID] = t
+	}
+	var targets []comment.Target
+	for _, p := range pinned {
+		t, ok := now[p.ID]
+		switch {
+		case !ok:
+			// skipped by commentTargets already (gone, hidden, closed)
+		case !strings.EqualFold(t.Repo, p.Repo) || t.Number != p.Number:
+			skipped = append(skipped, skippedTarget{
+				Label:  p.Repo + " #" + itoa(p.Number) + " " + p.Title,
+				Reason: "now points at " + t.Repo + " #" + itoa(t.Number) + "; not the destination you previewed",
+			})
+		default:
+			targets = append(targets, p)
+		}
+	}
+	return targets, skipped, nil
 }
 
 // commentTargets resolves the selected ids against the owner's stored items. Only

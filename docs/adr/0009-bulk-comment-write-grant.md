@@ -101,18 +101,23 @@ The client keeps the workload's guard rules (ADR 0007, "public-only guard"):
 2. Submitting renders a **preview**: the exact comment and every target, with any
    items it will skip (gone, hidden or closed since the page rendered, since bulk
    actions never act on items off the radar). Nothing is posted yet. The preview
-   registers the comment and the items it showed as eligible (never those it listed
-   as skipped), for its owner, under a one-time nonce (in memory, bounded per owner
+   registers the comment and the destinations it showed as eligible (never those it
+   listed as skipped), each as its item and the repository and number shown for it,
+   for its owner, under a one-time nonce (in memory, bounded per owner
    and in all, for 30 minutes).
 3. **Confirm** sends only that nonce. It atomically consumes the registered preview
-   and posts its comment to each of its items still on the radar (confirming may drop
-   an item, never add one), in order, one at a time, at least a second apart: GitHub asks for serial content creation, spaced
+   and posts its comment to each pinned destination whose item is still on the radar
+   and still names that repository and number (a write-back can change an item's
+   GitHub fields under the same ID; such an item is dropped, never redirected).
+   Confirming may drop a destination, never add or replace one. Posts go in order, one at a time, at least a second apart: GitHub asks for serial content creation, spaced
    out. A nonce gofer does not hold (never issued, expired, or from before a web-pod
    restart) is refused, never posted, so no resubmit can post a second time. The
    refusal says gofer cannot tell what an earlier confirmation did, and to check the
    items on GitHub before previewing again. A nonce
-   already confirmed shows that batch's results again (kept for an hour). A batch
-   that attempted nothing (no grant, the worklist unreadable) reopens its preview.
+   already confirmed shows that batch's results again (kept for an hour), to its owner,
+   with or without a live grant: only starting a batch needs one, so a user whose
+   grant died mid-batch can still see which comments landed. A batch that attempted
+   nothing (no grant, the worklist unreadable) reopens its preview.
 4. The confirm request must be same-origin, in addition to SameSite=Lax. A browser
    that sends fetch metadata decides (`Sec-Fetch-Site: same-origin`): gofer's
    `Referrer-Policy: no-referrer` makes a form POST send `Origin: null`. Without
@@ -128,7 +133,8 @@ The client keeps the workload's guard rules (ADR 0007, "public-only guard"):
    GitHub's rate-limit signals) stops the batch, says when to try again, and leaves
    the rest unattempted. The grant is read again before every post after the first,
    so a disconnect or logout mid-batch stops it even before GitHub confirms the
-   revocation.
+   revocation, and so does a grant of another version (disconnected and connected
+   again): a batch never continues under a grant it did not start with.
 
 Posting is detached from the browser request, under an overall deadline, so a closed
 tab does not leave a batch half-reported.

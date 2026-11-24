@@ -132,7 +132,8 @@ func (s *Service) State(ctx context.Context, userID string) (enabled, connected 
 // deleted: WriteRejected), on a rate limit, when ctx ends, or when the grant is no
 // longer usable locally: it is read again before every post after the first, so a
 // disconnect (or logout) mid-batch stops the batch even if GitHub has not yet
-// confirmed the revocation. A post whose answer was lost is Unknown, never reported
+// confirmed the revocation, and so does a grant of another version (disconnected and
+// connected again): a batch never continues under a grant it did not start with. A post whose answer was lost is Unknown, never reported
 // as not posted.
 func (s *Service) Post(ctx context.Context, userID string, targets []Target, body string) ([]Result, error) {
 	cred, err := s.creds.WriteCredential(ctx, userID)
@@ -162,8 +163,11 @@ func (s *Service) Post(ctx context.Context, userID string, targets []Target, bod
 				stopped = "Not attempted: commenting was disconnected."
 			case err != nil:
 				stopped = "Not attempted: gofer could not confirm commenting is still connected."
-			default:
-				cred = fresh // the same grant, or one reconnected meanwhile
+			case fresh.Version != cred.Version:
+				// Disconnected and connected again (or refreshed) since the batch
+				// began: the batch was approved under the grant it started with, so it
+				// never carries on under another.
+				stopped = "Not attempted: commenting was reconnected while this batch ran."
 			}
 		}
 		if stopped != "" {

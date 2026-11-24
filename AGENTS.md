@@ -446,14 +446,17 @@ Wired on the web-tier side; they define what a runtime must respect:
   logout. Storing a write grant is strict, and every failed connection revokes the
   token it was issued, that token only (`discardToken`), never the authorization. The web tier posts with it
   (`internal/comment` over `internal/ghcomment`, which checks `"private": false`
-  first and follows no redirect). The preview registers the comment and the items it
-  showed as eligible under a one-time nonce (confirming may drop an item, never add
-  one); a same-origin confirm consumes it, and a nonce gofer does not hold
-  is refused, so nothing posts twice from one preview, across a restart included.
+  first and follows no redirect). The preview registers the comment and the destinations
+  it showed as eligible (item, repository and number) under a one-time nonce;
+  confirming drops one whose item left the radar or now names another destination,
+  and never adds or redirects one. A same-origin confirm consumes it, and a nonce
+  gofer does not hold is refused, so nothing posts twice from one preview, across a
+  restart included. A confirmed batch's results are its owner's to read without a
+  live grant; only starting one needs it.
   Same-origin trusts `Sec-Fetch-Site: same-origin`, since `Referrer-Policy:
   no-referrer` makes a form's `Origin` "null". Posts are serial, a second apart; a
-  rate limit stops the batch, the grant is re-read before each post (a disconnect
-  stops it), and a POST whose answer was lost is "unknown", never "not posted". Targets are items on the radar only (`WorkItem.OnRadar`). @
+  rate limit stops the batch, the grant is re-read before each post (a disconnect,
+  or a grant of another version, stops it), and a POST whose answer was lost is "unknown", never "not posted". Targets are items on the radar only (`WorkItem.OnRadar`). @
   suggestions are each repository's assignees, read with the user's read credential
   and cached in memory, counted against every selected repository (unchecked ones are
   unknown). `reload.js` does not reload while items are checked.

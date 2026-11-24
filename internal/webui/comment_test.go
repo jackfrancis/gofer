@@ -466,3 +466,64 @@ func TestCommentUnknownConfirmationIsHonest(t *testing.T) {
 		t.Errorf("page:\n%s", body)
 	}
 }
+
+// Review P1 (third round): confirming posts to the repository and number the preview
+// showed. A write-back that changes an item's GitHub fields under the same ID drops
+// it from the batch instead of redirecting the comment.
+func TestCommentConfirmPinsDestination(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	nonce := preview(t, h, "/lgtm", "github:a/one#1", "github:b/two#2")
+	err := h.store.Update(context.Background(), "github:42", func(items []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		for _, it := range items {
+			if it.ID == "github:a/one#1" {
+				it.GitHub.Repo, it.GitHub.Number = "other/repo", 99
+				return []worklist.WorkItem{it}, nil
+			}
+		}
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin")
+	if c.postCount() != 1 || len(c.posts[0]) != 1 {
+		t.Fatalf("posts = %+v", c.posts)
+	}
+	if got := c.posts[0][0]; got.Repo != "b/two" || got.Number != 2 {
+		t.Errorf("posted to %s #%d", got.Repo, got.Number)
+	}
+	if !strings.Contains(rec.Body.String(), "not the destination you previewed") {
+		t.Errorf("results do not explain the dropped item:\n%s", rec.Body)
+	}
+}
+
+// Review P2 (third round): the owner reads a completed batch's results without a
+// live grant; only starting a batch needs one, and a refused start consumes nothing.
+func TestCommentReceiptNeedsNoGrant(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	done := preview(t, h, "/lgtm", "github:a/one#1")
+	pending := preview(t, h, "/hold", "github:b/two#2")
+	postComment(h, confirmForm(done), "Sec-Fetch-Site", "same-origin")
+
+	c.connected = false // the grant died, or was disconnected
+	rec := postComment(h, confirmForm(done), "Sec-Fetch-Site", "same-origin")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Already posted: 1 of 1") {
+		t.Fatalf("receipt without a grant = %d\n%s", rec.Code, rec.Body)
+	}
+	rec = postComment(h, confirmForm(pending), "Sec-Fetch-Site", "same-origin")
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/?commenting=connect" {
+		t.Fatalf("new batch without a grant = %d %q", rec.Code, rec.Header().Get("Location"))
+	}
+	c.connected = true
+	postComment(h, confirmForm(pending), "Sec-Fetch-Site", "same-origin")
+	if c.postCount() != 2 {
+		t.Errorf("posts = %d; the refused start should have left its preview to confirm", c.postCount())
+	}
+	// Another user cannot read the receipt.
+	h.sessions = fakeSessions{&session.User{ID: "github:7", Provider: "github"}}
+	if rec := postComment(h, confirmForm(done), "Sec-Fetch-Site", "same-origin"); rec.Code == http.StatusOK {
+		t.Error("another user read the receipt")
+	}
+}
