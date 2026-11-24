@@ -438,12 +438,13 @@ Wired on the web-tier side; they define what a runtime must respect:
   `ChainSynthesis`): only when a visible answered panel review is not yet covered by a
   synthesis and at least two visible answered reviews, not all by one known model, are
   there to compare. Either review can land last. The synthesis records the reviews it
-  weighs (`Message.Reviews`; a legacy request's are rebuilt from the visible answered
-  reviews before it, and `ThreadWindow` writes them onto its copy before trimming, so
+  weighs (`Message.Reviews`; a legacy request's are rebuilt from the visible reviews
+  asked and answered before it, and `ThreadWindow` writes them onto its copy before trimming, so
   a review that does not fit makes the run decline); the plane hands it to `Ingestor.Synthesize` (default model), off
   the reply's request. Its run's read (`ThreadWindow`) keeps those reviews first, the
-  model is sent ONLY those request/answer pairs (`WorkItem.SynthesisInputs`), never
-  the rest of the thread, and the run declines with a `NoticePanelInputs` notice,
+  model is sent ONLY those request/answer pairs (`WorkItem.SynthesisInputs`, each
+  request followed by its own answer, since overlapping reviews answer out of
+  position), never the rest of the thread, and the run declines with a `NoticePanelInputs` notice,
   never a verdict, if any is hidden, gone or did not fit, or fewer than two remain.
   The radar's verdict is the newest answered synthesis request's, through its reply
   link (`ReviewVerdict`), never the last reply to arrive. Nothing tracks run IDs in

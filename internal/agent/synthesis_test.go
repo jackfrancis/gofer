@@ -115,3 +115,28 @@ func TestConverseSynthesisNoticeNamesItsAttempt(t *testing.T) {
 		t.Fatalf("want a declined legacy synthesis with a notice for attempt-2, got %+v (model asked: %v)", last, fc.gotUser != "")
 	}
 }
+
+// Overlapping reviews reach the model as alternating request/answer turns.
+func TestConverseSynthesisAlternatesTurns(t *testing.T) {
+	now := time.Now().UTC()
+	item := synthesisItem(now)
+	th := item.Thread
+	item.Thread = []worklist.Message{th[0], th[2], th[3], th[1], th[4]} // q1, p1, r2→p1, r1→q1, s1
+	sink := &memSink{items: []worklist.WorkItem{item}}
+	fc := &fakeConverser{reply: "DISAGREEMENT\nThey differ."}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: item.ID, Turn: "s1", Converser: fc}, fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	for i, m := range fc.gotHistory {
+		want := worklist.RoleUser
+		if i%2 == 1 {
+			want = worklist.RoleAgent
+		}
+		if m.Role != want {
+			t.Fatalf("history turn %d is %s, want %s: %+v", i, m.Role, want, fc.gotHistory)
+		}
+	}
+	if len(fc.gotHistory) != 4 || fc.gotHistory[1].ReplyTo != fc.gotHistory[0].ID || fc.gotHistory[3].ReplyTo != fc.gotHistory[2].ID {
+		t.Fatalf("each request must be followed by its own answer, got %+v", fc.gotHistory)
+	}
+}

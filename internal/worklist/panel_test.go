@@ -355,3 +355,46 @@ func TestRevertAttempt(t *testing.T) {
 		t.Fatal("RevertAttempt must leave a later attempt alone")
 	}
 }
+
+// Reviews that overlapped answer out of position; the comparison still pairs each
+// request with its own answer, so the model gets alternating turns.
+func TestSynthesisInputsPairsOverlappingReviews(t *testing.T) {
+	w := WorkItem{ID: "a", Thread: []Message{
+		{ID: "q1", Role: RoleUser, Kind: KindReviewRequest, Content: "Can you review this PR?", At: t0},
+		{ID: "p1", Role: RoleUser, Kind: KindReviewRequest, Content: IndependentReviewPrompt, At: t0},
+		{ID: "rp", ReplyTo: "p1", Role: RoleAgent, Content: "blind review", At: t1},
+		{ID: "rq", ReplyTo: "q1", Role: RoleAgent, Content: "first review", At: t1},
+		{ID: "s1", Role: RoleUser, Kind: KindSynthesisRequest, Content: SynthesisPrompt, Reviews: []string{"p1", "q1"}, At: t2},
+	}}
+	for _, legacy := range []bool{false, true} {
+		if legacy {
+			w.Thread[4].Reviews = nil
+		}
+		in, ok := w.SynthesisInputs("s1")
+		var got []string
+		for _, m := range in {
+			got = append(got, m.ID)
+		}
+		if want := []string{"q1", "rq", "p1", "rp"}; !ok || !slices.Equal(got, want) {
+			t.Fatalf("legacy=%v: inputs = %v %v, want request/answer pairs %v", legacy, got, ok, want)
+		}
+	}
+}
+
+// A legacy request's comparison is the reviews answered before it was asked: one
+// that finished after the consensus was requested is not part of that round, so the
+// round is still ready (and fits) without it.
+func TestLegacySynthesisLeavesOutLateAnswers(t *testing.T) {
+	w := WorkItem{ID: "a", Type: TypePullRequest, Thread: append(panelThread(),
+		Message{ID: "q3", Role: RoleUser, Kind: KindReviewRequest, Content: "Can you review this PR?", At: t2},
+		Message{ID: "s1", Role: RoleUser, Kind: KindSynthesisRequest, Content: SynthesisPrompt, At: t2},
+		Message{ID: "r3", ReplyTo: "q3", Role: RoleAgent, Content: "a late review", At: t2},
+	)}
+	in, ok := w.SynthesisInputs("s1")
+	if !ok || len(in) != 4 {
+		t.Fatalf("want the two reviews answered before the round, got %+v %v", in, ok)
+	}
+	if !w.SynthesisFits("s1") {
+		t.Fatal("a short legacy round must fit, so Retry is offered")
+	}
+}

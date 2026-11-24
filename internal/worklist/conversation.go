@@ -377,8 +377,8 @@ func (w WorkItem) ReviewVerdict() string {
 	return ""
 }
 
-// SynthesisInputs returns the turns the synthesis request at key compares, in
-// thread order: each review request it weighs followed by its answer. Those are the
+// SynthesisInputs returns the turns the synthesis request at key compares: each
+// review request it weighs, in thread order, immediately followed by its answer. Those are the
 // only turns its run sends the model. A request records its reviews
 // (Message.Reviews); for one stored before that, the comparison is rebuilt from the
 // visible answered review requests before it. ok is false, and the run declines
@@ -399,8 +399,14 @@ func (w WorkItem) SynthesisInputs(key string) ([]Message, bool) {
 	if len(keys) < 2 {
 		return nil, false
 	}
-	pos := make([]int, 0, 2*len(keys))
+	type pair struct{ ask, answer int }
+	pairs := make([]pair, 0, len(keys))
+	seen := make(map[string]bool, len(keys))
 	for _, k := range keys {
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
 		j, ok := w.TurnIndex(k)
 		if !ok || w.Thread[j].Role != RoleUser || w.Thread[j].Kind != KindReviewRequest || w.Thread[j].Hidden {
 			return nil, false
@@ -409,13 +415,15 @@ func (w WorkItem) SynthesisInputs(key string) ([]Message, bool) {
 		if !ok || w.Thread[a].Hidden {
 			return nil, false
 		}
-		pos = append(pos, j, a)
+		pairs = append(pairs, pair{j, a})
 	}
-	slices.Sort(pos)
-	pos = slices.Compact(pos)
-	out := make([]Message, len(pos))
-	for n, p := range pos {
-		out[n] = w.Thread[p]
+	// Each request is followed by its own answer (its reply link), in request order:
+	// reviews that overlapped answer out of position, and a chat endpoint refuses two
+	// user turns in a row.
+	slices.SortFunc(pairs, func(x, y pair) int { return x.ask - y.ask })
+	out := make([]Message, 0, 2*len(pairs))
+	for _, p := range pairs {
+		out = append(out, w.Thread[p.ask], w.Thread[p.answer])
 	}
 	return out, true
 }
@@ -437,7 +445,8 @@ func (w WorkItem) SynthesisFits(key string) bool {
 
 // synthesisReviews is the keys of the review requests the synthesis request at
 // position i compares: the ones it names, or, for a request stored before it named
-// them, the visible answered review requests before it.
+// them, the visible review requests before it whose answers landed before it too (a
+// review answered later was not part of that round).
 func (w WorkItem) synthesisReviews(i int, replies map[string]int) []string {
 	if len(w.Thread[i].Reviews) > 0 {
 		return w.Thread[i].Reviews
@@ -448,8 +457,8 @@ func (w WorkItem) synthesisReviews(i int, replies map[string]int) []string {
 		if m.Role != RoleUser || m.Kind != KindReviewRequest || m.Hidden {
 			continue
 		}
-		if a, ok := replies[w.TurnKey(k)]; ok && !w.Thread[a].Hidden {
-			keys = append(keys, w.TurnKey(k))
+		if a, ok := replies[w.TurnKey(k)]; ok && a < i && !w.Thread[a].Hidden {
+			keys = append(keys, w.TurnKey(k)) // answered before this round was asked
 		}
 	}
 	return keys
