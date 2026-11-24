@@ -2,6 +2,8 @@ package ghcomment
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,9 +15,11 @@ import (
 
 // This file is the pending review (ADR 0010): gofer creates a review with no event,
 // which GitHub keeps PENDING, visible only to its author until they submit it on
-// GitHub. It adds three calls to the client, on a public repository only:
+// GitHub. It adds four calls to the client, on a public repository only:
 //
 //   - GET /repos/{repo}/pulls/{n}/reviews, to find a pending review already there;
+//   - GET /repos/{repo}/pulls/{n}/files, to check the commented files' patches are
+//     still the ones the comments were anchored to;
 //   - GET /repos/{repo}/pulls/{n}, for its state, head commit and base branch, read
 //     last, right before the write;
 //   - POST /repos/{repo}/pulls/{n}/reviews, with no event.
@@ -27,14 +31,21 @@ const (
 	// maxReviewPages bounds how many pages (of 100) of reviews are read to look for
 	// a pending one.
 	maxReviewPages = 10
+	// filesPerPage and maxFilePages bound the files read to check patches: GitHub
+	// lists at most 3000 files. maxFilesPageBytes bounds one page, patches included.
+	filesPerPage      = 50
+	maxFilePages      = 60
+	maxFilesPageBytes = 8 << 20
 )
 
 // Errors a caller distinguishes.
 var (
-	// ErrHeadMoved means the pull request's head is no longer the commit the
-	// comments are anchored to, or its base branch is not the one they were drafted
-	// against: a push or a retarget changed what the lines mean.
-	ErrHeadMoved = errors.New("the pull request's head or base changed")
+	// ErrHeadMoved means the pull request changed under the draft: its head is no
+	// longer the commit the comments are anchored to, its base branch is not the one
+	// they were drafted against, or a commented file's patch is not the one they were
+	// anchored to (a related change merged into the base moved the merge base). The
+	// lines may mean something else now.
+	ErrHeadMoved = errors.New("the pull request changed since the draft")
 	// ErrNotOpen means the pull request is closed or merged.
 	ErrNotOpen = errors.New("the pull request is not open")
 	// ErrPendingExists means the user already has a pending review on the pull
@@ -50,30 +61,58 @@ type ReviewComment struct {
 	Body string `json:"body"`
 }
 
-// PendingReview creates a PENDING review on repo's pull request number, anchored to
-// commit, with body and comments, after checking the repository is public, the user
-// has no pending review on it already, and then, as close to the write as the API
-// allows, that the pull request is open, its head is still commit and its base
-// branch still baseRef. GitHub takes commit_id as an anchor, not a precondition (it
-// accepts an older commit), so these checks are gofer's. It returns the review's web
-// URL when GitHub gave one. A POST whose answer was lost is ErrOutcomeUnknown.
-func (c *Client) PendingReview(ctx context.Context, token, repo string, number int, commit, baseRef, body string, comments []ReviewComment) (string, error) {
+// Review is a pending review to create: the head commit and base branch it is
+// anchored to, its summary and inline comments, and, for every commented file, the
+// PatchDigest of the patch the comments were anchored to.
+type Review struct {
+	Commit   string
+	BaseRef  string
+	Body     string
+	Comments []ReviewComment
+	Patches  map[string]string // path -> PatchDigest
+}
+
+// PatchDigest identifies one file's patch as GitHub lists it on the pull request's
+// files: hex SHA-256 of the patch text. The workload records it when it drafts
+// (worklist.PatchDigest computes the same), and PendingReview compares it.
+func PatchDigest(patch string) string {
+	sum := sha256.Sum256([]byte(patch))
+	return hex.EncodeToString(sum[:])
+}
+
+// PendingReview creates rv as a PENDING review on repo's pull request number. First
+// it checks the repository is public and the user has no pending review there. Then
+// it checks every commented file's patch is still the one its comments were anchored
+// to, so a change merged into the base that moved the merge base refuses the review,
+// while one that left these files' hunks alone does not. Last, as close to the write
+// as the API allows, it checks the pull request is open with its head still
+// rv.Commit and its base branch still rv.BaseRef. GitHub takes commit_id as an
+// anchor, not a precondition (it accepts an older commit), so these checks are
+// gofer's. It returns the review's web URL when GitHub gave one. A POST whose answer
+// was lost, or that got a server error, is ErrOutcomeUnknown.
+func (c *Client) PendingReview(ctx context.Context, token, repo string, number int, rv Review) (string, error) {
 	if number <= 0 {
 		return "", errors.New("github: no pull request number")
 	}
-	if commit == "" || baseRef == "" {
+	if rv.Commit == "" || rv.BaseRef == "" {
 		return "", errors.New("github: no commit and base branch to anchor the review to")
 	}
-	if strings.TrimSpace(body) == "" && len(comments) == 0 {
+	if strings.TrimSpace(rv.Body) == "" && len(rv.Comments) == 0 {
 		return "", errors.New("github: an empty review")
 	}
-	if len(body) > MaxBodyBytes || len(comments) > MaxReviewComments {
+	if len(rv.Body) > MaxBodyBytes || len(rv.Comments) > MaxReviewComments {
 		return "", errors.New("github: the review is too large")
 	}
-	for _, cm := range comments {
+	want := map[string]string{}
+	for _, cm := range rv.Comments {
 		if cm.Path == "" || cm.Line < 1 || (cm.Side != "RIGHT" && cm.Side != "LEFT") || cm.Body == "" || len(cm.Body) > MaxBodyBytes {
 			return "", errors.New("github: an invalid review comment")
 		}
+		d := rv.Patches[cm.Path]
+		if d == "" {
+			return "", errors.New("github: a review comment on a file with no patch to check")
+		}
+		want[cm.Path] = d
 	}
 	canon, err := c.PublicRepo(ctx, token, repo)
 	if err != nil {
@@ -87,8 +126,12 @@ func (c *Client) PendingReview(ctx context.Context, token, repo string, number i
 	if pending {
 		return "", ErrPendingExists
 	}
-	// The pull request is read after the review list is paged, right before the
-	// POST, so its state, head and base are as fresh as the API lets gofer check.
+	if err := c.checkPatches(ctx, token, pull, want); err != nil {
+		return "", err
+	}
+	// The pull request is read after the lists are paged, right before the POST, so
+	// its state, head and base are as fresh as the API lets gofer check. A push since
+	// the files were read shows here as a new head.
 	raw, err := c.do(ctx, token, http.MethodGet, pull, nil, http.StatusOK)
 	if err != nil {
 		return "", err
@@ -108,7 +151,7 @@ func (c *Client) PendingReview(ctx context.Context, token, repo string, number i
 	if !strings.EqualFold(pr.State, "open") {
 		return "", ErrNotOpen
 	}
-	if !strings.EqualFold(pr.Head.SHA, commit) || pr.Base.Ref != baseRef {
+	if !strings.EqualFold(pr.Head.SHA, rv.Commit) || pr.Base.Ref != rv.BaseRef {
 		return "", ErrHeadMoved
 	}
 	// No "event": GitHub creates the review PENDING.
@@ -116,7 +159,7 @@ func (c *Client) PendingReview(ctx context.Context, token, repo string, number i
 		CommitID string          `json:"commit_id"`
 		Body     string          `json:"body,omitempty"`
 		Comments []ReviewComment `json:"comments,omitempty"`
-	}{commit, body, comments})
+	}{rv.Commit, rv.Body, rv.Comments})
 	if err != nil {
 		return "", err
 	}
@@ -137,6 +180,48 @@ func (c *Client) PendingReview(ctx context.Context, token, repo string, number i
 		return out.HTMLURL, fmt.Errorf("github: the review was created %s, not pending", strings.ToLower(out.State))
 	}
 	return out.HTMLURL, nil
+}
+
+// checkPatches pages the pull request's files until every path in want is found,
+// and refuses (ErrHeadMoved) if one is gone from the diff, has no patch now, or has a
+// patch whose PatchDigest differs. A list too long to read whole is an error, never a
+// pass.
+func (c *Client) checkPatches(ctx context.Context, token, pull string, want map[string]string) error {
+	if len(want) == 0 {
+		return nil
+	}
+	left := len(want)
+	for page := 1; page <= maxFilePages; page++ {
+		raw, err := c.doLimit(ctx, token, http.MethodGet, pull+"/files?per_page="+strconv.Itoa(filesPerPage)+"&page="+strconv.Itoa(page), nil, http.StatusOK, maxFilesPageBytes)
+		if err != nil {
+			return err
+		}
+		var files []struct {
+			Filename string `json:"filename"`
+			Patch    string `json:"patch"`
+		}
+		if err := json.Unmarshal(raw, &files); err != nil {
+			return errors.New("github: unreadable file list")
+		}
+		for _, f := range files {
+			d, ok := want[f.Filename]
+			if !ok {
+				continue
+			}
+			if f.Patch == "" || PatchDigest(f.Patch) != d {
+				return ErrHeadMoved
+			}
+			delete(want, f.Filename)
+			left--
+		}
+		if left == 0 {
+			return nil
+		}
+		if len(files) < filesPerPage {
+			return ErrHeadMoved // a commented file is no longer in the diff
+		}
+	}
+	return errors.New("github: too many files to check the commented ones")
 }
 
 // hasPendingReview reports whether the pull request (its API path) has a pending

@@ -17,15 +17,15 @@ type fakeReviewGH struct {
 	got   []ghcomment.ReviewComment
 }
 
-func (g *fakeReviewGH) PendingReview(_ context.Context, token, _ string, _ int, _, _, _ string, comments []ghcomment.ReviewComment) (string, error) {
-	g.token, g.got = token, comments
+func (g *fakeReviewGH) PendingReview(_ context.Context, token, _ string, _ int, rv ghcomment.Review) (string, error) {
+	g.token, g.got = token, rv.Comments
 	if g.err != nil {
 		return "", g.err
 	}
 	return "https://github.com/o/r/pull/1#pullrequestreview-9", nil
 }
 
-var testReview = Review{Repo: "o/r", Number: 1, Commit: "abc", BaseRef: "main", Comments: []ghcomment.ReviewComment{{Path: "a.go", Line: 1, Side: "RIGHT", Body: "x"}}}
+var testReview = Review{Repo: "o/r", Number: 1, Review: ghcomment.Review{Commit: "abc", BaseRef: "main", Comments: []ghcomment.ReviewComment{{Path: "a.go", Line: 1, Side: "RIGHT", Body: "x"}}}}
 
 // The review is created with the write grant, and each GitHub outcome becomes words
 // for the user; a 401 marks the grant rejected.

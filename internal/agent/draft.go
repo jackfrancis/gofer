@@ -67,11 +67,17 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 		return reply(draftClosedReply, nil)
 	}
 	text, anchors, omitted := renderDiff(diff.Files, maxDiffPromptBytes)
+	patches := map[string]string{} // every rendered file's patch digest; the draft keeps the commented ones
+	for _, f := range diff.Files {
+		if anchors[f.Path] != nil {
+			patches[f.Path] = worklist.PatchDigest(f.Patch)
+		}
+	}
 	prop, err := p.Drafter.DraftReview(ctx, worklist.DraftInput{Item: item, ViewerLogin: viewer, History: history, Diff: text})
 	if err != nil {
 		return fmt.Errorf("draft review: %w", err)
 	}
-	pin := worklist.DraftReview{Repo: item.GitHub.Repo, Number: item.GitHub.Number, Commit: diff.HeadSHA, BaseRef: diff.BaseRef}
+	pin := worklist.DraftReview{Repo: item.GitHub.Repo, Number: item.GitHub.Number, Commit: diff.HeadSHA, BaseRef: diff.BaseRef, Patches: patches}
 	draft, moved := anchorDraft(prop, anchors, pin)
 	return reply(draftContent(draft, prop.Excluded, moved, omitted, diff.Complete), draft)
 }
@@ -166,7 +172,7 @@ func renderDiff(files []github.DiffFile, budget int) (string, map[string]map[anc
 // point is never lost to a bad anchor. moved counts those. It returns nil when there
 // is nothing to post.
 func anchorDraft(prop worklist.DraftProposal, anchors map[string]map[anchor]bool, pin worklist.DraftReview) (*worklist.DraftReview, int) {
-	d := &worklist.DraftReview{Repo: pin.Repo, Number: pin.Number, Commit: pin.Commit, BaseRef: pin.BaseRef}
+	d := &worklist.DraftReview{Repo: pin.Repo, Number: pin.Number, Commit: pin.Commit, BaseRef: pin.BaseRef, Patches: pin.Patches}
 	general := append([]string(nil), prop.General...)
 	moved := 0
 	for _, c := range prop.Comments {

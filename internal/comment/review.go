@@ -12,19 +12,16 @@ import (
 
 // Reviewer is the GitHub client's pending-review call (ghcomment.Client).
 type Reviewer interface {
-	PendingReview(ctx context.Context, token, repo string, number int, commit, baseRef, body string, comments []ghcomment.ReviewComment) (string, error)
+	PendingReview(ctx context.Context, token, repo string, number int, rv ghcomment.Review) (string, error)
 }
 
 // Review is a pending review the owner confirmed from a draft (ADR 0010): the pull
-// request, the head commit and base branch its comments are anchored to, the summary
-// and the comments.
+// request, and the review (its anchors, summary, comments and the commented files'
+// patch digests).
 type Review struct {
-	Repo     string
-	Number   int
-	Commit   string
-	BaseRef  string
-	Body     string
-	Comments []ghcomment.ReviewComment
+	Repo   string
+	Number int
+	ghcomment.Review
 }
 
 // ReviewResult is what happened: Created, Unknown (the request reached GitHub but
@@ -55,7 +52,7 @@ func (s *Service) PendingReview(ctx context.Context, userID string, rv Review) (
 	if err != nil {
 		return ReviewResult{}, err
 	}
-	link, err := gh.PendingReview(ctx, cred.AccessToken, rv.Repo, rv.Number, rv.Commit, rv.BaseRef, rv.Body, rv.Comments)
+	link, err := gh.PendingReview(ctx, cred.AccessToken, rv.Repo, rv.Number, rv.Review)
 	var rl *ghcomment.RateLimitError
 	var se *ghcomment.StatusError
 	switch {
@@ -69,7 +66,7 @@ func (s *Service) PendingReview(ctx context.Context, userID string, rv Review) (
 	case errors.Is(err, ghcomment.ErrPendingExists):
 		return ReviewResult{Error: "You already have a pending review on this pull request, and GitHub allows one. Submit or discard it on GitHub, then try again."}, nil
 	case errors.Is(err, ghcomment.ErrHeadMoved):
-		return ReviewResult{Error: "The pull request has new commits, or a new base branch, since these comments were drafted, so their lines may have moved. Draft the review comments again."}, nil
+		return ReviewResult{Error: "The pull request changed since these comments were drafted (new commits, a new base branch, or a change merged into its base that touched these files), so their lines may mean something else now. Nothing was created; draft the review comments again."}, nil
 	case errors.Is(err, ghcomment.ErrNotOpen):
 		return ReviewResult{Error: "The pull request is no longer open."}, nil
 	case errors.As(err, &rl):

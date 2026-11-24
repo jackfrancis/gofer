@@ -10,9 +10,17 @@ import (
 
 const testCommit = "0123456789abcdef0123456789abcdef01234567"
 
-// pinned is a draft pinned to o/r#1 at testCommit against main.
+// pinned is a draft pinned to o/r#1 at testCommit against main, with a patch
+// digest for every commented file.
 func pinned(body string, comments ...DraftComment) *DraftReview {
-	return &DraftReview{Repo: "o/r", Number: 1, Commit: testCommit, BaseRef: "main", Body: body, Comments: comments}
+	d := &DraftReview{Repo: "o/r", Number: 1, Commit: testCommit, BaseRef: "main", Body: body, Comments: comments}
+	for _, c := range comments {
+		if d.Patches == nil {
+			d.Patches = map[string]string{}
+		}
+		d.Patches[c.Path] = PatchDigest("patch of " + c.Path)
+	}
+	return d
 }
 
 // A stored draft is always within its bounds: invalid comments are dropped, text is
@@ -54,9 +62,20 @@ func TestBoundDraft(t *testing.T) {
 	if c := d.Comments[1]; c.Side != SideLeft || len(c.Body) > MaxDraftCommentBytes {
 		t.Errorf("second comment: side %q, %d bytes", c.Side, len(c.Body))
 	}
-	many := pinned("")
+	// Digests are kept for commented files only, and a comment whose file has no
+	// valid digest is dropped: it could not be checked before the review is created.
+	if len(d.Patches) != 1 || d.Patches["a.go"] == "" {
+		t.Errorf("patches = %v", d.Patches)
+	}
+	unchecked := pinned("", DraftComment{Path: "a.go", Line: 1, Body: "x"}, DraftComment{Path: "b.go", Line: 1, Body: "y"})
+	unchecked.Patches["b.go"] = "not-a-digest"
+	unchecked.Patches["c.go"] = PatchDigest("uncommented")
+	if got := BoundDraft(unchecked); len(got.Comments) != 1 || got.Comments[0].Path != "a.go" || len(got.Patches) != 1 {
+		t.Errorf("unchecked comment kept: %+v", got)
+	}
+	many := pinned("", DraftComment{Path: "a.go", Line: 1, Body: "x"})
 	for i := range MaxDraftComments + 5 {
-		many.Comments = append(many.Comments, DraftComment{Path: "a.go", Line: i + 1, Body: "x"})
+		many.Comments = append(many.Comments, DraftComment{Path: "a.go", Line: i + 2, Body: "x"})
 	}
 	if got := len(BoundDraft(many).Comments); got != MaxDraftComments {
 		t.Errorf("kept %d comments, want %d", got, MaxDraftComments)

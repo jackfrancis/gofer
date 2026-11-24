@@ -28,7 +28,11 @@ const draftReviewPrompt = "Draft review comments for the points this conversatio
 
 // draftReviewTimeout bounds creating the pending review: a few GitHub calls. It runs
 // detached from the browser request, so a closed tab does not cut it short midway.
-const draftReviewTimeout = 60 * time.Second
+var draftReviewTimeout = 60 * time.Second // a variable so tests can shorten it
+
+// settleTimeout bounds recording what happened to a confirmation (or releasing it),
+// apart from draftReviewTimeout, which the GitHub calls may have used up.
+const settleTimeout = 10 * time.Second
 
 // ReviewCreator creates a pending review (comment.Service). A Commenter that does
 // not implement it offers no draft review.
@@ -209,7 +213,7 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	draft := it.Thread[i].Draft
-	rv := comment.Review{Repo: draft.Repo, Number: draft.Number, Commit: draft.Commit, BaseRef: draft.BaseRef}
+	rv := comment.Review{Repo: draft.Repo, Number: draft.Number, Review: ghcomment.Review{Commit: draft.Commit, BaseRef: draft.BaseRef, Patches: map[string]string{}}}
 	seen := map[int]bool{}
 	for _, v := range r.PostForm["c"] {
 		n, err := strconv.Atoi(v)
@@ -219,6 +223,7 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 		seen[n] = true
 		c := draft.Comments[n]
 		rv.Comments = append(rv.Comments, ghcomment.ReviewComment{Path: c.Path, Line: c.Line, Side: c.Side, Body: c.Body})
+		rv.Patches[c.Path] = draft.Patches[c.Path]
 	}
 	if r.PostForm.Get("summary") == "1" {
 		rv.Body = draft.Body
@@ -246,7 +251,12 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	settle := func(receipt *worklist.DraftReceipt) {
-		if err := worklist.SettleDraft(ctx, h.store, user.ID, id, key, claimedAt, receipt); err != nil {
+		// Its own deadline: the request's may have run out reading GitHub, and a
+		// release that never lands would leave a draft nothing was sent for
+		// unconfirmable.
+		sctx, scancel := context.WithTimeout(context.WithoutCancel(r.Context()), settleTimeout)
+		defer scancel()
+		if err := worklist.SettleDraft(sctx, h.store, user.ID, id, key, claimedAt, receipt); err != nil {
 			// The claim stands: the thread shows the draft as possibly created, and no
 			// replay writes again. Safe, if less precise.
 			slog.WarnContext(ctx, "pending review: could not record the outcome", "user", user.ID, "err", err)

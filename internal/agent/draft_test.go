@@ -115,6 +115,11 @@ func TestRunConverseDraftsReview(t *testing.T) {
 	if d.Commit != draftHead || d.Repo != "o/r" || d.Number != 1 || d.BaseRef != "main" || len(d.Comments) != 2 {
 		t.Fatalf("draft = %+v", d)
 	}
+	// The commented file's patch is recorded, so the web tier can tell if the
+	// merge base moved under it.
+	if len(d.Patches) != 1 || d.Patches["a.go"] != worklist.PatchDigest(draftPatch) {
+		t.Fatalf("draft = %+v", d)
+	}
 	if d.Comments[0].Side != worklist.SideRight || d.Comments[1].Side != worklist.SideLeft {
 		t.Errorf("comments = %+v", d.Comments)
 	}

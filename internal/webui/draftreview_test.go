@@ -21,11 +21,17 @@ type fakeReviewCommenter struct {
 	result  comment.ReviewResult
 	reviews []comment.Review
 	during  func() // when set, PendingReview calls it first (to look at the store mid-request)
+	expire  bool   // when set, PendingReview waits out the request's deadline and fails, as a slow GitHub read would
 }
 
-func (f *fakeReviewCommenter) PendingReview(_ context.Context, _ string, rv comment.Review) (comment.ReviewResult, error) {
+func (f *fakeReviewCommenter) PendingReview(ctx context.Context, _ string, rv comment.Review) (comment.ReviewResult, error) {
 	if f.during != nil {
 		f.during()
+	}
+	if f.expire {
+		<-ctx.Done()
+		f.reviews = append(f.reviews, rv)
+		return comment.ReviewResult{}, ctx.Err()
 	}
 	f.reviews = append(f.reviews, rv)
 	return f.result, nil
@@ -40,6 +46,7 @@ func draftedThread(at time.Time) []worklist.Message {
 		{ID: "d", Role: worklist.RoleUser, Content: draftReviewPrompt, Kind: worklist.KindDraftReviewRequest, At: at},
 		{ID: "a", ReplyTo: "d", Role: worklist.RoleAgent, Content: "Drafted 2.", At: at, Draft: &worklist.DraftReview{
 			Repo: "o/r", Number: 1, Commit: draftCommit, BaseRef: "main", Body: "- Add a test.",
+			Patches: map[string]string{"a.go": worklist.PatchDigest("pa"), "b.go": worklist.PatchDigest("pb")},
 			Comments: []worklist.DraftComment{
 				{Path: "a.go", Line: 3, Side: "RIGHT", Body: "Rename x."},
 				{Path: "b.go", Line: 9, Side: "LEFT", Body: "Why remove this?"},
@@ -198,6 +205,9 @@ func TestCreateDraftReviewSendsTheStoredSelection(t *testing.T) {
 	}
 	if got := rv.Comments[0]; got.Path != "b.go" || got.Line != 9 || got.Side != "LEFT" || got.Body != "Why remove this?" {
 		t.Errorf("comment = %+v", got)
+	}
+	if len(rv.Patches) != 1 || rv.Patches["b.go"] != worklist.PatchDigest("pb") {
+		t.Errorf("patches sent = %v, want b.go's only", rv.Patches)
 	}
 	if !strings.Contains(rec.Body.String(), "Pending review created") || !strings.Contains(rec.Body.String(), "pullrequestreview-9") {
 		t.Errorf("result page:\n%s", rec.Body.String())
@@ -358,4 +368,42 @@ func TestEmptyRedraftRetiresTheDraft(t *testing.T) {
 	if rec := postCreate(h, draftConfirmForm(th), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusConflict || len(c.reviews) != 0 {
 		t.Errorf("status %d, reviews %+v", rec.Code, c.reviews)
 	}
+}
+
+// A request whose deadline ran out reading GitHub, before anything was sent, still
+// releases its claim (settling has its own deadline), so the draft can be confirmed
+// again.
+func TestCreateDraftReviewReleasesAfterTheDeadline(t *testing.T) {
+	old := draftReviewTimeout
+	draftReviewTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { draftReviewTimeout = old })
+	th := draftedThread(time.Now().Add(-time.Hour))
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, expire: true}
+	h, _, mem := draftFixture(t, c, th)
+	// The store honours its context, as SQLite does, so a write under the request's
+	// expired deadline would fail.
+	store := ctxStore{mem}
+	h.store = store
+	if rec := postCreate(h, draftConfirmForm(th), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusBadGateway {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); it.Thread[3].DraftReceipt != nil {
+		t.Fatalf("the claim was not released: %+v", it.Thread[3].DraftReceipt)
+	}
+	c.expire = false
+	c.result = comment.ReviewResult{Created: true}
+	postCreate(h, draftConfirmForm(th), "Sec-Fetch-Site", "same-origin")
+	if len(c.reviews) != 2 {
+		t.Errorf("the draft could not be confirmed again: %d attempts", len(c.reviews))
+	}
+}
+
+// ctxStore is a store whose writes fail once their context is done.
+type ctxStore struct{ worklist.Store }
+
+func (s ctxStore) Update(ctx context.Context, ownerID string, fn func([]worklist.WorkItem) ([]worklist.WorkItem, error)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.Store.Update(ctx, ownerID, fn)
 }

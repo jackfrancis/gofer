@@ -583,7 +583,8 @@ Wired on the web-tier side; they define what a runtime must respect:
   unsettled disagreement is left out and listed), keeps inline only comments on a line
   the diff showed (others move into the summary), and replies with a
   `worklist.DraftReview` on `Message.Draft`, pinned to the repository, number, head
-  commit and base branch it was anchored to. Context lines anchor RIGHT only, as
+  commit and base branch it was anchored to, with each commented file's patch digest
+  (`DraftReview.Patches`, `worklist.PatchDigest` = `ghcomment.PatchDigest`). Context lines anchor RIGHT only, as
   GitHub defines them, and the annotated diff stays within its byte budget, notices
   included. `AppendReply` bounds the draft (`BoundDraft`) and drops it from a reply to
   any other turn or when pinned to another pull request; no agent read sends a draft
@@ -595,11 +596,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   the form (which names the turn, the draft's `Digest`, covering the pin, and the
   positions to keep), claims a durable `DraftReceipt` on the turn
   (`worklist.ClaimDraft`) before calling GitHub, and settles or releases it
-  (`SettleDraft`): a draft creates at most one review, and a replayed confirmation
-  shows the receipt and sends nothing. `comment.Service.PendingReview` creates it with
-  the write grant only while the user has no pending review there and, checked last,
-  the pull request is open with the draft's head and base branch; the POST has no
-  `event`, so GitHub keeps it pending. gofer never submits a review.
+  (`SettleDraft`, under its own deadline, never the request's): a draft creates at
+  most one review, and a replayed confirmation shows the receipt and sends nothing.
+  `comment.Service.PendingReview` creates it with the write grant only while the user
+  has no pending review there, every commented file's patch still has its digest (a
+  related merge into the base can move the merge base without moving head or base
+  branch), and, checked last, the pull request is open with the draft's head and base
+  branch; the POST has no `event`, so GitHub keeps it pending. Any 5xx on a ghcomment
+  POST is an unknown outcome, never "not posted". gofer never submits a review.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

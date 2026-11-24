@@ -41,7 +41,9 @@ review's text is written by a model, so this feature needs that rule amended.
    and side are an anchor the run showed the model; any other moves into the review
    summary with its location, so an agreed point is never lost to a bad anchor. The
    draft is **pinned** to what it was anchored to: the repository and pull request
-   number, the head commit, and the base branch.
+   number, the head commit, the base branch, and a digest of each commented file's
+   patch (`DraftReview.Patches`, SHA-256 of the patch text GitHub lists). A comment
+   on a file with no recorded digest is not stored.
 4. **Reply.** The run replies with a readable account (the numbered comments, the
    summary, and the points left out for lack of consensus) and a structured
    `worklist.DraftReview` on the reply (`Message.Draft`). `worklist.AppendReply`
@@ -69,14 +71,19 @@ review's text is written by a model, so this feature needs that rule amended.
    turn, written in the same transaction that re-checks the draft). It is then settled
    to `created` (with the review's link) or `unknown` (the answer was lost), or
    released when GitHub certainly created nothing (`SettleDraft`), so the owner can try
-   again. A confirmation of a draft that already has a receipt sends nothing to GitHub
-   and shows what the earlier one did; the thread shows the receipt instead of the form.
+   again. Settling has its own short deadline, apart from the request's, which the
+   GitHub calls may have used up: a release must land even when nothing was sent
+   because time ran out. A confirmation of a draft that already has a receipt sends
+   nothing to GitHub and shows what the earlier one did; the thread shows the receipt
+   instead of the form. A POST answered with any server error (5xx) is `unknown`, never
+   released: a 500 does not say the write was rolled back.
 8. **Create.** `comment.Service.PendingReview` creates the review with the write grant
-   through `internal/ghcomment` (three new calls, public repositories only, no
+   through `internal/ghcomment` (four new calls, public repositories only, no
    redirects followed). It reads the reviews (and refuses if the user already has a
-   pending one). Then, last, it reads the pull request: it must be open, with its head
-   still the draft's commit and its base still the draft's branch, since a push or a
-   retarget changes what the lines mean. Then it sends
+   pending one). It pages the pull request's files until it has every commented file,
+   and refuses if one left the diff, lost its patch, or has a patch whose digest
+   differs. Then, last, it reads the pull request: it must be open, with its head still
+   the draft's commit and its base still the draft's branch. Then it sends
    `POST /repos/{repo}/pulls/{n}/reviews` with `commit_id`, the summary and the
    comments and **no `event`**. GitHub treats `commit_id` as an anchor, not a
    precondition (it accepts an older commit), so these checks are gofer's, made as close
@@ -104,14 +111,22 @@ replay finds it. A claim whose request was cut off (the process died between cla
 settle) stays `creating`; after the request deadline the thread reads it as possibly
 created, never as not created. To create another review, the user drafts again.
 
-### The base branch, not the base commit
+### Revalidating the hunks, not pinning the base commit
 
-The base side of the diff (LEFT lines) is the merge base of the pull request's head and
-its base branch. With the head unchanged, it changes when the pull request is
-retargeted to another branch, which changes `base.ref`, and that is pinned. The base
-branch's tip (`base.sha`) moves whenever anything is merged into it, which leaves the
-diff unchanged, so pinning it would refuse nearly every confirmation on a busy
-repository.
+The diff is taken against the merge base of the pull request's head and its base
+branch. With the head unchanged, that merge base moves when the pull request is
+retargeted, or when a related change (one sharing history with this pull request) is
+merged into the base branch; either can change what a line number means, or drop a
+line from the diff. The base branch's tip (`base.sha`) moves whenever anything at all
+is merged into it, which usually leaves the diff unchanged, so pinning it would refuse
+nearly every confirmation on a busy repository; and the API offers the merge base
+itself only through the compare endpoint, whose answer carries the whole comparison.
+
+So gofer pins the base branch (a retarget refuses outright) and checks the hunks the
+review actually touches: the patch of every commented file, compared by digest with
+the one the comments were anchored to. A related merge that changed those patches
+refuses the review; one that left them alone, like any unrelated advance of the base,
+does not.
 
 ## Consequences
 
@@ -121,11 +136,12 @@ repository.
   name, but only as a pending review only they can see, after they saw and chose that
   exact text, and only through the web tier. The workload still holds read-only tokens
   and never the write grant.
-- `internal/ghcomment` makes four kinds of call instead of three.
+- `internal/ghcomment` makes five kinds of call instead of three.
 - A draft is as good as the model's reading of the conversation. The reply lists what
   was left out, so a missed disagreement is visible before anything is created.
-- Comments are anchored to the head and base branch the run read. After a push or a
-  retarget the review is refused ("draft again"), never anchored to moved lines.
+- Comments are anchored to the head, base branch and patches the run read. After a
+  push, a retarget, or a merge into the base that changed a commented file's patch,
+  the review is refused ("draft again"), never anchored to moved lines.
 - Each draft creates at most one review; starting over means drafting again.
 - Long threads are read through the bounded thread window (`MaxItemBytes`), as every
   converse run reads them; the oldest turns of a very long thread may be left out.

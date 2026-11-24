@@ -53,6 +53,19 @@ type DraftReview struct {
 	BaseRef  string         `json:"base_ref"`
 	Body     string         `json:"body,omitempty"`
 	Comments []DraftComment `json:"comments,omitempty"`
+	// Patches maps every commented file to the PatchDigest of the patch its comments
+	// were anchored to. The web tier re-reads those patches before it creates the
+	// review and refuses if one changed: a related change merged into the base can
+	// move the merge base, and with it the lines, without moving the head or the base
+	// branch.
+	Patches map[string]string `json:"patches,omitempty"`
+}
+
+// PatchDigest identifies one file's patch as GitHub lists it on the pull request's
+// files: hex SHA-256 of the patch text (ghcomment.PatchDigest computes the same).
+func PatchDigest(patch string) string {
+	sum := sha256.Sum256([]byte(patch))
+	return hex.EncodeToString(sum[:])
 }
 
 // DraftComment is one inline comment: a single line of one file's diff.
@@ -107,9 +120,10 @@ var draftRepo = regexp.MustCompile(`^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`)
 
 // BoundDraft returns d normalized to what may be stored: nil when its pin (repo,
 // number, full commit id, base branch) is invalid or nothing is left to post;
-// comments with an empty body, an invalid path, a line below 1 or an unknown side
-// dropped; text cut to its bound; at most MaxDraftComments comments. A side left
-// empty is RIGHT.
+// comments with an empty body, an invalid path, a line below 1, an unknown side, or
+// no valid patch digest for their file dropped; text cut to its bound; at most
+// MaxDraftComments comments; patch digests kept for commented files only. A side
+// left empty is RIGHT.
 func BoundDraft(d *DraftReview) *DraftReview {
 	if d == nil || !validCommit(d.Commit) || !draftRepo.MatchString(d.Repo) || d.Number <= 0 ||
 		d.BaseRef == "" || len(d.BaseRef) > maxDraftRefBytes || !utf8.ValidString(d.BaseRef) {
@@ -128,10 +142,15 @@ func BoundDraft(d *DraftReview) *DraftReview {
 			side = SideRight
 		}
 		body := strings.TrimSpace(c.Body)
-		if body == "" || c.Line < 1 || (side != SideRight && side != SideLeft) || !ValidDraftPath(c.Path) {
+		digest := d.Patches[c.Path]
+		if body == "" || c.Line < 1 || (side != SideRight && side != SideLeft) || !ValidDraftPath(c.Path) || len(digest) != 64 || !isHex(digest) {
 			continue
 		}
 		out.Comments = append(out.Comments, DraftComment{Path: c.Path, Line: c.Line, Side: side, Body: cutText(body, MaxDraftCommentBytes)})
+		if out.Patches == nil {
+			out.Patches = map[string]string{}
+		}
+		out.Patches[c.Path] = strings.ToLower(digest)
 	}
 	if out.Empty() {
 		return nil
@@ -155,9 +174,10 @@ func ValidDraftPath(p string) bool {
 
 // validCommit reports whether s is a full commit id (SHA-1 or SHA-256, hex).
 func validCommit(s string) bool {
-	if len(s) != 40 && len(s) != 64 {
-		return false
-	}
+	return (len(s) == 40 || len(s) == 64) && isHex(s)
+}
+
+func isHex(s string) bool {
 	_, err := hex.DecodeString(s)
 	return err == nil
 }
