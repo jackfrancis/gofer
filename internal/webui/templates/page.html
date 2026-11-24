@@ -245,7 +245,7 @@
       {{end}}
       {{if .SynthesisTooLarge}}
       <div class="zz-stalled">
-        <p>The reviews this consensus compares are too large to read together, so it can&rsquo;t be retried. Hide some of them and run the review panel again for a smaller comparison.</p>
+        <p>The reviews this consensus compares are too large to read together, so it can&rsquo;t be retried. Hide some of them and get another 2nd opinion for a smaller comparison.</p>
       </div>
       {{end}}
       {{with .Draft}}
@@ -281,11 +281,11 @@
       {{if and .SecondOpinionEnabled (not .ReplyPending)}}
       <form class="zz-so-form" method="post" action="/items/second-opinion">
         <input type="hidden" name="id" value="{{.Item.ID}}">
-        <label class="zz-so-label" for="zz-so-model">Review panel</label>
+        <label class="zz-so-label" for="zz-so-model">2nd opinion from</label>
         <select class="zz-so-select" id="zz-so-model" name="choice">
           {{range .SecondOpinionOptions}}<option value="{{.Value}}">{{.Label}}</option>{{end}}
         </select>
-        <button class="btn btn-sm" type="submit" title="An independent review by the selected model, then a consensus check by the default model">Run review panel</button>
+        <button class="btn btn-sm" type="submit" title="An independent review by the selected model, then a consensus check by the default model">Get 2nd Opinion</button>
       </form>
       {{end}}
       {{else}}
@@ -364,7 +364,7 @@
           <details class="zz-menu">
             <summary class="btn btn-sm">Get 2nd Opinion ({{.SecondOpinionCount}})</summary>
             <div class="zz-menu-list">
-              <div class="zz-menu-head">2nd opinion with&hellip;</div>
+              <div class="zz-menu-head">2nd opinion from&hellip;</div>
               {{range .SecondOpinionMenuOptions}}
               <form method="post" action="/items/second-opinion-all">
                 {{template "projectScope" $}}
@@ -377,7 +377,7 @@
           {{else if eq .SecondOpinionMode "auto"}}
           <form method="post" action="/items/second-opinion-all">
             {{template "projectScope" $}}
-            <button class="btn btn-sm" type="submit" title="The first reviews used different models — a different model is auto-picked per PR">Get 2nd Opinion ({{.SecondOpinionCount}})</button>
+            <button class="btn btn-sm" type="submit" title="An independent review by a model other than the first reviewer (auto-picked per PR, since the first reviews used different models), then a consensus check by the default model">Get 2nd Opinion ({{.SecondOpinionCount}})</button>
           </form>
           {{end}}
           {{if .ResetCount}}

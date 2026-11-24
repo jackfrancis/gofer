@@ -825,7 +825,7 @@ func (h *Handler) HideItem(w http.ResponseWriter, r *http.Request) {
 // the PR's diff and discussion as source context before answering.
 const reviewPrompt = "Can you review this PR?"
 
-// independentReviewPrompt is the message posted by the "Review panel" action to the
+// independentReviewPrompt is the message posted by the "Get 2nd Opinion" action to the
 // alternative model (worklist.IndependentReviewPrompt).
 const independentReviewPrompt = worklist.IndependentReviewPrompt
 
@@ -949,7 +949,7 @@ func (h *Handler) revertShared(ctx context.Context, ownerID string, err error, s
 	}
 }
 
-// SecondOpinion handles POST /items/second-opinion — the "Review panel" action. It
+// SecondOpinion handles POST /items/second-opinion — the "Get 2nd Opinion" action. It
 // appends an independent-review prompt to the item's thread and dispatches a blind
 // review by the selected model, which must differ from the item's first reviewer
 // (panelChoices); once reviews to compare have landed, in either order, the agent

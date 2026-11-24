@@ -49,7 +49,7 @@ func knownNotice(n string) bool { return n == NoticeReconnect || n == NoticePane
 const ReconnectNotice = "gofer can't reach GitHub for you: sign in again to reconnect, then ask again."
 
 // PanelInputsNotice is the text of a NoticePanelInputs turn.
-const PanelInputsNotice = "gofer didn't run the consensus: a review it compares is hidden or gone, or the reviews are too large to read together. Unhide the review and retry, or hide some reviews and run the review panel again for a smaller comparison."
+const PanelInputsNotice = "gofer didn't run the consensus: a review it compares is hidden or gone, or the reviews are too large to read together. Unhide the review and retry, or hide some reviews and get another 2nd opinion for a smaller comparison."
 
 // ErrSignInRequired is the error a ToolBox returns (wrapped) when the user's
 // provider credential is gone and only signing in again helps. A Conversationalist

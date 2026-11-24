@@ -368,7 +368,7 @@ Wired on the web-tier side; they define what a runtime must respect:
   (`Selection.Open`, which means on the radar) leaves it out of enrichment and
   ranking. The radar lists open hidden items in a greyscale section below the ranked
   list (`Resolution.Hidden`, most recently hidden first) with an Unhide button and no
-  Discuss: a hidden item takes no new turn, retry, review panel or turn hide/unhide
+  Discuss: a hidden item takes no new turn, retry, 2nd opinion or turn hide/unhide
   (`appendTurn`, `ThreadRetry`, `HideMessage`), and its thread page is read-only.
   Unhide (`worklist.UnhideItem`) brings it back empty. Its pre-hide CI summary is
   kept but marked `CISummary.Stale` (labeled as last known) until enrich reads the
@@ -428,7 +428,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   converse dispatch it turns away returns a `*ingest.RunSharedError`
   (`ErrRunShared`), not nil, so a retry knows no run of its own started.
   A second opinion posts its own user turn, so it is never a duplicate.
-- The review panel (`POST /items/second-opinion`, and Get 2nd Opinion in bulk) posts
+- Get 2nd Opinion (`POST /items/second-opinion` on a thread, and in bulk; "the review
+  panel" in the code, though no reviewers confer: a blind review, then an agreement
+  check) posts
   `worklist.IndependentReviewPrompt` as a review request (a panel review is
   `KindReviewRequest` with that text, `Message.IsPanelReview`; the same text typed into
   Discuss is not one) for a blind review by a model other than the item's first

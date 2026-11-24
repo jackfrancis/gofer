@@ -117,7 +117,7 @@ func TestWorklistSecondOpinionButton(t *testing.T) {
 	if !strings.Contains(auto, `action="/items/second-opinion-all"`) || !strings.Contains(auto, "Get 2nd Opinion (2)") {
 		t.Fatalf("expected the immediate 2nd-opinion button, got:\n%s", auto)
 	}
-	if strings.Contains(auto, "2nd opinion with") {
+	if strings.Contains(auto, "2nd opinion from") {
 		t.Fatal("auto mode should not render a model menu")
 	}
 

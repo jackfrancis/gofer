@@ -741,7 +741,7 @@ func (i *Ingestor) Synthesize(ctx context.Context, ownerID string, ref worklist.
 	sctx, cancel := context.WithTimeout(ctx, submitTimeout)
 	defer cancel()
 	if err := i.dispatchConverse(sctx, ownerID, ref, "", "", false); err != nil && !errors.Is(err, ErrRunShared) {
-		i.log.Warn("review-panel synthesis dispatch failed; the thread offers a retry", "owner", ownerID, "item", ref.Item, "turn", ref.Turn, "err", err)
+		i.log.Warn("second-opinion synthesis dispatch failed; the thread offers a retry", "owner", ownerID, "item", ref.Item, "turn", ref.Turn, "err", err)
 	}
 }
 
