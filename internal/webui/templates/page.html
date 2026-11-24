@@ -232,6 +232,7 @@
           <details class="zz-menu zz-filter">
             <summary class="btn btn-sm" title="Choose which projects to show">Projects: {{if .ProjectsFiltered}}{{.SelectedProjects}} of {{len .Projects}}{{else}}All{{end}} &#9662;</summary>
             <form class="zz-menu-list zz-filter-list" method="post" action="/items/projects">
+              <input type="hidden" name="offered" value="{{.ProjectsOffered}}">
               <label class="zz-filter-opt zz-filter-all" hidden><input type="checkbox" name="all" value="1" data-filter-all disabled{{if not .ProjectsFiltered}} checked{{end}}> Select all</label>
               <div class="zz-filter-options">
                 {{range .Projects}}
@@ -245,7 +246,26 @@
             </form>
           </details>
           {{end}}
-          <p class="zz-count">{{if .ProjectsFiltered}}{{len .Items}} of {{.TotalItems}} items{{else}}{{len .Items}} item{{if ne (len .Items) 1}}s{{end}}{{end}} on your radar{{if .WatchRefresh}}<span data-refreshing role="status"{{if not .Refreshing}} hidden{{end}}> · refreshing from GitHub…</span>{{end}}</p>
+          {{if or (gt (len .Labels) 1) .LabelsFiltered}}
+          <details class="zz-menu zz-filter">
+            <summary class="btn btn-sm" title="Choose which labels to show, within the selected projects">Labels: {{if .LabelsFiltered}}{{.SelectedLabels}} of {{len .Labels}}{{else}}All{{end}} &#9662;</summary>
+            <form class="zz-menu-list zz-filter-list" method="post" action="/items/labels">
+              <input type="hidden" name="offered" value="{{.LabelsOffered}}">
+              <label class="zz-filter-opt zz-filter-all" hidden><input type="checkbox" name="all" value="1" data-filter-all disabled{{if not .LabelsFiltered}} checked{{end}}> Select all</label>
+              <div class="zz-filter-options">
+                {{range .Labels}}
+                {{if .None}}<label class="zz-filter-opt"><input type="checkbox" name="nolabel" value="1" data-filter-label{{if .Selected}} checked{{end}}> <span class="zz-filter-name zz-filter-none">{{.Name}}</span> <span class="zz-filter-count">{{.Count}}</span></label>
+                {{else}}<label class="zz-filter-opt"><input type="checkbox" name="label" value="{{.Key}}" data-filter-label{{if .Selected}} checked{{end}}> <span class="zz-filter-name"><span class="Label zz-ghlabel{{with .Class}} {{.}}{{end}}">{{.Name}}</span></span> <span class="zz-filter-count">{{.Count}}</span></label>{{end}}
+                {{end}}
+              </div>
+              <div class="zz-filter-actions">
+                <button class="btn btn-primary btn-sm" type="submit">Apply</button>
+                {{if .LabelsFiltered}}<button class="btn btn-sm" type="submit" name="all" value="1">Show all labels</button>{{end}}
+              </div>
+            </form>
+          </details>
+          {{end}}
+          <p class="zz-count">{{if .Filtered}}{{len .Items}} of {{.TotalItems}} items{{else}}{{len .Items}} item{{if ne (len .Items) 1}}s{{end}}{{end}} on your radar{{if .WatchRefresh}}<span data-refreshing role="status"{{if not .Refreshing}} hidden{{end}}> · refreshing from GitHub…</span>{{end}}</p>
         </div>
         <div class="zz-toolbar-actions">
           <form method="post" action="/items/refresh">
@@ -269,7 +289,7 @@
             {{else}}
             <form method="post" action="/items/review-all">
               {{template "projectScope" $}}
-              <button class="btn btn-primary btn-sm" type="submit" title="Review every pull request{{if .ProjectsFiltered}} in the selected projects{{end}} that hasn't been reviewed yet">Review all PRs{{if gt .ReviewCount 1}} ({{.ReviewCount}}){{end}}</button>
+              <button class="btn btn-primary btn-sm" type="submit" title="Review every pull request{{template "filterScope" .}} that hasn't been reviewed yet">Review all PRs{{if gt .ReviewCount 1}} ({{.ReviewCount}}){{end}}</button>
             </form>
             {{end}}
           {{end}}
@@ -296,7 +316,7 @@
           {{if .ResetCount}}
           <form method="post" action="/items/reset-conversations">
             {{template "projectScope" $}}
-            <button class="btn btn-sm btn-danger" type="submit" title="Clear every Discuss thread{{if .ProjectsFiltered}} in the selected projects{{end}}, including on hidden and completed items, so the review workflows can be run again from scratch. This cannot be undone; the work itself is untouched.">Reset Conversations ({{.ResetCount}})</button>
+            <button class="btn btn-sm btn-danger" type="submit" title="Clear every Discuss thread{{template "filterScope" .}}, including on hidden and completed items, so the review workflows can be run again from scratch. This cannot be undone; the work itself is untouched.">Reset Conversations ({{.ResetCount}})</button>
           </form>
           {{end}}
         </div>
@@ -308,7 +328,15 @@
         {{end}}{{end}}
       </ul>
       {{end}}
+      {{if and .LabelsFiltered .SelectedLabels (lt .SelectedLabels (len .Labels))}}
+      <ul class="zz-selected-projects zz-selected-labels" aria-label="Selected labels">
+        {{range .Labels}}{{if .Selected}}
+        <li>{{if .None}}<span class="zz-filter-none">{{.Name}}</span>{{else}}<span class="Label zz-ghlabel{{with .Class}} {{.}}{{end}}">{{.Name}}</span>{{end}}</li>
+        {{end}}{{end}}
+      </ul>
+      {{end}}
       {{with .ProjectsError}}<p class="zz-stalled" role="alert">{{.}}</p>{{end}}
+      {{with .LabelsError}}<p class="zz-stalled" role="alert">{{.}}</p>{{end}}
       {{with .CommentNotice}}<p class="zz-stalled" role="status">{{.}}</p>{{end}}
       {{if .CommentEnabled}}{{if .CommentConnected}}
       <details class="zz-compose" data-compose>
@@ -332,7 +360,7 @@
       {{range .Items}}
         {{template "item" (row . $.ConvEnabled $.CommentConnected)}}
       {{else}}
-        <div class="zz-empty"><p>{{if .Waiting}}Nothing{{if .ProjectsFiltered}} in the selected projects{{end}} needs you right now.{{else if .ProjectsFiltered}}No items in the selected projects.{{else}}Nothing on your radar right now.{{end}}</p></div>
+        <div class="zz-empty"><p>{{if .Waiting}}Nothing{{template "filterScope" .}} needs you right now.{{else if .LabelsFiltered}}No {{if .HiddenItems}}ranked {{end}}items match the selected {{if .ProjectsFiltered}}projects and {{end}}labels{{if .HiddenItems}}; only hidden ones do{{end}}.{{else if .ProjectsFiltered}}No {{if .HiddenItems}}ranked {{end}}items in the selected projects{{if .HiddenItems}}; only hidden ones{{end}}.{{else}}Nothing on your radar right now.{{end}}</p></div>
       {{end}}
       {{with .Waiting}}
       <section class="zz-waiting" aria-labelledby="zz-waiting-head">
@@ -372,7 +400,10 @@
   </div>
 </body>
 </html>
-{{define "projectScope"}}{{if .ProjectsFiltered}}<input type="hidden" name="scope" value="{{.ProjectScope}}">{{end}}{{end}}
+{{/* The page's filters, posted back by each bulk form: the projects (scope) and the labels it shows. */}}
+{{define "projectScope"}}{{if .ProjectsFiltered}}<input type="hidden" name="scope" value="{{.ProjectScope}}">{{end}}{{if .LabelsFiltered}}<input type="hidden" name="labels" value="{{.LabelScope}}">{{end}}{{end}}
+{{/* Words naming what a bulk action covers under the page's filters, for its tooltip. */}}
+{{define "filterScope"}}{{if and .ProjectsFiltered .LabelsFiltered}} in the selected projects with the selected labels{{else if .ProjectsFiltered}} in the selected projects{{else if .LabelsFiltered}} with the selected labels{{end}}{{end}}
 {{define "item"}}{{with .Item}}
         <div class="zz-item">
           <div class="zz-item-head">

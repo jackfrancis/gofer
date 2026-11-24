@@ -103,7 +103,9 @@ var signals = []struct {
 // FetchWorklist retrieves the issues and pull requests on the user's radar —
 // everything they are involved in, plus everything awaiting their review —
 // deduplicated by item ID. When an item surfaces under more than one query, the
-// reasons are merged onto a single work item.
+// reasons are merged onto a single work item, and its newest copy decides its state.
+// Another contributor's draft pull request is left out (searchItem.othersDraft)
+// without making the fetch partial, and reported in Fetch.OthersDrafts.
 //
 // Each query is paged to exhaustion rather than sampled: a long-running
 // contributor's involvement runs to hundreds of open items, and taking one arbitrary
@@ -135,6 +137,17 @@ type Fetch struct {
 	// review is requested: when that search is partial, an item may arrive through
 	// involves: alone while its request is still pending.
 	ReviewRequestsComplete bool
+	// OthersDrafts maps, by item ID, the hits whose current state (the newest copy
+	// across the searches) is another contributor's draft pull request, left out of
+	// Items, to that copy as a work item (Draft set; ingest stores it only retired,
+	// never on the radar, to remember the state). Unlike an absence, this is positive
+	// evidence, so ingest retires a stored copy of each even when the fetch is
+	// partial, unless the stored copy is a ready pull request GitHub updated later
+	// than the draft result (the search index can lag the item). Only observations
+	// from a repository the public-only gate confirms are listed; one from a
+	// repository that is private, gone or unanswered is evidence of nothing, and an
+	// unanswered check also makes the fetch incomplete, as for a hit.
+	OthersDrafts map[string]worklist.WorkItem
 }
 
 // FetchWorklistDetail is FetchWorklist, also reporting whether the review-request
@@ -147,7 +160,15 @@ func (c *Client) FetchWorklistDetail(ctx context.Context, token string) (Fetch, 
 	if err != nil {
 		return Fetch{}, fmt.Errorf("github login: %w", err)
 	}
-	seen := make(map[string]worklist.WorkItem)
+	// Hits are reconciled by item ID before anything is decided about them: the same
+	// item can come back from two queries walked at different moments, and the copy
+	// GitHub updated last is its current state (a pull request marked draft, or ready,
+	// between the two walks). Reasons are merged across every copy.
+	type hit struct {
+		item    searchItem
+		reasons []worklist.Reason
+	}
+	seen := make(map[string]*hit)
 	complete, reviewsComplete := true, true
 	for _, s := range signals {
 		found, whole, err := c.searchIssues(ctx, token, s.query)
@@ -159,26 +180,48 @@ func (c *Client) FetchWorklistDetail(ctx context.Context, token string) (Fetch, 
 			reviewsComplete = reviewsComplete && whole
 		}
 		for _, it := range found {
-			wi, ok := it.toWorkItem(s.reason, viewer, now)
-			if !ok {
+			id, rs := it.id(), reasonsFor(s.reason, it, viewer)
+			h, dup := seen[id]
+			if !dup {
+				seen[id] = &hit{item: it, reasons: rs}
 				continue
 			}
-			if existing, dup := seen[wi.ID]; dup {
-				for _, r := range wi.Signals.Reasons {
-					existing.Signals.Reasons = appendReason(existing.Signals.Reasons, r)
-				}
-				seen[wi.ID] = existing
-				continue
+			for _, r := range rs {
+				h.reasons = appendReason(h.reasons, r)
 			}
-			seen[wi.ID] = wi
+			if newerState(it, h.item) {
+				h.item = it
+			}
 		}
 	}
 	out := make([]worklist.WorkItem, 0, len(seen))
-	for _, wi := range seen {
-		out = append(out, wi)
+	var draftHits []*hit
+	for _, h := range seen {
+		if h.item.othersDraft(viewer) {
+			draftHits = append(draftHits, h)
+			continue
+		}
+		out = append(out, h.item.workItem(h.reasons, now))
 	}
-	out, confirmed := c.publicHits(ctx, token, out)
+	// A draft observation passes the same public-only gate as a hit: one from a
+	// repository not confirmed public is evidence of nothing (a definite private
+	// verdict overrides it), so it can neither retire nor preserve a stored item.
+	draftRepos := make([]string, 0, len(draftHits))
+	for _, d := range draftHits {
+		draftRepos = append(draftRepos, d.item.repo())
+	}
+	out, verdicts, confirmed := c.publicHits(ctx, token, out, draftRepos)
 	complete = complete && confirmed
+	var drafts map[string]worklist.WorkItem
+	for _, d := range draftHits {
+		if verdicts[d.item.repo()] != verdictPublic {
+			continue
+		}
+		if drafts == nil {
+			drafts = make(map[string]worklist.WorkItem)
+		}
+		drafts[d.item.id()] = d.item.workItem(d.reasons, now)
+	}
 	// Deduplication runs through a map, so without this the result order is Go's
 	// randomized map iteration — and every downstream "first N" (the rank cap, any
 	// paging) would pick a different arbitrary subset on each run, reshuffling the
@@ -190,7 +233,19 @@ func (c *Client) FetchWorklistDetail(ctx context.Context, token string) (Fetch, 
 		}
 		return strings.Compare(a.ID, b.ID)
 	})
-	return Fetch{Items: out, Complete: complete, ReviewRequestsComplete: reviewsComplete}, nil
+	return Fetch{Items: out, Complete: complete, ReviewRequestsComplete: reviewsComplete, OthersDrafts: drafts}, nil
+}
+
+// newerState reports whether search hit a, for the same item as b, is its newer
+// state. The newer updated_at wins. GitHub reports timestamps to the second, so two
+// states can share one: on such a tie a draft beats a ready copy, so the answer never
+// depends on which search returned first, and the item stays off the worklist until
+// a later read shows it ready.
+func newerState(a, b searchItem) bool {
+	if c := a.UpdatedAt.Compare(b.UpdatedAt); c != 0 {
+		return c > 0
+	}
+	return a.Draft && !b.Draft
 }
 
 // appendReason adds r to rs if not already present, keeping reasons unique and in
@@ -275,7 +330,44 @@ type searchItem struct {
 	} `json:"pull_request"`
 }
 
+// othersDraft reports a draft pull request someone other than the viewer opened.
+// Its author is still working on it, so it is not the viewer's work yet, whatever
+// their relationship to it (mentioned, assigned, even asked to review): it stays off
+// the worklist until it is marked ready for review. A hit with no author is not
+// proven to be the viewer's, so it is treated as someone else's.
+func (it searchItem) othersDraft(viewer string) bool {
+	if it.PullRequest == nil || !it.Draft {
+		return false
+	}
+	return it.User == nil || !strings.EqualFold(it.User.Login, viewer)
+}
+
+// repo is the hit's "owner/name".
+func (it searchItem) repo() string {
+	return strings.TrimPrefix(it.RepositoryURL, defaultBaseURL+"/repos/")
+}
+
+// id is the work item ID the hit maps to.
+func (it searchItem) id() string {
+	return "github:" + it.repo() + "#" + strconv.Itoa(it.Number)
+}
+
+// toWorkItem maps a single search hit to a work item. ok is false for a hit that
+// does not belong on the worklist: another contributor's draft pull request
+// (othersDraft). Ingest retires a stored copy of one (a pull request converted back
+// to draft), keeping its thread, and it resurfaces once it is marked ready for
+// review. FetchWorklistDetail reconciles hits across searches first and maps the
+// result with workItem.
 func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.Time) (worklist.WorkItem, bool) {
+	if it.othersDraft(viewer) {
+		return worklist.WorkItem{}, false
+	}
+	return it.workItem(reasonsFor(reason, it, viewer), now), true
+}
+
+// workItem maps a search hit, already judged to belong on the worklist, to a work
+// item with the given reasons.
+func (it searchItem) workItem(reasons []worklist.Reason, now time.Time) worklist.WorkItem {
 	// The search/issues endpoint returns both issues and PRs; a pull_request
 	// object marks a PR. Both belong on the radar, so map the type instead of
 	// dropping issues.
@@ -285,14 +377,14 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 		itemType = worklist.TypePullRequest
 		merged = it.PullRequest.MergedAt != nil
 	}
-	repo := strings.TrimPrefix(it.RepositoryURL, defaultBaseURL+"/repos/")
+	repo := it.repo()
 	var author string
 	if it.User != nil {
 		author = it.User.Login
 	}
 
 	sig := worklist.Signals{
-		Reasons:        reasonsFor(reason, it, viewer),
+		Reasons:        reasons,
 		Comments:       it.Comments,
 		OpenedAt:       it.CreatedAt,
 		LastActivityAt: it.UpdatedAt,
@@ -316,7 +408,7 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 	}
 
 	return worklist.WorkItem{
-		ID:     "github:" + repo + "#" + strconv.Itoa(it.Number),
+		ID:     it.id(),
 		Source: "github",
 		Type:   itemType,
 		GitHub: worklist.GitHubRef{
@@ -335,7 +427,7 @@ func (it searchItem) toWorkItem(reason worklist.Reason, viewer string, now time.
 		},
 		Signals: sig,
 		Meta:    worklist.Metadata{Origin: worklist.OriginAgent},
-	}, true
+	}
 }
 
 // searchIssues walks a search query page by page. whole reports that the walk saw
@@ -432,15 +524,22 @@ const (
 // is false when any repository's check had no answer (a timeout, a rate limit, the
 // run's time budget): its items are left out, and the caller must not treat the
 // fetch as the whole open set. A definite answer (private, not found, refused) drops
-// the items without that.
-func (c *Client) publicHits(ctx context.Context, token string, items []worklist.WorkItem) (kept []worklist.WorkItem, confirmed bool) {
+// the items without that. extraRepos are checked alongside (the repositories of the
+// draft observations, Fetch.OthersDrafts), and every verdict is returned.
+func (c *Client) publicHits(ctx context.Context, token string, items []worklist.WorkItem, extraRepos []string) (kept []worklist.WorkItem, verdicts map[string]verdict, confirmed bool) {
 	var repos []string
-	verdicts := make(map[string]verdict)
-	for _, it := range items {
-		if _, ok := verdicts[it.GitHub.Repo]; !ok {
-			verdicts[it.GitHub.Repo] = verdictUnknown
-			repos = append(repos, it.GitHub.Repo)
+	verdicts = make(map[string]verdict)
+	add := func(repo string) {
+		if _, ok := verdicts[repo]; !ok {
+			verdicts[repo] = verdictUnknown
+			repos = append(repos, repo)
 		}
+	}
+	for _, it := range items {
+		add(it.GitHub.Repo)
+	}
+	for _, repo := range extraRepos {
+		add(repo)
 	}
 	// The checks stop gateTimeReserve before the run's deadline, in flight or not:
 	// a repository left unchecked stays unknown rather than spend what the write-back
@@ -488,7 +587,7 @@ func (c *Client) publicHits(ctx context.Context, token string, items []worklist.
 			kept = append(kept, it)
 		}
 	}
-	return kept, confirmed
+	return kept, verdicts, confirmed
 }
 
 // hasNextPage reports whether a response's Link header advertises a further page.
