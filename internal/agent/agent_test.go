@@ -909,3 +909,354 @@ func TestRefreshReviewRequestEvidence(t *testing.T) {
 		}
 	})
 }
+
+// A partial fetch retires nothing it merely did not see, but a stored pull request
+// the fetch SAW as another contributor's draft is retired all the same (thread kept):
+// otherwise an account whose issue search never completes would keep a converted
+// draft on the radar as ready indefinitely.
+func TestRunIngestPartialFetchRetiresOthersDrafts(t *testing.T) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case r.URL.Path == "/search/issues":
+			q := r.URL.Query().Get("q")
+			switch {
+			case strings.Contains(q, "is:issue"):
+				// The issue search is partial, so the whole fetch is.
+				_, _ = w.Write([]byte(`{"incomplete_results":true,"items":[]}`))
+			case strings.Contains(q, "involves:@me"):
+				_, _ = w.Write([]byte(`{"total_count":2,"items":[
+					{"number":7,"title":"T","html_url":"u","state":"open","repository_url":"https://api.github.com/repos/o/r","user":{"login":"someone"},"pull_request":{"url":"x"}},
+					{"number":8,"title":"T","html_url":"u","state":"open","draft":true,"repository_url":"https://api.github.com/repos/o/r","user":{"login":"someone"},"pull_request":{"url":"x"}}]}`))
+			default:
+				_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
+			}
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+	thread := worklist.Message{Role: worklist.RoleUser, Content: "review?"}
+	sink := &memSink{items: []worklist.WorkItem{prItem(7), prItem(8, thread), prItem(9)}}
+	if err := Run(context.Background(),
+		Params{JobType: JobIngest, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+		fakeVendor{token: "tok"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	draft := itemByID(t, sink.items, "github:o/r#8")
+	if draft.Meta.CompletedAt.IsZero() {
+		t.Fatal("another contributor's draft stayed on the radar after a partial fetch")
+	}
+	if len(draft.Thread) != 1 {
+		t.Errorf("retiring must keep the thread; got %d turns", len(draft.Thread))
+	}
+	if got := itemByID(t, sink.items, "github:o/r#7"); !got.Meta.CompletedAt.IsZero() {
+		t.Error("a ready pull request was retired")
+	}
+	if got := itemByID(t, sink.items, "github:o/r#9"); !got.Meta.CompletedAt.IsZero() {
+		t.Error("an item missing from a PARTIAL fetch was retired")
+	}
+}
+
+// draftServer answers the radar queries with one pull request, #8, shown as another
+// contributor's draft last updated at draftAt. partial makes the issue search
+// incomplete, and with it the whole fetch.
+func draftServer(t *testing.T, draftAt time.Time, partial bool) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case r.URL.Path == "/search/issues":
+			q := r.URL.Query().Get("q")
+			switch {
+			case strings.Contains(q, "is:issue"):
+				fmt.Fprintf(w, `{"incomplete_results":%v,"total_count":0,"items":[]}`, partial)
+			case strings.Contains(q, "involves:@me"):
+				fmt.Fprintf(w, `{"total_count":1,"items":[{"number":8,"title":"T","html_url":"u","state":"open","draft":true,"updated_at":%q,"repository_url":"https://api.github.com/repos/o/r","user":{"login":"someone"},"pull_request":{"url":"x"}}]}`,
+					draftAt.Format(time.RFC3339))
+			default:
+				_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
+			}
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+}
+
+// The search index can lag an item: a draft result older than the ready state the
+// store already holds is stale, so neither a partial nor a complete refresh retires
+// the ready PR on its strength. On a tie the draft wins (GitHub's timestamps are to
+// the second), and a stored copy that is itself a draft is retired whatever its time.
+func TestRunIngestStaleDraftResultKeepsNewerReadyPR(t *testing.T) {
+	draftAt := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name      string
+		storedAt  time.Time
+		storedDft bool
+		retired   bool
+	}{
+		{"stored ready is newer", draftAt.Add(4 * time.Minute), false, false},
+		{"stored ready is older", draftAt.Add(-4 * time.Minute), false, true},
+		{"tie", draftAt, false, true},
+		{"stored copy is a newer draft", draftAt.Add(4 * time.Minute), true, true},
+	}
+	for _, partial := range []bool{true, false} {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("%s/partial=%v", tc.name, partial), func(t *testing.T) {
+				srv := draftServer(t, draftAt, partial)
+				defer srv.Close()
+				stored := prItem(8, worklist.Message{Role: worklist.RoleUser, Content: "review?"})
+				stored.GitHub.UpdatedAt, stored.GitHub.Draft = tc.storedAt, tc.storedDft
+				sink := &memSink{items: []worklist.WorkItem{stored}}
+				if err := Run(context.Background(),
+					Params{JobType: JobIngest, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+					fakeVendor{token: "tok"}, sink); err != nil {
+					t.Fatal(err)
+				}
+				got := itemByID(t, sink.items, "github:o/r#8")
+				if retired := !got.Meta.CompletedAt.IsZero(); retired != tc.retired {
+					t.Fatalf("retired = %v, want %v", retired, tc.retired)
+				}
+				if len(got.Thread) != 1 {
+					t.Errorf("thread has %d turns, want 1", len(got.Thread))
+				}
+			})
+		}
+	}
+}
+
+// lifecycleServer answers the radar queries with the given pull request hits, from
+// repository o/r, whose visibility lookup answers private as given. partial makes
+// the issue search incomplete, and with it the whole fetch.
+func lifecycleServer(t *testing.T, partial, private bool, hits ...string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if name, ok := githubtest.RepoLookup(r); ok {
+			fmt.Fprintf(w, `{"id":1,"full_name":%q,"private":%v}`, name, private)
+			return
+		}
+		q := r.URL.Query().Get("q")
+		switch {
+		case r.URL.Path == "/user":
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+		case r.URL.Path == "/search/issues" && strings.Contains(q, "is:issue"):
+			fmt.Fprintf(w, `{"incomplete_results":%v,"total_count":0,"items":[]}`, partial)
+		case r.URL.Path == "/search/issues" && strings.Contains(q, "involves:@me"):
+			fmt.Fprintf(w, `{"total_count":%d,"items":[%s]}`, len(hits), strings.Join(hits, ","))
+		case r.URL.Path == "/search/issues":
+			_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// lifecycleHit is another contributor's pull request #n at 12:mm.
+func lifecycleHit(n int, draft bool, minute int) string {
+	return fmt.Sprintf(`{"number":%d,"title":"T","html_url":"u","state":"open","draft":%v,"updated_at":"2026-11-23T12:%02d:00Z","repository_url":"https://api.github.com/repos/o/r","user":{"login":"someone"},"pull_request":{"url":"x"}}`,
+		n, draft, minute)
+}
+
+func runLifecycleIngest(t *testing.T, srv *httptest.Server, sink *memSink) {
+	t.Helper()
+	if err := Run(context.Background(),
+		Params{JobType: JobIngest, Provider: "github", GitHubBaseURL: srv.URL, Client: srv.Client()},
+		fakeVendor{token: "tok"}, sink); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Retiring a confirmed draft records its draft state and GitHub time, so a later
+// refresh whose index still serves the older ready copy cannot reopen it; a ready
+// copy GitHub updated after the draft is the PR marked ready, and resurfaces it with
+// its thread. Partial and complete refreshes alike.
+func TestRunIngestConfirmedDraftSurvivesStaleReadyResult(t *testing.T) {
+	for _, partial := range []bool{true, false} {
+		t.Run(fmt.Sprintf("partial=%v", partial), func(t *testing.T) {
+			const id = "github:o/r#8"
+			stored := prItem(8, worklist.Message{Role: worklist.RoleUser, Content: "note"})
+			stored.GitHub.UpdatedAt = time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+			sink := &memSink{items: []worklist.WorkItem{stored}}
+
+			runLifecycleIngest(t, lifecycleServer(t, partial, false, lifecycleHit(8, true, 4)), sink)
+			got := itemByID(t, sink.items, id)
+			if got.OnRadar() {
+				t.Fatal("the 12:04 draft was not retired")
+			}
+			if !got.GitHub.Draft || !got.GitHub.UpdatedAt.Equal(time.Date(2026, 11, 23, 12, 4, 0, 0, time.UTC)) {
+				t.Errorf("retirement recorded draft=%v updated=%v, want the 12:04 draft", got.GitHub.Draft, got.GitHub.UpdatedAt)
+			}
+			retiredAt := got.Meta.CompletedAt
+
+			runLifecycleIngest(t, lifecycleServer(t, partial, false, lifecycleHit(8, false, 0)), sink)
+			if got := itemByID(t, sink.items, id); got.OnRadar() {
+				t.Fatal("a stale 12:00 ready result reopened the 12:04 draft")
+			}
+			runLifecycleIngest(t, lifecycleServer(t, partial, false, lifecycleHit(8, false, 4)), sink)
+			if got := itemByID(t, sink.items, id); got.OnRadar() {
+				t.Fatal("a ready result tied with the draft reopened it")
+			}
+			// Seeing the same draft again writes nothing new.
+			runLifecycleIngest(t, lifecycleServer(t, partial, false, lifecycleHit(8, true, 4)), sink)
+			if got := itemByID(t, sink.items, id); !got.Meta.CompletedAt.Equal(retiredAt) {
+				t.Errorf("re-seeing the draft re-stamped CompletedAt: %v -> %v", retiredAt, got.Meta.CompletedAt)
+			}
+
+			runLifecycleIngest(t, lifecycleServer(t, partial, false, lifecycleHit(8, false, 9)), sink)
+			got = itemByID(t, sink.items, id)
+			if !got.OnRadar() || got.GitHub.Draft {
+				t.Fatalf("the 12:09 ready result did not resurface the PR (on radar %v, draft %v)", got.OnRadar(), got.GitHub.Draft)
+			}
+			if len(got.Thread) != 1 {
+				t.Errorf("thread has %d turns, want 1", len(got.Thread))
+			}
+		})
+	}
+}
+
+// A draft observation from a repository the gate confirms private is evidence of
+// nothing, so it cannot keep a newer stored ready PR on the radar: a complete
+// refresh retires it with everything else from that repository.
+func TestRunIngestPrivateRepoDraftPreservesNothing(t *testing.T) {
+	stored := prItem(8)
+	stored.GitHub.UpdatedAt = time.Date(2026, 11, 23, 12, 4, 0, 0, time.UTC)
+	sink := &memSink{items: []worklist.WorkItem{stored, prItem(9)}}
+	runLifecycleIngest(t, lifecycleServer(t, false, true, lifecycleHit(8, true, 0), lifecycleHit(9, false, 4)), sink)
+	if itemByID(t, sink.items, "github:o/r#9").OnRadar() {
+		t.Fatal("a PR from a repository confirmed private stayed on the radar")
+	}
+	if itemByID(t, sink.items, "github:o/r#8").OnRadar() {
+		t.Error("a draft result from a private repository kept a stored ready PR on the radar")
+	}
+}
+
+// twoSearchServer answers the involves: and review-requested: pull request searches
+// with independent snapshots of the same PR (an empty string answers nothing).
+// partialReview makes the review-request search incomplete.
+func twoSearchServer(t *testing.T, involved, review string, partialReview bool) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user" {
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+			return
+		}
+		if r.URL.Path != "/search/issues" {
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		hit, partial := "", false
+		q := r.URL.Query().Get("q")
+		switch {
+		case strings.Contains(q, "review-requested:@me"):
+			hit, partial = review, partialReview
+		case strings.Contains(q, "is:pr") && strings.Contains(q, "involves:@me"):
+			hit = involved
+		}
+		n := 0
+		if hit != "" {
+			n = 1
+		}
+		fmt.Fprintf(w, `{"total_count":%d,"items":[%s],"incomplete_results":%v}`, n, hit, partial)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A draft seen on first sight, with no stored row, is still remembered (as a row
+// already retired, never on the radar), so a later partial refresh serving only the
+// older ready copy cannot put it on the radar; a newer ready copy does.
+func TestRunIngestRemembersFirstSeenDraft(t *testing.T) {
+	const id = "github:o/r#8"
+	sink := &memSink{}
+	runLifecycleIngest(t, twoSearchServer(t, lifecycleHit(8, false, 0), lifecycleHit(8, true, 4), false), sink)
+	got, ok := worklist.Find(sink.items, id)
+	if !ok {
+		t.Fatal("the first-seen draft was not remembered")
+	}
+	if got.OnRadar() || !got.GitHub.Draft {
+		t.Fatalf("the first-seen draft is on radar %v, draft %v; want a retired draft", got.OnRadar(), got.GitHub.Draft)
+	}
+	runLifecycleIngest(t, twoSearchServer(t, lifecycleHit(8, false, 0), "", true), sink)
+	if got := itemByID(t, sink.items, id); got.OnRadar() {
+		t.Fatal("the older 12:00 ready copy put the 12:04 draft on the radar")
+	}
+	runLifecycleIngest(t, twoSearchServer(t, lifecycleHit(8, false, 9), "", false), sink)
+	if got := itemByID(t, sink.items, id); !got.OnRadar() {
+		t.Fatal("the newer 12:09 ready copy did not put the PR on the radar")
+	}
+}
+
+// An older ready copy never rolls back the stored state: it is not written, but it
+// still proves the item open. So a later draft result older than the newest ready
+// state stored cannot retire the PR.
+func TestRunIngestOlderReadyCopyKeepsNewerState(t *testing.T) {
+	const id = "github:o/r#8"
+	sink := &memSink{}
+	runLifecycleIngest(t, twoSearchServer(t, lifecycleHit(8, false, 0), lifecycleHit(8, false, 9), false), sink)
+	if got := itemByID(t, sink.items, id); got.GitHub.UpdatedAt.Minute() != 9 || !got.OnRadar() {
+		t.Fatalf("the newest ready copy was not stored (updated %v, on radar %v)", got.GitHub.UpdatedAt, got.OnRadar())
+	}
+	runLifecycleIngest(t, twoSearchServer(t, lifecycleHit(8, false, 0), "", true), sink)
+	if got := itemByID(t, sink.items, id); got.GitHub.UpdatedAt.Minute() != 9 {
+		t.Fatalf("the older 12:00 copy rolled the stored state back to %v", got.GitHub.UpdatedAt)
+	}
+	runLifecycleIngest(t, twoSearchServer(t, lifecycleHit(8, true, 4), "", true), sink)
+	if got := itemByID(t, sink.items, id); !got.OnRadar() {
+		t.Fatal("a 12:04 draft result retired a PR stored ready at 12:09")
+	}
+	// A complete refresh serving only the older copy does not retire it as missing.
+	runLifecycleIngest(t, twoSearchServer(t, lifecycleHit(8, false, 0), "", false), sink)
+	if got := itemByID(t, sink.items, id); !got.OnRadar() || got.GitHub.UpdatedAt.Minute() != 9 {
+		t.Fatalf("a complete refresh with an older copy: on radar %v, updated %v", got.OnRadar(), got.GitHub.UpdatedAt)
+	}
+}
+
+// Which searches matched is current even when a hit's payload is older than the
+// stored state: the stored GitHub fields stand (keepNewerState), but the review
+// request follows the review-request search. A complete search without the PR clears
+// it, a match adds it, and a partial search without it keeps the stored request.
+func TestRunIngestStaleHitReconcilesReviewRequest(t *testing.T) {
+	const id = "github:o/r#8"
+	old, fresh := lifecycleHit(8, false, 0), lifecycleHit(8, false, 9)
+	requested := func(it worklist.WorkItem) bool {
+		return slices.Contains(it.Signals.Reasons, worklist.ReasonReviewRequested)
+	}
+	check := func(t *testing.T, sink *memSink, wantRequested bool) {
+		t.Helper()
+		it := itemByID(t, sink.items, id)
+		if !it.OnRadar() || it.GitHub.UpdatedAt.Minute() != 9 {
+			t.Fatalf("the newer 12:09 state was lost: on radar %v, updated %v", it.OnRadar(), it.GitHub.UpdatedAt)
+		}
+		if requested(it) != wantRequested {
+			t.Fatalf("review requested = %v, want %v; reasons %v", requested(it), wantRequested, it.Signals.Reasons)
+		}
+	}
+	t.Run("complete search no longer matches", func(t *testing.T) {
+		sink := &memSink{}
+		runLifecycleIngest(t, twoSearchServer(t, old, fresh, false), sink)
+		check(t, sink, true)
+		runLifecycleIngest(t, twoSearchServer(t, old, "", false), sink)
+		check(t, sink, false)
+		if it := itemByID(t, sink.items, id); !slices.Equal(it.Signals.Reasons, []worklist.Reason{worklist.ReasonInvolved}) {
+			t.Fatalf("reasons = %v, want [involved]", it.Signals.Reasons)
+		}
+	})
+	t.Run("search now matches", func(t *testing.T) {
+		sink := &memSink{}
+		runLifecycleIngest(t, twoSearchServer(t, fresh, "", false), sink)
+		check(t, sink, false)
+		runLifecycleIngest(t, twoSearchServer(t, "", old, false), sink)
+		check(t, sink, true)
+	})
+	t.Run("partial search keeps the request", func(t *testing.T) {
+		sink := &memSink{}
+		runLifecycleIngest(t, twoSearchServer(t, old, fresh, false), sink)
+		check(t, sink, true)
+		runLifecycleIngest(t, twoSearchServer(t, old, "", true), sink)
+		check(t, sink, true)
+	})
+}

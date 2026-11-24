@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -324,5 +325,171 @@ func TestSearchIssuesResultCeilingIsPartial(t *testing.T) {
 	}
 	if whole {
 		t.Error("a walk ended by the result ceiling must not report the set as whole")
+	}
+}
+
+// Another contributor's draft is left out of the fetch without making it partial: the
+// walk still saw the whole open set, so a stored copy of the draft (a pull request
+// converted back to draft) is retired, and it resurfaces once marked ready.
+func TestFetchWorklistSkipsOthersDraftsAndStaysComplete(t *testing.T) {
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user" {
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+			return
+		}
+		q := r.URL.Query().Get("q")
+		switch {
+		case strings.Contains(q, "is:pr") && strings.Contains(q, "involves:@me"):
+			_, _ = w.Write([]byte(`{"total_count":3,"items":[
+				{"number":1,"repository_url":"https://api.github.com/repos/o/r","state":"open","draft":true,"user":{"login":"me"},"pull_request":{"url":"x"}},
+				{"number":2,"repository_url":"https://api.github.com/repos/o/r","state":"open","draft":true,"user":{"login":"someone"},"pull_request":{"url":"x"}},
+				{"number":3,"repository_url":"https://api.github.com/repos/o/r","state":"open","user":{"login":"someone"},"pull_request":{"url":"x"}}]}`))
+		case strings.Contains(q, "review-requested:@me"):
+			_, _ = w.Write([]byte(`{"total_count":1,"items":[
+				{"number":4,"repository_url":"https://api.github.com/repos/o/r","state":"open","draft":true,"user":{"login":"someone"},"pull_request":{"url":"x"}}]}`))
+		default:
+			_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.Client(), srv.URL)
+	f, err := c.FetchWorklistDetail(context.Background(), "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []int
+	for _, it := range f.Items {
+		got = append(got, it.GitHub.Number)
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, []int{1, 3}) {
+		t.Fatalf("items %v, want [1 3] (others' drafts #2 and #4 left out)", got)
+	}
+	if !f.Complete || !f.ReviewRequestsComplete {
+		t.Fatalf("complete=%v reviewsComplete=%v, want both true", f.Complete, f.ReviewRequestsComplete)
+	}
+	if got := slices.Sorted(maps.Keys(f.OthersDrafts)); !slices.Equal(got, []string{"github:o/r#2", "github:o/r#4"}) {
+		t.Fatalf("OthersDrafts %v, want [github:o/r#2 github:o/r#4]", got)
+	}
+	if d := f.OthersDrafts["github:o/r#4"]; !d.GitHub.Draft || d.GitHub.Number != 4 || !slices.Contains(d.Signals.Reasons, worklist.ReasonReviewRequested) {
+		t.Errorf("draft #4 reported as %+v, want the draft with its reasons", d)
+	}
+}
+
+// The same pull request can come back from both searches, walked at different
+// moments, in different states. The copy GitHub updated last is its state: marked
+// draft after the involves: walk, it is left out (and reported as a draft); marked
+// ready after it, it is kept, with the reasons of both copies.
+func TestFetchWorklistNewestCopyDecidesDraft(t *testing.T) {
+	const (
+		ready = `{"number":7,"repository_url":"https://api.github.com/repos/o/r","state":"open","updated_at":%q,"user":{"login":"someone"},"pull_request":{"url":"x"}}`
+		draft = `{"number":7,"repository_url":"https://api.github.com/repos/o/r","state":"open","draft":true,"updated_at":%q,"user":{"login":"someone"},"pull_request":{"url":"x"}}`
+	)
+	older, newer := "2026-11-01T00:00:00Z", "2026-11-02T00:00:00Z"
+	cases := []struct {
+		name, involves, reviews string
+		kept                    bool
+	}{
+		{"marked draft between walks", fmt.Sprintf(ready, older), fmt.Sprintf(draft, newer), false},
+		{"marked ready between walks", fmt.Sprintf(draft, older), fmt.Sprintf(ready, newer), true},
+		{"newer copy first", fmt.Sprintf(draft, newer), fmt.Sprintf(ready, older), false},
+		// GitHub reports timestamps to the second, so two states can tie: the draft
+		// wins whichever search returned it.
+		{"tie, ready first", fmt.Sprintf(ready, newer), fmt.Sprintf(draft, newer), false},
+		{"tie, draft first", fmt.Sprintf(draft, newer), fmt.Sprintf(ready, newer), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/user" {
+					_, _ = w.Write([]byte(`{"login":"me"}`))
+					return
+				}
+				q := r.URL.Query().Get("q")
+				switch {
+				case strings.Contains(q, "is:pr") && strings.Contains(q, "involves:@me"):
+					fmt.Fprintf(w, `{"total_count":1,"items":[%s]}`, tc.involves)
+				case strings.Contains(q, "review-requested:@me"):
+					fmt.Fprintf(w, `{"total_count":1,"items":[%s]}`, tc.reviews)
+				default:
+					_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
+				}
+			}))
+			defer srv.Close()
+			f, err := NewClient(srv.Client(), srv.URL).FetchWorklistDetail(context.Background(), "tok")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.kept {
+				d, ok := f.OthersDrafts["github:o/r#7"]
+				if len(f.Items) != 0 || len(f.OthersDrafts) != 1 || !ok || !d.GitHub.Draft ||
+					!d.GitHub.UpdatedAt.Equal(time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)) {
+					t.Fatalf("items %d, OthersDrafts %v; want the draft left out and reported", len(f.Items), f.OthersDrafts)
+				}
+				return
+			}
+			if len(f.Items) != 1 || len(f.OthersDrafts) != 0 {
+				t.Fatalf("items %d, OthersDrafts %v; want the ready PR kept", len(f.Items), f.OthersDrafts)
+			}
+			it := f.Items[0]
+			if it.GitHub.Draft || !it.GitHub.UpdatedAt.Equal(time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)) {
+				t.Errorf("kept the older copy: draft=%v updated=%v", it.GitHub.Draft, it.GitHub.UpdatedAt)
+			}
+			if !slices.Contains(it.Signals.Reasons, worklist.ReasonReviewRequested) || !slices.Contains(it.Signals.Reasons, worklist.ReasonInvolved) {
+				t.Errorf("reasons %v, want both copies' reasons", it.Signals.Reasons)
+			}
+		})
+	}
+}
+
+// A draft observation passes the public-only gate like a hit: one from a repository
+// confirmed private is not reported, and one whose check has no answer is not
+// reported and makes the fetch incomplete.
+func TestFetchWorklistGatesDraftObservations(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		lookup   func(w http.ResponseWriter, name string)
+		complete bool
+	}{
+		{"public", func(w http.ResponseWriter, name string) {
+			fmt.Fprintf(w, `{"id":1,"full_name":%q,"private":false}`, name)
+		}, true},
+		{"private", func(w http.ResponseWriter, name string) {
+			fmt.Fprintf(w, `{"id":1,"full_name":%q,"private":true}`, name)
+		}, true},
+		{"no answer", func(w http.ResponseWriter, _ string) {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if name, ok := githubtest.RepoLookup(r); ok {
+					tc.lookup(w, name)
+					return
+				}
+				q := r.URL.Query().Get("q")
+				switch {
+				case r.URL.Path == "/user":
+					_, _ = w.Write([]byte(`{"login":"me"}`))
+				case strings.Contains(q, "is:pr") && strings.Contains(q, "involves:@me"):
+					_, _ = w.Write([]byte(`{"total_count":1,"items":[{"number":2,"repository_url":"https://api.github.com/repos/o/r","state":"open","draft":true,"user":{"login":"someone"},"pull_request":{"url":"x"}}]}`))
+				default:
+					_, _ = w.Write([]byte(`{"total_count":0,"items":[]}`))
+				}
+			}))
+			defer srv.Close()
+			f, err := NewClient(srv.Client(), srv.URL).FetchWorklistDetail(context.Background(), "tok")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, reported := f.OthersDrafts["github:o/r#2"]
+			if reported != (tc.name == "public") {
+				t.Errorf("draft reported = %v", reported)
+			}
+			if f.Complete != tc.complete {
+				t.Errorf("complete = %v, want %v", f.Complete, tc.complete)
+			}
+		})
 	}
 }

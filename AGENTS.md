@@ -105,6 +105,32 @@ priority band. Server-side sort. Scoring is a pure function of an item's Signals
 the worklist is re-scored at read time. Job types the workload implements:
 github-ingest, github-enrich, llm-rank, github-converse, github-research.
 
+Ingest leaves out another contributor's draft pull request, whatever the user's
+relationship to it (`github.searchItem.othersDraft`); the user's own drafts stay.
+Hits are reconciled by ID first, and the copy with the newest `updated_at` decides
+the state, since the searches are walked at different moments; GitHub's timestamps
+are to the second, so on a tie the draft wins (`github.newerState`). The fetch still
+counts as complete, and it names the drafts it saw with their `updated_at`
+(`github.Fetch.OthersDrafts`), so a stored PR converted back to draft is retired
+(thread kept) even by a partial refresh (`agent.retireDrafts`), and resurfaces once
+marked ready for review. Retiring one records the confirmed state (`Draft`, and
+`GitHub.UpdatedAt` advanced to the draft result's, `agent.retireDrafts`); a draft
+with no stored row is stored already retired, never on the radar, to remember it.
+The stored GitHub state never moves back in time: a hit older than it
+(`agent.newerState`, the draft winning a tie) does not write its GitHub fields
+(`agent.keepNewerState`), though it still counts as open for retirement, so an older
+ready copy can neither reopen a draft nor roll back the time a later draft result is
+judged against. Which searches matched is current even when a payload is not, so a
+stale hit of a live item still carries its review-request membership onto the stored
+item (`agent.withReviewMembership`), reconciled as any hit's is. A stale hit that
+changes nothing is not written, but the run still goes on to enrich (CI can move on
+the same commit, and a request kept by a partial search needs the timeline read): an
+empty write-back never means nothing to enrich. A stale hit of a retired item writes
+nothing. A draft result never retires a stored ready PR GitHub updated strictly later
+(`agent.readyAfterDraft`): the search index lagged it. Draft observations pass the
+public-only gate like hits, so one from a repository not confirmed public is
+evidence of nothing.
+
 ## Security invariants (the contract a runtime must honor)
 
 Wired on the web-tier side; they define what a runtime must respect:
@@ -283,7 +309,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   and `waiting_on` keep it waiting, and a `waiting_on` login counts only if the last
   word mentions it or it is the author. New activity always wins over a reading. A
   refresh keeps the waiting timestamps only for an item whose GitHub `updated_at` is
-  unchanged, and the last word always (`carryTurnSignals`). The rank selection leaves waiting
+  unchanged, and the last word always (`carryTurnSignals`); `AwaitingMeSince` dates
+  the review request, so it goes whenever the reconciliation leaves no request (a
+  complete search confirmed it removed; a partial one keeps both). The rank selection leaves waiting
   items out before its top-N cutoff (`Selection.Top`), and Review all PRs and Get 2nd
   Opinion skip them (`WorkItem.Actionable`); Reset Conversations still covers them.
   `RunPolicy.Apply` bounds the last word and reading on every write-back.
