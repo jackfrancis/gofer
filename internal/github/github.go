@@ -139,14 +139,15 @@ type Fetch struct {
 	ReviewRequestsComplete bool
 	// OthersDrafts maps, by item ID, the hits whose current state (the newest copy
 	// across the searches) is another contributor's draft pull request, left out of
-	// Items, to that copy's updated_at. Unlike an absence, this is positive evidence,
-	// so ingest retires a stored copy of each even when the fetch is partial, unless
-	// the stored copy is a ready pull request GitHub updated later than the draft
-	// result (the search index can lag the item). Only observations from a repository
-	// the public-only gate confirms are listed; one from a repository that is private,
-	// gone or unanswered is evidence of nothing, and an unanswered check also makes
-	// the fetch incomplete, as for a hit.
-	OthersDrafts map[string]time.Time
+	// Items, to that copy as a work item (Draft set; ingest stores it only retired,
+	// never on the radar, to remember the state). Unlike an absence, this is positive
+	// evidence, so ingest retires a stored copy of each even when the fetch is
+	// partial, unless the stored copy is a ready pull request GitHub updated later
+	// than the draft result (the search index can lag the item). Only observations
+	// from a repository the public-only gate confirms are listed; one from a
+	// repository that is private, gone or unanswered is evidence of nothing, and an
+	// unanswered check also makes the fetch incomplete, as for a hit.
+	OthersDrafts map[string]worklist.WorkItem
 }
 
 // FetchWorklistDetail is FetchWorklist, also reporting whether the review-request
@@ -194,10 +195,10 @@ func (c *Client) FetchWorklistDetail(ctx context.Context, token string) (Fetch, 
 		}
 	}
 	out := make([]worklist.WorkItem, 0, len(seen))
-	var draftHits []searchItem
+	var draftHits []*hit
 	for _, h := range seen {
 		if h.item.othersDraft(viewer) {
-			draftHits = append(draftHits, h.item)
+			draftHits = append(draftHits, h)
 			continue
 		}
 		out = append(out, h.item.workItem(h.reasons, now))
@@ -207,19 +208,19 @@ func (c *Client) FetchWorklistDetail(ctx context.Context, token string) (Fetch, 
 	// verdict overrides it), so it can neither retire nor preserve a stored item.
 	draftRepos := make([]string, 0, len(draftHits))
 	for _, d := range draftHits {
-		draftRepos = append(draftRepos, d.repo())
+		draftRepos = append(draftRepos, d.item.repo())
 	}
 	out, verdicts, confirmed := c.publicHits(ctx, token, out, draftRepos)
 	complete = complete && confirmed
-	var drafts map[string]time.Time
+	var drafts map[string]worklist.WorkItem
 	for _, d := range draftHits {
-		if verdicts[d.repo()] != verdictPublic {
+		if verdicts[d.item.repo()] != verdictPublic {
 			continue
 		}
 		if drafts == nil {
-			drafts = make(map[string]time.Time)
+			drafts = make(map[string]worklist.WorkItem)
 		}
-		drafts[d.id()] = d.UpdatedAt
+		drafts[d.item.id()] = d.item.workItem(d.reasons, now)
 	}
 	// Deduplication runs through a map, so without this the result order is Go's
 	// randomized map iteration — and every downstream "first N" (the rank cap, any

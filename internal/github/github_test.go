@@ -369,8 +369,11 @@ func TestFetchWorklistSkipsOthersDraftsAndStaysComplete(t *testing.T) {
 	if !f.Complete || !f.ReviewRequestsComplete {
 		t.Fatalf("complete=%v reviewsComplete=%v, want both true", f.Complete, f.ReviewRequestsComplete)
 	}
-	if want := map[string]time.Time{"github:o/r#2": {}, "github:o/r#4": {}}; !maps.Equal(f.OthersDrafts, want) {
-		t.Fatalf("OthersDrafts %v, want %v", f.OthersDrafts, want)
+	if got := slices.Sorted(maps.Keys(f.OthersDrafts)); !slices.Equal(got, []string{"github:o/r#2", "github:o/r#4"}) {
+		t.Fatalf("OthersDrafts %v, want [github:o/r#2 github:o/r#4]", got)
+	}
+	if d := f.OthersDrafts["github:o/r#4"]; !d.GitHub.Draft || d.GitHub.Number != 4 || !slices.Contains(d.Signals.Reasons, worklist.ReasonReviewRequested) {
+		t.Errorf("draft #4 reported as %+v, want the draft with its reasons", d)
 	}
 }
 
@@ -419,8 +422,9 @@ func TestFetchWorklistNewestCopyDecidesDraft(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !tc.kept {
-				want := map[string]time.Time{"github:o/r#7": time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)}
-				if len(f.Items) != 0 || !maps.EqualFunc(f.OthersDrafts, want, time.Time.Equal) {
+				d, ok := f.OthersDrafts["github:o/r#7"]
+				if len(f.Items) != 0 || len(f.OthersDrafts) != 1 || !ok || !d.GitHub.Draft ||
+					!d.GitHub.UpdatedAt.Equal(time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)) {
 					t.Fatalf("items %d, OthersDrafts %v; want the draft left out and reported", len(f.Items), f.OthersDrafts)
 				}
 				return

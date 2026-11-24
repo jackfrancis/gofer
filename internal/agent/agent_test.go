@@ -1122,3 +1122,84 @@ func TestRunIngestPrivateRepoDraftPreservesNothing(t *testing.T) {
 		t.Error("a draft result from a private repository kept a stored ready PR on the radar")
 	}
 }
+
+// twoSearchServer answers the involves: and review-requested: pull request searches
+// with independent snapshots of the same PR (an empty string answers nothing).
+// partialReview makes the review-request search incomplete.
+func twoSearchServer(t *testing.T, involved, review string, partialReview bool) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user" {
+			_, _ = w.Write([]byte(`{"login":"me"}`))
+			return
+		}
+		if r.URL.Path != "/search/issues" {
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		hit, partial := "", false
+		q := r.URL.Query().Get("q")
+		switch {
+		case strings.Contains(q, "review-requested:@me"):
+			hit, partial = review, partialReview
+		case strings.Contains(q, "is:pr") && strings.Contains(q, "involves:@me"):
+			hit = involved
+		}
+		n := 0
+		if hit != "" {
+			n = 1
+		}
+		fmt.Fprintf(w, `{"total_count":%d,"items":[%s],"incomplete_results":%v}`, n, hit, partial)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A draft seen on first sight, with no stored row, is still remembered (as a row
+// already retired, never on the radar), so a later partial refresh serving only the
+// older ready copy cannot put it on the radar; a newer ready copy does.
+func TestRunIngestRemembersFirstSeenDraft(t *testing.T) {
+	const id = "github:o/r#8"
+	sink := &memSink{}
+	runLifecycleIngest(t, twoSearchServer(t, lifecycleHit(8, false, 0), lifecycleHit(8, true, 4), false), sink)
+	got, ok := worklist.Find(sink.items, id)
+	if !ok {
+		t.Fatal("the first-seen draft was not remembered")
+	}
+	if got.OnRadar() || !got.GitHub.Draft {
+		t.Fatalf("the first-seen draft is on radar %v, draft %v; want a retired draft", got.OnRadar(), got.GitHub.Draft)
+	}
+	runLifecycleIngest(t, twoSearchServer(t, lifecycleHit(8, false, 0), "", true), sink)
+	if got := itemByID(t, sink.items, id); got.OnRadar() {
+		t.Fatal("the older 12:00 ready copy put the 12:04 draft on the radar")
+	}
+	runLifecycleIngest(t, twoSearchServer(t, lifecycleHit(8, false, 9), "", false), sink)
+	if got := itemByID(t, sink.items, id); !got.OnRadar() {
+		t.Fatal("the newer 12:09 ready copy did not put the PR on the radar")
+	}
+}
+
+// An older ready copy never rolls back the stored state: it is not written, but it
+// still proves the item open. So a later draft result older than the newest ready
+// state stored cannot retire the PR.
+func TestRunIngestOlderReadyCopyKeepsNewerState(t *testing.T) {
+	const id = "github:o/r#8"
+	sink := &memSink{}
+	runLifecycleIngest(t, twoSearchServer(t, lifecycleHit(8, false, 0), lifecycleHit(8, false, 9), false), sink)
+	if got := itemByID(t, sink.items, id); got.GitHub.UpdatedAt.Minute() != 9 || !got.OnRadar() {
+		t.Fatalf("the newest ready copy was not stored (updated %v, on radar %v)", got.GitHub.UpdatedAt, got.OnRadar())
+	}
+	runLifecycleIngest(t, twoSearchServer(t, lifecycleHit(8, false, 0), "", true), sink)
+	if got := itemByID(t, sink.items, id); got.GitHub.UpdatedAt.Minute() != 9 {
+		t.Fatalf("the older 12:00 copy rolled the stored state back to %v", got.GitHub.UpdatedAt)
+	}
+	runLifecycleIngest(t, twoSearchServer(t, lifecycleHit(8, true, 4), "", true), sink)
+	if got := itemByID(t, sink.items, id); !got.OnRadar() {
+		t.Fatal("a 12:04 draft result retired a PR stored ready at 12:09")
+	}
+	// A complete refresh serving only the older copy does not retire it as missing.
+	runLifecycleIngest(t, twoSearchServer(t, lifecycleHit(8, false, 0), "", false), sink)
+	if got := itemByID(t, sink.items, id); !got.OnRadar() || got.GitHub.UpdatedAt.Minute() != 9 {
+		t.Fatalf("a complete refresh with an older copy: on radar %v, updated %v", got.OnRadar(), got.GitHub.UpdatedAt)
+	}
+}
