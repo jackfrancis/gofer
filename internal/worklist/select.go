@@ -292,7 +292,7 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 			// and the run declines (SynthesisReady).
 			if th[anchor].Kind == KindSynthesisRequest {
 				replies := keyed.replies()
-				for _, k := range th[anchor].Reviews {
+				for _, k := range keyed.synthesisReviews(anchor, replies) {
 					q, ok := keyed.TurnIndex(k)
 					a, answered := replies[k]
 					if !ok || !answered || q >= anchor || a >= anchor || th[q].Hidden || th[a].Hidden {
@@ -359,7 +359,7 @@ func truncateMessage(m Message, budget int) Message {
 	original := len(m.Content)
 	note := fmt.Sprintf(truncationNote, original)
 	content := m.Content
-	n := budget - messageSize(Message{ID: m.ID, ReplyTo: m.ReplyTo, Role: m.Role, Model: m.Model, Kind: m.Kind, Verdict: m.Verdict, Reviews: m.Reviews, Hidden: m.Hidden, Notice: m.Notice, At: m.At}) - len(note)
+	n := budget - messageSize(Message{ID: m.ID, ReplyTo: m.ReplyTo, Role: m.Role, Model: m.Model, Kind: m.Kind, Verdict: m.Verdict, Reviews: m.Reviews, Attempt: m.Attempt, Hidden: m.Hidden, Notice: m.Notice, At: m.At}) - len(note)
 	for range 64 {
 		if n <= 0 {
 			break

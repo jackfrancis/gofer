@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -51,12 +52,24 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	// The turn's kind tells us whether this reply is a consensus synthesis, whose
 	// leading verdict token we record as structured metadata.
 	triggerKind := trigger.Kind
-	if triggerKind == worklist.KindSynthesisRequest && !item.SynthesisReady(triggerKey) {
-		// A review the synthesis weighs is hidden, gone, or did not fit the bounded read
-		// (which keeps those reviews first): the model would rule on agreement without
-		// it. Decline with a notice, never a verdict; the thread offers a retry once the
-		// reviews are back (worklist.RetryableSynthesis).
-		return postNotice(ctx, sink, item.ID, triggerKey, worklist.NoticePanelInputs, worklist.PanelInputsNotice)
+	// A notice this run posts ends only the attempt it read (Message.Attempt), so a
+	// late run of an earlier attempt cannot end a retry still in flight.
+	attempt := trigger.Attempt
+	var reviews []worklist.Message // a synthesis's comparison: its review pairs, nothing else
+	if triggerKind == worklist.KindSynthesisRequest {
+		var ready bool
+		reviews, ready = item.SynthesisInputs(triggerKey)
+		if !ready {
+			// A review the synthesis weighs is hidden, gone, or did not fit the bounded
+			// read (which keeps those reviews first), or there are not two to compare:
+			// the model would rule on agreement without them. Decline with a notice,
+			// never a verdict; the thread offers a retry once the reviews are back
+			// (worklist.RetryableSynthesis).
+			return postNotice(ctx, sink, item.ID, triggerKey, attempt, worklist.NoticePanelInputs, worklist.PanelInputsNotice)
+		}
+		// The model compares exactly the reviews this round recorded: a turn unhidden
+		// or posted since, a later review among them, is not part of this round.
+		history = reviews
 	}
 
 	// Live context plus read-only GitHub tools. With a credential the assistant gets
@@ -82,7 +95,7 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	holder, verr := newTokenHolder(ctx, vendor, provider, p.GitHubBaseURL)
 	switch {
 	case isSignInRequired(verr):
-		return postReconnect(ctx, sink, item.ID, triggerKey)
+		return postReconnect(ctx, sink, item.ID, triggerKey, attempt)
 	case verr != nil:
 		p.logger().Warn("converse: GitHub unavailable for this turn; answering from stored context", "err", verr)
 		holder, noGitHub = nil, true
@@ -101,7 +114,7 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		// The token was vended unexpired but GitHub refused it, and the broker
 		// confirmed the user's access is gone.
 		if holder.Reconnect() != nil {
-			return postReconnect(ctx, sink, item.ID, triggerKey)
+			return postReconnect(ctx, sink, item.ID, triggerKey, attempt)
 		}
 		if ferr := holder.Failed(); ferr != nil {
 			// GitHub refused the token and the broker could not be asked for a new
@@ -128,12 +141,15 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	model.Thread = nil
 	if i, ok := item.TurnIndex(triggerKey); ok && !p.Independent {
 		model.Thread = item.Thread[: i+1 : i+1]
+		if reviews != nil {
+			model.Thread = append(slices.Clip(reviews), item.Thread[i])
+		}
 	}
 	reply, err := p.Converser.Reply(ctx, model, viewerLogin, sourceContext, history, userText, tools)
 	if isSignInRequired(err) || (holder != nil && holder.Reconnect() != nil) {
 		// A tool call found the access gone: whatever the model produced is
 		// discarded, never saved as a reply or review.
-		return postReconnect(ctx, sink, item.ID, triggerKey)
+		return postReconnect(ctx, sink, item.ID, triggerKey, attempt)
 	}
 	if err != nil {
 		return fmt.Errorf("converse: %w", err)
@@ -216,18 +232,20 @@ const lostGitHubNote = "\n\n---\n_gofer lost access to GitHub partway through th
 // postReconnect saves a reconnect notice in reply to the turn: the run could not
 // reach GitHub for the user, who must sign in again. It is a system notice, not an
 // answer (worklist.NoticeReconnect), so review state does not count it.
-func postReconnect(ctx context.Context, sink Sink, itemID, triggerKey string) error {
-	return postNotice(ctx, sink, itemID, triggerKey, worklist.NoticeReconnect, worklist.ReconnectNotice)
+func postReconnect(ctx context.Context, sink Sink, itemID, triggerKey, attempt string) error {
+	return postNotice(ctx, sink, itemID, triggerKey, attempt, worklist.NoticeReconnect, worklist.ReconnectNotice)
 }
 
 // postNotice saves a system notice (worklist.Message.Notice) with text in reply to
-// the turn: the run ended without answering it.
-func postNotice(ctx context.Context, sink Sink, itemID, triggerKey, notice, text string) error {
+// the turn: the run ended without answering the attempt it read (attempt, the turn's
+// Message.Attempt when the run read it).
+func postNotice(ctx context.Context, sink Sink, itemID, triggerKey, attempt, notice, text string) error {
 	msg := worklist.Message{
 		ID:      worklist.NewMessageID(),
 		ReplyTo: triggerKey,
 		Role:    worklist.RoleAgent,
 		Notice:  notice,
+		Attempt: attempt,
 		Content: text,
 		At:      time.Now().UTC(),
 	}

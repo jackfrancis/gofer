@@ -293,6 +293,7 @@ type pageData struct {
 	RetryRefused             bool                // the last Retry was refused by the backend, so no run started
 	StalledHidden            bool                // the stalled turn is hidden: unhide it to retry
 	StalledSynthesis         bool                // the turn offered for Retry is a consensus synthesis (thread view)
+	SynthesisTooLarge        bool                // a stalled synthesis's reviews are too large to read together: no Retry (thread view)
 	Message                  string              // failure detail rendered on the error view
 	Failure                  string              // a failed user action, rendered on the error view in place of the discovery wording
 	RetryURL                 string              // where the error view's "Try again" goes; empty = the radar
@@ -380,6 +381,15 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 			}
 			if i, ok := it.TurnIndex(data.StalledTurn); ok && data.StalledTurn != "" && isSynthesisRequest(it.Thread[i]) {
 				data.StalledSynthesis = true
+			}
+			if !data.ItemHidden && !data.ReplyPending && data.StalledTurn == "" {
+				// A stalled synthesis no retry can answer: its reviews are all there but
+				// too large to read together. Say so, rather than offer a Retry that would
+				// only decline again.
+				if i, ok := it.StalledSynthesis(now, reviewStaleAfter); ok {
+					key := it.TurnKey(i)
+					data.SynthesisTooLarge = it.SynthesisReady(key) && !it.SynthesisFits(key)
+				}
 			}
 			// Delivering the thread is the read receipt (the UI has no script to send
 			// one). The key is the newest reply on this page, taken from the snapshot
@@ -506,7 +516,7 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 	choice := strings.TrimSpace(r.FormValue("choice"))
 	var (
 		turn        string
-		prev        time.Time // the turn's time before this attempt re-stamped it
+		stamp       worklist.RetryStamp // this attempt, which a refused dispatch undoes
 		independent bool
 		opt         ModelOption
 	)
@@ -535,11 +545,10 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 				return nil, nil // no model other than the first reviewer's
 			}
 			opt = pickOption(choices, choice)
-			// Re-stamp the turn, so it is pending again and a second retry within
-			// reviewStaleAfter finds nothing to do (RetryStalled, for any retryable turn).
-			prev = it.Thread[i].At
-			it.Thread = slices.Clone(it.Thread)
-			it.Thread[i].At = at
+			// Start a new attempt: the turn is pending again, a second retry within
+			// reviewStaleAfter finds nothing to do, and only this attempt's own notice
+			// can end it (worklist.Restamp).
+			stamp = it.Restamp(i, at)
 			turn = want
 			return []worklist.WorkItem{it}, nil
 		}
@@ -569,7 +578,7 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 		err := h.store.Update(ctx, user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 			undone = false
 			for _, it := range current {
-				if it.ID == id && it.UndoRetry(turn, at, prev) {
+				if it.ID == id && it.UndoRetry(stamp) {
 					undone = true
 					return []worklist.WorkItem{it}, nil
 				}
@@ -593,8 +602,8 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 // review-panel request is retried as a blind review (independent), by any
 // configured model the panel may use (panelChoices); ok is false when no such
 // model exists, and Retry is then not offered. A consensus synthesis is retried by the
-// default model only, and only while every review it weighs is visible
-// (SynthesisReady). Any other turn may use every configured model; with none
+// default model only, and only while every review it weighs is visible and they fit
+// the read its run would get (SynthesisFits). Any other turn may use every configured model; with none
 // configured the run uses its default.
 func (h *Handler) retryChoices(it worklist.WorkItem, i int) (choices []ModelOption, independent, ok bool) {
 	switch {
@@ -602,8 +611,8 @@ func (h *Handler) retryChoices(it worklist.WorkItem, i int) (choices []ModelOpti
 		choices = h.panelChoices(it)
 		return choices, true, len(choices) > 0
 	case isSynthesisRequest(it.Thread[i]):
-		if !it.SynthesisReady(it.TurnKey(i)) {
-			return nil, false, false
+		if !it.SynthesisFits(it.TurnKey(i)) {
+			return nil, false, false // a review is missing, or they cannot be read together
 		}
 		return nil, false, true // the run's default model, as the chained synthesis uses
 	}

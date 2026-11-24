@@ -382,24 +382,29 @@ Wired on the web-tier side; they define what a runtime must respect:
   `worklist.IndependentReviewPrompt` as a review request (a panel review is
   `KindReviewRequest` with that text, `Message.IsPanelReview`; the same text typed into
   Discuss is not one) for a blind review by a model other than the item's first
-  reviewer (`webui.panelChoices`, resolved against the item as stored, inside the
-  update that appends the turn). When any review's answer lands on the agent plane,
-  the same store update may chain the consensus synthesis turn
-  (`worklist.ApplyReplyAndChain` → `ChainSynthesis`): only when a visible answered
-  panel review is not yet covered by a synthesis and at least two visible answered
-  reviews, not all by one known model, are there to compare. Either review can land
-  last. The synthesis names the reviews it weighs (`Message.Reviews`); the plane hands
-  it to `Ingestor.Synthesize` (default model), off the reply's request. Its run's read
-  (`ThreadWindow`) keeps those reviews first, and the run declines with a
-  `NoticePanelInputs` notice, never a verdict, if any is hidden, gone, or did not fit
-  (`WorkItem.SynthesisReady`). The radar's verdict is the newest answered synthesis
-  request's, through its reply link (`ReviewVerdict`), never the last reply to arrive.
-  Nothing tracks run IDs in memory: a failed or declined synthesis stays retryable
-  wherever it sits in the thread (`RetryableSynthesis`, by the default model, once its
-  reviews are visible), so a Discuss turn since never strands it; a notice only ends
-  the attempt it followed (one older than the turn's re-stamped time does not count).
-  The thread page shows a working cue while a reply is pending and offers no panel
-  then; the handler refuses one too.
+  VISIBLE reviewer (`FirstReviewModel` skips a hidden review or answer;
+  `webui.panelChoices`, resolved against the item as stored, inside the update that
+  appends the turn). When any review's answer lands on the agent plane, the same store
+  update may chain the consensus synthesis turn (`worklist.ApplyReplyAndChain` →
+  `ChainSynthesis`): only when a visible answered panel review is not yet covered by a
+  synthesis and at least two visible answered reviews, not all by one known model, are
+  there to compare. Either review can land last. The synthesis records the reviews it
+  weighs (`Message.Reviews`; a legacy request's are rebuilt from the visible answered
+  reviews before it); the plane hands it to `Ingestor.Synthesize` (default model), off
+  the reply's request. Its run's read (`ThreadWindow`) keeps those reviews first, the
+  model is sent ONLY those request/answer pairs (`WorkItem.SynthesisInputs`), never
+  the rest of the thread, and the run declines with a `NoticePanelInputs` notice,
+  never a verdict, if any is hidden, gone or did not fit, or fewer than two remain.
+  The radar's verdict is the newest answered synthesis request's, through its reply
+  link (`ReviewVerdict`), never the last reply to arrive. Nothing tracks run IDs in
+  memory: a failed or declined synthesis stays retryable wherever it sits in the
+  thread (`RetryableSynthesis`, by the default model), so a Discuss turn since never
+  strands it, but only while its reviews fit the read its run would get
+  (`SynthesisFits`); otherwise the page says a smaller comparison is needed. A retry
+  starts a new attempt on the turn (`WorkItem.Restamp`, `Message.Attempt`), and a
+  notice carries the attempt its run read, so only that attempt's notice ends it
+  (`noticed`), never a late one from an earlier run. The thread page shows a working
+  cue while a reply is pending and offers no panel then; the handler refuses one too.
 - The scheduled refresh (`ingest.Refresher`, `REFRESH_INTERVAL`, off when unset or
   0, at least 1m otherwise) dispatches a github-ingest run per GitHub owner with
   stored work (`worklist.OwnerLister`), and only for owners

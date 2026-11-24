@@ -188,6 +188,11 @@
         {{end}}
       </div>
       {{end}}
+      {{if .SynthesisTooLarge}}
+      <div class="zz-stalled">
+        <p>The reviews this consensus compares are too large to read together, so it can&rsquo;t be retried. Hide some of them and run the review panel again for a smaller comparison.</p>
+      </div>
+      {{end}}
       {{if .ItemHidden}}
       <p class="zz-meta">This item is hidden.{{if .Assistant}} Unhide it to discuss it.{{end}}</p>
       {{else if .ConvEnabled}}

@@ -171,7 +171,11 @@ func TestSynthesisReady(t *testing.T) {
 		"a review's answer hidden": {func(w *WorkItem) { w.Thread[1].Hidden = true }, false},
 		"a review request hidden":  {func(w *WorkItem) { w.Thread[2].Hidden = true }, false},
 		"a review gone":            {func(w *WorkItem) { w.Thread = w.Thread[2:] }, false},
-		"legacy, naming none":      {func(w *WorkItem) { w.Thread[len(w.Thread)-1].Reviews = nil; w.Thread[1].Hidden = true }, true},
+		"legacy, naming none":      {func(w *WorkItem) { w.Thread[len(w.Thread)-1].Reviews = nil }, true},
+		// A legacy request's comparison is rebuilt from the visible reviews before it:
+		// with one hidden, a single review is left, which compares with nothing.
+		"legacy, one review left": {func(w *WorkItem) { w.Thread[len(w.Thread)-1].Reviews = nil; w.Thread[1].Hidden = true }, false},
+		"naming a single review":  {func(w *WorkItem) { w.Thread[len(w.Thread)-1].Reviews = []string{"p1"} }, false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -219,15 +223,26 @@ func TestRetryableSynthesis(t *testing.T) {
 	if w.ReplyPending(t2.Add(time.Minute), stale) {
 		t.Fatal("a declined synthesis is not pending")
 	}
-	// The retry re-stamps it: the notice answered the earlier attempt, so it is
+	// The retry starts a new attempt: the notice ended the earlier one, so the turn is
 	// pending again and not offered twice.
 	retry := t2.Add(2 * time.Minute)
-	w.Thread[4].At = retry
+	stamp := w.Restamp(4, retry)
 	if !w.ReplyPending(retry, stale) {
 		t.Fatal("a retried synthesis is pending")
 	}
 	if _, ok := w.RetryableSynthesis(retry, stale); ok {
 		t.Fatal("a just-retried synthesis is not retryable again")
+	}
+	// The earlier attempt's run finishes late and posts its notice after the retry
+	// (whatever its clock says): the retry is still in flight.
+	w.Thread = append(w.Thread, Message{ID: "n0", Role: RoleAgent, ReplyTo: "s1", Notice: NoticePanelInputs, Content: PanelInputsNotice, At: retry.Add(time.Second)})
+	if !w.ReplyPending(retry, stale) {
+		t.Fatal("a late notice from an earlier attempt must not end the retry")
+	}
+	// The retry's own notice ends it.
+	w.Thread = append(w.Thread, Message{ID: "n2", Role: RoleAgent, ReplyTo: "s1", Notice: NoticePanelInputs, Attempt: stamp.Attempt, Content: PanelInputsNotice, At: retry})
+	if w.ReplyPending(retry, stale) {
+		t.Fatal("the retry's own notice ends it")
 	}
 
 	// Answered, or superseded by a newer synthesis: nothing to retry.
@@ -269,5 +284,24 @@ func TestThreadWindowKeepsSynthesisReviews(t *testing.T) {
 	w.Thread[3].Hidden = true // the blind review's answer
 	if win := ThreadWindow(w, "s1", budget); win.SynthesisReady("s1") {
 		t.Fatal("a hidden review is not sent, so the run must decline")
+	}
+}
+
+// The first reviewer is the first visible one: a hidden review, or a review whose
+// answer is hidden, is out of the conversation and does not count.
+func TestFirstReviewModelIsTheFirstVisible(t *testing.T) {
+	th := panelThread()
+	th[1].Model, th[3].Model = "a", "b"
+	w := WorkItem{ID: "a", Thread: th}
+	if got := w.FirstReviewModel(); got != "a" {
+		t.Fatalf("FirstReviewModel = %q, want a", got)
+	}
+	w.Thread[1].Hidden = true
+	if got := w.FirstReviewModel(); got != "b" {
+		t.Fatalf("with a's answer hidden, FirstReviewModel = %q, want b", got)
+	}
+	w.Thread[1].Hidden, w.Thread[0].Hidden = false, true
+	if got := w.FirstReviewModel(); got != "b" {
+		t.Fatalf("with a's request hidden, FirstReviewModel = %q, want b", got)
 	}
 }

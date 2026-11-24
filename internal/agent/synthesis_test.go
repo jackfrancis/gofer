@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -62,4 +63,54 @@ func TestConverseSynthesisNeedsItsReviews(t *testing.T) {
 			t.Fatal("a declined synthesis carries no verdict and stays unanswered")
 		}
 	})
+}
+
+// The model compares exactly the reviews the round recorded: a review unhidden (or
+// posted) since the turn was chained, and any other discussion, stay out.
+func TestConverseSynthesisSendsOnlyItsReviews(t *testing.T) {
+	now := time.Now().UTC()
+	item := synthesisItem(now)
+	s1 := item.Thread[4]
+	item.Thread = append(item.Thread[:4],
+		worklist.Message{ID: "q3", Role: worklist.RoleUser, Kind: worklist.KindReviewRequest, Content: "Can you review this PR?", At: now},
+		worklist.Message{ID: "r3", ReplyTo: "q3", Role: worklist.RoleAgent, Content: "a dissenting review", Model: "c", At: now},
+		worklist.Message{ID: "d1", Role: worklist.RoleUser, Content: "what about the docs?", At: now},
+		worklist.Message{ID: "d2", ReplyTo: "d1", Role: worklist.RoleAgent, Content: "they need work", At: now},
+		s1)
+	sink := &memSink{items: []worklist.WorkItem{item}}
+	fc := &fakeConverser{reply: "AGREEMENT\nBoth approve."}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: item.ID, Turn: "s1", Converser: fc}, fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, m := range fc.gotHistory {
+		got = append(got, m.ID)
+	}
+	if want := []string{"q1", "r1", "p1", "r2"}; !slices.Equal(got, want) {
+		t.Fatalf("history = %v, want only the recorded review pairs %v", got, want)
+	}
+	for _, m := range fc.gotItem.Thread {
+		if m.ID == "r3" || m.ID == "d2" {
+			t.Fatalf("the model's item copy carries %s, which this round does not compare", m.ID)
+		}
+	}
+}
+
+// A notice names the attempt the run read; a legacy synthesis (no recorded reviews)
+// with only one visible review declines too.
+func TestConverseSynthesisNoticeNamesItsAttempt(t *testing.T) {
+	now := time.Now().UTC()
+	item := synthesisItem(now)
+	item.Thread[4].Reviews = nil // stored before reviews were recorded
+	item.Thread[4].Attempt = "attempt-2"
+	item.Thread[3].Hidden = true
+	sink := &memSink{items: []worklist.WorkItem{item}}
+	fc := &fakeConverser{reply: "AGREEMENT\nOne review agrees with itself."}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: deadGitHub(t), ItemID: item.ID, Turn: "s1", Converser: fc}, fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	last := sink.items[0].Thread[len(sink.items[0].Thread)-1]
+	if fc.gotUser != "" || last.Notice != worklist.NoticePanelInputs || last.Attempt != "attempt-2" {
+		t.Fatalf("want a declined legacy synthesis with a notice for attempt-2, got %+v (model asked: %v)", last, fc.gotUser != "")
+	}
 }

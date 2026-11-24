@@ -2,8 +2,10 @@ package webui
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -176,5 +178,76 @@ func TestRetryStrandedSynthesis(t *testing.T) {
 	retry() // a double submit
 	if len(pipe.turns) != 1 {
 		t.Fatalf("a second retry within the window dispatches nothing, got %v", pipe.turns)
+	}
+}
+
+// A hidden first review does not count: with model A's review hidden and B's blind
+// review the only visible one, the next panel offers A, for the thread picker and the
+// bulk action alike.
+func TestReviewPanelExcludesTheFirstVisibleReviewer(t *testing.T) {
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-time.Hour)
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, State: "open"}, Thread: []worklist.Message{
+		{ID: "q1", Role: worklist.RoleUser, Kind: worklist.KindReviewRequest, Content: reviewPrompt, At: old},
+		{ID: "r1", ReplyTo: "q1", Role: worklist.RoleAgent, Content: "A's review", Model: "a", Hidden: true, At: old},
+		{ID: "p1", Role: worklist.RoleUser, Kind: worklist.KindReviewRequest, Content: independentReviewPrompt, At: old},
+		{ID: "r2", ReplyTo: "p1", Role: worklist.RoleAgent, Content: "B's review", Model: "b", At: old},
+	}})
+	pipe := &recordPipeline{}
+	opts := []ModelOption{
+		{Value: "c0|a", Label: "a", Endpoint: "https://a", Model: "a"},
+		{Value: "c1|b", Label: "b", Endpoint: "https://b", Model: "b"},
+	}
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, pipe, nil, true, opts)
+	h.now = func() time.Time { return now }
+	rec := httptest.NewRecorder()
+	h.Thread(rec, httptest.NewRequest(http.MethodGet, "/items/thread?id=pr1", nil))
+	out := rec.Body.String()
+	so := out[strings.Index(out, `id="zz-so-model"`):]
+	so = so[:strings.Index(so, "</select>")]
+	if strings.Contains(so, "c1|b") || !strings.Contains(so, "c0|a") {
+		t.Fatalf("the panel must exclude b, the first visible reviewer, got:\n%s", so)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/items/second-opinion", strings.NewReader("id=pr1&choice=c1|b"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.SecondOpinion(httptest.NewRecorder(), req)
+	if len(pipe.soModels) != 1 || pipe.soModels[0] != "a" {
+		t.Fatalf("panel: want model a, got %v", pipe.soModels)
+	}
+}
+
+// Reviews that are each valid but too large to read together: the page offers no
+// Retry, says a smaller comparison is needed, and a forged retry dispatches nothing.
+func TestSynthesisTooLargeOffersNoRetry(t *testing.T) {
+	now := retryNow
+	old := now.Add(-time.Hour)
+	big := strings.Repeat("r", 750<<10)
+	th := []worklist.Message{}
+	var keys []string
+	for i := range 6 {
+		q := fmt.Sprintf("q%d", i)
+		th = append(th,
+			worklist.Message{ID: q, Role: worklist.RoleUser, Kind: worklist.KindReviewRequest, Content: reviewPrompt, At: old},
+			worklist.Message{ID: "r" + q, ReplyTo: q, Role: worklist.RoleAgent, Content: big, Model: fmt.Sprint(i), At: old})
+		keys = append(keys, q)
+	}
+	th = append(th, worklist.Message{ID: "s1", Role: worklist.RoleUser, Kind: worklist.KindSynthesisRequest, Content: worklist.SynthesisPrompt, Reviews: keys, At: old})
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest, Thread: th})
+	pipe := &recordPipeline{}
+	h := retryHandler(store, pipe, &now)
+	rec := httptest.NewRecorder()
+	h.Thread(rec, httptest.NewRequest(http.MethodGet, "/items/thread?id=pr1", nil))
+	out := rec.Body.String()
+	if strings.Contains(out, `action="/items/thread/retry"`) {
+		t.Fatal("no Retry for a comparison that cannot fit")
+	}
+	if !strings.Contains(out, "too large to read together") {
+		t.Fatal("the page must say a smaller comparison is needed")
+	}
+	postRetry(h, url.Values{"id": {"pr1"}, "turn": {"s1"}})
+	if len(pipe.turns) != 0 {
+		t.Fatalf("a comparison that cannot fit must not be dispatched, got %v", pipe.turns)
 	}
 }

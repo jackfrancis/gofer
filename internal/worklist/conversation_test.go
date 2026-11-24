@@ -189,33 +189,36 @@ func TestReconnectNotice(t *testing.T) {
 }
 
 // UndoRetry restores a refused attempt's turn only while it still carries exactly
-// that attempt's time and is unanswered: a later attempt, or an answer, wins.
+// that attempt and is unanswered: a later attempt, or an answer, wins.
 func TestUndoRetry(t *testing.T) {
 	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
 	prev := now.Add(-10 * time.Minute)
 	stalled := func() WorkItem {
-		return WorkItem{ID: "i", Thread: []Message{{ID: "t1", Role: RoleUser, Content: "q", At: prev}}}
+		return WorkItem{ID: "i", Thread: []Message{{ID: "t1", Role: RoleUser, Content: "q", Attempt: "a0", At: prev}}}
 	}
 
 	it := stalled()
 	key, ok := it.RetryStalled(now, 5*time.Minute)
-	if !ok || key != "t1" || !it.Thread[0].At.Equal(now) {
-		t.Fatalf("RetryStalled = %q %v, at %v", key, ok, it.Thread[0].At)
+	if !ok || key != "t1" || !it.Thread[0].At.Equal(now) || it.Thread[0].Attempt == "a0" || it.Thread[0].Attempt == "" {
+		t.Fatalf("RetryStalled = %q %v, turn %+v: want a new attempt", key, ok, it.Thread[0])
 	}
-	if !it.UndoRetry("t1", now, prev) || !it.Thread[0].At.Equal(prev) {
-		t.Fatal("UndoRetry must restore this attempt's turn")
+	it = stalled()
+	stamp := it.Restamp(0, now)
+	if !it.UndoRetry(stamp) || !it.Thread[0].At.Equal(prev) || it.Thread[0].Attempt != "a0" {
+		t.Fatalf("UndoRetry must restore this attempt's turn, got %+v", it.Thread[0])
 	}
 
 	later := stalled()
-	later.Thread[0].At = now.Add(time.Minute) // another attempt re-stamped it since
-	if later.UndoRetry("t1", now, prev) {
+	stamp = later.Restamp(0, now)
+	later.Restamp(0, now) // another attempt since, at the same time
+	if later.UndoRetry(stamp) {
 		t.Fatal("UndoRetry must leave a later attempt alone")
 	}
 
 	answered := stalled()
-	answered.Thread[0].At = now
+	stamp = answered.Restamp(0, now)
 	answered.Thread = append(answered.Thread, Message{ID: "a1", ReplyTo: "t1", Role: RoleAgent, Content: "a", At: now})
-	if answered.UndoRetry("t1", now, prev) {
+	if answered.UndoRetry(stamp) {
 		t.Fatal("UndoRetry must leave an answered turn alone")
 	}
 

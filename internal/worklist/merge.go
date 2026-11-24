@@ -218,6 +218,9 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 	if !knownNotice(reply.Notice) {
 		reply.Notice = "" // only notices gofer knows
 	}
+	if reply.Notice == "" {
+		reply.Attempt = "" // only a notice names the attempt it ended
+	}
 	reply.ReplyTo = replyTo
 	found := false // the answered turn is still in the thread
 	for i, m := range item.Thread {
