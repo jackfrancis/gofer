@@ -340,3 +340,12 @@ body {
 .zz-target-ok .zz-target-status { color: var(--success); }
 .zz-target-fail .zz-target-status { color: var(--danger); }
 .zz-target-unknown .zz-target-status { color: var(--attention); }
+
+/* Draft review (ADR 0010): the button at the bottom of a thread, and the selection under the newest draft. */
+.zz-draft-review { margin: 12px 0; }
+.zz-draft-review a { color: var(--accent); }
+.zz-draft-form { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+.zz-draft-form fieldset { border: 0; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.zz-draft-form legend { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+.zz-draft-pick { font-size: 13px; overflow-wrap: anywhere; }
+.zz-draft-form .zz-meta { margin: 6px 0 0; font-size: 12px; }

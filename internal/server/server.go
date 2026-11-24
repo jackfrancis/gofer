@@ -174,6 +174,10 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// Bulk comment (ADR 0009): preview, then confirm, posted by the web tier with the
 	// user's write grant; and the @ suggestions for the comment box.
 	mux.Handle("POST /items/comment", http.HandlerFunc(webHandler.Comment))
+	// Draft review comments (ADR 0010): ask for the agreed comments, then create a
+	// pending review on GitHub from the stored draft.
+	mux.Handle("POST /items/draft-review", http.HandlerFunc(webHandler.DraftReview))
+	mux.Handle("POST /items/draft-review/create", http.HandlerFunc(webHandler.CreateDraftReview))
 	mux.Handle("GET /items/mentions", http.HandlerFunc(webHandler.Mentions))
 
 	// Auth lifecycle.

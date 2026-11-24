@@ -1,6 +1,7 @@
 # ADR 0009 — An opt-in write grant for posting the user's own comments
 
 Status: proposed — implemented; not yet run against real GitHub.
+Amended by: ADR 0010 (draft review comments created as a pending review).
 Date: 2026-11-23
 
 ## Context

@@ -97,6 +97,7 @@ type Params struct {
 	Converser     worklist.Conversationalist // github-converse assistant; required for that job
 	Independent   bool                       // converse: answer blind — omit prior thread turns (independent review)
 	Researcher    worklist.ResearchRanker    // github-research re-ranker; required for that job
+	Drafter       worklist.ReviewDrafter     // converse: drafts a draft-review request's comments; nil answers that drafting is unavailable
 	TurnReader    worklist.TurnReader        // reads the user's last word on waiting items; nil leaves the timeline to decide
 	Bots          []string                   // logins whose comments are automated (BOT_REVIEWERS): never the last word
 	EnrichLimit   int                        // optional cap on items to enrich; 0 enriches every item

@@ -87,6 +87,14 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		if login, lerr := gh.Login(ctx, token); lerr == nil {
 			viewerLogin = login
 		}
+		if triggerKind == worklist.KindDraftReviewRequest {
+			// A draft review reads the diff, not the discussion, and answers with a
+			// structured draft (draft.go).
+			if holder.Reconnect() != nil {
+				return postReconnect(ctx, sink, item.ID, triggerKey)
+			}
+			return runDraftReview(ctx, p, sink, item, triggerKey, history, gh, holder, viewerLogin)
+		}
 		isPR := item.Type == worklist.TypePullRequest
 		if disc, derr := gh.Discussion(ctx, token, item.GitHub.Repo, item.GitHub.Number, isPR); derr == nil {
 			sourceContext = formatDiscussion(disc)
@@ -107,6 +115,10 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 			defer box.Close()
 			tools = reconnectBox{ToolBox: box, h: holder}
 		}
+	}
+	if noGitHub && triggerKind == worklist.KindDraftReviewRequest {
+		// A draft is anchored to the diff: without GitHub there is nothing to anchor to.
+		return postDraftUnavailable(ctx, p, sink, item.ID, triggerKey)
 	}
 	if noGitHub {
 		userText += githubUnavailableNote

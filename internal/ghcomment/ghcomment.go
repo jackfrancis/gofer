@@ -1,11 +1,14 @@
-// Package ghcomment is the web tier's only GitHub client (ADR 0009). It does exactly
-// three things, each on a public repository only:
+// Package ghcomment is the web tier's only GitHub client (ADR 0009, ADR 0010). It does
+// exactly four things, each on a public repository only:
 //
 //   - check a repository is public (GET /repos/{repo}), using the canonical name
 //     GitHub answers with for the call that follows;
 //   - post a comment on an issue or pull request (POST /repos/{repo}/issues/{n}/comments);
 //   - list a repository's assignable users (GET /repos/{repo}/assignees), for the
-//     bulk comment box's @-mention suggestions.
+//     bulk comment box's @-mention suggestions;
+//   - create a PENDING review on a pull request from the owner's confirmed draft
+//     (review.go): read the pull request and its reviews, then POST the review with
+//     no event, so GitHub keeps it a draft until the user submits it there.
 //
 // It follows no redirect at all (it calls the transport directly, so no Location
 // reaches an error) and never puts a token in an error or a log.

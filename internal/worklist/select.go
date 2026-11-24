@@ -255,6 +255,7 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 	th := slices.Clone(item.Thread)
 	for i := range th {
 		th[i].ID = full.TurnKey(i)
+		th[i].Draft = nil // a run reads a draft's summary (its Content), never the draft itself
 		if th[i].Role == RoleAgent && th[i].ReplyTo == "" && th[i].Notice == "" && i > 0 && full.Thread[i-1].Role == RoleUser {
 			th[i].ReplyTo = full.TurnKey(i - 1)
 		}

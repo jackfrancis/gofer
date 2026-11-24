@@ -235,6 +235,13 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 	if _, done := item.replies()[replyTo]; done {
 		return false, nil // the turn already has its answer
 	}
+	// Only a draft-review request is answered with a draft, and a stored draft is
+	// always within its bounds, whatever the run sent.
+	if i, _ := item.TurnIndex(replyTo); item.IsDraftReviewRequest(i) && reply.Notice == "" {
+		reply.Draft = BoundDraft(reply.Draft)
+	} else {
+		reply.Draft = nil
+	}
 	if reply.ID == "" {
 		reply.ID = NewMessageID()
 	}

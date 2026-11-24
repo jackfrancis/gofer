@@ -307,6 +307,8 @@ type pageData struct {
 	CommentConnected         bool                // worklist: the user connected the write grant
 	CommentNotice            string              // worklist: the outcome of the last connect/disconnect, for the user
 	Comment                  *commentView        // comment-preview / comment-results views
+	Draft                    *draftThread        // thread: the draft review's button and newest draft (draftreview.go); nil shows neither
+	DraftResult              *draftResult        // draft-review-result view
 }
 
 // Index handles GET /. It renders the sign-in view for anonymous visitors, the
@@ -360,6 +362,14 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 					}
 				} else if i, _ := it.LastUserTurn(); it.Thread[i].Hidden {
 					data.StalledHidden = true
+				}
+			}
+			if !it.IsHidden() {
+				data.Draft = h.draftThreadView(r.Context(), user, it, now)
+				if data.Draft != nil && data.Draft.Index >= 0 {
+					// The draft's Create button posts same-origin only; this lets it send
+					// its real Origin on a browser without fetch metadata (see Comment).
+					w.Header().Set("Referrer-Policy", "same-origin")
 				}
 			}
 			// Delivering the thread is the read receipt (the UI has no script to send
@@ -1209,6 +1219,8 @@ var funcs = template.FuncMap{
 	"waitingTitle":           waitingTitle,
 	"isSecondOpinionRequest": isSecondOpinionRequest,
 	"isSynthesisRequest":     isSynthesisRequest,
+	"isDraftReviewRequest":   isDraftReviewRequest,
+	"add1":                   func(i int) int { return i + 1 },
 	"userHandle":             userHandle,
 	"avatarURL":              avatarURL,
 }
