@@ -297,3 +297,43 @@ body {
   padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px;
   font-family: inherit; font-size: 13px; background: #fff;
 }
+
+/* Bulk comment (ADR 0009). */
+.zz-compose { margin: 0 0 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-subtle); }
+.zz-compose > summary { cursor: pointer; padding: 10px 14px; font-size: 14px; font-weight: 600; }
+.zz-compose-count { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 6px; }
+.zz-compose-form { display: flex; flex-direction: column; gap: 8px; padding: 0 14px 10px; }
+.zz-compose-hint, .zz-compose-connect { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+.zz-compose-hint { margin: 0; }
+.zz-compose-connect a { color: var(--accent); }
+.zz-compose-disconnect { margin: 0; padding: 0 14px 10px; }
+.zz-mention-wrap { position: relative; }
+.zz-mention-wrap textarea {
+  width: 100%; box-sizing: border-box; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px;
+  font-family: inherit; font-size: 14px; resize: vertical; background: #fff;
+}
+.zz-mentions {
+  position: absolute; left: 0; right: 0; top: 100%; z-index: 10; margin: 2px 0 0; padding: 4px;
+  list-style: none; max-height: 240px; overflow-y: auto;
+  background: #fff; border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(140,149,159,0.2);
+}
+.zz-mentions li { display: flex; justify-content: space-between; gap: 12px; padding: 6px 10px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+.zz-mentions li[aria-selected="true"], .zz-mentions li:hover { background: var(--bg-subtle); }
+.zz-mention-note { color: var(--attention); font-size: 12px; white-space: nowrap; }
+.zz-mentions .zz-mention-empty { color: var(--muted); cursor: default; }
+.zz-select { margin: 3px 0 0; flex: none; width: 16px; height: 16px; }
+.zz-item-head:has(.zz-select) .zz-title { flex: 1; }
+.zz-comment-page h1 { font-size: 20px; margin: 0 0 6px; }
+.zz-comment-page h2 { font-size: 15px; margin: 20px 0 8px; }
+.zz-comment-page .zz-meta { display: block; }
+.zz-comment-body {
+  white-space: pre-wrap; word-break: break-word; margin: 12px 0; padding: 10px 12px;
+  background: var(--bg-subtle); border: 1px solid var(--border); border-radius: 6px; font-size: 13px;
+}
+.zz-targets { margin: 0; padding: 0; list-style: none; }
+.zz-targets li { padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 14px; display: flex; flex-wrap: wrap; gap: 6px 10px; }
+.zz-targets a { color: var(--accent); text-decoration: none; font-weight: 600; }
+.zz-target-status { color: var(--muted); font-size: 13px; margin-left: auto; }
+.zz-target-ok .zz-target-status { color: var(--success); }
+.zz-target-fail .zz-target-status { color: var(--danger); }
+.zz-target-unknown .zz-target-status { color: var(--attention); }

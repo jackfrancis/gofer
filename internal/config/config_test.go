@@ -273,3 +273,31 @@ func TestParseRefreshInterval(t *testing.T) {
 		t.Fatalf("unset REFRESH_INTERVAL must leave the schedule off: %v, %v", got, err)
 	}
 }
+
+// The write client (ADR 0009) is optional, needs GitHub sign-in, comes as a pair, and
+// must be a different app from sign-in, whose token runs hold.
+func TestValidateGitHubWrite(t *testing.T) {
+	signIn := OAuthApp{ClientID: "cid", ClientSecret: "csec"}
+	cases := []struct {
+		name    string
+		p       Providers
+		wantErr bool
+		enabled bool
+	}{
+		{"unset", Providers{GitHub: signIn}, false, false},
+		{"set", Providers{GitHub: signIn, GitHubWrite: OAuthApp{ClientID: "wcid", ClientSecret: "wsec"}}, false, true},
+		{"id only", Providers{GitHub: signIn, GitHubWrite: OAuthApp{ClientID: "wcid"}}, true, false},
+		{"secret only", Providers{GitHub: signIn, GitHubWrite: OAuthApp{ClientSecret: "wsec"}}, true, false},
+		{"no sign-in", Providers{GitHubWrite: OAuthApp{ClientID: "wcid", ClientSecret: "wsec"}}, true, false},
+		{"same app as sign-in", Providers{GitHub: signIn, GitHubWrite: OAuthApp{ClientID: "cid", ClientSecret: "csec"}}, true, true},
+	}
+	for _, tc := range cases {
+		err := validateGitHubWrite(tc.p)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%s: err = %v, want error %v", tc.name, err, tc.wantErr)
+		}
+		if !tc.wantErr && tc.p.CommentingEnabled() != tc.enabled {
+			t.Errorf("%s: CommentingEnabled = %v", tc.name, tc.p.CommentingEnabled())
+		}
+	}
+}

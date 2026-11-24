@@ -178,8 +178,10 @@ func (v *VaultStore) markWith(ctx context.Context, ex execer, userID, provider s
 // transaction: either this call removed the session and the logout is recorded, or
 // neither happened. A session already gone (another logout of it got there first)
 // is session.ErrNotFound, and nothing is recorded, so each browser session starts
-// at most one logout. An empty sessionKey records the logout alone.
-func (v *VaultStore) MarkLogoutEndingSession(ctx context.Context, sessionKey, userID, provider string) error {
+// at most one logout. An empty sessionKey records the logout alone. Each provider in
+// more is recorded in the same transaction (logout of the sign-in credential and
+// the write grant together, ADR 0009).
+func (v *VaultStore) MarkLogoutEndingSession(ctx context.Context, sessionKey, userID, provider string, more ...string) error {
 	return v.inTx(ctx, func(tx *sql.Tx) error {
 		if sessionKey != "" {
 			res, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE id_hash = ?`, sessionKey)
@@ -192,7 +194,12 @@ func (v *VaultStore) MarkLogoutEndingSession(ctx context.Context, sessionKey, us
 				return session.ErrNotFound
 			}
 		}
-		return v.markWith(ctx, tx, userID, provider)
+		for _, p := range append([]string{provider}, more...) {
+			if err := v.markWith(ctx, tx, userID, p); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 

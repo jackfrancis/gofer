@@ -1,6 +1,7 @@
 package webui
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -80,5 +81,27 @@ func TestRadarOnlyWaitingInTheSelectedProject(t *testing.T) {
 	}
 	if strings.Contains(out, "No items in the selected projects.") || !strings.Contains(out, "Nothing in the selected projects needs you right now.") {
 		t.Fatalf("empty state wrong:\n%s", out)
+	}
+}
+
+// A waiting item is on the radar, so it can be selected for a bulk comment (a nudge
+// to whoever it waits on), and the comment reaches it.
+func TestWaitingItemTakesABulkComment(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	wait := waitingPR("github:o/r#9", time.Now())
+	wait.Source = "github"
+	store.Seed("github:42", wait)
+	h := New(fakeSessions{&session.User{ID: "github:42", Provider: "github", Login: "octocat"}}, store, &recordPipeline{}, reconnectProviders{false}, false, nil)
+	h.UseCommenter(&fakeCommenter{enabled: true, connected: true})
+	rec := httptest.NewRecorder()
+	h.Index(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	page := rec.Body.String()
+	section := page[strings.Index(page, "zz-waiting-head"):]
+	if !strings.Contains(section, `value="github:o/r#9" form="zz-bulk-comment"`) {
+		t.Fatal("the waiting item has no bulk-comment checkbox")
+	}
+	targets, skipped, err := h.commentTargets(context.Background(), "github:42", []string{wait.ID})
+	if err != nil || len(targets) != 1 || len(skipped) != 0 {
+		t.Errorf("targets %v, skipped %v, err %v", targets, skipped, err)
 	}
 }

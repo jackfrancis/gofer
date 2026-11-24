@@ -14,7 +14,9 @@ import (
 	"github.com/jackfrancis/gofer/internal/api"
 	"github.com/jackfrancis/gofer/internal/auth"
 	"github.com/jackfrancis/gofer/internal/authn"
+	"github.com/jackfrancis/gofer/internal/comment"
 	"github.com/jackfrancis/gofer/internal/config"
+	"github.com/jackfrancis/gofer/internal/ghcomment"
 	"github.com/jackfrancis/gofer/internal/identity"
 	"github.com/jackfrancis/gofer/internal/ingest"
 	"github.com/jackfrancis/gofer/internal/metrics"
@@ -119,6 +121,13 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// runtime (not the web tier) runs the model, vending the token from the broker.
 	convEnabled := cfg.ConversationEnabled
 	webHandler := webui.New(sessions, readStore, ingestor, authH, convEnabled, options)
+	// The bulk comment (ADR 0009), when the separate write client is configured: the
+	// web tier posts the user's own comment with their write grant, which the broker
+	// never vends to a run.
+	if cfg.Providers.CommentingEnabled() {
+		webHandler.UseCommenter(comment.New(authH, ghcomment.New("https://api.github.com", nil)))
+		log.Info("bulk comment enabled (GITHUB_WRITE_CLIENT_ID)")
+	}
 
 	mux := http.NewServeMux()
 
@@ -161,6 +170,10 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// Batch action: run the review panel on every PR reviewed once but not yet given a
 	// second opinion.
 	mux.Handle("POST /items/second-opinion-all", http.HandlerFunc(webHandler.SecondOpinionAllPRs))
+	// Bulk comment (ADR 0009): preview, then confirm, posted by the web tier with the
+	// user's write grant; and the @ suggestions for the comment box.
+	mux.Handle("POST /items/comment", http.HandlerFunc(webHandler.Comment))
+	mux.Handle("GET /items/mentions", http.HandlerFunc(webHandler.Mentions))
 
 	// Auth lifecycle.
 	mux.HandleFunc("GET /auth/providers", func(w http.ResponseWriter, r *http.Request) {
@@ -169,6 +182,12 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	mux.HandleFunc("GET /auth/{provider}/login", authH.Login)
 	mux.HandleFunc("GET /auth/{provider}/callback", authH.Callback)
 	mux.HandleFunc("POST /auth/logout", authH.Logout)
+	// The optional write grant (ADR 0009): connected by a signed-in GitHub user under
+	// its own cookie, never a way to sign in. These outrank /auth/{provider}/..., which
+	// refuses the grant provider anyway.
+	mux.HandleFunc("GET /auth/github-write/login", authH.ConnectWrite)
+	mux.HandleFunc("GET /auth/github-write/callback", authH.ConnectWriteCallback)
+	mux.HandleFunc("POST /auth/github-write/disconnect", authH.DisconnectWrite)
 
 	// Current principal (interactive user today; workloads once gofer mints its
 	// own agent-plane tokens).
