@@ -241,9 +241,11 @@ func TestPostOutcomes(t *testing.T) {
 		t.Errorf("201 with a lost body: link %q, err %v; want posted with no link", link, err)
 	}
 
-	gateway := postServer(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) })
-	if _, err := gateway.Comment(context.Background(), token, "o/r", 1, "hi"); !errors.Is(err, ErrOutcomeUnknown) {
-		t.Errorf("502 on a POST: %v, want ErrOutcomeUnknown", err)
+	for _, status := range []int{http.StatusInternalServerError, http.StatusBadGateway} {
+		gateway := postServer(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) })
+		if _, err := gateway.Comment(context.Background(), token, "o/r", 1, "hi"); !errors.Is(err, ErrOutcomeUnknown) {
+			t.Errorf("%d on a POST: %v, want ErrOutcomeUnknown", status, err)
+		}
 	}
 
 	dropped := postServer(t, func(w http.ResponseWriter, r *http.Request) {

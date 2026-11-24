@@ -501,3 +501,35 @@ func TestAgentTurns(t *testing.T) {
 		t.Fatal("a run without metadata:write wrote a turn reading")
 	}
 }
+
+// No agent read carries a structured draft review or its receipt, hidden turns'
+// included: the whole-list read (kept for older runtimes) and the single-item read
+// both send the reply's text only (ADR 0010).
+func TestAgentReadsLeaveDraftsOut(t *testing.T) {
+	store := worklist.NewMemoryStore()
+	draft := &worklist.DraftReview{Repo: "o/r", Number: 1, Commit: "0123456789abcdef0123456789abcdef01234567", BaseRef: "main", Body: "draft-body-secret"}
+	store.Seed("u1", worklist.WorkItem{ID: "a", OwnerID: "u1", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1}, Thread: []worklist.Message{
+		{ID: "d", Role: worklist.RoleUser, Content: "draft", Kind: worklist.KindDraftReviewRequest},
+		{ID: "r", ReplyTo: "d", Role: worklist.RoleAgent, Content: "drafted-text", Draft: draft, DraftReceipt: &worklist.DraftReceipt{State: worklist.DraftCreated, URL: "https://github.com/receipt-secret"}},
+		{ID: "h", ReplyTo: "d", Role: worklist.RoleAgent, Content: "older", Hidden: true, Draft: draft},
+	}})
+	h := NewIngestHandler(store, nil, worklist.NewRunPolicy(nil))
+	for target, hf := range map[string]http.HandlerFunc{"/agent/worklist": h.List, "/agent/worklist/item?id=a&turn=d": h.Item} {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req = req.WithContext(principal.NewContext(req.Context(), &principal.Principal{ActingUserID: "u1"}))
+		rec := httptest.NewRecorder()
+		hf(rec, req)
+		body := rec.Body.Bytes()
+		if rec.Code != http.StatusOK || !bytes.Contains(body, []byte("drafted-text")) {
+			t.Fatalf("%s: %d %s", target, rec.Code, body)
+		}
+		for _, leak := range []string{"draft-body-secret", "receipt-secret", `"draft":`, `"draft_receipt":`} {
+			if bytes.Contains(body, []byte(leak)) {
+				t.Errorf("%s carries %s: %s", target, leak, body)
+			}
+		}
+	}
+	if it, _, _ := store.Get(context.Background(), "u1", "a"); it.Thread[1].Draft == nil {
+		t.Error("a read changed the stored draft")
+	}
+}

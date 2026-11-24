@@ -98,6 +98,7 @@ type Params struct {
 	Independent   bool                       // converse: answer blind — omit prior thread turns (independent review)
 	Attempt       string                     // converse: the attempt this run is (worklist.Message.Attempt); its notices name it, whatever the stored turn says by then
 	Researcher    worklist.ResearchRanker    // github-research re-ranker; required for that job
+	Drafter       worklist.ReviewDrafter     // converse: drafts a draft-review request's comments; nil answers that drafting is unavailable
 	TurnReader    worklist.TurnReader        // reads the user's last word on waiting items; nil leaves the timeline to decide
 	Bots          []string                   // logins whose comments are automated (BOT_REVIEWERS): never the last word
 	EnrichLimit   int                        // optional cap on items to enrich; 0 enriches every item

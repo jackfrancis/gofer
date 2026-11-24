@@ -99,6 +99,7 @@ func work(ctx context.Context, rt *aeiruntime.Runtime) error {
 		params.Ranker = llm.NewRanker(cfg)
 		params.Converser = llm.NewConverser(cfg)
 		params.Researcher = llm.NewResearchRanker(cfg)
+		params.Drafter = llm.NewReviewDrafter(cfg)
 		params.TurnReader = llm.NewTurnReader(cfg)
 		log.Info("chat model configured", "endpoint", endpoint, "model", model)
 	} else {

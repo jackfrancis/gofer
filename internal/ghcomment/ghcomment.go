@@ -1,11 +1,14 @@
-// Package ghcomment is the web tier's only GitHub client (ADR 0009). It does exactly
-// three things, each on a public repository only:
+// Package ghcomment is the web tier's only GitHub client (ADR 0009, ADR 0010). It does
+// exactly four things, each on a public repository only:
 //
 //   - check a repository is public (GET /repos/{repo}), using the canonical name
 //     GitHub answers with for the call that follows;
 //   - post a comment on an issue or pull request (POST /repos/{repo}/issues/{n}/comments);
 //   - list a repository's assignable users (GET /repos/{repo}/assignees), for the
-//     bulk comment box's @-mention suggestions.
+//     bulk comment box's @-mention suggestions;
+//   - create a PENDING review on a pull request from the owner's confirmed draft
+//     (review.go): read the pull request and its reviews, then POST the review with
+//     no event, so GitHub keeps it a draft until the user submits it there.
 //
 // It follows no redirect at all (it calls the transport directly, so no Location
 // reaches an error) and never puts a token in an error or a log.
@@ -49,8 +52,8 @@ var (
 	// ErrInvalidRepo means the name is not a plain owner/name.
 	ErrInvalidRepo = errors.New("not a repository name")
 	// ErrOutcomeUnknown means a POST was sent but gofer cannot tell whether GitHub
-	// acted on it: the answer was lost (timeout, dropped connection) or was a gateway
-	// error (502/503/504), which GitHub can give after the comment was created. A
+	// acted on it: the answer was lost (timeout, dropped connection) or was a server
+	// error (5xx), which GitHub or a gateway can give after the write happened. A
 	// retry could post a duplicate.
 	ErrOutcomeUnknown = errors.New("github may or may not have acted on the request")
 )
@@ -204,9 +207,18 @@ var errBodyLost = errors.New("github: response body lost")
 
 // do sends one request and returns the body of a response with status want. Any
 // redirect is an error: the client follows none. For a POST, an error after the
-// request was written, or a gateway error, is ErrOutcomeUnknown; an error before it
-// was written is a definite failure.
+// request was written, or any server error (5xx), is ErrOutcomeUnknown; an error
+// before it was written is a definite failure.
 func (c *Client) do(ctx context.Context, token, method, path string, payload []byte, want int) ([]byte, error) {
+	return c.doLimit(ctx, token, method, path, payload, want, maxResponseBytes)
+}
+
+// errTooLarge is a wanted response longer than the caller's limit.
+var errTooLarge = errors.New("github: response too large")
+
+// doLimit is do, reading at most limit bytes of the response: a wanted response
+// longer than that is errTooLarge, never a truncated body.
+func (c *Client) doLimit(ctx context.Context, token, method, path string, payload []byte, want, limit int) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	var wrote atomic.Bool
@@ -244,18 +256,26 @@ func (c *Client) do(ctx context.Context, token, method, path string, payload []b
 		return nil, errors.New("github: request failed")
 	}
 	defer resp.Body.Close()
-	data, rerr := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	data, rerr := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	switch {
 	case resp.StatusCode == want:
 		if rerr != nil {
 			return data, errBodyLost
+		}
+		if len(data) > limit {
+			if post {
+				return nil, errBodyLost // the write happened; only its answer is unreadable
+			}
+			return nil, errTooLarge
 		}
 		return data, nil
 	case resp.StatusCode == http.StatusUnauthorized:
 		return nil, ErrUnauthorized
 	case resp.StatusCode >= 300 && resp.StatusCode < 400:
 		return nil, &StatusError{Status: resp.StatusCode, Message: "redirected; gofer follows no redirect"}
-	case post && (resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout):
+	case post && resp.StatusCode >= 500:
+		// A server error does not say the write was rolled back: GitHub (or a
+		// gateway in front of it) can fail after it acted.
 		return nil, ErrOutcomeUnknown
 	}
 	var msg struct {

@@ -84,6 +84,23 @@
         </div>
       </div>
 
+    {{else if eq .View "draft-review-result"}}
+      <p><a href="/items/thread?id={{.Item.ID | urlquery}}">&larr; Back to the conversation</a></p>
+      <div class="zz-comment-page">
+        {{with .DraftResult}}
+        <h1>{{if .Created}}Pending review created{{else if .Unknown}}Pending review: unknown{{else}}No pending review created{{end}}</h1>
+        {{if .Repeat}}<p class="zz-meta">This draft was already confirmed, so gofer sent nothing to GitHub now. This is what the earlier confirmation did.</p>{{end}}
+        <p class="zz-meta"><a href="{{.Item.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.Item.GitHub.Repo}} #{{.Item.GitHub.Number}}</a> {{.Item.GitHub.Title}}</p>
+        {{if .Created}}
+        <p>{{if .Repeat}}gofer created a pending review from this draft.{{else}}gofer created a pending review with {{.Comments}} inline comment{{if ne .Comments 1}}s{{end}}{{if .Summary}} and a summary{{end}}.{{end}} It is a draft only you can see until you submit it: open it on GitHub to edit, submit or discard it.</p>
+        <div class="zz-actions"><a class="btn btn-primary" href="{{with .URL}}{{.}}{{else}}{{$.Item.GitHub.URL}}/files{{end}}" target="_blank" rel="noopener noreferrer">Open on GitHub</a></div>
+        {{else}}
+        <p class="zz-stalled" role="alert">{{.Error}}</p>
+        <div class="zz-actions"><a class="btn btn-primary" href="{{.Item.GitHub.URL}}" target="_blank" rel="noopener noreferrer">Open on GitHub</a></div>
+        {{end}}
+        {{end}}
+      </div>
+
     {{else if eq .View "comment-results"}}
       <p><a href="/">&larr; Back to radar</a></p>
       <div class="zz-comment-page">
@@ -129,6 +146,8 @@
         {{range $i, $m := .Item.Thread}}
           {{if isSynthesisRequest $m}}{{else if isSecondOpinionRequest $m}}
           <div class="zz-notice">{{userHandle $.User}} has requested a 2nd review</div>
+          {{else if isDraftReviewRequest $m}}
+          <div class="zz-notice">{{userHandle $.User}} asked for draft review comments</div>
           {{else if eq $m.Notice "reconnect"}}
           <div class="zz-notice zz-notice--reconnect">{{$m.Content}} <a href="/auth/{{$.User.Provider}}/login">Sign in again</a></div>
           {{else if eq $m.Notice "panel_inputs"}}
@@ -148,6 +167,42 @@
           {{else}}
           <div class="zz-msg zz-msg--{{$m.Role}}">
             {{if eq $m.Role "agent"}}{{markdown $m.Content}}{{else}}{{$m.Content}}{{end}}
+            {{if and $.Draft $m.Draft (eq $i $.Draft.Index)}}
+            {{with $.Draft.Receipt}}
+            {{/* Already confirmed: say what happened; never offer to create it again. */}}
+            <div class="zz-draft-receipt">
+              {{if eq .State "created"}}
+              <p>Pending review created on GitHub{{with .URL}} &middot; <a href="{{.}}" target="_blank" rel="noopener noreferrer">open it</a>{{end}}. Submit or discard it there. To start over, draft the comments again.</p>
+              {{else}}
+              <p role="alert">{{if and (eq .State "creating") (not $.Draft.Interrupted)}}gofer is creating this pending review; reload in a moment.{{else}}gofer may have created this pending review (its answer was lost, or the request was interrupted). Check the pull request on GitHub; gofer will not create another from this draft. To start over, draft the comments again.{{end}}</p>
+              {{end}}
+            </div>
+            {{else}}
+            {{/* The offered draft: choose what goes into the pending review. Each checkbox shows the exact text it sends. The server reads the draft itself from the store; the form only names it (msg, digest) and what to leave out. */}}
+            <form class="zz-draft-form" method="post" action="/items/draft-review/create">
+              <input type="hidden" name="id" value="{{$.Item.ID}}">
+              <input type="hidden" name="msg" value="{{$.Item.TurnKey $i}}">
+              <input type="hidden" name="digest" value="{{$.Draft.Digest}}">
+              <fieldset>
+                <legend>Pending review on {{$m.Draft.Repo}} #{{$m.Draft.Number}}, at commit <code>{{shortSHA $m.Draft.Commit}}</code> against <code>{{$m.Draft.BaseRef}}</code>. Exactly this text is sent:</legend>
+                {{range $j, $c := $m.Draft.Comments}}
+                <div class="zz-draft-pick">
+                  <label><input type="checkbox" name="c" value="{{$j}}" checked> {{add1 $j}}. <code>{{$c.Path}}</code> line {{$c.Line}}{{if eq $c.Side "LEFT"}} (removed line){{end}}</label>
+                  <pre class="zz-draft-text">{{$c.Body}}</pre>
+                </div>
+                {{end}}
+                {{if $m.Draft.Body}}
+                <div class="zz-draft-pick">
+                  <label><input type="checkbox" name="summary" value="1" checked> Review summary</label>
+                  <pre class="zz-draft-text">{{$m.Draft.Body}}</pre>
+                </div>
+                {{end}}
+              </fieldset>
+              <button class="btn btn-sm btn-primary" type="submit" title="Creates a pending review on GitHub as you. It is a draft only you can see until you submit it on GitHub.">Create pending review on GitHub</button>
+              <p class="zz-meta">gofer creates the review as a draft (pending) on GitHub, as you{{with userHandle $.User}} ({{.}}){{end}}, once per draft. Nothing is submitted: open the pull request on GitHub to edit, submit or discard it.</p>
+            </form>
+            {{end}}
+            {{end}}
             <div class="zz-msgfoot">
               {{if $m.Model}}<span class="zz-model">via {{$m.Model}}</span>{{end}}
               {{if eq $m.Role "agent"}}<button class="zz-iconbtn zz-copy" type="button" data-copy="{{$m.Content}}" title="Copy" aria-label="Copy reply" hidden><svg class="zz-icon zz-icon-copy" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="5.5" y="5.5" width="9" height="9" rx="1.75"/><path d="M3.5 10.5h-.25A1.75 1.75 0 0 1 1.5 8.75v-5.5A1.75 1.75 0 0 1 3.25 1.5h5.5a1.75 1.75 0 0 1 1.75 1.75v.25"/></svg><svg class="zz-icon zz-icon-check" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M3 8.5l3.25 3.25L13 5"/></svg><svg class="zz-icon zz-icon-fail" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.75v3.5M8 11.25h.01"/></svg><span class="zz-copy-fail" aria-hidden="true">Copy failed</span></button>{{end}}
@@ -191,6 +246,18 @@
       {{if .SynthesisTooLarge}}
       <div class="zz-stalled">
         <p>The reviews this consensus compares are too large to read together, so it can&rsquo;t be retried. Hide some of them and run the review panel again for a smaller comparison.</p>
+      </div>
+      {{end}}
+      {{with .Draft}}
+      <div class="zz-draft-review">
+        {{if .Connected}}
+        <form method="post" action="/items/draft-review">
+          <input type="hidden" name="id" value="{{$.Item.ID}}">
+          <button class="btn btn-sm" type="submit"{{if not .Ready}} disabled title="{{.Why}}"{{else}} title="Drafts review comments for the points this conversation agrees on. Nothing is posted until you create the pending review."{{end}}>Draft Review Comments</button>
+        </form>
+        {{else}}
+        <p class="zz-meta"><a href="/auth/github-write/login">Connect GitHub to comment</a> to draft review comments from this conversation as a pending review on GitHub.</p>
+        {{end}}
       </div>
       {{end}}
       {{if .ItemHidden}}

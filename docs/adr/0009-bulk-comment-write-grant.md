@@ -1,6 +1,7 @@
 # ADR 0009 — An opt-in write grant for posting the user's own comments
 
 Status: proposed — implemented; not yet run against real GitHub.
+Amended by: ADR 0010 (draft review comments created as a pending review).
 Date: 2026-11-23
 
 ## Context
@@ -127,7 +128,7 @@ The client keeps the workload's guard rules (ADR 0007, "public-only guard"):
 5. The results page shows each target as posted (with a link to the comment, when
    GitHub's answer arrived whole), unknown, or not posted (with the reason). A 201 is
    posted even if its body was lost. A POST whose answer was lost after the request
-   was written, or that got a gateway error (502/503/504), is **unknown**: it may
+   was written, or that got a server error (any 5xx, amended by ADR 0010: a 500 does not say the write was rolled back either), is **unknown**: it may
    have been posted, and the page says to check before posting again. A 401 confirmed
    by GitHub's check-token deletes the stored grant. A rate limit (429, or 403 with
    GitHub's rate-limit signals) stops the batch, says when to try again, and leaves

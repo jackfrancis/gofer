@@ -62,8 +62,8 @@ internal/checkout/   unpack a repo tarball safely; search/list/read it (workload
 internal/prow/       read a Prow job's public logs/artifacts from GCS, allowlisted (workload-only)
 internal/llm/        LLM ranking / converse (workload-only)
 internal/markdown/   render + sanitize assistant Markdown
-internal/comment/    bulk comment: post the user's comment with the write grant; @ suggestions (web tier, ADR 0009)
-internal/ghcomment/  the web tier's only GitHub client: public check, post a comment, list assignees
+internal/comment/    bulk comment: post the user's comment with the write grant; @ suggestions; create a pending review from a confirmed draft (web tier, ADR 0009, ADR 0010)
+internal/ghcomment/  the web tier's only GitHub client: public check, post a comment, list assignees, create a pending review
 internal/metrics/    Prometheus metrics
 Dockerfile           web-tier image
 Dockerfile.runtime   agent-runtime image (AEI launches it per run)
@@ -156,8 +156,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   The one write-capable credential is the opt-in write grant (ADR 0009, vault
   provider `github-write`, a separate classic OAuth app with `public_repo`), and it
   never leaves the web tier: `auth.Handler.Credential` and the broker each refuse it,
-  independently. It posts only the user's own comment, from their confirmed
-  submission, with no model involved.
+  independently. It posts only what the user confirmed: their own comment, with no
+  model involved, or the comments they kept from a draft review, created as a
+  PENDING review that only they see until they submit it on GitHub (ADR 0010).
 
 ## Conventions & gotchas
 
@@ -607,6 +608,37 @@ Wired on the web-tier side; they define what a runtime must respect:
   suggestions are each repository's assignees, read with the user's read credential
   and cached in memory, counted against every selected repository (unchecked ones are
   unknown). `reload.js` does not reload while items are checked.
+- Draft review comments (ADR 0010): at the bottom of a reviewed pull request's
+  thread, "Draft Review Comments" (offered only with commenting configured; a connect
+  link without the grant) posts a `KindDraftReviewRequest` turn and dispatches a
+  converse run by the default model. The run (`internal/agent/draft.go`) reads the
+  head commit and patches (`github.Client.PullDiff`), annotates the lines a comment
+  may anchor to, asks `worklist.ReviewDrafter` (`llm.ReviewDrafter`) for only the
+  points the visible conversation agrees on (the user's own messages decide; an
+  unsettled disagreement is left out and listed), keeps inline only comments on a line
+  the diff showed (others move into the summary), and replies with a
+  `worklist.DraftReview` on `Message.Draft`, pinned to the repository, number, head
+  commit and base branch it was anchored to, with each commented file's patch digest
+  (`DraftReview.Patches`, `worklist.PatchDigest` = `ghcomment.PatchDigest`). Context lines anchor RIGHT only, as
+  GitHub defines them, and the annotated diff stays within its byte budget, notices
+  included. `AppendReply` bounds the draft (`BoundDraft`) and drops it from a reply to
+  any other turn or when pinned to another pull request; no agent read sends a draft
+  or receipt back to a run (`ThreadWindow`, and `RedactDrafts` on the whole-list
+  read). The thread offers only the newest draft request's reply
+  (`WorkItem.LatestDraft`; an empty redraft retires the previous draft), only while
+  its pin matches the item, and shows the exact stored text beside each checkbox.
+  `webui.CreateDraftReview` (same-origin only) reads the draft from the store, never
+  the form (which names the turn, the draft's `Digest`, covering the pin, and the
+  positions to keep), claims a durable `DraftReceipt` on the turn
+  (`worklist.ClaimDraft`) before calling GitHub, and settles or releases it
+  (`SettleDraft`, under its own deadline, never the request's): a draft creates at
+  most one review, and a replayed confirmation shows the receipt and sends nothing.
+  `comment.Service.PendingReview` creates it with the write grant only while the user
+  has no pending review there, every commented file's patch still has its digest (a
+  related merge into the base can move the merge base without moving head or base
+  branch), and, checked last, the pull request is open with the draft's head and base
+  branch; the POST has no `event`, so GitHub keeps it pending. Any 5xx on a ghcomment
+  POST is an unknown outcome, never "not posted". gofer never submits a review.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

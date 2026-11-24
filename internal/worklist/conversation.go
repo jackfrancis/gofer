@@ -24,6 +24,9 @@ const (
 const (
 	KindReviewRequest    = "review_request"    // "review this PR" (Review-all, or an independent 2nd-opinion review)
 	KindSynthesisRequest = "synthesis_request" // the consensus turn that weighs the reviews
+	// KindDraftReviewRequest asks for the review comments the conversation agrees
+	// on, drafted for a pending GitHub review (draft.go, ADR 0010).
+	KindDraftReviewRequest = "draft_review_request"
 )
 
 // Message.Notice values: an agent turn that is a system notice rather than an
@@ -111,8 +114,15 @@ type Message struct {
 	Hidden bool `json:"hidden,omitempty"`
 	// Notice marks an agent turn that is a system notice (NoticeReconnect), not an
 	// answer: it does not answer the turn it replies to. Empty on every other turn.
-	Notice string    `json:"notice,omitempty"`
-	At     time.Time `json:"at"`
+	Notice string `json:"notice,omitempty"`
+	// Draft is the draft review an agent turn answering a KindDraftReviewRequest
+	// carries (draft.go). AppendReply bounds it, and drops it from a reply to any
+	// other turn. Runs never read it back (ThreadWindow leaves it out).
+	Draft *DraftReview `json:"draft,omitempty"`
+	// DraftReceipt records the owner's confirmation of Draft (draft.go): written by
+	// the web tier only (ClaimDraft, SettleDraft), never by a run.
+	DraftReceipt *DraftReceipt `json:"draft_receipt,omitempty"`
+	At           time.Time     `json:"at"`
 }
 
 // ParseVerdict extracts the leading verdict token the consensus synthesis is asked to

@@ -315,6 +315,8 @@ type pageData struct {
 	CommentConnected         bool                // worklist: the user connected the write grant
 	CommentNotice            string              // worklist: the outcome of the last connect/disconnect, for the user
 	Comment                  *commentView        // comment-preview / comment-results views
+	Draft                    *draftThread        // thread: the draft review's button and newest draft (draftreview.go); nil shows neither
+	DraftResult              *draftResult        // draft-review-result view
 }
 
 // Index handles GET /. It renders the sign-in view for anonymous visitors, the
@@ -396,6 +398,14 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 				if i, ok := it.StalledSynthesis(now, reviewStaleAfter); ok {
 					key := it.TurnKey(i)
 					data.SynthesisTooLarge = it.SynthesisReady(key) && !it.SynthesisFits(key)
+				}
+			}
+			if !it.IsHidden() {
+				data.Draft = h.draftThreadView(r.Context(), user, it, now)
+				if data.Draft != nil && data.Draft.Index >= 0 {
+					// The draft's Create button posts same-origin only; this lets it send
+					// its real Origin on a browser without fetch metadata (see Comment).
+					w.Header().Set("Referrer-Policy", "same-origin")
 				}
 			}
 			// Delivering the thread is the read receipt (the UI has no script to send
@@ -1327,8 +1337,16 @@ var funcs = template.FuncMap{
 	"waitingTitle":           waitingTitle,
 	"isSecondOpinionRequest": isSecondOpinionRequest,
 	"isSynthesisRequest":     isSynthesisRequest,
-	"userHandle":             userHandle,
-	"avatarURL":              avatarURL,
+	"isDraftReviewRequest":   isDraftReviewRequest,
+	"add1":                   func(i int) int { return i + 1 },
+	"shortSHA": func(s string) string {
+		if len(s) > 7 {
+			return s[:7]
+		}
+		return s
+	},
+	"userHandle": userHandle,
+	"avatarURL":  avatarURL,
 }
 
 // AvatarOrigin serves GitHub avatars. It is the one third-party origin the page
