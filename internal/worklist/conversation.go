@@ -32,10 +32,20 @@ const (
 	// NoticeReconnect: gofer could not reach GitHub for the user, who must sign in
 	// again. The UI shows a sign-in prompt with it.
 	NoticeReconnect = "reconnect"
+	// NoticePanelInputs: the consensus synthesis did not run, because a review it
+	// weighs (Message.Reviews) is hidden, gone, or did not fit the run's read. The
+	// thread offers to retry the synthesis once the reviews are back (RetryableSynthesis).
+	NoticePanelInputs = "panel_inputs"
 )
+
+// knownNotice reports whether n is a notice gofer knows, which AppendReply keeps.
+func knownNotice(n string) bool { return n == NoticeReconnect || n == NoticePanelInputs }
 
 // ReconnectNotice is the text of a NoticeReconnect turn.
 const ReconnectNotice = "gofer can't reach GitHub for you: sign in again to reconnect, then ask again."
+
+// PanelInputsNotice is the text of a NoticePanelInputs turn.
+const PanelInputsNotice = "gofer didn't run the consensus: a review it compares is hidden, or too large to read with this conversation. Unhide it (or hide other turns), then retry the consensus."
 
 // ErrSignInRequired is the error a ToolBox returns (wrapped) when the user's
 // provider credential is gone and only signing in again helps. A Conversationalist
@@ -79,6 +89,12 @@ type Message struct {
 	// synthesis agent reply, parsed from the model's leading verdict token; empty on
 	// every other message.
 	Verdict string `json:"verdict,omitempty"`
+	// Reviews lists the keys (TurnKey) of the review requests a synthesis request
+	// weighs, recorded when it is chained (ChainSynthesis): the run compares exactly
+	// those reviews, and declines (NoticePanelInputs) if any is no longer visible to it
+	// (SynthesisReady). Empty on every other turn, and on synthesis requests stored
+	// before it was recorded.
+	Reviews []string `json:"reviews,omitempty"`
 	// Hidden marks a turn the user has hidden from the thread view. A hidden turn is
 	// also withheld from the model as future conversation context (see splitThread), so
 	// a long review thread can be pared down to its definitive turns without deleting
@@ -230,11 +246,22 @@ func (w WorkItem) replies() map[string]int {
 }
 
 // noticed is the set of user turns a system notice replied to: the run that took
-// the turn finished, without answering it.
+// the turn finished, without answering it. A notice older than its turn's time
+// replied to an earlier attempt: a retry re-stamps the turn (ThreadRetry), and the
+// retried turn is pending again until its own run ends.
 func (w WorkItem) noticed() map[string]bool {
+	asked := make(map[string]time.Time)
+	for i, m := range w.Thread {
+		if m.Role == RoleUser {
+			asked[w.TurnKey(i)] = m.At
+		}
+	}
 	out := make(map[string]bool)
 	for _, m := range w.Thread {
-		if m.Role == RoleAgent && m.Notice != "" && m.ReplyTo != "" {
+		if m.Role != RoleAgent || m.Notice == "" || m.ReplyTo == "" {
+			continue
+		}
+		if at, ok := asked[m.ReplyTo]; ok && !m.At.Before(at) {
 			out[m.ReplyTo] = true
 		}
 	}
@@ -318,15 +345,73 @@ func (w WorkItem) FirstReviewModel() string {
 // second-opinion round has finished and a verdict is available.
 func (w WorkItem) HasSecondOpinion() bool { return w.hasCompletedRequest(KindSynthesisRequest) }
 
-// ReviewVerdict returns the consensus outcome (VerdictAgree / VerdictDisagree) from
-// the most recent synthesis reply, or "" when there is none.
+// ReviewVerdict returns the consensus outcome (VerdictAgree / VerdictDisagree) of the
+// newest answered synthesis request, read from its answer (the reply its ReplyTo
+// links), or "" when there is none or that answer carries no verdict. Replies land
+// out of order, so the newest request decides, not the last reply to arrive: an
+// older round's late answer never replaces a newer round's verdict.
 func (w WorkItem) ReviewVerdict() string {
+	replies := w.replies()
 	for i := len(w.Thread) - 1; i >= 0; i-- {
-		if m := w.Thread[i]; m.Role == RoleAgent && m.Verdict != "" {
-			return m.Verdict
+		if m := w.Thread[i]; m.Role == RoleUser && m.Kind == KindSynthesisRequest {
+			if j, ok := replies[w.TurnKey(i)]; ok {
+				return w.Thread[j].Verdict
+			}
 		}
 	}
 	return ""
+}
+
+// SynthesisReady reports whether the synthesis request at key can be answered from
+// the item as given: every review it weighs (Message.Reviews) is a visible review
+// request in the thread whose answer is there and visible too. The web tier checks it
+// on the stored item before a retry; the run checks it on the bounded window it read
+// (ThreadWindow keeps those reviews first), and declines without a verdict if it
+// fails. A request stored before Reviews was recorded names none, so it is ready.
+func (w WorkItem) SynthesisReady(key string) bool {
+	i, ok := w.TurnIndex(key)
+	if !ok || w.Thread[i].Role != RoleUser || w.Thread[i].Kind != KindSynthesisRequest {
+		return false
+	}
+	replies := w.replies()
+	for _, k := range w.Thread[i].Reviews {
+		j, ok := w.TurnIndex(k)
+		if !ok || w.Thread[j].Role != RoleUser || w.Thread[j].Kind != KindReviewRequest || w.Thread[j].Hidden {
+			return false
+		}
+		if a, ok := replies[k]; !ok || w.Thread[a].Hidden {
+			return false
+		}
+	}
+	return true
+}
+
+// RetryableSynthesis returns the position of the synthesis request the thread can
+// retry, wherever it sits in the thread: the newest synthesis request, if it is not
+// hidden, has no answer, is no longer plausibly in flight (older than staleAfter, or
+// a notice ended its run), and still has every review it weighs (SynthesisReady).
+// Unlike RetryableTurn it does not need to be the last user turn, so a Discuss turn
+// posted after a failed synthesis does not strand it: the verdict can be recovered
+// without another blind review.
+func (w WorkItem) RetryableSynthesis(now time.Time, staleAfter time.Duration) (int, bool) {
+	for i := len(w.Thread) - 1; i >= 0; i-- {
+		m := w.Thread[i]
+		if m.Role != RoleUser || m.Kind != KindSynthesisRequest {
+			continue
+		}
+		key := w.TurnKey(i)
+		if m.Hidden || w.Answered(key) {
+			return 0, false
+		}
+		if !w.noticed()[key] && now.Sub(m.At) < staleAfter {
+			return 0, false // still plausibly in flight
+		}
+		if !w.SynthesisReady(key) {
+			return 0, false
+		}
+		return i, true
+	}
+	return 0, false
 }
 
 // hasSynthesisRequest reports whether a consensus synthesis has been requested at all

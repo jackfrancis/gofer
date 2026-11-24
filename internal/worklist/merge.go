@@ -192,7 +192,8 @@ var ErrEmptyReply = errors.New("worklist: reply has no content")
 //
 //   - The reply is always a visible agent turn with no request kind, whatever it
 //     claims, so a run cannot put words in the owner's mouth. It gets an ID if it has
-//     none. It keeps a Notice only if it is one gofer knows (NoticeReconnect).
+//     none. It keeps a Notice only if it is one gofer knows (NoticeReconnect,
+//     NoticePanelInputs). It never carries Reviews, which mark user turns only.
 //   - If the answered turn is no longer in the thread (the owner cleared the
 //     conversation), the reply is dropped.
 //   - A reply already in the thread (same ID, or for a reply without one the same
@@ -212,8 +213,9 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 	}
 	reply.Role = RoleAgent
 	reply.Kind = "" // request kinds mark user turns only
+	reply.Reviews = nil
 	reply.Hidden = false
-	if reply.Notice != NoticeReconnect {
+	if !knownNotice(reply.Notice) {
 		reply.Notice = "" // only notices gofer knows
 	}
 	reply.ReplyTo = replyTo

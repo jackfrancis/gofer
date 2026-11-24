@@ -131,6 +131,8 @@
           <div class="zz-notice">{{userHandle $.User}} has requested a 2nd review</div>
           {{else if eq $m.Notice "reconnect"}}
           <div class="zz-notice zz-notice--reconnect">{{$m.Content}} <a href="/auth/{{$.User.Provider}}/login">Sign in again</a></div>
+          {{else if eq $m.Notice "panel_inputs"}}
+          <div class="zz-notice">{{$m.Content}}</div>
           {{else if $m.Hidden}}
           <div class="zz-hidden">
             <span>Hidden {{if eq $m.Role "agent"}}reply{{else}}message{{end}}</span>
@@ -169,7 +171,8 @@
       </div>
       {{if .ReplyStalled}}
       <div class="zz-stalled">
-        <p>The assistant hasn&rsquo;t responded &mdash; it may have been rate-limited or the run failed.{{if .StalledHidden}} Unhide your message to retry it.{{end}}</p>
+        {{if .StalledSynthesis}}<p>The consensus on the reviews didn&rsquo;t finish. Retry it to get the verdict, without another review.</p>
+        {{else}}<p>The assistant hasn&rsquo;t responded &mdash; it may have been rate-limited or the run failed.{{if .StalledHidden}} Unhide your message to retry it.{{end}}</p>{{end}}
         {{if .RetryRefused}}<p role="alert">The retry could not be started. Try again in a moment.</p>{{end}}
         {{if and .ConvEnabled .StalledTurn}}
         <form class="zz-retry-form" method="post" action="/items/thread/retry">

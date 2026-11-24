@@ -682,12 +682,14 @@ func (i *Ingestor) converseInFlight(ownerID, itemID string) bool {
 }
 
 // Synthesize dispatches the review panel's consensus synthesis: a github-converse run
-// answering ref, the synthesis turn the agent plane chained onto the thread when the
-// panel's blind review landed (worklist.ApplyReplyAndChain). It uses the DEFAULT
-// model (no per-turn override) and is not independent, so it reads every review in
-// the thread. The agent plane calls it off the reply's request, so the dispatch is
-// bounded by submitTimeout and its failure is logged, not returned: the turn then
-// stays pending, and once reviewStaleAfter passes the thread offers to retry it.
+// answering ref, the synthesis turn the agent plane chained onto the thread when a
+// review landed and a panel review had another to compare
+// (worklist.ApplyReplyAndChain). It uses the DEFAULT model (no per-turn override) and
+// is not independent, so it reads the reviews the turn names (Message.Reviews). The
+// agent plane calls it off the reply's request, so the dispatch is bounded by
+// submitTimeout and its failure is logged, not returned: the turn then stays pending,
+// and once reviewStaleAfter passes the thread offers to retry it, even after later
+// turns (worklist.RetryableSynthesis).
 func (i *Ingestor) Synthesize(ctx context.Context, ownerID string, ref worklist.TurnRef) {
 	sctx, cancel := context.WithTimeout(ctx, submitTimeout)
 	defer cancel()

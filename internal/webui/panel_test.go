@@ -61,3 +61,120 @@ func TestReviewPanelWhileReplyPending(t *testing.T) {
 		t.Fatalf("an answered thread shows the panel and no cue, got:\n%s", out)
 	}
 }
+
+// The panel never compares a model with itself: once the alternative model has given
+// the item's first review (the owner ran the panel first), the panel offers the other
+// model, and a choice made on a page rendered before that review landed is resolved
+// against the item as stored.
+func TestReviewPanelPicksAModelOtherThanTheFirstReviewer(t *testing.T) {
+	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest})
+	pipe := &recordPipeline{}
+	opts := []ModelOption{
+		{Value: "c0|default-model", Label: "default-model", Endpoint: "https://default", Model: "default-model"},
+		{Value: "c1|alt", Label: "alt", Endpoint: "https://second", Model: "alt"},
+	}
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, pipe, nil, true, opts)
+	h.now = func() time.Time { return now }
+	page := func() string {
+		rec := httptest.NewRecorder()
+		h.Thread(rec, httptest.NewRequest(http.MethodGet, "/items/thread?id=pr1", nil))
+		return rec.Body.String()
+	}
+	panel := func(choice string) {
+		req := httptest.NewRequest(http.MethodPost, "/items/second-opinion", strings.NewReader("id=pr1&choice="+choice))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		h.SecondOpinion(httptest.NewRecorder(), req)
+	}
+
+	picker := func() string {
+		out := page()
+		so := out[strings.Index(out, `id="zz-so-model"`):]
+		return so[:strings.Index(so, "</select>")]
+	}
+	if so := picker(); !strings.Contains(so, "c1|alt") || strings.Contains(so, "c0|default-model") {
+		t.Fatalf("with no review yet the panel offers the alternative model, got:\n%s", so)
+	}
+	panel("c1|alt")
+	if len(pipe.soModels) != 1 || pipe.soModels[0] != "alt" {
+		t.Fatalf("first panel: want alt, got %v", pipe.soModels)
+	}
+	// alt's blind review lands and is the item's first review.
+	ref := pipe.turns[0]
+	if err := worklist.ApplyReply(context.Background(), store, "u1", "pr1", ref.Turn, worklist.Message{ID: "r1", Content: "review", Model: "alt", At: now}); err != nil {
+		t.Fatal(err)
+	}
+	if so := picker(); strings.Contains(so, "c1|alt") || !strings.Contains(so, "c0|default-model") {
+		t.Fatalf("after alt's first review the panel offers only the default model, got:\n%s", picker())
+	}
+	// A stale page still posting alt is resolved against the stored item.
+	panel("c1|alt")
+	if len(pipe.soModels) != 2 || pipe.soModels[1] != "default-model" {
+		t.Fatalf("second panel: want default-model (never the first reviewer's), got %v", pipe.soModels)
+	}
+}
+
+// A consensus synthesis whose dispatch failed stays retryable after the owner writes
+// again, by the default model, under its own key, and is not offered while a review it
+// weighs is hidden.
+func TestRetryStrandedSynthesis(t *testing.T) {
+	now := retryNow
+	old := now.Add(-time.Hour)
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", worklist.WorkItem{ID: "pr1", Type: worklist.TypePullRequest, Thread: []worklist.Message{
+		{ID: "q1", Role: worklist.RoleUser, Kind: worklist.KindReviewRequest, Content: reviewPrompt, At: old},
+		{ID: "r1", ReplyTo: "q1", Role: worklist.RoleAgent, Content: "first review", Model: "default", At: old},
+		{ID: "p1", Role: worklist.RoleUser, Kind: worklist.KindReviewRequest, Content: independentReviewPrompt, At: old},
+		{ID: "r2", ReplyTo: "p1", Role: worklist.RoleAgent, Content: "blind review", Model: "alt", At: old},
+		{ID: "s1", Role: worklist.RoleUser, Kind: worklist.KindSynthesisRequest, Content: worklist.SynthesisPrompt, Reviews: []string{"q1", "p1"}, At: old},
+		{ID: "d1", Role: worklist.RoleUser, Content: "and the tests?", At: old},
+		{ID: "d2", ReplyTo: "d1", Role: worklist.RoleAgent, Content: "they pass", At: old},
+	}})
+	pipe := &recordPipeline{}
+	h := retryHandler(store, pipe, &now)
+	page := func() string {
+		rec := httptest.NewRecorder()
+		h.Thread(rec, httptest.NewRequest(http.MethodGet, "/items/thread?id=pr1", nil))
+		return rec.Body.String()
+	}
+	retry := func() {
+		req := httptest.NewRequest(http.MethodPost, "/items/thread/retry", strings.NewReader("id=pr1&turn=s1&choice=c1|alt"))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		h.ThreadRetry(httptest.NewRecorder(), req)
+	}
+
+	// Hidden review: no offer, and a forged retry does nothing.
+	hide := func(hidden bool) {
+		_ = store.Update(context.Background(), "u1", func(cur []worklist.WorkItem) ([]worklist.WorkItem, error) {
+			cur[0].Thread[1].Hidden = hidden
+			return cur, nil
+		})
+	}
+	hide(true)
+	if out := page(); strings.Contains(out, `name="turn" value="s1"`) {
+		t.Fatal("no synthesis retry while a review it weighs is hidden")
+	}
+	retry()
+	if len(pipe.turns) != 0 {
+		t.Fatalf("a synthesis missing a review must not be dispatched, got %v", pipe.turns)
+	}
+
+	hide(false)
+	out := page()
+	if !strings.Contains(out, `name="turn" value="s1"`) || !strings.Contains(out, "consensus on the reviews") {
+		t.Fatalf("the stranded synthesis must be offered for retry, got:\n%s", out)
+	}
+	retry()
+	if len(pipe.turns) != 1 || pipe.turns[0].Turn != "s1" || pipe.converseModels[0] != "" || len(pipe.secondOpinions) != 0 {
+		t.Fatalf("want one default-model converse for s1, got turns %v models %v so %v", pipe.turns, pipe.converseModels, pipe.secondOpinions)
+	}
+	it := storedItem(t, store, "pr1")
+	if i, _ := it.TurnIndex("s1"); !it.Thread[i].At.Equal(now) || len(it.Thread) != 7 {
+		t.Fatalf("the retry re-stamps s1 and adds no turn, got %+v", it.Thread)
+	}
+	retry() // a double submit
+	if len(pipe.turns) != 1 {
+		t.Fatalf("a second retry within the window dispatches nothing, got %v", pipe.turns)
+	}
+}

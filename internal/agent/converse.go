@@ -51,6 +51,13 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	// The turn's kind tells us whether this reply is a consensus synthesis, whose
 	// leading verdict token we record as structured metadata.
 	triggerKind := trigger.Kind
+	if triggerKind == worklist.KindSynthesisRequest && !item.SynthesisReady(triggerKey) {
+		// A review the synthesis weighs is hidden, gone, or did not fit the bounded read
+		// (which keeps those reviews first): the model would rule on agreement without
+		// it. Decline with a notice, never a verdict; the thread offers a retry once the
+		// reviews are back (worklist.RetryableSynthesis).
+		return postNotice(ctx, sink, item.ID, triggerKey, worklist.NoticePanelInputs, worklist.PanelInputsNotice)
+	}
 
 	// Live context plus read-only GitHub tools. With a credential the assistant gets
 	// both a pre-fetched snapshot of the item and tools to look up anything else —
@@ -210,12 +217,18 @@ const lostGitHubNote = "\n\n---\n_gofer lost access to GitHub partway through th
 // reach GitHub for the user, who must sign in again. It is a system notice, not an
 // answer (worklist.NoticeReconnect), so review state does not count it.
 func postReconnect(ctx context.Context, sink Sink, itemID, triggerKey string) error {
+	return postNotice(ctx, sink, itemID, triggerKey, worklist.NoticeReconnect, worklist.ReconnectNotice)
+}
+
+// postNotice saves a system notice (worklist.Message.Notice) with text in reply to
+// the turn: the run ended without answering it.
+func postNotice(ctx context.Context, sink Sink, itemID, triggerKey, notice, text string) error {
 	msg := worklist.Message{
 		ID:      worklist.NewMessageID(),
 		ReplyTo: triggerKey,
 		Role:    worklist.RoleAgent,
-		Notice:  worklist.NoticeReconnect,
-		Content: worklist.ReconnectNotice,
+		Notice:  notice,
+		Content: text,
 		At:      time.Now().UTC(),
 	}
 	if err := sink.Reply(ctx, itemID, triggerKey, msg); err != nil {

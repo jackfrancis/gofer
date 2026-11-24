@@ -2,7 +2,10 @@ package worklist
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 )
 
 func panelThread() []Message {
@@ -21,7 +24,32 @@ func TestChainSynthesis(t *testing.T) {
 		want     bool
 	}{
 		"panel review answered after an earlier review": {func(*WorkItem) {}, "p1", true},
-		"an ordinary review":                            {func(*WorkItem) {}, "q1", false},
+		// The earlier review ran long and lands after the panel's blind one.
+		"earlier review answered last": {func(w *WorkItem) {
+			w.Thread = []Message{w.Thread[0], w.Thread[2], w.Thread[3], w.Thread[1]}
+		}, "q1", true},
+		"a turn that is not a review": {func(w *WorkItem) {
+			w.Thread = append(w.Thread, Message{ID: "d1", Role: RoleUser, Content: "thoughts?", At: t2}, Message{ID: "d2", Role: RoleAgent, ReplyTo: "d1", Content: "some", At: t2})
+		}, "d1", false},
+		"panel text sent as a Discuss turn": {func(w *WorkItem) { w.Thread[2].Kind = "" }, "p1", false},
+		"already covered by a synthesis": {func(w *WorkItem) {
+			w.Thread = append(w.Thread, Message{ID: "s1", Role: RoleUser, Content: SynthesisPrompt, Kind: KindSynthesisRequest, Reviews: []string{"q1", "p1"}, At: t2})
+		}, "q1", false},
+		"covered by a synthesis stored before Reviews": {func(w *WorkItem) {
+			w.Thread = append(w.Thread, Message{ID: "s1", Role: RoleUser, Content: SynthesisPrompt, Kind: KindSynthesisRequest, At: t2})
+		}, "p1", false},
+		"a second panel after a synthesis": {func(w *WorkItem) {
+			w.Thread = append(w.Thread,
+				Message{ID: "s1", Role: RoleUser, Content: SynthesisPrompt, Kind: KindSynthesisRequest, Reviews: []string{"q1", "p1"}, At: t2},
+				Message{ID: "p2", Role: RoleUser, Content: IndependentReviewPrompt, Kind: KindReviewRequest, At: t2},
+				Message{ID: "r3", Role: RoleAgent, ReplyTo: "p2", Content: "another blind review", Model: "c", At: t2})
+		}, "p2", true},
+		"every review by the same model": {func(w *WorkItem) {
+			w.Thread[1].Model, w.Thread[3].Model = "b", "b"
+		}, "p1", false},
+		"reviews by different models": {func(w *WorkItem) {
+			w.Thread[1].Model, w.Thread[3].Model = "a", "b"
+		}, "p1", true},
 		"panel review with no earlier review": {func(w *WorkItem) {
 			w.Thread = w.Thread[2:]
 		}, "p1", false},
@@ -53,6 +81,18 @@ func TestChainSynthesis(t *testing.T) {
 			last := w.Thread[len(w.Thread)-1]
 			if len(w.Thread) != n+1 || last.ID != key || last.Kind != KindSynthesisRequest || last.Role != RoleUser || last.Content != SynthesisPrompt || !last.At.Equal(t2) {
 				t.Fatalf("want one synthesis request appended under %q, got %+v", key, w.Thread)
+			}
+			var want []string
+			for i, m := range w.Thread[:n] {
+				if m.Role == RoleUser && m.Kind == KindReviewRequest && !m.Hidden && w.Answered(w.TurnKey(i)) {
+					want = append(want, w.TurnKey(i))
+				}
+			}
+			if !slices.Equal(last.Reviews, want) {
+				t.Fatalf("the synthesis names every visible answered review: got %v, want %v", last.Reviews, want)
+			}
+			if !w.SynthesisReady(key) {
+				t.Fatal("a freshly chained synthesis has its reviews")
 			}
 			if !w.ReplyPending(t2, 5*t1.Sub(t0)) {
 				t.Fatal("the chained synthesis turn awaits its answer")
@@ -94,5 +134,140 @@ func TestApplyReplyAndChainOnce(t *testing.T) {
 		if it.ID == "b" && len(it.Thread) != 4 {
 			t.Fatalf("ApplyReply must not chain, got %+v", it.Thread)
 		}
+	}
+}
+
+// The radar's verdict is the newest synthesis round's, read through its reply link,
+// whatever order the answers landed in.
+func TestReviewVerdictFollowsTheNewestRound(t *testing.T) {
+	th := append(panelThread(),
+		Message{ID: "s1", Role: RoleUser, Content: SynthesisPrompt, Kind: KindSynthesisRequest, Reviews: []string{"q1", "p1"}, At: t2},
+		Message{ID: "p2", Role: RoleUser, Content: IndependentReviewPrompt, Kind: KindReviewRequest, At: t2},
+		Message{ID: "r3", Role: RoleAgent, ReplyTo: "p2", Content: "third review", At: t2},
+		Message{ID: "s2", Role: RoleUser, Content: SynthesisPrompt, Kind: KindSynthesisRequest, Reviews: []string{"q1", "p1", "p2"}, At: t2},
+	)
+	w := WorkItem{ID: "a", Type: TypePullRequest, Thread: th}
+	newer := Message{ID: "v2", Role: RoleAgent, ReplyTo: "s2", Content: "they differ", Verdict: VerdictDisagree, At: t2}
+	older := Message{ID: "v1", Role: RoleAgent, ReplyTo: "s1", Content: "they agree", Verdict: VerdictAgree, At: t2}
+
+	w.Thread = append(w.Thread, older)
+	if got := w.ReviewVerdict(); got != VerdictAgree {
+		t.Fatalf("with only the first round answered, want its verdict, got %q", got)
+	}
+	w.Thread = append(th, newer, older) // the older round's answer lands last
+	if got := w.ReviewVerdict(); got != VerdictDisagree {
+		t.Fatalf("a late answer to an older round must not replace the newer verdict, got %q", got)
+	}
+}
+
+// A synthesis is ready only while every review it names is visible and answered.
+func TestSynthesisReady(t *testing.T) {
+	base := append(panelThread(), Message{ID: "s1", Role: RoleUser, Content: SynthesisPrompt, Kind: KindSynthesisRequest, Reviews: []string{"q1", "p1"}, At: t2})
+	cases := map[string]struct {
+		edit func(*WorkItem)
+		want bool
+	}{
+		"all there":                {func(*WorkItem) {}, true},
+		"a review's answer hidden": {func(w *WorkItem) { w.Thread[1].Hidden = true }, false},
+		"a review request hidden":  {func(w *WorkItem) { w.Thread[2].Hidden = true }, false},
+		"a review gone":            {func(w *WorkItem) { w.Thread = w.Thread[2:] }, false},
+		"legacy, naming none":      {func(w *WorkItem) { w.Thread[len(w.Thread)-1].Reviews = nil; w.Thread[1].Hidden = true }, true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			w := WorkItem{ID: "a", Thread: slices.Clone(base)}
+			tc.edit(&w)
+			if got := w.SynthesisReady("s1"); got != tc.want {
+				t.Fatalf("SynthesisReady = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A failed synthesis stays retryable after the owner writes again, and after a
+// notice declined it; once retried (re-stamped) it is pending, not retryable.
+func TestRetryableSynthesis(t *testing.T) {
+	stale := 5 * time.Minute
+	now := t2.Add(time.Hour)
+	th := append(panelThread(),
+		Message{ID: "s1", Role: RoleUser, Content: SynthesisPrompt, Kind: KindSynthesisRequest, Reviews: []string{"q1", "p1"}, At: t2},
+		Message{ID: "d1", Role: RoleUser, Content: "and the tests?", At: t2},
+		Message{ID: "d2", Role: RoleAgent, ReplyTo: "d1", Content: "they pass", At: t2},
+	)
+	w := WorkItem{ID: "a", Thread: th}
+	if _, ok := w.RetryableTurn(now, stale); ok {
+		t.Fatal("the last turn is answered: RetryableTurn offers nothing")
+	}
+	i, ok := w.RetryableSynthesis(now, stale)
+	if !ok || w.TurnKey(i) != "s1" {
+		t.Fatalf("the stranded synthesis must be retryable, got %d %v", i, ok)
+	}
+	if _, ok := w.RetryableSynthesis(t2.Add(time.Minute), stale); ok {
+		t.Fatal("a synthesis still plausibly in flight is not retryable")
+	}
+
+	// Declined for a hidden review: not retryable until it is unhidden.
+	w.Thread = append(slices.Clone(th), Message{ID: "n1", Role: RoleAgent, ReplyTo: "s1", Notice: NoticePanelInputs, Content: PanelInputsNotice, At: t2.Add(time.Second)})
+	w.Thread[1].Hidden = true
+	if _, ok := w.RetryableSynthesis(t2.Add(time.Minute), stale); ok {
+		t.Fatal("a synthesis missing a review is not retryable")
+	}
+	w.Thread[1].Hidden = false
+	if _, ok := w.RetryableSynthesis(t2.Add(time.Minute), stale); !ok {
+		t.Fatal("a declined synthesis is retryable at once once its reviews are back")
+	}
+	if w.ReplyPending(t2.Add(time.Minute), stale) {
+		t.Fatal("a declined synthesis is not pending")
+	}
+	// The retry re-stamps it: the notice answered the earlier attempt, so it is
+	// pending again and not offered twice.
+	retry := t2.Add(2 * time.Minute)
+	w.Thread[4].At = retry
+	if !w.ReplyPending(retry, stale) {
+		t.Fatal("a retried synthesis is pending")
+	}
+	if _, ok := w.RetryableSynthesis(retry, stale); ok {
+		t.Fatal("a just-retried synthesis is not retryable again")
+	}
+
+	// Answered, or superseded by a newer synthesis: nothing to retry.
+	w.Thread = append(slices.Clone(th), Message{ID: "v1", Role: RoleAgent, ReplyTo: "s1", Content: "agree", Verdict: VerdictAgree, At: t2})
+	if _, ok := w.RetryableSynthesis(now, stale); ok {
+		t.Fatal("an answered synthesis is not retryable")
+	}
+}
+
+// The read a synthesis run gets keeps the reviews it compares, however much
+// discussion came since; one hidden is left out, and the run declines.
+func TestThreadWindowKeepsSynthesisReviews(t *testing.T) {
+	th := panelThread()
+	for i := range 40 {
+		id := strings.Repeat("x", 3) + string(rune('a'+i%26)) + string(rune('a'+i/26))
+		th = append(th,
+			Message{ID: "u" + id, Role: RoleUser, Content: strings.Repeat("chat ", 400), At: t2},
+			Message{ID: "g" + id, Role: RoleAgent, ReplyTo: "u" + id, Content: strings.Repeat("reply ", 400), At: t2})
+	}
+	th = append(th, Message{ID: "s1", Role: RoleUser, Content: SynthesisPrompt, Kind: KindSynthesisRequest, Reviews: []string{"q1", "p1"}, At: t2})
+	w := WorkItem{ID: "a", Type: TypePullRequest, Thread: th}
+
+	budget := encodedSize(Project(w)) + 20<<10 // room for a few turns only
+	win := ThreadWindow(w, "s1", budget)
+	if !win.SynthesisReady("s1") {
+		t.Fatalf("the window must keep both reviews and their answers, got %d turns", len(win.Thread))
+	}
+	if win.Thread[len(win.Thread)-1].ID != "s1" || len(win.Thread) >= len(th) {
+		t.Fatalf("the window ends at the synthesis and is cut, got %d of %d turns", len(win.Thread), len(th))
+	}
+	for i := 1; i < len(win.Thread); i++ {
+		a, _ := w.TurnIndex(win.Thread[i-1].ID)
+		b, _ := w.TurnIndex(win.Thread[i].ID)
+		if a >= b {
+			t.Fatal("the window keeps thread order")
+		}
+	}
+
+	w.Thread[3].Hidden = true // the blind review's answer
+	if win := ThreadWindow(w, "s1", budget); win.SynthesisReady("s1") {
+		t.Fatal("a hidden review is not sent, so the run must decline")
 	}
 }
