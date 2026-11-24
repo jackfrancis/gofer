@@ -45,11 +45,12 @@ const (
 // user may be on any requested team). A request the search itself showed is never
 // removed here: the timeline cannot tell whether a team request includes the user.
 //
-// requested (optional) names the items this refresh's review-requested:@me search
-// returned, as opposed to a request carried over (carried): only a fresh hit is
-// evidence that a team request names the user (github.ActivityOptions.ReviewRequested).
-// A standalone enrich has run no search, so it attributes no team request.
-func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried, requested map[string]bool) error {
+// reviews is what this refresh's review-requested:@me search showed (the zero value
+// for a standalone enrich, which ran none). Only a fresh hit is new evidence that a
+// team request names the user (github.ActivityOptions.ReviewRequested); a request
+// carried over is none. What an earlier search confirmed (Signals.TeamConfirmed)
+// stands unless this one was walked whole without returning the item.
+func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried map[string]bool, reviews reviewSearch) error {
 	provider := p.Provider
 	if provider == "" {
 		provider = "github"
@@ -100,12 +101,12 @@ func runEnrich(ctx context.Context, p Params, vendor Vendor, sink Sink, carried,
 		opts := github.ActivityOptions{Author: items[i].GitHub.Author, Bots: p.Bots,
 			// This refresh's review-requested:@me search returned the item: a team
 			// request may be ours. A carried request is no such evidence.
-			ReviewRequested: requested[items[i].ID],
+			ReviewRequested: reviews.hits[items[i].ID],
 			PullRequest:     items[i].Type == worklist.TypePullRequest,
 			Prior:           items[i].Signals.LastWord}
-		if carried[items[i].ID] {
-			// The search was cut short before it reached the item: what an earlier one
-			// confirmed stands while the same team requests are outstanding.
+		if !reviews.complete {
+			// No complete search says the request is gone: what an earlier one confirmed
+			// stands while those team requests are outstanding.
 			opts.Confirmed = items[i].Signals.TeamConfirmed
 		}
 		if slices.Contains(items[i].Signals.Reasons, worklist.ReasonAuthor) {

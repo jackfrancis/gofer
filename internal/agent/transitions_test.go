@@ -182,22 +182,111 @@ func TestRefreshConfirmedTeamSurvivesPartialSearch(t *testing.T) {
 	}
 }
 
-// The confirmation covers only the requests it saw: after a partial search, a team
-// request made since is not attributed, and neither is what is left once one of the
-// confirmed requests is withdrawn.
+// The confirmation covers only the requests it saw. After a partial search, a team
+// request made since neither ends it nor joins it, and withdrawing a confirmed
+// request ends it.
 func TestRefreshConfirmationCoversOnlyThoseRequests(t *testing.T) {
-	for name, event := range map[string]string{
-		"new request": `{"event":"review_requested","actor":{"login":"other-lead"},"requested_team":{"slug":"other-team"},"created_at":"2026-01-05T10:00:00Z"}`,
-		"withdrawn":   `{"event":"review_request_removed","actor":{"login":"lead"},"requested_team":{"slug":"my-team"},"created_at":"2026-01-05T10:00:00Z"}`,
-	} {
-		t.Run(name, func(t *testing.T) {
+	t.Run("another team asked", func(t *testing.T) {
+		store := worklist.NewMemoryStore()
+		s, before := confirmedTeamRequest(t, store)
+		s.reviewHit, s.reviewSearchIncomplete = false, true
+		s.timeline = append(s.timeline, `{"event":"review_requested","actor":{"login":"other-lead"},"requested_team":{"slug":"other-team"},"created_at":"2026-01-05T10:00:00Z"}`)
+		it := s.refresh(t, store, "2026-01-05T10:00:00Z")
+		c := it.Signals.TeamConfirmed
+		if !it.Actionable() || !it.Signals.AwaitingMeSince.Equal(before.Signals.AwaitingMeSince) || it.Signals.ReviewRequestedBy != "lead" ||
+			c == nil || len(c.Requests) != 1 || c.Requests[0].Team != "my-team" {
+			t.Errorf("actionable %t, awaiting me since %v, requester %q, confirmation %+v", it.Actionable(), it.Signals.AwaitingMeSince, it.Signals.ReviewRequestedBy, c)
+		}
+	})
+	t.Run("withdrawn", func(t *testing.T) {
+		store := worklist.NewMemoryStore()
+		s, _ := confirmedTeamRequest(t, store)
+		s.reviewHit, s.reviewSearchIncomplete = false, true
+		s.timeline = append(s.timeline, `{"event":"review_request_removed","actor":{"login":"lead"},"requested_team":{"slug":"my-team"},"created_at":"2026-01-05T10:00:00Z"}`)
+		it := s.refresh(t, store, "2026-01-05T10:00:00Z")
+		if !it.Signals.AwaitingMeSince.IsZero() || it.Signals.TeamConfirmed != nil {
+			t.Errorf("awaiting me since %v, confirmation %+v", it.Signals.AwaitingMeSince, it.Signals.TeamConfirmed)
+		}
+	})
+	t.Run("complete search without it", func(t *testing.T) {
+		store := worklist.NewMemoryStore()
+		s, _ := confirmedTeamRequest(t, store)
+		s.reviewHit = false // a complete search that no longer returns the PR
+		it := s.refresh(t, store, "2026-01-05T10:00:00Z")
+		if !it.Signals.AwaitingMeSince.IsZero() || it.Signals.TeamConfirmed != nil {
+			t.Errorf("awaiting me since %v, confirmation %+v", it.Signals.AwaitingMeSince, it.Signals.TeamConfirmed)
+		}
+	})
+}
+
+// A partial refresh can miss the PR in every search while finding other work, and a
+// standalone enrich runs no search: neither undoes an unchanged confirmed request.
+func TestRefreshConfirmationSurvivesNoSearchHit(t *testing.T) {
+	for _, job := range []string{JobIngest, JobEnrich} {
+		t.Run(job, func(t *testing.T) {
 			store := worklist.NewMemoryStore()
-			s, _ := confirmedTeamRequest(t, store)
-			s.reviewHit, s.reviewSearchIncomplete = false, true
-			s.timeline = append(s.timeline, event)
-			it := s.refresh(t, store, "2026-01-05T10:00:00Z")
-			if !it.Signals.AwaitingMeSince.IsZero() || it.Signals.TeamConfirmed != nil {
-				t.Errorf("awaiting me since %v, confirmation %+v", it.Signals.AwaitingMeSince, it.Signals.TeamConfirmed)
+			s, before := confirmedTeamRequest(t, store)
+			srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+				q := r.URL.Query().Get("q")
+				switch {
+				case r.URL.Path == "/user":
+					fmt.Fprint(w, `{"login":"me"}`)
+				case r.URL.Path == "/search/issues" && strings.Contains(q, "is:issue"):
+					fmt.Fprint(w, `{"total_count":1,"items":[{"number":8,"title":"other issue","state":"open","repository_url":"https://api.github.com/repos/o/r","user":{"login":"me"}}]}`)
+				case r.URL.Path == "/search/issues":
+					fmt.Fprint(w, `{"total_count":0,"incomplete_results":true,"items":[]}`)
+				case r.URL.Path == "/repos/o/r/issues/7/timeline":
+					fmt.Fprintf(w, "[%s]", strings.Join(s.timeline, ","))
+				case r.URL.Path == "/repos/o/r/issues/8/timeline":
+					fmt.Fprint(w, `[]`)
+				case r.URL.Path == "/repos/o/r/pulls/7":
+					fmt.Fprintf(w, `{"head":{"sha":%q}}`, s.head)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+			ctx := context.Background()
+			if err := Run(ctx, Params{JobType: job, GitHubBaseURL: srv.URL, Client: srv.Client()}, fakeVendor{token: "test"}, NewStoreSink(store, snapOwner)); err != nil {
+				t.Fatal(err)
+			}
+			if job == JobIngest {
+				if _, found, err := store.Get(ctx, snapOwner, "github:o/r#8"); err != nil || !found {
+					t.Fatalf("setup: the other hit was not ingested: found %v, err %v", found, err)
+				}
+			}
+			it, _, err := store.Get(ctx, snapOwner, before.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !it.Actionable() || it.Signals.TeamConfirmed == nil || !it.Signals.AwaitingMeSince.Equal(before.Signals.AwaitingMeSince) || it.Signals.ReviewRequestedBy != "lead" {
+				t.Errorf("actionable %t, confirmation %+v, requester %q", it.Actionable(), it.Signals.TeamConfirmed, it.Signals.ReviewRequestedBy)
+			}
+		})
+	}
+}
+
+// After a re-review request, editing my last comment to ask the author something
+// hands them the turn as posting it would, from the edit.
+func TestRefreshEditAfterRequestMatchesPosting(t *testing.T) {
+	const at = "2026-01-05T10:00:00Z"
+	const body = "@author can you add the missing test before I re-review?"
+	for _, form := range []string{"post", "edit"} {
+		t.Run(form, func(t *testing.T) {
+			store := worklist.NewMemoryStore()
+			s := githubSnapshot{head: snapHeadA, timeline: []string{snapQuestion, snapRequest}, reviewHit: true}
+			if !s.refresh(t, store, "2026-01-04T10:00:00Z").Actionable() {
+				t.Fatal("setup: the re-review request should be actionable")
+			}
+			if form == "post" {
+				s.timeline = append(s.timeline, `{"event":"commented","id":20,"actor":{"login":"me"},"created_at":"`+at+`","body":"`+body+`"}`)
+			} else {
+				s.timeline[0] = `{"event":"commented","id":19,"actor":{"login":"me"},"created_at":"2026-01-01T10:00:00Z","updated_at":"` + at + `","body":"` + body + `"}`
+			}
+			it := s.refresh(t, store, at)
+			w, waiting := it.Waiting()
+			if !waiting || w.Since.Format(time.RFC3339) != at {
+				t.Errorf("waiting %t since %v, awaiting me since %v; want the author's turn from %s", waiting, w.Since, it.Signals.AwaitingMeSince, at)
 			}
 		})
 	}

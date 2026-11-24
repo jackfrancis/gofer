@@ -63,9 +63,10 @@ type ActivityOptions struct {
 	// awaits no one in particular.
 	ReviewRequested bool
 	// Confirmed is the team requests an earlier refresh's search confirmed
-	// (worklist.Signals.TeamConfirmed), passed when this refresh's search was cut short
-	// and kept the item's request without returning it. It is evidence as
-	// ReviewRequested is, but only while exactly those requests are outstanding: a
+	// (worklist.Signals.TeamConfirmed), passed when no complete search this refresh
+	// says otherwise: the review search was cut short or did not run. It is evidence
+	// as ReviewRequested is, but only while every one of those requests is still
+	// outstanding (the same team, the same request event), and it covers only them: a
 	// partial search neither confirms a new request nor cancels an unchanged one.
 	Confirmed *worklist.TeamConfirmation
 	// PullRequest says the item is a pull request, whose head commit says whether the
@@ -277,6 +278,11 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 	}
 	if lastEvent != nil && lastEvent.Event == "commented" && lastEvent.UpdatedAt.After(lastActivityAt) {
 		lastActivityAt = lastEvent.UpdatedAt // an edit: the comment as it reads now
+		if lastActor == login && lastActivityAt.After(myLastActivityAt) {
+			// Editing the last word engages as posting it would: a request it now
+			// answers no longer awaits login. The request itself stands on GitHub.
+			myLastActivityAt = lastActivityAt
+		}
 	}
 	if answeredAt.After(lastActivityAt) {
 		lastActivityAt, lastActor, lastActivityDecisive, lastEvent = answeredAt, "", false, nil
@@ -299,24 +305,37 @@ func (c *Client) ItemActivityFor(ctx context.Context, token, repo string, number
 	if !requestedAt.IsZero() && requestedAt.After(myLastActivityAt) {
 		meSince = requestedAt
 	}
-	var earliest, latest time.Time
-	actors := map[string]bool{}
-	for _, tr := range teamRequests {
-		if earliest.IsZero() || tr.at.Before(earliest) {
-			earliest = tr.at
+	// The team requests the evidence covers: every outstanding one on a fresh search
+	// hit, or the ones an earlier search confirmed while each is still outstanding (the
+	// same team, the same request event). A request made since is not covered.
+	var covered []worklist.ConfirmedRequest
+	switch {
+	case personalPending || len(teamRequests) == 0:
+	case opts.ReviewRequested:
+		for team, tr := range teamRequests {
+			covered = append(covered, worklist.ConfirmedRequest{Team: team, At: tr.at})
 		}
-		if tr.at.After(latest) {
-			latest = tr.at
-		}
-		actors[tr.actor] = true
+	case opts.Confirmed != nil && opts.Confirmed.StillOutstanding(func(team string) (time.Time, bool) {
+		tr, ok := teamRequests[team]
+		return tr.at, ok
+	}):
+		covered = opts.Confirmed.Requests
 	}
-	// An earlier search's confirmation stands only for exactly the requests it saw:
-	// none withdrawn (the count) and none made since (the latest).
-	confirmed := opts.Confirmed != nil && opts.Confirmed.Count == len(teamRequests) && opts.Confirmed.Latest.Equal(latest)
-	if (opts.ReviewRequested || confirmed) && !personalPending && len(teamRequests) > 0 {
-		// The search hit is otherwise unexplained: one of the outstanding team requests
+	if len(covered) > 0 {
+		// The search hit is otherwise unexplained: one of the covered team requests
 		// names login, though which is unknown when there are several.
-		a.TeamConfirmed = &worklist.TeamConfirmation{Latest: latest, Count: len(teamRequests)}
+		a.TeamConfirmed = worklist.NewTeamConfirmation(covered)
+		var earliest, latest time.Time
+		actors := map[string]bool{}
+		for _, cr := range covered {
+			if earliest.IsZero() || cr.At.Before(earliest) {
+				earliest = cr.At
+			}
+			if cr.At.After(latest) {
+				latest = cr.At
+			}
+			actors[teamRequests[cr.Team].actor] = true
+		}
 		if len(actors) == 1 {
 			for actor := range actors {
 				a.RequestedByLogin = actor

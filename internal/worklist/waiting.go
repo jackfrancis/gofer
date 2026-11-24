@@ -1,6 +1,7 @@
 package worklist
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -112,17 +113,68 @@ func (lw LastWord) Key() string {
 
 // TeamConfirmation records the team review requests outstanding when a refresh's
 // review-requested:@me search confirmed one of them names the user (enrich: the hit
-// had no other explanation): how many there were and when the latest was made. While
-// exactly those requests are outstanding (the same count, none made after Latest), a
-// later search that was cut short and did not return the item leaves the
-// confirmation standing; a request made since is not covered.
+// had no other explanation), each by its team and when it was made. Which one names
+// the user is unknown, so the confirmation stands only while every one of them is
+// still outstanding (StillOutstanding): then a search that was cut short, or none at
+// all, leaves it standing. A request made since is not covered, and does not end it.
 type TeamConfirmation struct {
-	Latest time.Time `json:"latest"`
-	Count  int       `json:"count"`
+	Requests []ConfirmedRequest `json:"requests"`
 }
 
-// maxTeamRequests bounds TeamConfirmation.Count.
-const maxTeamRequests = 1000
+// ConfirmedRequest is one team review request a TeamConfirmation covers.
+type ConfirmedRequest struct {
+	Team string    `json:"team"`
+	At   time.Time `json:"at"`
+}
+
+const (
+	// maxTeamRequests bounds TeamConfirmation.Requests.
+	maxTeamRequests = 20
+	// maxTeamSlug bounds ConfirmedRequest.Team.
+	maxTeamSlug = 100
+)
+
+// NewTeamConfirmation returns a confirmation of requests in a stable order, or nil
+// when there are none or more than it holds.
+func NewTeamConfirmation(requests []ConfirmedRequest) *TeamConfirmation {
+	c := &TeamConfirmation{Requests: slices.Clone(requests)}
+	slices.SortFunc(c.Requests, func(a, b ConfirmedRequest) int {
+		return cmp.Or(strings.Compare(a.Team, b.Team), a.At.Compare(b.At))
+	})
+	if !c.valid() {
+		return nil
+	}
+	return c
+}
+
+// valid reports whether c is within its bounds: a confirmation with any malformed
+// request is dropped whole, since dropping one request would widen what it covers.
+func (c *TeamConfirmation) valid() bool {
+	if len(c.Requests) == 0 || len(c.Requests) > maxTeamRequests {
+		return false
+	}
+	for _, r := range c.Requests {
+		if r.Team == "" || len(r.Team) > maxTeamSlug || r.At.IsZero() {
+			return false
+		}
+	}
+	return true
+}
+
+// StillOutstanding reports whether every request c covers is still outstanding:
+// outstanding returns when the team's outstanding request was made, if it has one.
+// A team asked again since holds a different request.
+func (c *TeamConfirmation) StillOutstanding(outstanding func(team string) (time.Time, bool)) bool {
+	if c == nil || !c.valid() {
+		return false
+	}
+	for _, r := range c.Requests {
+		if at, ok := outstanding(r.Team); !ok || !at.Equal(r.At) {
+			return false
+		}
+	}
+	return true
+}
 
 // Outcomes of a TurnReading.
 const (
@@ -170,8 +222,8 @@ func (r *TurnReading) bound() {
 // BoundTurnSignals holds an item's LastWord and TurnReading to their bounds, in place,
 // whatever a run sent. RunPolicy.Apply calls it on every write-back.
 func BoundTurnSignals(s *Signals) {
-	if c := s.TeamConfirmed; c != nil && (c.Latest.IsZero() || c.Count <= 0 || c.Count > maxTeamRequests) {
-		s.TeamConfirmed = nil
+	if c := s.TeamConfirmed; c != nil {
+		s.TeamConfirmed = NewTeamConfirmation(c.Requests)
 	}
 	if s.LastWord != nil {
 		lw := *s.LastWord

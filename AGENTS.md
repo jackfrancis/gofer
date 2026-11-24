@@ -231,11 +231,13 @@ Wired on the web-tier side; they define what a runtime must respect:
   the item (`ActivityOptions.ReviewRequested`, from `freshRequests`; a request carried
   over from an earlier search is no evidence of who made a later one, and a
   standalone enrich attributes none), and no personal request of theirs explains the
-  hit. The confirmation is recorded (`Signals.TeamConfirmed`: how many team requests
-  were outstanding, and the latest), and after a search that was cut short and kept
-  the request without returning the item it stands while exactly those requests are
-  outstanding (`ActivityOptions.Confirmed`): a partial search neither confirms a new
-  request nor cancels an unchanged one. Which team names them is unknown when several are outstanding, so the item
+  hit. The confirmation is recorded (`Signals.TeamConfirmed`: each team request it
+  covered, by team and request time), and unless this refresh's review search was
+  walked whole without returning the item (cut short, or none ran, as in a standalone
+  enrich) it stands while every one of those requests is still outstanding
+  (`ActivityOptions.Confirmed`, `TeamConfirmation.StillOutstanding`), covering only
+  them: a partial search neither confirms a new request nor cancels an unchanged one,
+  and another team asked since neither ends it nor joins it. Which team names them is unknown when several are outstanding, so the item
   awaits them only if every outstanding team request was made since their last
   comment or review (since the latest), and the requester (`ReviewRequestedBy`, so a
   bot's team request scores as a bot's) is named only if those requests share an
@@ -253,8 +255,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   it is (a review request may outrank it for a while) and across every refresh. Force-push and
   ready-for-review events, which GitHub dates, answer a comment too. Words are
   ordered among themselves by when they were made, so an edit never jumps a reply;
-  against those events, and for the wait's date, a comment counts from its last edit
-  (`updated_at`). A review with no
+  against those events, for the wait's date, and, when it is the last word, as the
+  user's engagement (a review request made before the edit no longer outranks it), a
+  comment counts from its last edit (`updated_at`). A review with no
   summary is read through its inline comments, up to `reviewCommentPages` pages; one
   longer than that has no text. On the user's own item a reviewer's decisive review is the
   user's turn, and a wait with no recorded last word (stored before `LastWord`

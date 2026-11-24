@@ -312,9 +312,35 @@ func TestLastWordKeyCoversTheCutMiddle(t *testing.T) {
 		t.Error("a last word stored without a digest keys differently from a new one of the same text")
 	}
 	bad := LastWord{ID: "comment:1", Text: "short", Digest: "not hex"}
-	s := Signals{LastWord: &bad, TeamConfirmed: &TeamConfirmation{Count: -1, Latest: time.Now()}}
+	s := Signals{LastWord: &bad, TeamConfirmed: &TeamConfirmation{Requests: []ConfirmedRequest{{Team: "", At: time.Now()}}}}
 	BoundTurnSignals(&s)
 	if s.LastWord.Digest != "" || s.TeamConfirmed != nil {
 		t.Errorf("bounds kept digest %q, confirmation %+v", s.LastWord.Digest, s.TeamConfirmed)
+	}
+}
+
+// A confirmation is kept in a stable order, stands only while each of its requests
+// is outstanding as the same request, and is dropped whole if any request is malformed.
+func TestTeamConfirmation(t *testing.T) {
+	t1, t2 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	c := NewTeamConfirmation([]ConfirmedRequest{{Team: "red", At: t2}, {Team: "blue", At: t1}})
+	if c == nil || c.Requests[0].Team != "blue" {
+		t.Fatalf("confirmation %+v", c)
+	}
+	out := map[string]time.Time{"blue": t1, "red": t2, "green": t2}
+	look := func(team string) (time.Time, bool) { at, ok := out[team]; return at, ok }
+	if !c.StillOutstanding(look) {
+		t.Error("all confirmed requests outstanding (and another team asked): want standing")
+	}
+	out["red"] = t2.Add(time.Hour) // red asked again: a different request
+	if c.StillOutstanding(look) {
+		t.Error("a re-requested team still counted as the confirmed request")
+	}
+	delete(out, "red")
+	if c.StillOutstanding(look) {
+		t.Error("a withdrawn request still counted")
+	}
+	if NewTeamConfirmation([]ConfirmedRequest{{Team: "red", At: t1}, {Team: "", At: t1}}) != nil {
+		t.Error("a confirmation with a malformed request was kept")
 	}
 }
