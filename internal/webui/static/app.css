@@ -97,6 +97,7 @@ body {
 .zz-filter-all { font-weight: 600; border-bottom: 1px solid var(--border); border-radius: 6px 6px 0 0; padding-bottom: 6px; margin-bottom: 2px; }
 .zz-filter-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
 .zz-filter-count { color: var(--muted); font-size: 12px; }
+.zz-filter-none { font-style: italic; color: var(--muted); } /* the label filter's "No label" entry */
 /* The selected projects, listed under the toolbar while the filter narrows the radar,
    each a link to its repository's pull requests. */
 .zz-selected-projects {
@@ -110,6 +111,8 @@ body {
 }
 .zz-selected-projects a { color: var(--accent); text-decoration: none; }
 .zz-selected-projects a:hover { text-decoration: underline; }
+/* The selected labels are drawn as the labels themselves, so their items need no pill. */
+.zz-selected-labels li { border: 0; padding: 0; background: none; }
 /* Apply comes first in the markup (the form's default button) but sits on the right. */
 .zz-filter-actions { display: flex; flex-direction: row-reverse; justify-content: flex-start; gap: 6px; margin-top: 4px; }
 

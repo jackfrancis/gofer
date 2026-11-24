@@ -162,6 +162,7 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	mux.Handle("GET /items/refresh-status", http.HandlerFunc(webHandler.RefreshStatus))
 	// The radar's project filter: saves which repositories the radar shows.
 	mux.Handle("POST /items/projects", http.HandlerFunc(webHandler.FilterProjects))
+	mux.Handle("POST /items/labels", http.HandlerFunc(webHandler.FilterLabels))
 	// Clear every conversation thread, so the review workflows can be demoed or
 	// exercised again from scratch without rebuilding the environment.
 	mux.Handle("POST /items/reset-conversations", http.HandlerFunc(webHandler.ResetConversations))

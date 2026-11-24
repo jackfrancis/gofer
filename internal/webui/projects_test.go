@@ -158,14 +158,15 @@ func TestProjectFilterKeepsFullListOrder(t *testing.T) {
 	}
 }
 
-// "Select all", or checking every project on the radar (all a script-less browser can
-// send), clears the saved selection.
+// "Select all", or checking every project the checklist rendered (all a script-less
+// browser can send), clears the saved selection.
 func TestProjectFilterSelectAllClears(t *testing.T) {
 	h := projectsFixture(t)
+	rendered := scopeOf("a/one", "b/two", "c/three")
 	for name, form := range map[string]url.Values{
 		"select all":      {"all": {"1"}, "project": {"a/one"}},
-		"every project":   {"project": {"a/one", "b/two", "c/three"}},
-		"every + unknown": {"project": {"a/one", "b/two", "c/three", "z/gone"}},
+		"every project":   {"project": {"a/one", "b/two", "c/three"}, "offered": {rendered}},
+		"every + unknown": {"project": {"a/one", "b/two", "c/three", "z/gone"}, "offered": {rendered}},
 	} {
 		c := postFilter(t, h, form)
 		if c == nil || c.MaxAge >= 0 {
@@ -329,7 +330,11 @@ func TestBulkActionsFollowSubmittedScope(t *testing.T) {
 	post := func(store *worklist.MemoryStore, pipe *recordPipeline, path, scope string, c *http.Cookie, handle func(*Handler, http.ResponseWriter, *http.Request)) {
 		h := &Handler{sessions: fakeSessions{&session.User{ID: "u1"}}, store: store, pipeline: pipe, convEnabled: true, options: opts, now: func() time.Time { return now }}
 		form := url.Values{"choice": {"c1|alt"}}
-		if scope != "" {
+		switch scope {
+		case "": // an unfiltered page's form: no scope field
+		case presentEmptyScope:
+			form["scope"] = []string{""}
+		default:
 			form.Set("scope", scope)
 		}
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
@@ -365,6 +370,12 @@ func TestBulkActionsFollowSubmittedScope(t *testing.T) {
 		{"every project", scopeOf("a/one", "b/two"), nil, "new-a,new-b", "rev-a,rev-b", "hidden-a,rev-a,rev-b"},
 		{"empty selection", "p=", nil, "", "", ""},
 		{"garbled scope", "%zz", nil, "", "", ""},
+		// Only an absent scope means every project: a present but empty or malformed one
+		// must not widen the action.
+		{"present but empty scope", presentEmptyScope, nil, "", "", ""},
+		{"empty project name", "p=a%2Fone&p=", nil, "", "", ""},
+		{"unknown key", "p=a%2Fone&x=1", nil, "", "", ""},
+		{"no p key", "q=a%2Fone", nil, "", "", ""},
 	} {
 		pipe := &recordPipeline{}
 		post(seed(), pipe, "/items/review-all", tc.scope, tc.cookie, (*Handler).ReviewAllPRs)
@@ -687,5 +698,73 @@ func TestProjectPullsURL(t *testing.T) {
 		if got := (ProjectOption{Name: name}).PullsURL(); got != want {
 			t.Errorf("PullsURL(%q) = %q, want %q", name, got, want)
 		}
+	}
+}
+
+// presentEmptyScope stands for a scope field that is present but empty.
+const presentEmptyScope = "<present but empty>"
+
+// A bulk form's scope must be exactly one strict encoding; only an absent field means
+// every project.
+func TestFormSelectionIsStrict(t *testing.T) {
+	read := func(form url.Values) (map[string]bool, bool) {
+		req := httptest.NewRequest(http.MethodPost, "/items/reset-conversations", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return formSelection(req)
+	}
+	if sel, ok := read(url.Values{}); !ok || sel != nil {
+		t.Fatalf("absent scope = %v, %v; want every project", sel, ok)
+	}
+	if sel, ok := read(url.Values{"scope": {"p="}}); !ok || sel == nil || len(sel) != 0 {
+		t.Fatalf(`"p=" = %v, %v; want the empty selection`, sel, ok)
+	}
+	if sel, ok := read(url.Values{"scope": {scopeOf("a/one")}}); !ok || len(sel) != 1 || !sel["a/one"] {
+		t.Fatalf("a/one scope = %v, %v", sel, ok)
+	}
+	for name, form := range map[string]url.Values{
+		"empty":    {"scope": {""}},
+		"repeated": {"scope": {scopeOf("a/one"), scopeOf("b/two")}},
+		"garbled":  {"scope": {"%zz"}},
+		"labels":   {"scope": {"f=1&l=bug"}},
+	} {
+		if sel, ok := read(form); !ok || sel == nil || len(sel) != 0 {
+			t.Errorf("%s scope = %v, %v; want a selection of nothing", name, sel, ok)
+		}
+	}
+}
+
+// Whether Apply means "Select all" is judged against the checklist the user saw. A
+// project they left unchecked whose last item retired before Apply keeps the selection
+// narrowed, so the next new project does not join it; a form that names no rendered
+// checklist never clears.
+func TestProjectFilterSelectAllJudgedByRenderedChecklist(t *testing.T) {
+	a := inRepo(worklist.WorkItem{ID: "i1", GitHub: worklist.GitHubRef{Number: 1, Title: "t-a"}}, "a/one")
+	store := worklist.NewMemoryStore()
+	store.Seed("u1", a) // b/two, rendered and left unchecked, has since left the radar
+	h := New(fakeSessions{&session.User{ID: "u1"}}, store, &recordPipeline{}, reconnectProviders{false}, false, nil)
+
+	c := postFilter(t, h, url.Values{"project": {"a/one"}, "offered": {scopeOf("a/one", "b/two")}})
+	if c == nil || c.MaxAge <= 0 {
+		t.Fatalf("a narrowed selection must stay saved, got %+v", c)
+	}
+	store.Seed("u1", a, inRepo(worklist.WorkItem{ID: "i2", GitHub: worklist.GitHubRef{Number: 2, Title: "t-c"}}, "c/new"))
+	if got := order(getIndex(t, h, c), "t-a", "t-c"); strings.Join(got, ",") != "t-a" {
+		t.Fatalf("a project new since the selection must stay filtered out, radar shows %v", got)
+	}
+
+	for name, offered := range map[string][]string{"no offered": nil, "garbled": {"%zz"}, "empty": {""}, "repeated": {"p=a%2Fone", "p=a%2Fone"}} {
+		form := url.Values{"project": {"a/one", "c/new"}}
+		if offered != nil {
+			form["offered"] = offered
+		}
+		if c := postFilter(t, h, form); c == nil || c.MaxAge <= 0 {
+			t.Errorf("%s: without a readable rendered checklist Apply must save, not clear; got %+v", name, c)
+		}
+	}
+
+	page := getIndex(t, projectsFixture(t), nil)
+	want := `<input type="hidden" name="offered" value="` + template.HTMLEscapeString(scopeOf("a/one", "b/two", "c/three")) + `">`
+	if !strings.Contains(page, want) {
+		t.Errorf("project checklist lacks %q", want)
 	}
 }
