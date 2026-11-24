@@ -120,8 +120,11 @@ The stored GitHub state never moves back in time: a hit older than it
 ready copy can neither reopen a draft nor roll back the time a later draft result is
 judged against. Which searches matched is current even when a payload is not, so a
 stale hit of a live item still carries its review-request membership onto the stored
-item (`agent.withReviewMembership`), reconciled as any hit's is; a stale hit of a
-retired item writes nothing. A
+item (`agent.withReviewMembership`), reconciled as any hit's is: a confirmed removal
+also clears the stored `AwaitingMeSince` (`agent.settlePins`), a partial search keeps
+both, and a request kept that way still sends the run on to enrich's timeline read
+even when the ingest has nothing to write. A stale hit of a retired item writes
+nothing. A
 draft result never retires a stored ready PR GitHub updated strictly later
 (`agent.readyAfterDraft`): the search index lagged it. Draft observations pass the
 public-only gate like hits, so one from a repository not confirmed public is

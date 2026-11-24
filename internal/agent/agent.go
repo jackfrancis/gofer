@@ -263,7 +263,7 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 	// item open, so retirement counts every hit.
 	items, pinned := keepNewerState(items, existing)
 	items, carried := reconcileFetched(items, existing, fetch.ReviewRequestsComplete)
-	items = dropUnchangedPins(items, existing, pinned)
+	items = settlePins(items, existing, pinned)
 	// Retire what left the open set. Only a COMPLETE fetch proves an item is gone: a
 	// partial walk (time budget, rate limit, result ceiling) simply may not have
 	// reached it, and retiring it then would hide open work.
@@ -284,11 +284,16 @@ func runIngest(ctx context.Context, p Params, vendor Vendor, sink Sink) error {
 		log.Info("ingest: retired other contributors' drafts", "count", len(drafts))
 		items = append(items, drafts...)
 	}
-	if len(items) == 0 {
+	// A request kept only because the review-request search was partial (carried)
+	// still needs enrich's timeline read to confirm it, even when nothing changed to
+	// write (settlePins dropped the item as stored).
+	if len(items) == 0 && len(carried) == 0 {
 		return nil
 	}
-	if err := writeBack(ctx, sink, items); err != nil {
-		return fmt.Errorf("ingest: %w", err)
+	if len(items) > 0 {
+		if err := writeBack(ctx, sink, items); err != nil {
+			return fmt.Errorf("ingest: %w", err)
+		}
 	}
 	// The backfill continues into enrich (per-item timeline signals) then rank
 	// (the model proposal), so one pass yields a fully scored radar. Both are
@@ -453,7 +458,7 @@ func retireDrafts(drafts map[string]worklist.WorkItem, existing []worklist.WorkI
 // item the stale hit is replaced by the stored item carrying the hit's review-request
 // membership (withReviewMembership); reconcileFetched then treats it as any hit, so a
 // complete review-request search without it clears the request and a match adds it.
-// Those IDs are returned in pinned, for dropUnchangedPins. A stale hit of a retired item
+// Those IDs are returned in pinned, for settlePins. A stale hit of a retired item
 // is dropped: it must not reopen it, and a retired item carries no request. Either
 // way the hit still proves its item open, so the caller counts it for
 // retireMissing. A new slice is returned; fetched is unchanged.
@@ -503,10 +508,14 @@ func withReviewMembership(old, hit worklist.WorkItem) worklist.WorkItem {
 	return it
 }
 
-// dropUnchangedPins leaves out of the write-back each item keepNewerState pinned to the
-// stored state whose review request came out of reconcileFetched as stored: the
-// write would change nothing.
-func dropUnchangedPins(items, existing []worklist.WorkItem, pinned map[string]bool) []worklist.WorkItem {
+// settlePins finishes each item keepNewerState pinned to the stored state, once
+// reconcileFetched has decided its review request. With no request left (the
+// reconciliation confirmed it removed) the stored AwaitingMeSince, which dates that
+// request (github.Activity), is cleared too, so a withdrawn request cannot keep
+// scoring as one waiting on the user if enrich cannot read the timeline; a request
+// kept by a partial search keeps its date. An item that comes out as stored is left
+// out of the write-back: the write would change nothing.
+func settlePins(items, existing []worklist.WorkItem, pinned map[string]bool) []worklist.WorkItem {
 	if len(pinned) == 0 {
 		return items
 	}
@@ -514,14 +523,25 @@ func dropUnchangedPins(items, existing []worklist.WorkItem, pinned map[string]bo
 	for _, it := range existing {
 		stored[it.ID] = it
 	}
-	return slices.DeleteFunc(items, func(it worklist.WorkItem) bool {
-		if !pinned[it.ID] {
-			return false
+	kept := items[:0]
+	for _, it := range items {
+		if pinned[it.ID] && !settlePin(&it, stored[it.ID]) {
+			continue
 		}
-		old := stored[it.ID]
-		return sameReasons(it.Signals.Reasons, old.Signals.Reasons) &&
-			it.Signals.ReviewRequestedBy == old.Signals.ReviewRequestedBy
-	})
+		kept = append(kept, it)
+	}
+	return kept
+}
+
+// settlePin clears a pinned item's waiting date when its request is gone and reports
+// whether it still differs from the stored item old.
+func settlePin(it *worklist.WorkItem, old worklist.WorkItem) (changed bool) {
+	if !slices.Contains(it.Signals.Reasons, worklist.ReasonReviewRequested) {
+		it.Signals.AwaitingMeSince = time.Time{}
+	}
+	return !sameReasons(it.Signals.Reasons, old.Signals.Reasons) ||
+		it.Signals.ReviewRequestedBy != old.Signals.ReviewRequestedBy ||
+		!it.Signals.AwaitingMeSince.Equal(old.Signals.AwaitingMeSince)
 }
 
 // sameReasons reports whether a and b hold the same reasons, in any order.
