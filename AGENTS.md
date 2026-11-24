@@ -62,6 +62,8 @@ internal/checkout/   unpack a repo tarball safely; search/list/read it (workload
 internal/prow/       read a Prow job's public logs/artifacts from GCS, allowlisted (workload-only)
 internal/llm/        LLM ranking / converse (workload-only)
 internal/markdown/   render + sanitize assistant Markdown
+internal/comment/    bulk comment: post the user's comment with the write grant; @ suggestions (web tier, ADR 0009)
+internal/ghcomment/  the web tier's only GitHub client: public check, post a comment, list assignees
 internal/metrics/    Prometheus metrics
 Dockerfile           web-tier image
 Dockerfile.runtime   agent-runtime image (AEI launches it per run)
@@ -115,7 +117,8 @@ Wired on the web-tier side; they define what a runtime must respect:
 - **Credentials vended on demand.** Downstream provider tokens come from
   `GET /agent/credential` (behind RequireScope) and are held by the workload for the
   run only — never a standing secret, never logged, never persisted. gofer core
-  packages import no provider client; only the workload (`internal/agent`) does.
+  packages import no provider client; only the workload (`internal/agent`) does,
+  apart from the web tier's narrow `internal/ghcomment` (ADR 0009).
   The broker vends through `auth.Handler.Credential`, which refreshes expiring
   (GitHub App) tokens; the refresh token never leaves the web tier.
 - **The chat-model token is the same class.** The web tier holds only the non-secret
@@ -123,7 +126,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   In the optional model-gateway profile (`AI_GATEWAY_URL`, ADR 0008) neither holds
   it: agentgateway does, runs present their run credential (`ai_auth=gateway`), and
   the gateway asks gofer (`/agent/model-access`) before attaching the key.
-- **Least privilege.** Source scopes are READ; only gofer metadata is WRITE.
+- **Least privilege.** Tokens vended to runs are READ; only gofer metadata is WRITE.
+  The one write-capable credential is the opt-in write grant (ADR 0009, vault
+  provider `github-write`, a separate classic OAuth app with `public_repo`), and it
+  never leaves the web tier: `auth.Handler.Credential` and the broker each refuse it,
+  independently. It posts only the user's own comment, from their confirmed
+  submission, with no model involved.
 
 ## Conventions & gotchas
 
@@ -425,6 +433,33 @@ Wired on the web-tier side; they define what a runtime must respect:
   does not match. A retired or hidden item's CI (enrich reads neither) is labeled as
   the last known result; hiding keeps it, since it is a GitHub field, and unhiding
   marks it `Stale` (labeled as from before the hide) until enrich reads the head. It is display-only: nothing scores on it.
+- The bulk comment (ADR 0009) is on only with `GITHUB_WRITE_CLIENT_ID`/`_SECRET`,
+  which config requires to name a different OAuth app from sign-in (a classic grant
+  accumulates scopes per user and app, which would put `public_repo` on the token runs
+  hold). The grant is connected under its own cookie (`session.StartGrant`, path
+  `/auth/github-write`), so the session survives, and only by the GitHub account the
+  session belongs to. Logout records the write grant's pending revocation in the same
+  commit as the session's end (`beginSessionLogout`), whether or not commenting is
+  still configured. The flow is bound to the session that began it
+  (`OAuthFlow.SessionKey`), and the callback re-checks that session under the write
+  grant's marker lock before storing, so an in-flight connection cannot outlive a
+  logout. Storing a write grant is strict, and every failed connection revokes the
+  token it was issued, that token only (`discardToken`), never the authorization. The web tier posts with it
+  (`internal/comment` over `internal/ghcomment`, which checks `"private": false`
+  first and follows no redirect). The preview registers the comment and the destinations
+  it showed as eligible (item, repository and number) under a one-time nonce;
+  confirming drops one whose item left the radar or now names another destination,
+  and never adds or redirects one. A same-origin confirm consumes it, and a nonce
+  gofer does not hold is refused, so nothing posts twice from one preview, across a
+  restart included. A confirmed batch's results are its owner's to read without a
+  live grant; only starting one needs it.
+  Same-origin trusts `Sec-Fetch-Site: same-origin`, since `Referrer-Policy:
+  no-referrer` makes a form's `Origin` "null". Posts are serial, a second apart; a
+  rate limit stops the batch, the grant is re-read before each post (a disconnect,
+  or a grant of another version, stops it), and a POST whose answer was lost is "unknown", never "not posted". Targets are items on the radar only (`WorkItem.OnRadar`). @
+  suggestions are each repository's assignees, read with the user's read credential
+  and cached in memory, counted against every selected repository (unchecked ones are
+  unknown). `reload.js` does not reload while items are checked.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

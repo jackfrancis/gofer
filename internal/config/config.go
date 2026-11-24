@@ -349,6 +349,35 @@ type Providers struct {
 	// client ID. See ADR 0007.
 	GitHubKind      string
 	MicrosoftTenant string
+	// GitHubWrite is the optional, separate classic OAuth app a user connects to let
+	// gofer post their own comments (GITHUB_WRITE_CLIENT_ID/SECRET, scope public_repo;
+	// ADR 0009). Its token never leaves the web tier and is never vended to a run.
+	// Unset: commenting is off.
+	GitHubWrite OAuthApp
+}
+
+// CommentingEnabled reports whether gofer can post comments for users who connect
+// the write grant: GitHub sign-in and the separate write client are both configured.
+func (p Providers) CommentingEnabled() bool { return p.GitHub.Enabled() && p.GitHubWrite.Enabled() }
+
+// validateGitHubWrite refuses a write client that would put write scope on the
+// sign-in token: a classic OAuth grant accumulates scopes per (user, app), so the
+// write grant must come from a different app than sign-in (ADR 0009).
+func validateGitHubWrite(p Providers) error {
+	w := p.GitHubWrite
+	if w.ClientID == "" && w.ClientSecret == "" {
+		return nil
+	}
+	if !w.Enabled() {
+		return fmt.Errorf("GITHUB_WRITE_CLIENT_ID and GITHUB_WRITE_CLIENT_SECRET must be set together")
+	}
+	if !p.GitHub.Enabled() {
+		return fmt.Errorf("GITHUB_WRITE_CLIENT_ID needs GitHub sign-in (GITHUB_CLIENT_ID/SECRET): the write grant is connected by a signed-in GitHub user")
+	}
+	if w.ClientID == p.GitHub.ClientID {
+		return fmt.Errorf("GITHUB_WRITE_CLIENT_ID must name a different OAuth app than GITHUB_CLIENT_ID: the sign-in token is vended to runs and must stay read-only (ADR 0009)")
+	}
+	return nil
 }
 
 // GITHUB_CLIENT_KIND values.
@@ -422,30 +451,39 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	return &Config{
-		DataDir:        dataDir,
-		VaultKey:       vaultKey,
-		Addr:           getEnv("ADDR", ":8080"),
-		BaseURL:        strings.TrimRight(getEnv("BASE_URL", "http://localhost:8080"), "/"),
-		AllowedOrigins: splitAndTrim(os.Getenv("ALLOWED_ORIGINS")),
-		SessionSecret:  []byte(secret),
-		CookieSecure:   getEnv("COOKIE_SECURE", "false") == "true",
-		Providers: Providers{
-			Google: OAuthApp{
-				ClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
-				ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
-			},
-			GitHub: OAuthApp{
-				ClientID:     os.Getenv("GITHUB_CLIENT_ID"),
-				ClientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
-			},
-			GitHubKind: githubKind,
-			Microsoft: OAuthApp{
-				ClientID:     os.Getenv("MICROSOFT_CLIENT_ID"),
-				ClientSecret: os.Getenv("MICROSOFT_CLIENT_SECRET"),
-			},
-			MicrosoftTenant: getEnv("MICROSOFT_TENANT", "common"),
+	providers := Providers{
+		Google: OAuthApp{
+			ClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
+			ClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
 		},
+		GitHub: OAuthApp{
+			ClientID:     os.Getenv("GITHUB_CLIENT_ID"),
+			ClientSecret: os.Getenv("GITHUB_CLIENT_SECRET"),
+		},
+		GitHubKind: githubKind,
+		Microsoft: OAuthApp{
+			ClientID:     os.Getenv("MICROSOFT_CLIENT_ID"),
+			ClientSecret: os.Getenv("MICROSOFT_CLIENT_SECRET"),
+		},
+		MicrosoftTenant: getEnv("MICROSOFT_TENANT", "common"),
+		GitHubWrite: OAuthApp{
+			ClientID:     strings.TrimSpace(os.Getenv("GITHUB_WRITE_CLIENT_ID")),
+			ClientSecret: strings.TrimSpace(os.Getenv("GITHUB_WRITE_CLIENT_SECRET")),
+		},
+	}
+	if err := validateGitHubWrite(providers); err != nil {
+		return nil, err
+	}
+
+	return &Config{
+		DataDir:             dataDir,
+		VaultKey:            vaultKey,
+		Addr:                getEnv("ADDR", ":8080"),
+		BaseURL:             strings.TrimRight(getEnv("BASE_URL", "http://localhost:8080"), "/"),
+		AllowedOrigins:      splitAndTrim(os.Getenv("ALLOWED_ORIGINS")),
+		SessionSecret:       []byte(secret),
+		CookieSecure:        getEnv("COOKIE_SECURE", "false") == "true",
+		Providers:           providers,
 		SinkURL:             getEnv("GOFER_SINK_URL", "http://gofer.gofer.svc.cluster.local:8080"),
 		Audience:            getEnv("AGENT_AUDIENCE", "gofer-agent"),
 		BotReviewers:        botReviewers,

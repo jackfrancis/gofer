@@ -109,6 +109,8 @@ type Handler struct {
 	convEnabled bool
 	options     []ModelOption // model picker options, default first (options[0]); nil when AI is disabled
 	reconnect   Reconnector   // nil: never prompt to sign in again
+	commenter   Commenter     // nil: no bulk comment (comment.go)
+	batches     batches       // confirmed bulk comments, by nonce
 	now         func() time.Time
 }
 
@@ -292,6 +294,10 @@ type pageData struct {
 	TotalItems               int                 // items on the whole radar, before the project filter
 	ProjectScope             string              // the shown selection, posted back by each bulk form ("" = every project)
 	ProjectsError            string              // why the last project selection was not saved
+	CommentEnabled           bool                // worklist: the deployment offers bulk comments (ADR 0009)
+	CommentConnected         bool                // worklist: the user connected the write grant
+	CommentNotice            string              // worklist: the outcome of the last connect/disconnect, for the user
+	Comment                  *commentView        // comment-preview / comment-results views
 }
 
 // Index handles GET /. It renders the sign-in view for anonymous visitors, the
@@ -1062,6 +1068,10 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 			Projects:   projects, ProjectsFiltered: selected != nil, SelectedProjects: selectedCount, TotalItems: len(res.Items),
 		}
 		data.LabelCSS = labelStylesheet(shown)
+		data.CommentEnabled, data.CommentConnected = h.commentState(r.Context(), user)
+		if data.CommentEnabled {
+			data.CommentNotice = commentNotices[r.URL.Query().Get("commenting")]
+		}
 		if scope != nil {
 			data.ProjectScope = encodeSelection(scope)
 		}
@@ -1085,6 +1095,14 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		}
 		return data, http.StatusOK
 	}
+}
+
+// commentNotices are the radar's words for the commenting query parameter, set by
+// the redirects that end a connect, disconnect or refused bulk comment.
+var commentNotices = map[string]string{
+	"connect":     "Connect GitHub for commenting first; gofer posts only with that separate grant.",
+	"unconfirmed": "Commenting is disconnected in gofer, but GitHub did not confirm the grant was revoked. Revoke it in GitHub's settings (Settings, Applications, Authorized OAuth Apps) to be sure.",
+	"error":       "gofer could not disconnect commenting right now. Try again in a moment.",
 }
 
 // refreshCheck is the query parameter of the no-script fallback's reload: that render

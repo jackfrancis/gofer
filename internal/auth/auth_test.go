@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -30,32 +31,44 @@ type fakeGitHub struct {
 	mu        sync.Mutex
 	expiring  bool              // issue 8 h tokens with refresh tokens (a GitHub App)
 	valid     map[string]bool   // live access tokens
+	issuer    map[string]string // access token -> the client that issued it ("" = cid)
+	userID    atomic.Int64      // the id /user answers with
+	userFails atomic.Bool       // /user answers 502
 	refresh   map[string]string // live refresh token -> the access token issued with it
 	n         int
 	killNext  bool // the next issued token is dead on arrival (a grant revoked mid-flow)
 	revokeErr bool // grant revocation fails
 	// checkStatus, when set, is check-token's answer whatever the token.
 	checkStatus int
+	// onCode, a func(), runs when an authorization code is exchanged, before the
+	// token is issued.
+	onCode atomic.Value
 	// onRefresh runs when a refresh is served, after the pair has rotated.
 	onRefresh func()
 	// onRevoke runs when a grant revocation arrives, with the token it carries.
 	onRevoke func(token string)
 
-	refreshes   atomic.Int32
-	checks      atomic.Int32
-	revoked     atomic.Int32 // grant revocations
-	revokedWith atomic.Value // string: the access token the last revocation carried
+	refreshes     atomic.Int32
+	checks        atomic.Int32
+	revoked       atomic.Int32 // grant revocations
+	revokedOther  atomic.Int32 // grant revocations of a client other than cid (the write grant)
+	tokensRevoked atomic.Int32 // single-token revocations
+	revokedWith   atomic.Value // string: the access token the last revocation carried
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
 	t.Helper()
-	f := &fakeGitHub{valid: map[string]bool{}, refresh: map[string]string{}}
+	f := &fakeGitHub{valid: map[string]bool{}, refresh: map[string]string{}, issuer: map[string]string{}}
 	f.login.Store("octocat")
+	f.userID.Store(42)
 	f.revokedWith.Store("")
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/login/oauth/access_token":
 			_ = r.ParseForm()
+			if hook, _ := f.onCode.Load().(func()); hook != nil && r.Form.Get("grant_type") == "authorization_code" {
+				hook() // outside f.mu: the hook may call back into this server
+			}
 			w.Header().Set("Content-Type", "application/json")
 			f.mu.Lock()
 			defer f.mu.Unlock()
@@ -73,11 +86,20 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 					f.onRefresh()
 				}
 			}
-			_ = json.NewEncoder(w).Encode(f.issueLocked())
+			resp := f.issueLocked()
+			if id := r.Form.Get("client_id"); id != "" && id != "cid" {
+				f.issuer[resp["access_token"].(string)] = id
+			}
+			_ = json.NewEncoder(w).Encode(resp)
 		case r.URL.Path == "/user":
+			if f.userFails.Load() {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"id":42,"login":"` + f.login.Load().(string) + `","email":"u@example.test"}`))
-		case r.URL.Path == "/applications/cid/token" && r.Method == http.MethodPost:
+			_, _ = w.Write([]byte(`{"id":` + strconv.FormatInt(f.userID.Load(), 10) + `,"login":"` + f.login.Load().(string) + `","email":"u@example.test"}`))
+		case appPath(r, "/token") != "" && r.Method == http.MethodPost:
+			client := appPath(r, "/token")
 			f.checks.Add(1)
 			if !f.basicAuthOK(r) {
 				w.WriteHeader(http.StatusUnauthorized)
@@ -90,13 +112,30 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 				w.WriteHeader(forced)
 				return
 			}
-			if f.isValid(bodyToken(r)) {
+			if tok := bodyToken(r); f.isValid(tok) && f.issuedBy(tok) == client {
 				_, _ = w.Write([]byte(`{"token":"echoed"}`))
 				return
 			}
 			http.NotFound(w, r)
-		case r.URL.Path == "/applications/cid/grant" && r.Method == http.MethodDelete:
+		case appPath(r, "/token") != "" && r.Method == http.MethodDelete:
+			// Revoking one token leaves the rest of the authorization alone.
+			client := appPath(r, "/token")
+			tok := bodyToken(r)
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if !f.valid[tok] || !f.basicAuthOK(r) || f.issuedByLocked(tok) != client {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			delete(f.valid, tok)
+			f.tokensRevoked.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		case appPath(r, "/grant") != "" && r.Method == http.MethodDelete:
+			client := appPath(r, "/grant")
 			f.revoked.Add(1)
+			if client != "cid" {
+				f.revokedOther.Add(1)
+			}
 			tok := bodyToken(r)
 			f.revokedWith.Store(tok)
 			if f.onRevoke != nil {
@@ -104,11 +143,19 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 			}
 			f.mu.Lock()
 			defer f.mu.Unlock()
-			if f.revokeErr || !f.valid[tok] || !f.basicAuthOK(r) {
+			if f.revokeErr || !f.valid[tok] || !f.basicAuthOK(r) || f.issuedByLocked(tok) != client {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
-			f.valid, f.refresh = map[string]bool{}, map[string]string{}
+			// Revoking a grant kills every token of that client, and only of that one.
+			for t := range f.valid {
+				if f.issuedByLocked(t) == client {
+					delete(f.valid, t)
+				}
+			}
+			if client == "cid" {
+				f.refresh = map[string]string{}
+			}
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
@@ -155,7 +202,33 @@ func (f *fakeGitHub) seed(access, refresh string) {
 
 func (f *fakeGitHub) basicAuthOK(r *http.Request) bool {
 	u, p, ok := r.BasicAuth()
-	return ok && u == "cid" && p == "csec"
+	return ok && ((u == "cid" && p == "csec") || (u == "wcid" && p == "wsec"))
+}
+
+// appPath is the client id in /applications/{id}{suffix}, or "".
+func appPath(r *http.Request, suffix string) string {
+	rest, ok := strings.CutPrefix(r.URL.Path, "/applications/")
+	if !ok {
+		return ""
+	}
+	id, ok := strings.CutSuffix(rest, suffix)
+	if !ok || strings.Contains(id, "/") {
+		return ""
+	}
+	return id
+}
+
+func (f *fakeGitHub) issuedBy(tok string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.issuedByLocked(tok)
+}
+
+func (f *fakeGitHub) issuedByLocked(tok string) string {
+	if c := f.issuer[tok]; c != "" {
+		return c
+	}
+	return "cid"
 }
 
 func bodyToken(r *http.Request) string {

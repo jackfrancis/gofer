@@ -82,6 +82,13 @@ func (h *CredentialHandler) Vend(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"access_token": h.aiToken, "token_type": "bearer"})
 		return
 	}
+	// The write grant (ADR 0009) never leaves the web tier. Credential refuses it
+	// too; this second, independent check keeps a run from ever reaching it if
+	// either is changed.
+	if provider == auth.WriteProvider {
+		writeError(w, http.StatusNotFound, "no credential for provider")
+		return
+	}
 	cred, err := h.source.Credential(r.Context(), p.ActingUserID, provider, auth.VendRequest{
 		Rejected: r.URL.Query().Get("rejected"),
 		RunID:    p.JobID,

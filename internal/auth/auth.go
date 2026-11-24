@@ -41,7 +41,18 @@ type provider struct {
 	// client, so it is tagged and vended. False for GitHub under a GitHub App, which
 	// never wrote such a row.
 	legacyRows bool
+	// grant marks a provider that is not a way to sign in but an extra grant a
+	// signed-in user connects (the write grant, ADR 0009). It is never offered on the
+	// sign-in page, never served by Login/Callback, and never vended by Credential.
+	grant bool
 }
+
+// github reports whether p is one of gofer's GitHub clients (sign-in or the write
+// grant): both are revoked at GitHub and re-checked with check-token.
+func (p *provider) github() bool { return isGitHub(p.name) }
+
+// isGitHub reports whether a provider name is one of gofer's GitHub clients.
+func isGitHub(name string) bool { return name == "github" || name == WriteProvider }
 
 // Handler exposes HTTP handlers for the OAuth login lifecycle.
 type Handler struct {
@@ -121,6 +132,7 @@ func NewHandler(cfg *config.Config, sessions *session.Manager, vlt vault.Vault) 
 		h.providers["github"] = &provider{
 			name:       "github",
 			legacyRows: !cfg.Providers.IsGitHubApp(),
+			mapUser:    mapGitHubUser,
 			oauth: &oauth2.Config{
 				ClientID:     app.ClientID,
 				ClientSecret: app.ClientSecret,
@@ -130,25 +142,25 @@ func NewHandler(cfg *config.Config, sessions *session.Manager, vlt vault.Vault) 
 			},
 			userURL:   "https://api.github.com/user",
 			userAgent: "gofer",
-			mapUser: func(raw map[string]any) (*session.User, error) {
-				id, ok := raw["id"].(float64)
-				if !ok {
-					return nil, fmt.Errorf("github: missing id")
-				}
-				email, _ := raw["email"].(string)
-				login, _ := raw["login"].(string)
-				name, _ := raw["name"].(string)
-				if name == "" {
-					name = login
-				}
-				return &session.User{
-					ID:       "github:" + strconv.FormatInt(int64(id), 10),
-					Provider: "github",
-					Email:    email,
-					Name:     name,
-					Login:    login,
-				}, nil
-			},
+		}
+		// The optional write grant (ADR 0009): a separate classic OAuth app with
+		// public_repo, connected by a signed-in GitHub user so gofer can post their
+		// comments. Config guarantees it is a different client from sign-in.
+		if w := cfg.Providers.GitHubWrite; cfg.Providers.CommentingEnabled() {
+			h.providers[WriteProvider] = &provider{
+				name:  WriteProvider,
+				grant: true,
+				oauth: &oauth2.Config{
+					ClientID:     w.ClientID,
+					ClientSecret: w.ClientSecret,
+					Endpoint:     github.Endpoint,
+					RedirectURL:  cfg.BaseURL + writePath + "/callback",
+					Scopes:       []string{"public_repo"},
+				},
+				userURL:   "https://api.github.com/user",
+				userAgent: "gofer",
+				mapUser:   mapGitHubUser,
+			}
 		}
 	}
 
@@ -182,6 +194,27 @@ func NewHandler(cfg *config.Config, sessions *session.Manager, vlt vault.Vault) 
 	return h
 }
 
+// mapGitHubUser maps GitHub's /user response onto a session.User.
+func mapGitHubUser(raw map[string]any) (*session.User, error) {
+	id, ok := raw["id"].(float64)
+	if !ok {
+		return nil, fmt.Errorf("github: missing id")
+	}
+	email, _ := raw["email"].(string)
+	login, _ := raw["login"].(string)
+	name, _ := raw["name"].(string)
+	if name == "" {
+		name = login
+	}
+	return &session.User{
+		ID:       "github:" + strconv.FormatInt(int64(id), 10),
+		Provider: "github",
+		Email:    email,
+		Name:     name,
+		Login:    login,
+	}, nil
+}
+
 // loginHTTPClient builds the HTTP client for the OAuth token exchange and the
 // provider user-info calls. Interactive login runs on a tight budget, so each
 // attempt is bounded and a transient DNS/egress blip is retried.
@@ -197,7 +230,10 @@ func loginHTTPClient() *http.Client {
 // Providers returns the names of the enabled providers.
 func (h *Handler) Providers() []string {
 	names := make([]string, 0, len(h.providers))
-	for name := range h.providers {
+	for name, p := range h.providers {
+		if p.grant {
+			continue // not a way to sign in
+		}
 		names = append(names, name)
 	}
 	return names
@@ -207,7 +243,7 @@ func (h *Handler) Providers() []string {
 // "provider", redirecting the user to the provider's consent screen.
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	p, ok := h.providers[r.PathValue("provider")]
-	if !ok {
+	if !ok || p.grant {
 		http.Error(w, "unknown provider", http.StatusNotFound)
 		return
 	}
@@ -231,7 +267,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 // fetches the user profile, and establishes an authenticated session.
 func (h *Handler) Callback(w http.ResponseWriter, r *http.Request) {
 	p, ok := h.providers[r.PathValue("provider")]
-	if !ok {
+	if !ok || p.grant {
 		http.Error(w, "unknown provider", http.StatusNotFound)
 		return
 	}
@@ -358,14 +394,14 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	// Record the pending logout and end the session together (one commit with the
 	// SQLite vault), again detached from the browser. If that fails nothing changed:
 	// the session stands, nothing is revoked, and the user is told to try again.
-	var lo *localLogout
+	var lo, writeLo *localLogout
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
 	err := h.sessions.EndWith(w, r.WithContext(cctx), func(ctx context.Context, sessionKey string) error {
 		if u == nil || h.vault == nil {
 			return nil
 		}
 		var err error
-		lo, err = h.beginLogout(ctx, sessionKey, u.ID, u.Provider)
+		lo, writeLo, err = h.beginSessionLogout(ctx, sessionKey, u.ID, u.Provider)
 		return err
 	})
 	cancel()
@@ -384,6 +420,11 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	}
 	if lo != nil {
 		res = h.revokeAndDelete(r.Context(), u.ID, u.Provider, lo)
+		// The write grant (ADR 0009) goes with the session that connected it; its
+		// pending logout was recorded in the same commit.
+		if writeLo != nil {
+			res = mergeLogout(res, h.revokeAndDelete(r.Context(), u.ID, WriteProvider, writeLo))
+		}
 	}
 	if res.confirmed {
 		w.WriteHeader(http.StatusNoContent)

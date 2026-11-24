@@ -24,6 +24,10 @@ data:
   # GitHub App used only for sign-in; expiring tokens refreshed by the web tier). Also
   # deliberately absent, so a deploy never flips it: set it on the live ConfigMap
   # together with the client secrets, then restart gofer-0 (ADR 0007, "Rollout").
+  # GITHUB_WRITE_CLIENT_ID / GITHUB_WRITE_CLIENT_SECRET (gofer-secrets) turn on the
+  # bulk comment: a SEPARATE classic OAuth app (callback BASE_URL +
+  # /auth/github-write/callback) that each user connects to let gofer post their
+  # own comments (public_repo). It must not be the sign-in app (ADR 0009).
   # REFRESH_INTERVAL (a Go duration, at least 1m, e.g. "15m") refreshes every
   # populated worklist from GitHub on that schedule; each refresh is a full ingest
   # run (GitHub walk, enrich, rank). With a chat model configured, each tick also
