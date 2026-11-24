@@ -37,19 +37,40 @@ type labelSelection struct {
 }
 
 // labelKey is the name a label is compared by: GitHub compares label names ignoring
-// case. It folds case the way strings.EqualFold does (Unicode simple folding), so names
-// EqualFold calls equal share one key ("ΟΣ" and "ος" included, which lowercasing alone
-// keeps apart). Each rune maps to the lowercase of the smallest rune in its folding
-// orbit, which every member of the orbit shares, so ASCII keys stay lowercase.
+// case. It folds case the way strings.EqualFold does (Unicode simple folding), so two
+// names share a key exactly when EqualFold calls them equal: "ΟΣ" and "ος" share one,
+// which lowercasing alone keeps apart, while "ID" and "İD" do not, which lowercasing
+// would merge. Each rune maps to a canonical member of its folding orbit (foldRune), so
+// ASCII keys stay lowercase.
 func labelKey(name string) string { return strings.Map(foldRune, name) }
 
-// foldRune maps r to its case-folding orbit's canonical rune (see labelKey).
+// foldRune maps r to its case-folding orbit's canonical rune: the lowercase of the
+// orbit's smallest rune when that lowercase is itself in the orbit, else the smallest
+// rune. Every member of an orbit gets the same rune, and it is always a member, so
+// runes in different orbits never collide ('İ', alone in its orbit, lowercases to an
+// ASCII 'i' that belongs to the orbit of 'I').
 func foldRune(r rune) rune {
 	m := r
 	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
 		m = min(m, f)
 	}
-	return unicode.ToLower(m)
+	if l := unicode.ToLower(m); inFoldOrbit(r, l) {
+		return l
+	}
+	return m
+}
+
+// inFoldOrbit reports whether c is in r's simple case-folding orbit.
+func inFoldOrbit(r, c rune) bool {
+	if c == r {
+		return true
+	}
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		if f == c {
+			return true
+		}
+	}
+	return false
 }
 
 // matches reports whether the selection shows it: always with no selection; otherwise

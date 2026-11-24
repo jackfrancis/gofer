@@ -441,8 +441,23 @@ func TestLabelKeyFoldsUnicodeCase(t *testing.T) {
 			t.Errorf("labelKey(%q) = %q, labelKey(%q) = %q; want equal", pair[0], labelKey(pair[0]), pair[1], labelKey(pair[1]))
 		}
 	}
+	// Names EqualFold keeps apart keep apart: lowercasing alone would merge these.
+	for _, pair := range [][2]string{{"ID", "İD"}, {"id", "İD"}, {"i", "ı"}, {"I", "ı"}} {
+		if labelKey(pair[0]) == labelKey(pair[1]) {
+			t.Errorf("labelKey(%q) = labelKey(%q) = %q; want distinct, as strings.EqualFold says", pair[0], pair[1], labelKey(pair[0]))
+		}
+	}
 	if labelKey("Bug") != "bug" {
 		t.Errorf("ASCII keys stay lowercase, got %q", labelKey("Bug"))
+	}
+	// Keys agree with strings.EqualFold across a corpus of awkward runes.
+	corpus := []string{"a", "A", "i", "I", "İ", "ı", "k", "K", "\u212a", "s", "S", "ſ", "σ", "ς", "Σ", "ß", "ẞ", "µ", "μ", "Μ", "ǅ", "ǆ", "Ǆ", "θ", "ϑ", "Θ", "ϴ", "Å", "å", "\u212b"}
+	for _, a := range corpus {
+		for _, b := range corpus {
+			if (labelKey(a) == labelKey(b)) != strings.EqualFold(a, b) {
+				t.Errorf("labelKey(%q)=%q, labelKey(%q)=%q, but EqualFold = %v", a, labelKey(a), b, labelKey(b), strings.EqualFold(a, b))
+			}
+		}
 	}
 	items := []worklist.WorkItem{
 		{ID: "a", Signals: worklist.Signals{Labels: []string{"ΟΣ"}}},
@@ -481,5 +496,24 @@ func TestLabelFilterNarrowsWaiting(t *testing.T) {
 	}
 	if !strings.Contains(page, `name="label" value="docs"`) {
 		t.Error("the checklist offers labels from waiting items")
+	}
+}
+
+// A selection of "ID" does not show an item labeled only "İD", and the two are separate
+// checklist options, in the page and in a bulk action's scope.
+func TestLabelFilterKeepsDottedIDistinct(t *testing.T) {
+	items := []worklist.WorkItem{
+		{ID: "ascii", Signals: worklist.Signals{Labels: []string{"ID"}}},
+		{ID: "dotted", Signals: worklist.Signals{Labels: []string{"İD"}}},
+	}
+	if opts := labelOptions(items, items, nil); len(opts) != 2 {
+		t.Fatalf("options = %+v, want two", opts)
+	}
+	got := filterLabels(items, labelSel(labelKey("ID")))
+	if len(got) != 1 || got[0].ID != "ascii" {
+		t.Fatalf("selecting ID shows %v, want only the ASCII item", got)
+	}
+	if (viewScope{labels: labelSel(labelKey("ID"))}).includes(items[1]) {
+		t.Fatal("a bulk scope of ID must not include an item labeled only İD")
 	}
 }
