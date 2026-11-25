@@ -34,6 +34,7 @@ const (
 // holder carry the user's read credential; history is the visible conversation
 // before the request.
 func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.WorkItem, triggerKey string, history []worklist.Message, gh *github.Client, holder *tokenHolder, viewer string) error {
+	var rev worklist.Revision // the revision the draft read, recorded on its reply (WorkItem.ReviewOutdated)
 	reply := func(content string, draft *worklist.DraftReview) error {
 		msg := worklist.Message{
 			ID:      worklist.NewMessageID(),
@@ -42,6 +43,9 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 			Content: content,
 			Model:   p.Model,
 			Draft:   draft,
+			Head:    rev.Head,
+			Base:    rev.Base,
+			Diff:    rev.Diff,
 			At:      time.Now().UTC(),
 		}
 		if err := sink.Reply(ctx, item.ID, triggerKey, msg); err != nil {
@@ -66,6 +70,7 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 	if !diff.Open {
 		return reply(draftClosedReply, nil)
 	}
+	rev = worklist.Revision{Head: diff.HeadSHA, Base: diff.BaseRef, Diff: diff.Digest()}
 	text, anchors, omitted := renderDiff(diff.Files, maxDiffPromptBytes)
 	patches := map[string]string{} // every rendered file's patch digest; the draft keeps the commented ones
 	for _, f := range diff.Files {
@@ -73,13 +78,42 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 			patches[f.Path] = worklist.PatchDigest(f.Patch)
 		}
 	}
-	prop, err := p.Drafter.DraftReview(ctx, worklist.DraftInput{Item: item, ViewerLogin: viewer, History: history, Diff: text})
+	prop, err := p.Drafter.DraftReview(ctx, worklist.DraftInput{Item: item, ViewerLogin: viewer, History: history, Diff: text, Head: diff.HeadSHA, Base: diff.BaseRef})
 	if err != nil {
 		return fmt.Errorf("draft review: %w", err)
 	}
-	pin := worklist.DraftReview{Repo: item.GitHub.Repo, Number: item.GitHub.Number, Commit: diff.HeadSHA, BaseRef: diff.BaseRef, Patches: patches}
+	// The conversation's approval is of the revision its latest review read. If the
+	// head was pushed, the base retargeted, or the diff moved since (or that review
+	// recorded none), it approves nothing here, and the reply says so whatever the
+	// model answered, so the owner knows to review again: the store applies the same
+	// rule (worklist.AppendReply), and the thread offers a review of the current
+	// revision (WorkItem.ReviewOutdated). A diff gofer cannot identify (too long to
+	// read whole, moving while read, a binary change with no patch) is never vouched
+	// for: an approval of it is withheld, and the reply says why.
+	var stale *staleReview
+	switch {
+	case diff.Unverifiable() != "":
+		if prop.Approve {
+			stale = &staleReview{unverifiable: diff.Unverifiable(), approved: true}
+		}
+		prop.Approve = false
+	case !item.Reviewed(rev):
+		stale = &staleReview{reviewed: item.ReviewedRevision(), now: rev, approved: prop.Approve}
+		prop.Approve = false
+	}
+	pin := worklist.DraftReview{Repo: item.GitHub.Repo, Number: item.GitHub.Number, Commit: diff.HeadSHA, BaseRef: diff.BaseRef, Patches: patches, Diff: rev.Diff}
 	draft, moved := anchorDraft(prop, anchors, pin)
-	return reply(draftContent(draft, prop.Excluded, moved, omitted, diff.Complete), draft)
+	return reply(draftContent(draft, prop.Excluded, moved, omitted, diff.Complete, stale), draft)
+}
+
+// staleReview is a latest review that read another revision (reviewed; zero when
+// it recorded none) than the one the draft is anchored to (now), or, with
+// unverifiable (why), a diff gofer cannot identify. approved marks an approval the
+// drafter proposed and the run withheld for it.
+type staleReview struct {
+	reviewed, now worklist.Revision
+	unverifiable  string
+	approved      bool
 }
 
 // anchor is one line a review comment may sit on.
@@ -169,10 +203,14 @@ func renderDiff(files []github.DiffFile, budget int) (string, map[string]map[anc
 // model's proposal: a comment stays inline
 // only if its line is one the diff showed it (anchors); any other, and any past
 // MaxDraftComments, moves into the review summary with its location, so an agreed
-// point is never lost to a bad anchor. moved counts those. It returns nil when there
-// is nothing to post.
+// point is never lost to a bad anchor. moved counts those. An approving proposal
+// marks the draft Approve (the review then carries worklist.ApprovalCommands). It
+// returns nil when there is nothing to post.
 func anchorDraft(prop worklist.DraftProposal, anchors map[string]map[anchor]bool, pin worklist.DraftReview) (*worklist.DraftReview, int) {
-	d := &worklist.DraftReview{Repo: pin.Repo, Number: pin.Number, Commit: pin.Commit, BaseRef: pin.BaseRef, Patches: pin.Patches}
+	d := &worklist.DraftReview{Repo: pin.Repo, Number: pin.Number, Commit: pin.Commit, BaseRef: pin.BaseRef, Patches: pin.Patches, Approve: prop.Approve}
+	if prop.Approve {
+		d.Diff = pin.Diff // the whole diff it approves, checked again before the review is created
+	}
 	general := append([]string(nil), prop.General...)
 	moved := 0
 	for _, c := range prop.Comments {
@@ -207,16 +245,26 @@ func anchorDraft(prop worklist.DraftProposal, anchors map[string]map[anchor]bool
 
 // draftContent is the reply's text: what was drafted (numbered, as the thread's
 // selection names them), what was left out for lack of consensus, and what could
-// not be placed. It is also what later runs read of the draft.
-func draftContent(d *worklist.DraftReview, excluded []string, moved, omitted int, complete bool) string {
+// not be placed, including an approval withheld because the reviews read another
+// commit. It is also what later runs read of the draft.
+func draftContent(d *worklist.DraftReview, excluded []string, moved, omitted int, complete bool, stale *staleReview) string {
 	var b strings.Builder
-	if d.Empty() {
+	switch {
+	case d.Empty() && stale != nil && stale.approved:
+		// The withheld approval was all there was: its note below says why.
+	case d.Empty():
 		b.WriteString("**Nothing to draft.** The conversation has no agreed, actionable point to turn into a review comment yet.\n")
-	} else {
+	case len(d.Comments) == 0 && d.Body == "":
+		fmt.Fprintf(&b, "**Drafted an approval** of commit `%s`: this conversation agrees the pull request is ready to approve, and has no comment for the author.", shortSHA(d.Commit))
+		b.WriteString(" Nothing is posted until you create the pending review below, and on GitHub it stays a draft only you can see until you submit it there.\n")
+	default:
 		n := len(d.Comments)
 		fmt.Fprintf(&b, "**Drafted %d inline review comment%s** from the points this conversation agrees on, anchored to commit `%s`.", n, plural(n), shortSHA(d.Commit))
 		if d.Body != "" {
 			b.WriteString(" Points no diff line carries are in the review summary.")
+		}
+		if d.Approve {
+			b.WriteString(" The conversation also agrees the pull request is ready to approve.")
 		}
 		b.WriteString(" Nothing is posted until you create the pending review below, and on GitHub it stays a draft only you can see until you submit it there.\n")
 		for i, c := range d.Comments {
@@ -225,6 +273,9 @@ func draftContent(d *worklist.DraftReview, excluded []string, moved, omitted int
 		if d.Body != "" {
 			fmt.Fprintf(&b, "\n**Review summary**\n\n%s\n", d.Body)
 		}
+	}
+	if d != nil && d.Approve {
+		fmt.Fprintf(&b, "\n**Approval** (a general comment, on lines of its own)\n\n```\n%s\n```\n", worklist.ApprovalCommands)
 	}
 	if len(excluded) > 0 {
 		b.WriteString("\n**Left out — no consensus yet**\n\n")
@@ -244,6 +295,27 @@ func draftContent(d *worklist.DraftReview, excluded []string, moved, omitted int
 	}
 	if len(notes) > 0 {
 		b.WriteString("\n_" + strings.Join(notes, " ") + "_\n")
+	}
+	switch {
+	case stale == nil:
+	case stale.unverifiable != "":
+		fmt.Fprintf(&b, "\n**No approval drafted.** The conversation agrees on approving, but %s, so gofer cannot check that an approval covers exactly what was reviewed.\n", stale.unverifiable)
+	default:
+		lead := "**The latest review is out of date.** It"
+		if stale.approved {
+			lead = "**No approval drafted.** The conversation agrees on approving, but its latest review"
+		}
+		r, n := stale.reviewed, stale.now
+		var why string
+		switch {
+		case r.Head == "" || r.Diff == "":
+			why = "did not record the revision it read in full"
+		case r.Head == n.Head && r.Base == n.Base:
+			why = fmt.Sprintf("read commit `%s` against `%s`, which the pull request still is, but its changes are no longer the ones that review read (a related change merged into `%s` moved the comparison)", shortSHA(r.Head), r.Base, r.Base)
+		default:
+			why = fmt.Sprintf("read commit `%s` against `%s`, and the pull request is now commit `%s` against `%s`", shortSHA(r.Head), r.Base, shortSHA(n.Head), n.Base)
+		}
+		fmt.Fprintf(&b, "\n%s %s, so no approval can be drafted from it. Review the current revision, then draft again.\n", lead, why)
 	}
 	return b.String()
 }

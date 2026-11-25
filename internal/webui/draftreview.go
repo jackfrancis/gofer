@@ -3,10 +3,12 @@ package webui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackfrancis/gofer/internal/comment"
@@ -25,6 +27,12 @@ import (
 
 // draftReviewPrompt is the request turn the button posts.
 const draftReviewPrompt = "Draft review comments for the points this conversation agrees on."
+
+// reviewAgainPrompt is the review request "Review the current revision" posts.
+const reviewAgainPrompt = "Review this PR again as it stands now: it changed since the earlier review."
+
+// outdatedDraft refuses a draft stored under older rules (DraftReview.Current).
+const outdatedDraft = "This draft was saved before gofer's current checks on drafted text, so gofer will not send it as it is. Nothing was created; draft the review comments again."
 
 // draftReviewTimeout bounds creating the pending review: a few GitHub calls. It runs
 // detached from the browser request, so a closed tab does not cut it short midway.
@@ -54,6 +62,14 @@ type draftThread struct {
 	// than draftReviewTimeout, whose request gofer never settled.
 	Receipt     *worklist.DraftReceipt
 	Interrupted bool
+	// Outdated marks a newest draft stored under older rules (DraftReview.Current):
+	// it is not offered, and the thread says to draft again.
+	Outdated bool
+	// ReviewOutdated marks a newest draft that read a revision other than the one
+	// the latest review read (WorkItem.ReviewOutdated): the thread offers a review
+	// of the current revision, enabled while no reply is in flight (ReviewReady).
+	ReviewOutdated bool
+	ReviewReady    bool
 }
 
 // reviewCreator returns the commenter's pending-review side, if it has one.
@@ -82,9 +98,17 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 	default:
 		v.Ready = true
 	}
+	v.ReviewOutdated = it.ReviewOutdated()
+	v.ReviewReady = v.ReviewOutdated && it.HasReview() && !it.ReplyPending(now, reviewStaleAfter)
 	// Only a draft pinned to the item's pull request as it stands is offered: a
-	// write-back that changed the item's destination retires it.
+	// write-back that changed the item's destination retires it. A draft stored under
+	// older rules is not offered either, though its receipt, if it was confirmed,
+	// still shows.
 	if i := it.LatestDraft(); i >= 0 && connected && it.Thread[i].Draft.For(it) {
+		if !it.Thread[i].Draft.Current() && it.Thread[i].DraftReceipt == nil {
+			v.Outdated = true
+			return v
+		}
 		v.Index = i
 		v.Digest = it.Thread[i].Draft.Digest()
 		v.Receipt = it.Thread[i].DraftReceipt
@@ -168,6 +192,51 @@ func (h *Handler) DraftReview(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, back, http.StatusSeeOther)
 }
 
+// ReviewAgain handles POST /items/review-again, the thread's "Review the current
+// revision": offered when the newest draft read a pull request revision other than
+// the one the latest review read (WorkItem.ReviewOutdated), so no approval could be
+// drafted from it. It appends a review request, keeping the conversation, and
+// dispatches it to the default model; its answer records the revision it read, so a
+// draft afterwards can approve it. A stale page (the review already current, a reply
+// in flight, the item off the radar) appends nothing.
+func (h *Handler) ReviewAgain(w http.ResponseWriter, r *http.Request) {
+	user := h.sessions.CurrentUser(r)
+	if user == nil || !h.convEnabled {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	id := r.FormValue("id")
+	back := "/items/thread?id=" + url.QueryEscape(id)
+	if id == "" {
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	now := h.now().UTC()
+	msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: reviewAgainPrompt, Kind: worklist.KindReviewRequest, At: now}
+	appended := false
+	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		appended = false
+		for i := range current {
+			it := current[i]
+			if it.ID != id {
+				continue
+			}
+			if it.Type != worklist.TypePullRequest || !it.OnRadar() || !it.ReviewOutdated() || it.ReplyPending(now, reviewStaleAfter) {
+				return nil, nil
+			}
+			current[i].Thread = append(current[i].Thread, msg)
+			appended = true
+			return current[i : i+1], nil
+		}
+		return nil, nil
+	})
+	if err == nil && appended {
+		opt, _ := h.defaultOption()
+		_ = h.pipeline.Converse(r.Context(), user.ID, worklist.TurnRef{Item: id, Turn: msg.ID}, opt.Endpoint, opt.Model)
+	}
+	http.Redirect(w, r, back, http.StatusSeeOther)
+}
+
 // draftResult is the result view's data.
 type draftResult struct {
 	Item     worklist.WorkItem
@@ -177,16 +246,22 @@ type draftResult struct {
 	URL      string // the pending review on GitHub, when GitHub gave a link
 	Comments int    // inline comments sent
 	Summary  bool   // the summary was sent
+	Approve  bool   // the approval commands were sent
 	Redraft  bool   // GitHub refused the draft as out of date: the page offers drafting again
 	Key      string // the refused draft's turn key and Digest, binding that offer to it
 	Digest   string
-	Error    string
+	// Body is the review body sent (the summary and approval kept), shown to copy:
+	// GitHub's dialog for submitting a pending review can open with an empty summary
+	// that replaces it.
+	Body  string
+	Error string
 }
 
 // CreateDraftReview handles POST /items/draft-review/create (same-origin only). It
 // creates a PENDING review on GitHub from the thread's offered draft, with the
-// comments the owner kept checked (form "c", by position) and the summary if checked
-// (form "summary").
+// comments the owner kept checked (form "c", by position), the summary if checked
+// (form "summary"), and, for an approving draft, its approval commands if checked
+// (form "approve"; worklist.ReviewBody puts them after the summary).
 //
 // The draft is read from the store, never from the form: the form names the turn and
 // the draft's digest, and the draft must still be the one the thread offers
@@ -230,13 +305,19 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusConflict, "This pull request is no longer on your radar, so gofer created nothing.")
 		return
 	}
+	if j := it.LatestDraft(); j >= 0 && it.TurnKey(j) == key && it.Thread[j].Draft.Digest() == digest && it.Thread[j].Draft.For(it) {
+		if prior := it.Thread[j].DraftReceipt; prior != nil {
+			h.renderReceipt(w, user, it, prior) // confirmed before, under whatever rules: nothing is sent
+			return
+		}
+		if !it.Thread[j].Draft.Current() {
+			fail(http.StatusConflict, outdatedDraft)
+			return
+		}
+	}
 	i, offered := it.OfferedDraft(key, digest)
 	if !offered {
 		fail(http.StatusConflict, notOffered)
-		return
-	}
-	if prior := it.Thread[i].DraftReceipt; prior != nil {
-		h.renderReceipt(w, user, it, prior)
 		return
 	}
 	if !connected {
@@ -256,11 +337,17 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 		rv.Comments = append(rv.Comments, ghcomment.ReviewComment{Path: c.Path, Line: c.Line, Side: c.Side, Body: c.Body})
 		rv.Patches[c.Path] = draft.Patches[c.Path]
 	}
+	summary := ""
 	if r.PostForm.Get("summary") == "1" {
-		rv.Body = draft.Body
+		summary = draft.Body
+	}
+	approve := draft.Approve && r.PostForm.Get("approve") == "1"
+	rv.Body = worklist.ReviewBody(summary, approve)
+	if approve {
+		rv.Diff = draft.Diff // GitHub must still show exactly the diff the approval is of
 	}
 	if len(rv.Comments) == 0 && rv.Body == "" {
-		fail(http.StatusBadRequest, "Select at least one comment, or the summary, to create a pending review.")
+		fail(http.StatusBadRequest, "Select at least one comment, the summary or the approval to create a pending review.")
 		return
 	}
 	// Claim the confirmation. The claim re-checks, atomically, that the draft is the
@@ -269,7 +356,7 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), draftReviewTimeout)
 	defer cancel()
 	claimedAt := h.now().UTC()
-	it, prior, err := worklist.ClaimDraft(ctx, h.store, user.ID, id, key, digest, claimedAt)
+	it, prior, err := worklist.ClaimDraft(ctx, h.store, user.ID, id, key, digest, rv.Body, claimedAt)
 	switch {
 	case errors.Is(err, worklist.ErrDraftNotOffered):
 		fail(http.StatusConflict, notOffered)
@@ -305,14 +392,14 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusBadGateway, "gofer could not create the pending review right now; nothing was created. Try again in a moment.")
 		return
 	case res.Created:
-		settle(&worklist.DraftReceipt{State: worklist.DraftCreated, URL: res.URL, At: claimedAt})
+		settle(&worklist.DraftReceipt{State: worklist.DraftCreated, URL: res.URL, Body: rv.Body, At: claimedAt})
 	case res.Unknown:
-		settle(&worklist.DraftReceipt{State: worklist.DraftUnknown, At: claimedAt})
+		settle(&worklist.DraftReceipt{State: worklist.DraftUnknown, Body: rv.Body, At: claimedAt})
 	default:
 		settle(nil) // GitHub certainly created nothing: the owner may try again
 	}
-	slog.InfoContext(ctx, "pending review", "user", user.ID, "created", res.Created, "unknown", res.Unknown, "comments", len(rv.Comments))
-	view := draftResult{Item: it, Created: res.Created, Unknown: res.Unknown, URL: res.URL, Comments: len(rv.Comments), Summary: rv.Body != "", Redraft: res.Stale, Key: key, Digest: digest, Error: res.Error}
+	slog.InfoContext(ctx, "pending review", "user", user.ID, "created", res.Created, "unknown", res.Unknown, "comments", len(rv.Comments), "approve", approve)
+	view := draftResult{Item: it, Created: res.Created, Unknown: res.Unknown, URL: res.URL, Comments: len(rv.Comments), Summary: summary != "", Approve: approve, Body: rv.Body, Redraft: res.Stale, Key: key, Digest: digest, Error: res.Error}
 	status := http.StatusOK
 	if !res.Created && !res.Unknown {
 		status = http.StatusConflict
@@ -320,10 +407,36 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 	h.render(w, status, pageData{View: "draft-review-result", User: user, Item: it, DraftResult: &view})
 }
 
+// Parts names what the review was created with, for the result page: "2 inline
+// comments, a summary and the approval commands", "the approval commands", ...
+func (v draftResult) Parts() string {
+	var parts []string
+	if v.Comments > 0 {
+		noun := "inline comments"
+		if v.Comments == 1 {
+			noun = "inline comment"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", v.Comments, noun))
+	}
+	if v.Summary {
+		parts = append(parts, "a summary")
+	}
+	if v.Approve {
+		parts = append(parts, "the approval commands")
+	}
+	switch len(parts) {
+	case 0:
+		return "nothing selected"
+	case 1:
+		return parts[0]
+	}
+	return strings.Join(parts[:len(parts)-1], ", ") + " and " + parts[len(parts)-1]
+}
+
 // renderReceipt answers a confirmation of a draft already confirmed: what the
 // earlier one did, with nothing sent to GitHub now.
 func (h *Handler) renderReceipt(w http.ResponseWriter, user *session.User, it worklist.WorkItem, rec *worklist.DraftReceipt) {
-	view := draftResult{Item: it, Repeat: true, Created: rec.State == worklist.DraftCreated, URL: rec.URL}
+	view := draftResult{Item: it, Repeat: true, Created: rec.State == worklist.DraftCreated, URL: rec.URL, Body: rec.Body}
 	if !view.Created {
 		view.Unknown = true
 		view.Error = "An earlier confirmation of this draft may have created a pending review: its answer was lost, or it was interrupted. Check the pull request on GitHub. gofer will not create another review from this draft; draft the comments again to start over."

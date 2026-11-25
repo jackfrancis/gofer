@@ -7,9 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/text"
 )
 
 // This file is the draft review (ADR 0010): a converse run, asked by a
@@ -38,9 +44,15 @@ const (
 	SideLeft  = "LEFT"
 )
 
+// ApprovalCommands is the review text an approving draft adds (DraftReview.Approve):
+// Prow's approval commands, each on its own line, as Prow's lgtm and approve plugins
+// read them from a submitted review's body.
+const ApprovalCommands = "/lgtm\n/approve"
+
 // DraftReview is the structured result of a draft-review run: inline comments
-// anchored to lines of one pull request's diff, and a summary Body for the agreed
-// points no diff line carries. It rides on the agent reply (Message.Draft).
+// anchored to lines of one pull request's diff, a summary Body for the agreed points
+// no diff line carries, and Approve when the conversation agrees the pull request is
+// ready to approve. It rides on the agent reply (Message.Draft).
 //
 // Repo, Number, Commit and BaseRef pin what the comments were anchored to. They are
 // part of the draft, so its Digest binds them: the web tier creates the review only
@@ -53,6 +65,17 @@ type DraftReview struct {
 	BaseRef  string         `json:"base_ref"`
 	Body     string         `json:"body,omitempty"`
 	Comments []DraftComment `json:"comments,omitempty"`
+	// Approve marks a draft whose conversation agrees the pull request is ready to
+	// approve: the review then carries ApprovalCommands as a general comment (in its
+	// body, after the summary; ReviewBody), which the owner may leave out like any
+	// other part. It is kept apart from Body so the summary's bound never cuts it.
+	Approve bool `json:"approve,omitempty"`
+	// Diff is, on an approving draft, the digest of the whole diff it approves
+	// (github.DiffDigest), the one the latest review read: the web tier creates the
+	// review only while the pull request still shows exactly that diff. Empty on a
+	// draft that does not approve; an approving draft without a valid one approves
+	// nothing (BoundDraft).
+	Diff string `json:"diff,omitempty"`
 	// Patches maps every commented file to the PatchDigest of the patch its comments
 	// were anchored to. The web tier re-reads those patches before it creates the
 	// review and refuses if one changed: a related change merged into the base can
@@ -82,9 +105,15 @@ type DraftComment struct {
 // nothing, across a restart too; then settled to what happened, or removed when
 // GitHub certainly created nothing, so the owner can try again.
 type DraftReceipt struct {
-	State string    `json:"state"` // DraftCreating | DraftCreated | DraftUnknown
-	URL   string    `json:"url,omitempty"`
-	At    time.Time `json:"at"`
+	State string `json:"state"` // DraftCreating | DraftCreated | DraftUnknown
+	URL   string `json:"url,omitempty"`
+	// Body is the review body sent (ReviewBody of what the owner kept), recorded in
+	// the claim, before gofer contacts GitHub, so a confirmation interrupted after
+	// GitHub created the review still shows it. GitHub's dialog for submitting a
+	// pending review can open with an empty summary that replaces it, so the thread
+	// shows it to copy into that dialog.
+	Body string    `json:"body,omitempty"`
+	At   time.Time `json:"at"`
 }
 
 // DraftReceipt states.
@@ -96,7 +125,19 @@ const (
 
 // Empty reports whether the draft has nothing to post.
 func (d *DraftReview) Empty() bool {
-	return d == nil || (strings.TrimSpace(d.Body) == "" && len(d.Comments) == 0)
+	return d == nil || (strings.TrimSpace(d.Body) == "" && len(d.Comments) == 0 && !d.Approve)
+}
+
+// ReviewBody is the body of the review created from a draft: the summary, if kept,
+// then ApprovalCommands, if kept, on lines of their own.
+func ReviewBody(summary string, approve bool) string {
+	switch {
+	case !approve:
+		return summary
+	case summary == "":
+		return ApprovalCommands
+	}
+	return summary + "\n\n" + ApprovalCommands
 }
 
 // Digest identifies the draft: its content and the pull request, commit and base it
@@ -121,17 +162,20 @@ var draftRepo = regexp.MustCompile(`^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`)
 // BoundDraft returns d normalized to what may be stored: nil when its pin (repo,
 // number, full commit id, base branch) is invalid or nothing is left to post;
 // comments with an empty body, an invalid path, a line below 1, an unknown side, or
-// no valid patch digest for their file dropped; text cut to its bound; at most
-// MaxDraftComments comments; patch digests kept for commented files only. A side
-// left empty is RIGHT.
+// no valid patch digest for their file dropped; command lines in the text
+// neutralized (NeutralizeCommands); text cut to its bound; at most MaxDraftComments
+// comments; patch digests kept for commented files only. A side left empty is RIGHT.
 func BoundDraft(d *DraftReview) *DraftReview {
-	if d == nil || !validCommit(d.Commit) || !draftRepo.MatchString(d.Repo) || d.Number <= 0 ||
-		d.BaseRef == "" || len(d.BaseRef) > maxDraftRefBytes || !utf8.ValidString(d.BaseRef) {
+	if d == nil || !validCommit(d.Commit) || !draftRepo.MatchString(d.Repo) || d.Number <= 0 || !validRef(d.BaseRef) {
 		return nil
 	}
 	out := &DraftReview{
 		Repo: d.Repo, Number: d.Number, Commit: strings.ToLower(d.Commit), BaseRef: d.BaseRef,
-		Body: cutText(strings.TrimSpace(d.Body), MaxDraftBodyBytes),
+		Body:    cutText(NeutralizeCommands(strings.TrimSpace(d.Body)), MaxDraftBodyBytes),
+		Approve: d.Approve && validDigest(d.Diff),
+	}
+	if out.Approve {
+		out.Diff = strings.ToLower(d.Diff)
 	}
 	for _, c := range d.Comments {
 		if len(out.Comments) == MaxDraftComments {
@@ -143,10 +187,10 @@ func BoundDraft(d *DraftReview) *DraftReview {
 		}
 		body := strings.TrimSpace(c.Body)
 		digest := d.Patches[c.Path]
-		if body == "" || c.Line < 1 || (side != SideRight && side != SideLeft) || !ValidDraftPath(c.Path) || len(digest) != 64 || !isHex(digest) {
+		if body == "" || c.Line < 1 || (side != SideRight && side != SideLeft) || !ValidDraftPath(c.Path) || !validDigest(digest) {
 			continue
 		}
-		out.Comments = append(out.Comments, DraftComment{Path: c.Path, Line: c.Line, Side: side, Body: cutText(body, MaxDraftCommentBytes)})
+		out.Comments = append(out.Comments, DraftComment{Path: c.Path, Line: c.Line, Side: side, Body: cutText(NeutralizeCommands(body), MaxDraftCommentBytes)})
 		if out.Patches == nil {
 			out.Patches = map[string]string{}
 		}
@@ -156,6 +200,129 @@ func BoundDraft(d *DraftReview) *DraftReview {
 		return nil
 	}
 	return out
+}
+
+// validDigest reports whether s is a hex SHA-256.
+func validDigest(s string) bool {
+	return len(s) == 64 && isHex(s)
+}
+
+// validRef reports whether s can be a stored branch name: non-empty, bounded, UTF-8.
+func validRef(s string) bool {
+	return s != "" && len(s) <= maxDraftRefBytes && utf8.ValidString(s)
+}
+
+// Current reports whether d is what BoundDraft would store today. A draft stored
+// under older rules (before command lines were neutralized, say) is not: the thread
+// does not offer it and a confirmation of it is refused (OfferedDraft), so it can
+// never send text today's rules would change. Drafting again replaces it.
+func (d *DraftReview) Current() bool {
+	b := BoundDraft(d)
+	return b != nil && b.Digest() == d.Digest()
+}
+
+// commandLine matches a line a bot such as Prow reads as a command: a slash and a
+// command word at the start of the line (after any indentation), then the end of
+// the line or a space. A path such as /usr/bin/x is not one: its word runs into
+// another slash.
+var commandLine = regexp.MustCompile(`^([ \t]*)(/[A-Za-z][A-Za-z0-9_-]*)([ \t\r].*)?$`)
+
+// SuggestionNote follows a suggestion block NeutralizeCommands turned into a plain
+// code block.
+const SuggestionNote = "_(gofer did not offer this as a suggested change: a line in it would act as a bot command on GitHub, so it is shown as plain code.)_"
+
+// NeutralizeCommands returns model-written review text with its line endings
+// normalized to LF and every command line (commandLine: /lgtm, /approve, /hold, ...)
+// made inert by wrapping its command in backticks, so it reads the same but no
+// longer starts with a slash. A drafted review acts on a pull request only through
+// what the owner selects: its approval commands come from DraftReview.Approve alone,
+// never from the text.
+//
+// Line endings come first: a bot splits lines at LF, and a browser turns a bare CR
+// into LF before the page's copy button reads the text, so a CR could otherwise hide
+// a command from this check and reveal it in the pasted text. The text stored, shown
+// and copied is this one.
+//
+// A GitHub suggestion block is applied verbatim, so it is never altered and left a
+// suggestion: one holding a command line (a .gitignore's /dist, say) becomes a plain
+// code block, with SuggestionNote after it, so the author cannot apply the altered
+// text. Blocks are found as Markdown parses them (goldmark), so a suggestion nested
+// in a list, with its fence indented past three spaces, is one too. Lines outside
+// any suggestion are judged as a bot reads them, raw. The result is a fixed point.
+func NeutralizeCommands(s string) string {
+	s = strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n")
+	lines := strings.Split(s, "\n")
+	hit := make([]bool, len(lines))
+	found := false
+	for i, l := range lines {
+		hit[i] = commandLine.MatchString(l)
+		found = found || hit[i]
+	}
+	if !found {
+		return s
+	}
+	starts := make([]int, len(lines)) // each line's byte offset in s
+	for i, off := 1, 0; i < len(lines); i++ {
+		off += len(lines[i-1]) + 1
+		starts[i] = off
+	}
+	lineOf := func(off int) int { return sort.Search(len(starts), func(i int) bool { return starts[i] > off }) - 1 }
+
+	// Suggestion blocks holding a command line: the language to replace on the
+	// opening line, and where the note goes.
+	type demotion struct{ col, n int }
+	opener := map[int]demotion{}  // opening line -> the language's column and length
+	noteAfter := map[int]string{} // line -> the note, indented to the block's fence
+	src := []byte(s)
+	doc := goldmark.New().Parser().Parse(text.NewReader(src))
+	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		fc, ok := n.(*ast.FencedCodeBlock)
+		if !entering || !ok || fc.Info == nil || fc.Lines().Len() == 0 {
+			return ast.WalkContinue, nil
+		}
+		lang := fc.Language(src)
+		if !strings.EqualFold(string(lang), "suggestion") {
+			return ast.WalkContinue, nil
+		}
+		first, last := lineOf(fc.Lines().At(0).Start), lineOf(fc.Lines().At(fc.Lines().Len()-1).Start)
+		if !slices.Contains(hit[first:last+1], true) {
+			return ast.WalkContinue, nil
+		}
+		info := fc.Info.Segment.Start
+		open := lineOf(info)
+		opener[open] = demotion{col: info - starts[open], n: len(lang)}
+		fence := strings.IndexAny(lines[open], "`~")
+		indent := strings.Map(func(r rune) rune {
+			if r == '\t' {
+				return r
+			}
+			return ' '
+		}, lines[open][:max(fence, 0)])
+		end := len(lines) - 1 // the closing fence, or the last line of a block left open
+		for k := last + 1; k < len(lines); k++ {
+			if t := strings.TrimSpace(lines[k]); len(t) >= 3 && (strings.Trim(t, "`") == "" || strings.Trim(t, "~") == "") {
+				end = k
+				break
+			}
+		}
+		noteAfter[end] = indent + SuggestionNote
+		return ast.WalkContinue, nil
+	})
+
+	out := make([]string, 0, len(lines)+len(noteAfter))
+	for i, l := range lines {
+		switch d, ok := opener[i]; {
+		case ok:
+			l = l[:d.col] + "text" + l[d.col+d.n:]
+		case hit[i]:
+			l = commandLine.ReplaceAllString(l, "$1`$2`$3")
+		}
+		out = append(out, l)
+		if note, ok := noteAfter[i]; ok {
+			out = append(out, note)
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 // ValidDraftPath reports whether p can name a file in a diff: a relative path
@@ -257,7 +424,7 @@ func (w WorkItem) RedraftRedundant() bool {
 	if i < 0 {
 		return false
 	}
-	if !w.Thread[i].Draft.For(w) || w.Thread[i].DraftReceipt != nil {
+	if !w.Thread[i].Draft.For(w) || !w.Thread[i].Draft.Current() || w.Thread[i].DraftReceipt != nil {
 		return false
 	}
 	if !w.Thread[req].ReadRevKnown {
@@ -305,11 +472,12 @@ func (w *WorkItem) SetHidden(i int, hidden bool) bool {
 
 // OfferedDraft returns the position of the draft turn key names if it is the draft
 // the thread offers now (LatestDraft), its digest is digest, and it is pinned to the
-// item's pull request as it stands (DraftReview.For). A receipt on it does not
-// matter here: the caller decides what a confirmed draft means.
+// item's pull request as it stands (DraftReview.For), and it is what today's rules
+// would store (DraftReview.Current). A receipt on it does not matter here: the
+// caller decides what a confirmed draft means.
 func (w WorkItem) OfferedDraft(key, digest string) (int, bool) {
 	i := w.LatestDraft()
-	if i < 0 || w.TurnKey(i) != key || w.Thread[i].Draft.Digest() != digest || !w.Thread[i].Draft.For(w) {
+	if i < 0 || w.TurnKey(i) != key || w.Thread[i].Draft.Digest() != digest || !w.Thread[i].Draft.For(w) || !w.Thread[i].Draft.Current() {
 		return 0, false
 	}
 	return i, true
@@ -321,12 +489,14 @@ func (w WorkItem) OfferedDraft(key, digest string) (int, bool) {
 var ErrDraftNotOffered = errors.New("the draft is no longer offered")
 
 // ClaimDraft claims ownerID's draft (item itemID, turn key, digest) for creation at
-// at, in one Store.Update: it records a DraftCreating receipt unless the draft
-// already has a receipt, which it returns instead (prior), with nothing written. It
+// at, in one Store.Update: it records a DraftCreating receipt carrying body (the
+// review body about to be sent, so an interrupted confirmation can still show it)
+// unless the draft already has a receipt, which it returns instead (prior), with
+// nothing written. It
 // returns the item as stored (with the claim when claimed) so the caller creates the
 // review from the stored draft. ErrDraftNotOffered when the draft is not offered or
 // the item is off the radar.
-func ClaimDraft(ctx context.Context, store Store, ownerID, itemID, key, digest string, at time.Time) (item WorkItem, prior *DraftReceipt, err error) {
+func ClaimDraft(ctx context.Context, store Store, ownerID, itemID, key, digest, body string, at time.Time) (item WorkItem, prior *DraftReceipt, err error) {
 	err = store.Update(ctx, ownerID, func(current []WorkItem) ([]WorkItem, error) {
 		item, prior = WorkItem{}, nil
 		for n := range current {
@@ -345,7 +515,7 @@ func ClaimDraft(ctx context.Context, store Store, ownerID, itemID, key, digest s
 				prior, item = &cp, current[n]
 				return nil, nil
 			}
-			current[n].Thread[i].DraftReceipt = &DraftReceipt{State: DraftCreating, At: at}
+			current[n].Thread[i].DraftReceipt = &DraftReceipt{State: DraftCreating, Body: body, At: at}
 			item = current[n]
 			return current[n : n+1], nil
 		}
@@ -417,16 +587,22 @@ type DraftInput struct {
 	ViewerLogin string
 	History     []Message
 	Diff        string
+	// Head and Base are the pull request's head commit and base branch the diff
+	// shows, which the draft is anchored to; a history turn's Head and Base are the
+	// revision it read.
+	Head, Base string
 }
 
 // DraftProposal is a ReviewDrafter's answer, before the run checks it against the
-// diff: inline comments, agreed points that belong to no diff line (General), and
-// the points it left out because the conversation does not agree on them (Excluded),
-// one short line each, which the reply shows so the owner sees what was held back.
+// diff: inline comments, agreed points that belong to no diff line (General), the
+// points it left out because the conversation does not agree on them (Excluded),
+// one short line each, which the reply shows so the owner sees what was held back,
+// and Approve when the conversation agrees the pull request is ready to approve.
 type DraftProposal struct {
 	Comments []DraftComment
 	General  []string
 	Excluded []string
+	Approve  bool
 }
 
 // ReviewDrafter drafts the review comments a conversation agrees on. It is

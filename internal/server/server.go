@@ -184,6 +184,7 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// pending review on GitHub from the stored draft.
 	mux.Handle("POST /items/draft-review", http.HandlerFunc(webHandler.DraftReview))
 	mux.Handle("POST /items/draft-review/create", http.HandlerFunc(webHandler.CreateDraftReview))
+	mux.Handle("POST /items/review-again", http.HandlerFunc(webHandler.ReviewAgain))
 	mux.Handle("GET /items/mentions", http.HandlerFunc(webHandler.Mentions))
 
 	// Auth lifecycle.

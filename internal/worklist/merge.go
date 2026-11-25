@@ -3,6 +3,7 @@ package worklist
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -223,6 +224,15 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 		reply.Attempt = "" // only a notice names the attempt it ended
 	}
 	reply.ReplyTo = replyTo
+	if validCommit(reply.Head) && validRef(reply.Base) {
+		reply.Head = strings.ToLower(reply.Head)
+		if !validDigest(reply.Diff) {
+			reply.Diff = ""
+		}
+		reply.Diff = strings.ToLower(reply.Diff)
+	} else {
+		reply.Head, reply.Base, reply.Diff = "", "", ""
+	}
 	found := false // the answered turn is still in the thread
 	for i, m := range item.Thread {
 		if reply.ID != "" && m.ID == reply.ID {
@@ -248,6 +258,14 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 	if i, _ := item.TurnIndex(replyTo); item.IsDraftReviewRequest(i) && reply.Notice == "" {
 		if reply.Draft = BoundDraft(reply.Draft); !reply.Draft.For(*item) {
 			reply.Draft = nil
+		}
+		// An approval approves the revision the latest review read, so it stands only
+		// on a draft pinned to that head, base and diff, whatever the run decided.
+		if d := reply.Draft; d != nil && d.Approve && !item.Reviewed(Revision{d.Commit, d.BaseRef, d.Diff}) {
+			d.Approve, d.Diff = false, "" // as BoundDraft stores a draft that does not approve, so it stays Current
+			if d.Empty() {
+				reply.Draft = nil
+			}
 		}
 	} else {
 		reply.Draft = nil

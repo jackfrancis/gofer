@@ -668,7 +668,33 @@ Wired on the web-tier side; they define what a runtime must respect:
   points the visible conversation agrees on (the user's own messages decide; an
   unsettled disagreement is left out and listed), keeps inline only comments on a line
   the diff showed (others move into the summary), and replies with a
-  `worklist.DraftReview` on `Message.Draft`, pinned to the repository, number, head
+  `worklist.DraftReview` on `Message.Draft` (marked `Approve` when the conversation
+  agrees the pull request is ready to approve: the review body then ends with
+  `worklist.ApprovalCommands`, `/lgtm` and `/approve` on lines of their own, a flag
+  apart from the summary so its bound never cuts them, offered as its own checkbox
+  and joined by `worklist.ReviewBody`; an approval stands only on a draft pinned to
+  the revision the latest visible review read, head, base and whole-diff digest,
+  `WorkItem.Reviewed` over the `Message.Head`/`Base`/`Diff` a review records from
+  one settled snapshot that is also what its model is shown (`github.PullDiff`,
+  settled on head, base branch, base commit and file count, re-read while the base
+  moves; a reconnect at the final read discards the answer; no
+  digest if the pull request moved while the model worked, or for a diff
+  `PullDiff.Unverifiable` names: cut, unsettled, or a binary change with no patch;
+  `github.DiffDigest`, matched by `ghcomment.DiffDigest`, which `PendingReview`
+  checks against every file, read 100 a page to `changed_files` as the workload
+  reads them, with every commented path and the base commit unmoved since (re-read
+  if it moved; past the cap is out of date), before creating an approval,
+  `ghcomment.Review.Diff`),
+  checked by `AppendReply` whatever the run sent; the run flags a stale review
+  whatever the model answered, and while the latest review is older than the draft
+  the thread offers "Review the current revision", `WorkItem.ReviewOutdated`,
+  `POST /items/review-again`; model-written draft text is LF-normalized and has
+  every bot-command line made inert, `worklist.NeutralizeCommands` in `BoundDraft`,
+  a suggestion block holding one (found by goldmark, lists included) turned into
+  plain code rather than altered, so the checkbox is the only source of a command; a stored draft `BoundDraft` would change
+  today is neither offered nor confirmable, `DraftReview.Current`; GitHub's submit
+  dialog can replace the body, so the body is saved on the receipt in the claim,
+  before GitHub is contacted, `DraftReceipt.Body`, and shown to copy), pinned to the repository, number, head
   commit and base branch it was anchored to, with each commented file's patch digest
   (`DraftReview.Patches`, `worklist.PatchDigest` = `ghcomment.PatchDigest`). Context lines anchor RIGHT only, as
   GitHub defines them, and the annotated diff stays within its byte budget, notices

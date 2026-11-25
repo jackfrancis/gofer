@@ -16,6 +16,9 @@ import (
 
 const draftCommit = "0123456789abcdef0123456789abcdef01234567"
 
+// draftDiff is the digest of the whole diff an approving draft approves.
+var draftDiff = worklist.PatchDigest("the whole diff")
+
 type fakeReviewCommenter struct {
 	fakeCommenter
 	result  comment.ReviewResult
@@ -576,4 +579,237 @@ func (s ctxStore) Update(ctx context.Context, ownerID string, fn func([]worklist
 		return err
 	}
 	return s.Store.Update(ctx, ownerID, fn)
+}
+
+// An approving draft offers its approval as its own checkbox, showing the exact
+// commands; confirming it sends them in the review body after the summary, leaving
+// it unchecked sends none, and a draft that does not approve never sends them,
+// whatever the form says.
+func TestCreateDraftReviewApproval(t *testing.T) {
+	approving := func() []worklist.Message {
+		th := draftedThread(time.Now().Add(-time.Hour))
+		th[3].Draft.Approve, th[3].Draft.Diff = true, draftDiff
+		return th
+	}
+	create := func(t *testing.T, th []worklist.Message, form url.Values) (comment.Review, string) {
+		t.Helper()
+		c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true}}
+		h, _, _ := draftFixture(t, c, th)
+		form.Set("id", draftItemID)
+		form.Set("msg", "a")
+		form.Set("digest", th[3].Draft.Digest())
+		rec := postCreate(h, form, "Sec-Fetch-Site", "same-origin")
+		if rec.Code != http.StatusOK || len(c.reviews) != 1 {
+			t.Fatalf("status %d, reviews %+v\n%s", rec.Code, c.reviews, rec.Body.String())
+		}
+		return c.reviews[0], rec.Body.String()
+	}
+
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	h, _, _ := draftFixture(t, c, approving())
+	page, _ := threadPage(t, h)
+	for _, want := range []string{`name="approve" value="1" checked`, "<pre class=\"zz-draft-text\">/lgtm\n/approve</pre>"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("thread lacks %q", want)
+		}
+	}
+	h, _, _ = draftFixture(t, c, draftedThread(time.Now().Add(-time.Hour)))
+	if page, _ := threadPage(t, h); strings.Contains(page, `name="approve"`) {
+		t.Error("a draft that does not approve offers an approval")
+	}
+
+	rv, body := create(t, approving(), url.Values{"summary": {"1"}, "approve": {"1"}})
+	if rv.Body != "- Add a test.\n\n/lgtm\n/approve" || len(rv.Comments) != 0 {
+		t.Errorf("summary and approval: body %q, %d comments", rv.Body, len(rv.Comments))
+	}
+	if rv.Diff != draftDiff {
+		t.Errorf("approval sent without its diff to check: %q", rv.Diff)
+	}
+	if !strings.Contains(body, "a summary and the approval commands") {
+		t.Errorf("result page:\n%s", body)
+	}
+	if rv, _ := create(t, approving(), url.Values{"approve": {"1"}}); rv.Body != worklist.ApprovalCommands {
+		t.Errorf("approval only: body %q", rv.Body)
+	}
+	if rv, _ := create(t, approving(), url.Values{"summary": {"1"}}); rv.Body != "- Add a test." || rv.Diff != "" {
+		t.Errorf("approval left out: body %q, diff %q", rv.Body, rv.Diff)
+	}
+	if rv, _ := create(t, draftedThread(time.Now().Add(-time.Hour)), url.Values{"summary": {"1"}, "approve": {"1"}}); rv.Body != "- Add a test." {
+		t.Errorf("a draft that does not approve sent: %q", rv.Body)
+	}
+}
+
+// A draft that only approves (no comment, no summary) is offered and creates a
+// review whose body is the approval commands.
+func TestCreateDraftReviewApprovalOnly(t *testing.T) {
+	th := draftedThread(time.Now().Add(-time.Hour))
+	th[3].Draft = &worklist.DraftReview{Repo: "o/r", Number: 1, Commit: draftCommit, BaseRef: "main", Approve: true, Diff: draftDiff}
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true}}
+	h, _, _ := draftFixture(t, c, th)
+	page, _ := threadPage(t, h)
+	if !strings.Contains(page, `name="approve" value="1" checked`) || strings.Contains(page, `name="summary"`) {
+		t.Fatalf("approval-only draft not offered as such")
+	}
+	rec := postCreate(h, url.Values{"id": {draftItemID}, "msg": {"a"}, "digest": {th[3].Draft.Digest()}, "approve": {"1"}}, "Sec-Fetch-Site", "same-origin")
+	if rec.Code != http.StatusOK || len(c.reviews) != 1 || c.reviews[0].Body != "/lgtm\n/approve" || len(c.reviews[0].Comments) != 0 {
+		t.Fatalf("status %d, reviews %+v", rec.Code, c.reviews)
+	}
+	if !strings.Contains(rec.Body.String(), "created a pending review with the approval commands.") {
+		t.Errorf("result page:\n%s", rec.Body.String())
+	}
+}
+
+// GitHub's submit dialog can open with an empty summary that replaces the review's
+// body, so the body sent is recorded on the receipt and shown, with a copy button
+// and the warning, on the result page, on a replay, and on the thread afterwards; an
+// unknown outcome shows it too. A review of inline comments only has no body to show.
+func TestCreateDraftReviewShowsTheBodyToPaste(t *testing.T) {
+	const want = "- Add a test.\n\n/lgtm\n/approve"
+	th := draftedThread(time.Now().Add(-time.Hour))
+	th[3].Draft.Approve, th[3].Draft.Diff = true, draftDiff
+	form := url.Values{"id": {draftItemID}, "msg": {"a"}, "digest": {th[3].Draft.Digest()}, "summary": {"1"}, "approve": {"1"}}
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true, URL: "https://github.com/o/r/pull/1#pullrequestreview-9"}}
+	h, _, store := draftFixture(t, c, th)
+	shows := func(t *testing.T, where, page string) {
+		t.Helper()
+		for _, s := range []string{
+			"<pre class=\"zz-draft-text\">" + want + "</pre>",
+			`data-copy="- Add a test.` + "\n\n" + `/lgtm` + "\n" + `/approve"`,
+			"Finish your review", "the approval commands would never reach the pull request",
+		} {
+			if !strings.Contains(page, s) {
+				t.Errorf("%s lacks %q", where, s)
+			}
+		}
+	}
+	rec := postCreate(h, form, "Sec-Fetch-Site", "same-origin")
+	shows(t, "result page", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), `<script src="/static/copy.js" defer></script>`) {
+		t.Error("the result page does not load copy.js")
+	}
+	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+	if r := it.Thread[3].DraftReceipt; r == nil || r.State != worklist.DraftCreated || r.Body != want {
+		t.Fatalf("receipt = %+v", r)
+	}
+	page, _ := threadPage(t, h)
+	shows(t, "thread", page)
+	shows(t, "replay", postCreate(h, form, "Sec-Fetch-Site", "same-origin").Body.String())
+
+	th = draftedThread(time.Now().Add(-time.Hour))
+	c = &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Unknown: true, Error: "lost"}}
+	h, _, _ = draftFixture(t, c, th)
+	out := postCreate(h, url.Values{"id": {draftItemID}, "msg": {"a"}, "digest": {th[3].Draft.Digest()}, "summary": {"1"}}, "Sec-Fetch-Site", "same-origin").Body.String()
+	if !strings.Contains(out, "<pre class=\"zz-draft-text\">- Add a test.</pre>") || strings.Contains(out, "approval commands would never") {
+		t.Errorf("unknown outcome page:\n%s", out)
+	}
+
+	th = draftedThread(time.Now().Add(-time.Hour))
+	c = &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true}}
+	h, _, _ = draftFixture(t, c, th)
+	if out := postCreate(h, url.Values{"id": {draftItemID}, "msg": {"a"}, "digest": {th[3].Draft.Digest()}, "c": {"0"}}, "Sec-Fetch-Site", "same-origin").Body.String(); strings.Contains(out, "zz-review-body") {
+		t.Error("a review with no body shows one to paste")
+	}
+}
+
+// When the newest draft read a revision the latest review did not (a push or a
+// retarget since), the thread offers "Review the current revision": it appends a
+// review request, keeping the conversation, and dispatches it to the default model.
+// With the review current, or a reply in flight, it does nothing.
+func TestReviewAgain(t *testing.T) {
+	const pushed = "fedcba9876543210fedcba9876543210fedcba98"
+	post := func(h *Handler) {
+		req := httptest.NewRequest(http.MethodPost, "/items/review-again", strings.NewReader(url.Values{"id": {draftItemID}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		h.ReviewAgain(rec, req)
+		if rec.Code != http.StatusSeeOther {
+			t.Fatalf("status %d", rec.Code)
+		}
+	}
+	outdated := func() []worklist.Message {
+		th := draftedThread(time.Now().Add(-time.Hour))
+		th[1].Head, th[1].Base = draftCommit, "main"
+		th[3].Head, th[3].Base = pushed, "main"
+		return th
+	}
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	h, p, store := draftFixture(t, c, outdated())
+	page, _ := threadPage(t, h)
+	if !strings.Contains(page, `action="/items/review-again"`) || !strings.Contains(page, "Review the current revision") {
+		t.Fatal("an outdated review offers no review of the current revision")
+	}
+	post(h)
+	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+	last := it.Thread[len(it.Thread)-1]
+	if last.Kind != worklist.KindReviewRequest || last.Content != reviewAgainPrompt || len(p.turns) != 1 || p.turns[0].Turn != last.ID || p.converseModels[0] != "m0" {
+		t.Fatalf("appended %+v, dispatched %+v models %v", last, p.turns, p.converseModels)
+	}
+	if len(it.Thread) != 5 {
+		t.Errorf("the conversation was not kept: %d turns", len(it.Thread))
+	}
+	post(h) // the review is now pending
+	if len(p.turns) != 1 {
+		t.Error("a second click dispatched again")
+	}
+
+	th := outdated()
+	th[3].Head = draftCommit // the draft read what the review read
+	h, p, _ = draftFixture(t, c, th)
+	if page, _ := threadPage(t, h); strings.Contains(page, "/items/review-again") {
+		t.Error("a current review offers another")
+	}
+	post(h)
+	if len(p.turns) != 0 {
+		t.Error("a current review was reviewed again")
+	}
+}
+
+// A draft stored under older rules (here, with a live command in its text) is not
+// offered and cannot be confirmed; the thread says to draft again. A confirmed one
+// still shows its receipt.
+func TestOutdatedDraftIsRefused(t *testing.T) {
+	th := draftedThread(time.Now().Add(-time.Hour))
+	th[3].Draft.Body = "Ship it.\n/lgtm"
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true}}
+	h, _, _ := draftFixture(t, c, th)
+	page, _ := threadPage(t, h)
+	if strings.Contains(page, `action="/items/draft-review/create"`) || !strings.Contains(page, "saved before gofer's current checks") {
+		t.Errorf("outdated draft offered, or no note:\n%s", page)
+	}
+	if !strings.Contains(page, `action="/items/draft-review"`) {
+		t.Error("drafting again is not offered over an outdated draft")
+	}
+	rec := postCreate(h, url.Values{"id": {draftItemID}, "msg": {"a"}, "digest": {th[3].Draft.Digest()}, "summary": {"1"}}, "Sec-Fetch-Site", "same-origin")
+	if rec.Code != http.StatusConflict || len(c.reviews) != 0 || !strings.Contains(rec.Body.String(), "draft the review comments again") {
+		t.Fatalf("status %d, reviews %+v\n%s", rec.Code, c.reviews, rec.Body.String())
+	}
+	th[3].DraftReceipt = &worklist.DraftReceipt{State: worklist.DraftCreated, URL: "https://github.com/o/r/pull/1#pullrequestreview-1", At: time.Now()}
+	h, _, _ = draftFixture(t, c, th)
+	if page, _ := threadPage(t, h); !strings.Contains(page, "Pending review created on GitHub") {
+		t.Error("a confirmed outdated draft hides its receipt")
+	}
+}
+
+// The body is saved in the claim, before GitHub is contacted, so a confirmation cut
+// off after GitHub created the review still shows the text to paste.
+func TestClaimSavesTheBody(t *testing.T) {
+	th := draftedThread(time.Now().Add(-time.Hour))
+	th[3].Draft.Approve, th[3].Draft.Diff = true, draftDiff
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true}}
+	h, _, store := draftFixture(t, c, th)
+	var during *worklist.DraftReceipt
+	c.during = func() {
+		it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+		during = it.Thread[3].DraftReceipt
+	}
+	postCreate(h, url.Values{"id": {draftItemID}, "msg": {"a"}, "digest": {th[3].Draft.Digest()}, "approve": {"1"}}, "Sec-Fetch-Site", "same-origin")
+	if during == nil || during.State != worklist.DraftCreating || during.Body != worklist.ApprovalCommands {
+		t.Fatalf("claim while GitHub was asked = %+v", during)
+	}
+	// Interrupted there: the thread shows the body with the warning.
+	th[3].DraftReceipt = during
+	h, _, _ = draftFixture(t, c, th)
+	if page, _ := threadPage(t, h); !strings.Contains(page, "<pre class=\"zz-draft-text\">/lgtm\n/approve</pre>") || !strings.Contains(page, "Finish your review") {
+		t.Errorf("an interrupted claim shows no body:\n%s", page)
+	}
 }

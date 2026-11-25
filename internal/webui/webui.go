@@ -1393,6 +1393,8 @@ var funcs = template.FuncMap{
 	"isSecondOpinionRequest": isSecondOpinionRequest,
 	"isSynthesisRequest":     isSynthesisRequest,
 	"isDraftReviewRequest":   isDraftReviewRequest,
+	"approvalCommands":       func() string { return worklist.ApprovalCommands },
+	"approvalIn":             func(body string) bool { return strings.HasSuffix(body, worklist.ApprovalCommands) },
 	"add1":                   func(i int) int { return i + 1 },
 	"shortSHA": func(s string) string {
 		if len(s) > 7 {

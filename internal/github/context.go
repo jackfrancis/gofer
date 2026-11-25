@@ -47,6 +47,7 @@ type Discussion struct {
 	ReviewComments []Comment
 	ChangedFiles   []string
 	HeadSHA        string
+	BaseRef        string // the pull request's base branch
 }
 
 // Comment is one discussion or inline review comment.
@@ -130,9 +131,12 @@ func (c *Client) Discussion(ctx context.Context, token, repo string, number int,
 			Head struct {
 				SHA string `json:"sha"`
 			} `json:"head"`
+			Base struct {
+				Ref string `json:"ref"`
+			} `json:"base"`
 		}
 		if err := json.Unmarshal(body, &pr); err == nil {
-			d.HeadSHA = pr.Head.SHA
+			d.HeadSHA, d.BaseRef = pr.Head.SHA, pr.Base.Ref
 		}
 	}
 

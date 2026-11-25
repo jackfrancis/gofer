@@ -18,6 +18,12 @@ const draftHead = "0123456789abcdef0123456789abcdef01234567"
 // draftPatch adds lines 11-12 and removes old line 11 in a.go.
 const draftPatch = "@@ -10,3 +10,4 @@ func f() {\n ctx\n-old\n+new1\n+new2\n tail"
 
+// draftDiff is the digest of the whole diff draftGitHub serves.
+var draftDiff = github.DiffDigest([]github.DiffFile{
+	{Path: "a.go", Status: "modified", SHA: "blob-a", Patch: draftPatch},
+	{Path: "logo.png", Status: "added", SHA: "blob-logo"},
+})
+
 type fakeDrafter struct {
 	prop worklist.DraftProposal
 	got  worklist.DraftInput
@@ -38,13 +44,15 @@ func draftGitHub(t *testing.T, state string) string {
 			_, _ = w.Write([]byte(`{"login":"octocat"}`))
 		case "/repos/o/r/pulls/1":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"state": state, "head": map[string]any{"sha": draftHead},
+				"state": state, "head": map[string]any{"sha": draftHead}, "changed_files": 2,
 				"base": map[string]any{"ref": "main", "repo": map[string]any{"full_name": "o/r"}},
 			})
+		case "/repos/o/r/issues/1":
+			_, _ = w.Write([]byte(`{"body":"desc"}`))
 		case "/repos/o/r/pulls/1/files":
 			_ = json.NewEncoder(w).Encode([]map[string]any{
-				{"filename": "a.go", "status": "modified", "patch": draftPatch},
-				{"filename": "logo.png", "status": "added"},
+				{"filename": "a.go", "status": "modified", "sha": "blob-a", "patch": draftPatch},
+				{"filename": "logo.png", "status": "added", "sha": "blob-logo"},
 			})
 		default:
 			http.NotFound(w, r)
@@ -60,7 +68,7 @@ func draftItem() worklist.WorkItem {
 		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, Title: "t"},
 		Thread: []worklist.Message{
 			{ID: "q", Role: worklist.RoleUser, Content: "review?", Kind: worklist.KindReviewRequest},
-			{ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "rename new1", Model: "m1"},
+			{ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "rename new1", Model: "m1", Head: draftHead, Base: "main", Diff: draftDiff},
 			{ID: "h", Role: worklist.RoleUser, Content: "secret aside", Hidden: true},
 			{ID: "d", Role: worklist.RoleUser, Content: "draft", Kind: worklist.KindDraftReviewRequest},
 		},
@@ -162,6 +170,231 @@ func TestRunConverseDraftsNothing(t *testing.T) {
 	issue.Type = worklist.TypeIssue
 	if m := run(t, issue, "open", &fakeDrafter{}); m.Draft != nil || m.Content != draftNotPRReply {
 		t.Errorf("issue: %+v", m)
+	}
+}
+
+// A conversation that agrees the pull request is ready to approve drafts the
+// approval as a general comment, alone or beside agreed nits, and says so.
+func TestRunConverseDraftsApproval(t *testing.T) {
+	run := func(t *testing.T, prop worklist.DraftProposal) worklist.Message {
+		t.Helper()
+		sink := &memSink{items: []worklist.WorkItem{draftItem()}}
+		err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: "github:o/r#1", Turn: "d", Converser: &fakeConverser{}, Drafter: &fakeDrafter{prop: prop}},
+			fakeVendor{token: "t"}, sink)
+		if err != nil {
+			t.Fatal(err)
+		}
+		th := sink.items[0].Thread
+		return th[len(th)-1]
+	}
+	m := run(t, worklist.DraftProposal{Approve: true})
+	if d := m.Draft; d == nil || !d.Approve || d.Body != "" || len(d.Comments) != 0 || d.Commit != draftHead {
+		t.Fatalf("approval-only draft = %+v", m.Draft)
+	}
+	for _, want := range []string{"Drafted an approval", "/lgtm\n/approve"} {
+		if !strings.Contains(m.Content, want) {
+			t.Errorf("reply lacks %q:\n%s", want, m.Content)
+		}
+	}
+	if strings.Contains(m.Content, "Nothing to draft") {
+		t.Errorf("an approval read as nothing to draft:\n%s", m.Content)
+	}
+	m = run(t, worklist.DraftProposal{Approve: true, Comments: []worklist.DraftComment{{Path: "a.go", Line: 11, Side: "RIGHT", Body: "Nit: rename."}}})
+	if d := m.Draft; d == nil || !d.Approve || len(d.Comments) != 1 {
+		t.Fatalf("approval with a nit = %+v", m.Draft)
+	}
+	for _, want := range []string{"Drafted 1 inline review comment", "ready to approve", "**Approval**"} {
+		if !strings.Contains(m.Content, want) {
+			t.Errorf("reply lacks %q:\n%s", want, m.Content)
+		}
+	}
+}
+
+// An approval is of the commit the latest review read: when the head moved since,
+// or that review recorded no commit, the run drafts no approval and says why, while
+// the agreed comments still stand.
+func TestRunConverseWithholdsStaleApproval(t *testing.T) {
+	for name, head := range map[string]string{"pushed since": "fedcba9876543210fedcba9876543210fedcba98", "unrecorded": ""} {
+		t.Run(name, func(t *testing.T) {
+			item := draftItem()
+			item.Thread[1].Head = head
+			sink := &memSink{items: []worklist.WorkItem{item}}
+			fd := &fakeDrafter{prop: worklist.DraftProposal{Approve: true}}
+			err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: item.ID, Turn: "d", Converser: &fakeConverser{}, Drafter: fd},
+				fakeVendor{token: "t"}, sink)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fd.got.Head != draftHead {
+				t.Errorf("drafter told head %q", fd.got.Head)
+			}
+			th := sink.items[0].Thread
+			m := th[len(th)-1]
+			if m.Draft != nil {
+				t.Fatalf("stale approval drafted: %+v", m.Draft)
+			}
+			why := "is now commit `0123456789ab` against `main`"
+			if head == "" {
+				why = "did not record the revision it read"
+			}
+			for _, want := range []string{"No approval drafted", why, "Review the current revision"} {
+				if !strings.Contains(m.Content, want) {
+					t.Errorf("reply lacks %q:\n%s", want, m.Content)
+				}
+			}
+			if strings.Contains(m.Content, "Nothing to draft") {
+				t.Errorf("reply says nothing to draft:\n%s", m.Content)
+			}
+		})
+	}
+	item := draftItem()
+	item.Thread[1].Head = "fedcba9876543210fedcba9876543210fedcba98"
+	sink := &memSink{items: []worklist.WorkItem{item}}
+	fd := &fakeDrafter{prop: worklist.DraftProposal{Approve: true, Comments: []worklist.DraftComment{{Path: "a.go", Line: 11, Side: "RIGHT", Body: "Rename."}}}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: item.ID, Turn: "d", Converser: &fakeConverser{}, Drafter: fd},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	th := sink.items[0].Thread
+	if d := th[len(th)-1].Draft; d == nil || d.Approve || len(d.Comments) != 1 {
+		t.Errorf("comments beside a stale approval = %+v", d)
+	}
+}
+
+// A drafter that correctly declines to approve an old head still leaves the owner
+// a way forward: the reply says the latest review is out of date, the draft reply
+// records the revision it read, and the thread offers a review of the current one.
+// A retarget (same head, new base) is out of date too.
+func TestRunConverseFlagsStaleReviewWithoutApproval(t *testing.T) {
+	for name, set := range map[string]func(*worklist.Message){
+		"pushed":     func(m *worklist.Message) { m.Head = "fedcba9876543210fedcba9876543210fedcba98" },
+		"retargeted": func(m *worklist.Message) { m.Base = "release" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			item := draftItem()
+			set(&item.Thread[1])
+			sink := &memSink{items: []worklist.WorkItem{item}}
+			if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: item.ID, Turn: "d", Converser: &fakeConverser{}, Drafter: &fakeDrafter{}},
+				fakeVendor{token: "t"}, sink); err != nil {
+				t.Fatal(err)
+			}
+			th := sink.items[0].Thread
+			m := th[len(th)-1]
+			for _, want := range []string{"The latest review is out of date", "Review the current revision"} {
+				if !strings.Contains(m.Content, want) {
+					t.Errorf("reply lacks %q:\n%s", want, m.Content)
+				}
+			}
+			if m.Head != draftHead || m.Base != "main" || !sink.items[0].ReviewOutdated() {
+				t.Errorf("draft reply revision %q %q; ReviewOutdated %v", m.Head, m.Base, sink.items[0].ReviewOutdated())
+			}
+		})
+	}
+	// A current review: no note, and nothing outdated.
+	sink := &memSink{items: []worklist.WorkItem{draftItem()}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: "github:o/r#1", Turn: "d", Converser: &fakeConverser{}, Drafter: &fakeDrafter{}},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	th := sink.items[0].Thread
+	if m := th[len(th)-1]; strings.Contains(m.Content, "out of date") || sink.items[0].ReviewOutdated() {
+		t.Errorf("a current review was flagged:\n%s", m.Content)
+	}
+}
+
+// A review's reply records the head commit the run read, which a later approval
+// must match.
+func TestRunConverseRecordsReviewedHead(t *testing.T) {
+	item := draftItem()
+	item.Thread = item.Thread[:1]
+	sink := &memSink{items: []worklist.WorkItem{item}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: item.ID, Turn: "q", Converser: &fakeConverser{reply: "LGTM"}},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	th := sink.items[0].Thread
+	if m := th[len(th)-1]; m.ReplyTo != "q" || m.Head != draftHead || m.Base != "main" || m.Diff != draftDiff {
+		t.Fatalf("reply = %+v", m)
+	}
+	if !sink.items[0].Reviewed(worklist.Revision{Head: draftHead, Base: "main", Diff: draftDiff}) {
+		t.Errorf("Reviewed(head, base) = false: %+v", th[len(th)-1])
+	}
+}
+
+// A stacked pull request whose dependency merged into its base shows a new diff
+// with the same head and base name: the review of the old diff approves nothing, the
+// reply says why, and an approval is pinned to the diff only when it matches.
+func TestRunConverseApprovalNeedsTheReviewedDiff(t *testing.T) {
+	item := draftItem()
+	item.Thread[1].Diff = worklist.PatchDigest("the diff before the dependency merged")
+	sink := &memSink{items: []worklist.WorkItem{item}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: item.ID, Turn: "d", Converser: &fakeConverser{}, Drafter: &fakeDrafter{prop: worklist.DraftProposal{Approve: true}}},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	th := sink.items[0].Thread
+	m := th[len(th)-1]
+	if m.Draft != nil || !strings.Contains(m.Content, "its changes are no longer the ones that review read") || m.Diff != draftDiff {
+		t.Fatalf("reply = %+v", m)
+	}
+	sink = &memSink{items: []worklist.WorkItem{draftItem()}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: "github:o/r#1", Turn: "d", Converser: &fakeConverser{}, Drafter: &fakeDrafter{prop: worklist.DraftProposal{Approve: true}}},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	th = sink.items[0].Thread
+	if d := th[len(th)-1].Draft; d == nil || !d.Approve || d.Diff != draftDiff {
+		t.Errorf("approval of the reviewed diff = %+v", d)
+	}
+}
+
+// A review's context and its recorded revision are one snapshot: the model is told
+// the head and files gofer records, even when a push lands while it works, and then
+// the review vouches for no diff (the model's tools may have read the new head), so
+// no approval can stand on it.
+func TestRunConverseReviewRecordsItsSnapshot(t *testing.T) {
+	const pushed = "fedcba9876543210fedcba9876543210fedcba98"
+	reads := 0
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"octocat"}`))
+		case "/repos/o/r/issues/1":
+			_, _ = w.Write([]byte(`{"body":"desc"}`))
+		case "/repos/o/r/pulls/1":
+			head := draftHead // the snapshot's two reads; every read after is the push
+			if reads >= 2 {
+				head = pushed
+			}
+			reads++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"state": "open", "head": map[string]any{"sha": head}, "changed_files": 2,
+				"base": map[string]any{"ref": "main", "repo": map[string]any{"full_name": "o/r"}},
+			})
+		case "/repos/o/r/pulls/1/files":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"filename": "a.go", "status": "modified", "sha": "blob-a", "patch": draftPatch},
+				{"filename": "logo.png", "status": "added", "sha": "blob-logo"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	item := draftItem()
+	item.Thread = item.Thread[:1]
+	sink := &memSink{items: []worklist.WorkItem{item}}
+	fc := &fakeConverser{reply: "LGTM"}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: srv.URL, ItemID: item.ID, Turn: "q", Converser: fc}, fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fc.gotSource, "Head commit: "+draftHead) || strings.Contains(fc.gotSource, pushed) {
+		t.Errorf("the model was not shown the snapshot's head:\n%s", fc.gotSource)
+	}
+	th := sink.items[0].Thread
+	if m := th[len(th)-1]; m.Head != draftHead || m.Diff != "" {
+		t.Errorf("a review that saw the pull request move vouches for a diff: %+v", m)
 	}
 }
 

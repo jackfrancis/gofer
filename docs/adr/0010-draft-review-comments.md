@@ -124,6 +124,132 @@ is evidence, but each point is judged on its own. With a single undisputed revie
 its actionable points are agreed. This is a model judgment; the user's review of the
 exact text before anything is created is the check on it.
 
+### Approval
+
+When the conversation agrees the pull request is ready to approve as it stands, the
+drafter says so (`"approve": true`; `DraftProposal.Approve`), and the draft is marked
+`DraftReview.Approve`. The review then carries `worklist.ApprovalCommands`,
+`/lgtm` and `/approve` each on a line of their own, as a general comment: in the
+review body, after the summary (`worklist.ReviewBody`), never on a file and line.
+Those are Prow's commands, which its lgtm and approve plugins read from a submitted
+review's body; on a repository without Prow they are only text.
+
+The bar is the same as for a comment: the reviews (or the settled outcome of their
+disagreement) recommend approving, no agreed point asks the author for a change before
+it merges, nothing about whether it should merge is unsettled, and the user's own
+messages decide. Non-blocking nits may still be drafted beside an approval; when in
+doubt, the drafter does not approve. An approving draft with no comment and no summary
+is still a draft (`DraftReview.Empty` counts the approval), so an approved pull request
+no longer answers "nothing to draft".
+
+The approval is a flag, not text in `Body`: the summary's bound (8 KiB, cut at the end)
+can never cut the commands, and the thread offers the approval as its own checkbox,
+showing exactly the text it sends, so the owner can keep the comments and leave the
+approval out, or the reverse. The flag is part of the draft, so its `Digest` covers it.
+The review is still created pending: the commands take effect only when the owner
+submits it on GitHub.
+
+**An approval is of the revision the reviews read.** A revision is the head commit,
+the base branch, and the digest of the whole diff GitHub shows
+(`worklist.Revision`; `github.DiffDigest`: SHA-256 over the files sorted by path, one
+line each of path, previous path, status, blob SHA and the patch's SHA-256). Every
+converse reply on a pull request records the head and base it read (`Message.Head`
+and `Base`, kept only as a valid pair), and a review also records the digest of the
+whole diff (`Message.Diff`). A review reads one settled snapshot first
+(`github.PullDiff`: the pull request, every file, then the pull request again, settled
+only when the second read names the same comparison: head, base branch, base commit
+and file count; a stacked dependency merged in between moves the base commit while
+leaving the rest alone, so the whole read is tried again, up to three times, and an
+unrelated advance of the base still settles) and shows the model that snapshot's head
+and file list, so what the model is told it reviews and what gofer records are the
+same read. The model's tools read GitHub live, so after it answers the run reads the
+pull request once more: if the head or base moved while it worked, the review vouches
+for no diff, and if that read finds the access gone, the turn gets the reconnect
+notice, never a saved review. A diff gofer cannot identify has no digest either
+(`PullDiff.Unverifiable`): a list not read whole, a snapshot that did not settle, or a
+file other than a new one that GitHub shows no patch for (a binary change), since its
+entry names only the head blob and a merge base that moved under it would leave the
+digest unchanged. `WorkItem.ReviewedRevision` is the revision the latest visible review
+read (the visible answer to a visible review request that landed last). An approval
+stands only on a draft pinned to exactly that revision, read whole
+(`WorkItem.Reviewed`): `AppendReply` clears the flag otherwise, whatever the run sent.
+A push changes the head, a retarget the base, and a related change merged into the
+base (a stacked pull request's dependency) changes the diff while leaving both alone;
+an unrelated advance of the base changes none of them, since the merge base stays put.
+The drafter is told the head and base, and the revision each assistant turn read.
+
+An approving draft carries the diff digest it approves (`DraftReview.Diff`; without a
+valid one it approves nothing). When the owner keeps the approval, the web tier sends
+it with the review (`ghcomment.Review.Diff`), and `PendingReview` reads every file the
+pull request lists and refuses (out of date, "draft again") unless they hash to that
+digest (`ghcomment.DiffDigest`, the same formula; a test holds the two equal), every
+commented path is among them, and the final read of the pull request reports as many
+files as were read and the same base commit the files were read against (if the base
+moved, the diff is read again, up to three times, so an unrelated advance still
+creates the review and a merged dependency refuses it). A pull request now past the
+3000-file cap is another diff than the one approved, so it is refused as out of date,
+which offers drafting again. Both sides read files the same way, 100 a page up to GitHub's 3000,
+complete only when as many were read as the pull request reports (`changed_files`),
+so a comparison the workload read whole is read whole here, and one it could not is
+never offered. A withheld approval clears its digest with it, so the comments beside
+it stay a current, confirmable draft. So
+neither a push, a retarget nor a moved merge base, before the draft or after it,
+turns an approval of one diff into one of another. A pull request whose diff gofer
+cannot identify gets no approval, and the reply says why.
+
+**A stale review is always flagged, and recoverable.** The run compares the latest
+review's revision with the one it read whatever the drafter answered, so a drafter
+that rightly declines to approve still leaves the owner a reason: the reply says the
+latest review is out of date, and which part moved ("No approval drafted" when the
+drafter had proposed one). The draft reply records the revision it read too, so the
+thread can tell (`WorkItem.ReviewOutdated`) and offers "Review the current revision"
+(`webui.ReviewAgain`, `POST /items/review-again`): a review request appended to the
+conversation, which is kept, and sent to the default model. Review all skips a
+reviewed pull request and a second opinion needs another model, so without this a
+single-model deployment had no way back short of clearing the conversation. The
+button shows only while the latest review is older than the draft: once a review
+lands after it, that review is the newer reading even if the pull request moved again
+in between, so the draft is what is stale, and drafting again (offered, since a turn
+now follows the draft) is the way forward, never another review of the same revision.
+
+**The checkbox is the only source of a command.** Model-written text is stored with
+every line a bot would read as a command (`/word` at the start of a line: `/lgtm`,
+`/approve`, `/hold`, `/retest`, ...) made inert, its command wrapped in backticks
+(`worklist.NeutralizeCommands`, in `BoundDraft`, so the preview shows the stored
+text). Unchecking the approval therefore leaves no approval command in what is sent.
+A path such as `/usr/bin/env` is not a command line and stays as written.
+
+Line endings are normalized to LF first: a bot splits lines at LF, and a browser turns
+a bare CR into LF before the copy button reads the text, so a CR could otherwise hide
+a command from the check and reveal it in what is pasted. The text stored, previewed
+and copied is the normalized one.
+
+A GitHub `suggestion` block is applied verbatim, so its text is never altered while it
+stays a suggestion: one holding a command-shaped line (a `.gitignore`'s `/dist`, say)
+becomes a plain `text` code block with a note after it
+(`worklist.SuggestionNote`), so the author reads the point but cannot apply edited
+code. A suggestion with no such line is kept exactly. Blocks are found as Markdown
+parses them (goldmark), so a suggestion nested in a list, its fence indented past
+three spaces, is found too, and the note is indented to stay in its list item. The
+rewrite is a fixed point.
+
+Drafts stored before a rule existed are held to it too: `DraftReview.Current` reports
+whether `BoundDraft` would store the draft unchanged today. One that is not is not
+offered (the thread says to draft again, and drafting again is never counted as
+redundant over it) and a confirmation of it is refused (`OfferedDraft`), so an older
+draft can never send text today's rules would change. A draft already confirmed still
+shows its receipt.
+
+**GitHub's submit dialog can drop the body.** GitHub's "Finish your review" dialog can
+open with an empty summary, and submitting it replaces the body gofer created, while
+inline comments survive: the review looks submitted, and the approval commands never
+reach Prow. gofer keeps the review pending, records the body it is about to send on
+the receipt (`DraftReceipt.Body`) in the claim itself, before it contacts GitHub, and
+shows it, with a copy button and that warning, on the result page, on a replay, and in
+the thread's receipt, to paste into the dialog's summary before submitting. Saving it
+in the claim means a confirmation cut off after GitHub created the review (still
+`creating`) shows it too. The same applies to any summary.
+
 ### Once per draft
 
 ADR 0009's bulk comment form carries a one-time key held in memory. GitHub's

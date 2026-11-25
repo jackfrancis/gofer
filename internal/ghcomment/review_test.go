@@ -26,6 +26,10 @@ type reviewAPI struct {
 	created map[string]any // the last review POST body
 	answer  int            // the POST's status; 0 = 200
 	calls   []string
+	baseSHA string                    // the base commit; "" = base0
+	changed int                       // changed_files reported; 0 = the files listed
+	onPull  func(a *reviewAPI, n int) // called before the nth pull read (from 0) is answered
+	pulls   int
 }
 
 func (a *reviewAPI) server(t *testing.T) *httptest.Server {
@@ -45,7 +49,23 @@ func (a *reviewAPI) server(t *testing.T) *httptest.Server {
 			if base == "" {
 				base = "main"
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"state": a.state, "head": map[string]any{"sha": a.head}, "base": map[string]any{"ref": base}})
+			if a.onPull != nil {
+				a.onPull(a, a.pulls)
+			}
+			a.pulls++
+			n := len(a.patches)
+			if a.patches == nil {
+				n = 1
+			}
+			changed := a.filler + n
+			if a.changed != 0 {
+				changed = a.changed
+			}
+			baseSHA := a.baseSHA
+			if baseSHA == "" {
+				baseSHA = "base0"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": a.state, "head": map[string]any{"sha": a.head}, "base": map[string]any{"ref": base, "sha": baseSHA}, "changed_files": changed})
 		case r.URL.Path == "/repos/Org/Public/pulls/7/files":
 			patches := a.patches
 			if patches == nil {
@@ -205,5 +225,111 @@ func TestPendingReviewPostAnswers(t *testing.T) {
 		if _, err := c.PendingReview(context.Background(), token, "org/public", 7, testReview("")); !errors.Is(err, ErrOutcomeUnknown) {
 			t.Errorf("%d on the POST: err = %v, want ErrOutcomeUnknown", status, err)
 		}
+	}
+}
+
+// An approval names the whole diff it approves: the review is created only while
+// every file the pull request lists hashes to that digest. A stacked dependency
+// merged into the base (a file added to the diff, same head and base) refuses it, as
+// a moved patch does; an approval without comments is checked all the same.
+func TestPendingReviewChecksTheApprovedDiff(t *testing.T) {
+	files := func(patches map[string]string, filler int) []File {
+		var out []File
+		for i := range filler {
+			out = append(out, File{Filename: "filler/" + strconv.Itoa(i) + ".go", Patch: "@@ -1 +1 @@\n-x\n+y"})
+		}
+		for p, patch := range patches {
+			out = append(out, File{Filename: p, Patch: patch})
+		}
+		return out
+	}
+	reviewed := DiffDigest(files(map[string]string{"a.go": reviewPatch}, 120))
+
+	api := &reviewAPI{state: "open", head: reviewHead, filler: 120}
+	c := New(api.server(t).URL, nil)
+	rv := testReview("/lgtm\n/approve")
+	rv.Diff = reviewed
+	if _, err := c.PendingReview(context.Background(), token, "org/public", 7, rv); err != nil {
+		t.Fatalf("matching diff refused: %v", err)
+	}
+	approvalOnly := Review{Commit: reviewHead, BaseRef: "main", Body: "/lgtm\n/approve", Diff: reviewed}
+	api = &reviewAPI{state: "open", head: reviewHead, filler: 120}
+	if _, err := New(api.server(t).URL, nil).PendingReview(context.Background(), token, "org/public", 7, approvalOnly); err != nil {
+		t.Fatalf("approval-only review refused: %v", err)
+	}
+	// The workload's boundary: 3000 files, thirty full pages, is read whole.
+	api = &reviewAPI{state: "open", head: reviewHead, filler: 2999}
+	big := approvalOnly
+	big.Diff = DiffDigest(files(map[string]string{"a.go": reviewPatch}, 2999))
+	if _, err := New(api.server(t).URL, nil).PendingReview(context.Background(), token, "org/public", 7, big); err != nil {
+		t.Fatalf("a matching 3000-file diff refused: %v", err)
+	}
+	// A comment on a path the approved diff does not list is refused, though the
+	// diff itself matches.
+	api = &reviewAPI{state: "open", head: reviewHead, filler: 120}
+	stray := testReview("/lgtm\n/approve")
+	stray.Diff = reviewed
+	stray.Comments = append(stray.Comments, ReviewComment{Path: "elsewhere.go", Line: 1, Side: "RIGHT", Body: "x"})
+	stray.Patches["elsewhere.go"] = PatchDigest("@@ -1 +1 @@\n-x\n+y")
+	if _, err := New(api.server(t).URL, nil).PendingReview(context.Background(), token, "org/public", 7, stray); !errors.Is(err, ErrHeadMoved) || api.created != nil {
+		t.Errorf("a comment off the approved diff: err %v, created %v", err, api.created)
+	}
+	for name, patches := range map[string]map[string]string{
+		"dependency's file now in the diff": {"a.go": reviewPatch, "dep.go": "@@ -0,0 +1 @@\n+dep"},
+		"patch moved":                       {"a.go": "@@ -1,2 +1,2 @@\n a\n-b\n+C"},
+	} {
+		api := &reviewAPI{state: "open", head: reviewHead, filler: 120, patches: patches}
+		_, err := New(api.server(t).URL, nil).PendingReview(context.Background(), token, "org/public", 7, approvalOnly)
+		if !errors.Is(err, ErrHeadMoved) || api.created != nil {
+			t.Errorf("%s: err %v, created %v", name, err, api.created)
+		}
+	}
+}
+
+// The base commit must hold still between reading an approved diff and the final
+// read of the pull request: a stacked dependency merged in between changes a patch
+// without moving the head, the base's name or the file count. When it moves, the
+// diff is read again: an unrelated advance still creates the review, a merged
+// dependency refuses it as out of date, and a base that keeps moving creates
+// nothing and asks to try again.
+func TestPendingReviewRechecksWhenTheBaseMoves(t *testing.T) {
+	approval := Review{Commit: reviewHead, BaseRef: "main", Body: "/lgtm\n/approve", Diff: DiffDigest([]File{{Filename: "a.go", Patch: reviewPatch}})}
+	run := func(onPull func(a *reviewAPI, n int)) (*reviewAPI, error) {
+		api := &reviewAPI{state: "open", head: reviewHead, onPull: onPull}
+		_, err := New(api.server(t).URL, nil).PendingReview(context.Background(), token, "org/public", 7, approval)
+		return api, err
+	}
+	// Reads: 0 = checkDiff's, 1 = the final read, 2 = the retry's checkDiff, 3 = its final read.
+	api, err := run(func(a *reviewAPI, n int) {
+		if n == 1 {
+			a.baseSHA = "base1" // unrelated: the files stay as they are
+		}
+	})
+	if err != nil || api.created == nil || api.pulls != 4 {
+		t.Errorf("unrelated advance: err %v, created %v, pull reads %d", err, api.created, api.pulls)
+	}
+	api, err = run(func(a *reviewAPI, n int) {
+		if n == 1 { // the dependency merged after the files were read
+			a.baseSHA = "base1"
+			a.patches = map[string]string{"a.go": "@@ -1,2 +1,2 @@\n a\n-b2\n+B"}
+		}
+	})
+	if !errors.Is(err, ErrHeadMoved) || api.created != nil {
+		t.Errorf("merged dependency: err %v, created %v", err, api.created)
+	}
+	api, err = run(func(a *reviewAPI, n int) { a.baseSHA = "base" + strconv.Itoa(n) })
+	if err == nil || errors.Is(err, ErrHeadMoved) || api.created != nil {
+		t.Errorf("a base that keeps moving: err %v, created %v", err, api.created)
+	}
+}
+
+// An approved diff was read whole, so a pull request now past the 3000-file cap is
+// another diff: the draft is out of date (ErrHeadMoved), so the owner is offered a
+// redraft rather than a retry that cannot succeed.
+func TestPendingReviewPastTheCapIsOutOfDate(t *testing.T) {
+	api := &reviewAPI{state: "open", head: reviewHead, changed: 3001}
+	approval := Review{Commit: reviewHead, BaseRef: "main", Body: "/lgtm\n/approve", Diff: DiffDigest([]File{{Filename: "a.go", Patch: reviewPatch}})}
+	if _, err := New(api.server(t).URL, nil).PendingReview(context.Background(), token, "org/public", 7, approval); !errors.Is(err, ErrHeadMoved) || api.created != nil {
+		t.Errorf("err %v, created %v", err, api.created)
 	}
 }
