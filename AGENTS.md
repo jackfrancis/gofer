@@ -663,9 +663,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   stranded state keeps a way out on the radar (`CommentingState`): an expired or
   disabled token (stored while tokens were allowed) or a grant from a previous
   commenting app (`OtherClient`) gets Disconnect, and a pending cleanup gets Retry
-  disconnect. A token connection that finished a pending disconnect reports what
-  that left (`tokenConnectedNotice`): an OAuth grant GitHub did not confirm revoked
-  sends the user to revoke it, since gofer no longer holds it. A rejection
+  disconnect. The OAuth callback enforces it too (the thread page has its own
+  connect link): it refuses to replace a live token or another app's grant. A token
+  connection that ran a pending disconnect first reports what that left
+  (`tokenConnectedNotice`, `priorWarning` on failure): an OAuth grant GitHub did not
+  confirm revoked sends the user to revoke it, since gofer no longer holds it; a
+  credential of unknown kind names both settings pages; the copy is called deleted
+  only once the vault confirmed it; and the token just connected is never one to
+  delete. A rejection
   is confirmed with `GET /user` (`tokenAlive`), never check-token, and logout's
   `revokeLocked` skips revocation for a token (`tokensSettings`). Report a deletion
   only from `logoutResult.tokenDeleted`/`cleanupPending`, never from which settings

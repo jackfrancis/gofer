@@ -107,7 +107,7 @@ func TestRadarStrandedCredentials(t *testing.T) {
 	if strings.Contains(other, `href="/auth/github-write/login"`) || strings.Contains(other, `action="/auth/github-write/token"`) {
 		t.Error("a way to connect is offered while another app's grant is in its way")
 	}
-	for query, want := range map[string]string{"?commenting=token-unrevoked": "did not confirm it was revoked", "?commenting=token-replaced": "delete the old one"} {
+	for query, want := range map[string]string{"?commenting=token-unrevoked": "did not confirm it was revoked", "?commenting=token-replaced": "if the previous one is not the token you just connected", "?commenting=token-unknown": "check both Authorized OAuth Apps and your personal access tokens"} {
 		if page, _ := radarPage(t, &detailCommenter{fakeCommenter: fakeCommenter{enabled: true}}, query); !strings.Contains(page, want) {
 			t.Errorf("%s: notice missing", query)
 		}

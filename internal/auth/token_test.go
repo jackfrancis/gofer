@@ -345,17 +345,24 @@ func TestInspectTokenExpiryFormats(t *testing.T) {
 type faultyVault struct {
 	vault.Vault
 	failDelete, failGet bool
+	// unreadable fails Get of the write grant until a Delete of it succeeds: a
+	// corrupted row gofer can remove but not read.
+	unreadable bool
 }
 
 func (f *faultyVault) Delete(ctx context.Context, userID, provider string) error {
 	if f.failDelete && provider == WriteProvider {
 		return errors.New("disk on fire")
 	}
-	return f.Vault.Delete(ctx, userID, provider)
+	err := f.Vault.Delete(ctx, userID, provider)
+	if err == nil && provider == WriteProvider {
+		f.unreadable = false
+	}
+	return err
 }
 
 func (f *faultyVault) Get(ctx context.Context, userID, provider string) (vault.Credential, error) {
-	if f.failGet && provider == WriteProvider {
+	if (f.failGet || f.unreadable) && provider == WriteProvider {
 		return vault.Credential{}, errors.New("disk on fire")
 	}
 	return f.Vault.Get(ctx, userID, provider)
@@ -775,5 +782,87 @@ func TestNonGitHubLogoutClaimsNoRevocation(t *testing.T) {
 	}
 	if out.Revocation != "none" || out.Cleanup != "pending" || strings.Contains(out.Message, "GitHub") {
 		t.Errorf("answer = %+v", out)
+	}
+}
+
+// Review (round 5): the OAuth callback, which the PR thread's connect link also
+// reaches, refuses to replace a grant from a previous commenting app (it would be
+// left live at GitHub): the new OAuth token is discarded and the old row kept until
+// the user disconnects it.
+func TestOAuthCallbackRefusesAPreviousAppsGrant(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newWriteHandler(t, gh)
+	_, signedIn := signIn(t, h)
+	connectWrite(t, h, signedIn)
+	old, _ := writeStored(t, vlt)
+	// The deployment moved to a new commenting app: the stored grant is the old one's.
+	old.ClientID = "a-previous-commenting-app"
+	if err := vlt.Put(bg, user, old); err != nil {
+		t.Fatal(err)
+	}
+	discarded := gh.tokensRevoked.Load()
+	rec, _, _ := connectWrite(t, h, signedIn)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "previous commenting app") {
+		t.Fatalf("callback: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); c.Version != old.Version {
+		t.Error("the previous app's grant was replaced")
+	}
+	if gh.tokensRevoked.Load() != discarded+1 {
+		t.Error("the refused OAuth token was not discarded")
+	}
+	disconnect(h, signedIn)
+	if rec, _, _ := connectWrite(t, h, signedIn); rec.Code != http.StatusFound {
+		t.Fatalf("callback after disconnect: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// Review (round 5): what a token connection says about the pending disconnect it
+// finished (or failed to finish) first.
+func TestTokenConnectPriorNotices(t *testing.T) {
+	// Revocation unconfirmed and the delete still failing: the 503 keeps the
+	// revocation warning but never says the copy is gone.
+	h, signedIn, pat, gh, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	connectWrite(t, h, signedIn)
+	gh.mu.Lock()
+	gh.revokeErr = true
+	gh.mu.Unlock()
+	h.vault = &faultyVault{Vault: vlt, failDelete: true}
+	disconnect(h, signedIn)
+	rec := postToken(h, signedIn, patToken)
+	body := rec.Body.String()
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(body, "did not confirm your earlier commenting grant was revoked") ||
+		!strings.Contains(body, "not finished deleting its copy") || strings.Contains(body, "deleted its copy") {
+		t.Errorf("still failing: %d %s", rec.Code, body)
+	}
+
+	// An old credential the delete could remove but nobody could read: either kind,
+	// so the notice names both settings pages.
+	h2, signedIn2, pat2, _, vlt2 := newTokenHandler(t)
+	pat2.set(patToken, goodPAT())
+	pat2.set(patToken2, goodPAT())
+	postToken(h2, signedIn2, patToken)
+	fv := &faultyVault{Vault: vlt2, failDelete: true}
+	h2.vault = fv
+	disconnect(h2, signedIn2)
+	fv.failDelete, fv.unreadable = false, true
+	rec = postToken(h2, signedIn2, patToken2)
+	if loc := rec.Header().Get("Location"); rec.Code != http.StatusSeeOther || loc != "/?commenting=token-unknown" {
+		t.Errorf("unreadable old credential: %d %q %s", rec.Code, loc, rec.Body)
+	}
+
+	// Reconnecting with the very token whose disconnect failed: nothing to tell the
+	// user to delete.
+	h3, signedIn3, pat3, _, vlt3 := newTokenHandler(t)
+	pat3.set(patToken, goodPAT())
+	postToken(h3, signedIn3, patToken)
+	fv3 := &faultyVault{Vault: vlt3, failDelete: true}
+	h3.vault = fv3
+	disconnect(h3, signedIn3)
+	fv3.failDelete = false
+	rec = postToken(h3, signedIn3, patToken)
+	if loc := rec.Header().Get("Location"); loc != "/?commenting=token" {
+		t.Errorf("same token: %d %q", rec.Code, loc)
 	}
 }

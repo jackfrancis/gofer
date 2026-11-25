@@ -253,6 +253,9 @@ func (h *Handler) ConnectWriteCallback(w http.ResponseWriter, r *http.Request) {
 	case outcome == grantTokenConnected:
 		h.failConnect(ctx, w, p, token, user.ID, http.StatusConflict, "gofer holds your personal access token for commenting, so the grant was not saved; disconnect commenting on the radar first to switch")
 		return
+	case outcome == grantOtherClient:
+		h.failConnect(ctx, w, p, token, user.ID, http.StatusConflict, "gofer holds a commenting grant from a previous commenting app, so the new grant was not saved; disconnect commenting on the radar first, then connect again")
+		return
 	case outcome == grantRevokedMidFlow:
 		writeGrantPage(w, http.StatusConflict, `<p>The grant was revoked while you were connecting it, so it was not saved.</p>`+
 			`<p><a href="`+writePath+`/login">Connect again</a> &middot; <a href="/">Back to radar</a></p>`)
@@ -308,10 +311,15 @@ func (h *Handler) storeWriteGrant(ctx context.Context, p *provider, userID, logi
 	}
 	// A live personal access token connected meanwhile (another tab, ADR 0011) is not
 	// replaced: the user would be left holding a token they no longer know gofer
-	// stopped using. The new OAuth token is discarded instead.
+	// stopped using. Nor is a grant from a previous commenting app (the write client
+	// ID changed): this client cannot revoke it, so replacing it would leave it live
+	// at GitHub with nothing in gofer to say so. The new OAuth token is discarded
+	// instead, and the user disconnects first.
 	switch existing, err := h.vault.Get(lctx, userID, p.name); {
 	case err == nil && isPersonalToken(existing) && !tokenExpired(existing, h.now()):
 		return grantTokenConnected, nil
+	case err == nil && !isPersonalToken(existing) && !fromConfiguredClient(p, existing):
+		return grantOtherClient, nil
 	case err != nil && !errors.Is(err, vault.ErrNotFound):
 		return 0, fmt.Errorf("read the write grant: %w", err)
 	}

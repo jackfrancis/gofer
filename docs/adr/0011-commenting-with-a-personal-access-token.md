@@ -95,7 +95,10 @@ provider, as before). Further:
   in the OAuth grant's way (the callback refuses while it is held), so the radar names
   it and offers Disconnect instead of the connect link. A grant from a previous
   commenting app (the write client ID changed) is treated the same way: named, with
-  Disconnect, and no way to connect until it is gone.
+  Disconnect, and no way to connect until it is gone. The OAuth callback enforces
+  this, not only the radar (the thread page has its own connect link): replacing that
+  grant would leave it live at GitHub, which this client cannot revoke, so the
+  callback discards its new token and asks the user to disconnect first.
 - **Rejected.** A 401 on a token is confirmed with `GET /user` (not the OAuth app's
   check-token, which knows nothing of tokens) before gofer drops its copy.
 - **Disconnect and logout.** gofer cannot revoke a personal access token. Both delete
@@ -110,7 +113,10 @@ provider, as before). Further:
   disconnect nobody is running, storing the token only once the old copy is gone. If
   that disconnect could not get GitHub to confirm an OAuth grant revoked, the
   connection says so and sends the user to revoke it by hand: once the token replaces
-  the row, gofer no longer holds the grant to revoke at a later logout. A revocation
+  the row, gofer no longer holds the grant to revoke at a later logout. If gofer could
+  not read what it held, it names both settings pages; a failed connection says the
+  old copy is deleted only if it is; and reconnecting with the very token whose
+  disconnect failed asks the user to delete nothing. A revocation
   GitHub did confirm is remembered for that credential version, so a retry deletes
   without asking again (GitHub answers an already-revoked token with 404). When the credential could not be read, the user is sent to
   both the authorized apps and the token settings, since it may have been either kind.

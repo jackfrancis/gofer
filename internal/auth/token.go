@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -218,14 +219,10 @@ func (h *Handler) ConnectWriteToken(w http.ResponseWriter, r *http.Request) {
 		return u != nil && u.ID == user.ID && h.sessions.SessionKey(r) == sessionKey, err
 	}
 	outcome, prior, err := h.storeWriteToken(ctx, p, user.ID, granted.Login, token, info.expiry, sessionValid)
-	if outcome != grantStored || err != nil {
-		// The earlier disconnect it finished may still have left an OAuth grant live.
-		if n := tokenConnectedNotice(prior); n == "token-unrevoked" {
-			unrevoked := fail
-			fail = func(status int, why string) {
-				unrevoked(status, why+` gofer did finish deleting your earlier commenting grant, but GitHub did not confirm it was revoked: revoke gofer's commenting app in <a href="`+oauthAppsSettings+`">GitHub's settings</a> (Authorized OAuth Apps).`)
-			}
-		}
+	if warn := priorWarning(prior); warn != "" && (outcome != grantStored || err != nil) {
+		// The earlier disconnect it ran first may have left a grant live at GitHub.
+		plain := fail
+		fail = func(status int, why string) { plain(status, why+" "+warn) }
 	}
 	switch {
 	case err != nil:
@@ -258,12 +255,42 @@ func tokenConnectedNotice(prior *logoutResult) string {
 	switch {
 	case prior == nil || prior.confirmed:
 		return "token"
+	case priorKindUnknown(prior):
+		// gofer could not read what it held: it may have been either kind.
+		return "token-unknown"
 	case slices.Contains(prior.settings, oauthAppsSettings):
 		return "token-unrevoked"
 	case prior.tokenDeleted:
 		return "token-replaced"
 	}
 	return "token"
+}
+
+// priorKindUnknown reports whether the disconnect could not tell which kind of
+// credential it held (unconfirmed names both settings pages).
+func priorKindUnknown(prior *logoutResult) bool {
+	return slices.Contains(prior.settings, oauthAppsSettings) && slices.Contains(prior.settings, tokensSettings)
+}
+
+// priorWarning is what a failed token connection's page adds about the pending
+// disconnect it ran first (prior), when that may have left something live at GitHub:
+// an OAuth grant GitHub did not confirm revoked, or a credential of unknown kind. It
+// says gofer's copy is gone only when the vault confirmed the deletion.
+func priorWarning(prior *logoutResult) string {
+	if prior == nil || prior.confirmed {
+		return ""
+	}
+	copyState := "gofer deleted its copy, so it can no longer revoke it for you"
+	if prior.cleanupPending {
+		copyState = "gofer has not finished deleting its copy yet"
+	}
+	switch {
+	case priorKindUnknown(prior):
+		return `GitHub did not confirm that what gofer held for commenting before was revoked, and gofer could not tell whether it was an OAuth grant or a token (` + copyState + `): check both <a href="` + oauthAppsSettings + `">Authorized OAuth Apps</a> and your <a href="` + tokensSettings + `">personal access tokens</a> in GitHub's settings.`
+	case slices.Contains(prior.settings, oauthAppsSettings):
+		return `GitHub did not confirm your earlier commenting grant was revoked (` + copyState + `): revoke gofer's commenting app in <a href="` + oauthAppsSettings + `">GitHub's settings</a> (Authorized OAuth Apps).`
+	}
+	return ""
 }
 
 // scopeList names scopes for a message.
@@ -280,6 +307,7 @@ const (
 	grantBusy                                       // a disconnect or logout of the write grant is pending
 	grantTokenConnected                             // a live personal access token is stored (the OAuth callback must not replace it)
 	grantCleanupFailed                              // a pending disconnect was retried and still could not delete gofer's copy
+	grantOtherClient                                // a grant from a previous commenting app is stored (the OAuth callback must not replace it)
 )
 
 // storeWriteToken stores a checked personal access token as the user's write grant,
@@ -309,14 +337,21 @@ func (h *Handler) storeWriteToken(ctx context.Context, p *provider, userID, logi
 	case pending && mine == nil:
 		return grantBusy, prior, nil
 	case pending:
+		// Whether the copy being deleted is this very token (a retry after a failed
+		// disconnect, with the same token): then nothing about it is left to delete.
+		old, gerr := h.vault.Get(ctx, userID, p.name)
+		same := gerr == nil && isPersonalToken(old) && subtle.ConstantTimeCompare([]byte(old.AccessToken), []byte(token)) == 1
 		res := h.runLogout(ctx, userID, p.name, mine)
 		if res.cleanupPending {
 			return grantCleanupFailed, &res, nil
 		}
 		// Its outcome goes back to the caller: an OAuth grant GitHub did not confirm
 		// revoked is still live there, and once the token replaces the row gofer can no
-		// longer revoke it, so the user must be told.
-		prior = &res
+		// longer revoke it, so the user must be told. The token just connected is never
+		// one to tell them to delete.
+		if !same {
+			prior = &res
+		}
 	}
 	defer h.locks.markerLock(userID, p.name)()
 	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
