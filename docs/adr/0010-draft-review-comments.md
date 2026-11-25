@@ -29,6 +29,14 @@ review's text is written by a model, so this feature needs that rule amended.
    the default model, as any Discuss turn. It is offered only when commenting is
    configured, on a pull request on the radar with a completed review and no reply in
    flight; without a connected write grant the thread links to connecting it instead.
+   It is not shown while drafting again would only repeat the offered draft
+   (`WorkItem.RedraftRedundant`): the draft is the thread's newest visible turn,
+   unconfirmed, pinned to the item's pull request at the head gofer last read
+   (`GitHub.CI.SHA`, when known). A visible turn after it, a receipt on it, or a newer
+   head brings the button back, and the request handler refuses a redundant one from a
+   stale page. A confirmation GitHub refuses as out of date (a moved base gofer cannot
+   see) offers "Draft Review Comments again" on its result page, which skips that
+   check (`redraft=1`), so the "draft again" it asks for is always reachable.
 2. **Draft (the run, read-only).** The workload (`internal/agent/draft.go`) reads the
    pull request's head commit, base branch and changed files with their patches
    (`github.Client.PullDiff`, public-only like every workload call). It annotates each

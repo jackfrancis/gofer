@@ -222,6 +222,34 @@ func (w WorkItem) LatestDraft() int {
 	return -1
 }
 
+// RedraftRedundant reports whether drafting again would only repeat the draft the
+// thread offers (LatestDraft): it is the thread's newest visible turn (hidden turns
+// are skipped, since the drafter never reads them), it is still pinned to the item's
+// pull request (DraftReview.For) at the head gofer last read there (GitHub.CI.SHA,
+// when known), and it is unconfirmed. A confirmed draft (any receipt) is used up: the
+// thread says to draft again to start over. A draft that is retired (an empty
+// redraft, a hidden reply, another pull request) or anchored to an older head leaves
+// drafting open, as does any turn after it.
+func (w WorkItem) RedraftRedundant() bool {
+	i := w.LatestDraft()
+	if i < 0 {
+		return false
+	}
+	d := w.Thread[i].Draft
+	if !d.For(w) || w.Thread[i].DraftReceipt != nil {
+		return false
+	}
+	if ci := w.GitHub.CI; ci != nil && ci.SHA != "" && !strings.EqualFold(ci.SHA, d.Commit) {
+		return false
+	}
+	for j := len(w.Thread) - 1; j > i; j-- {
+		if !w.Thread[j].Hidden {
+			return false
+		}
+	}
+	return true
+}
+
 // OfferedDraft returns the position of the draft turn key names if it is the draft
 // the thread offers now (LatestDraft), its digest is digest, and it is pinned to the
 // item's pull request as it stands (DraftReview.For). A receipt on it does not

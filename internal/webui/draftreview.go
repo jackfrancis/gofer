@@ -44,6 +44,7 @@ type ReviewCreator interface {
 // item is not a pull request on the radar, or commenting or the assistant is off.
 type draftThread struct {
 	Connected bool   // the write grant is connected; otherwise the thread links to connecting it
+	Redundant bool   // connected, and a redraft would repeat the draft the thread offers (RedraftRedundant): no button
 	Ready     bool   // the button is enabled: a completed review, and no reply in flight
 	Why       string // why the button is disabled
 	Index     int    // the position of the draft the thread offers; -1 for none
@@ -72,6 +73,8 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 	}
 	v := &draftThread{Connected: connected, Index: -1}
 	switch {
+	case connected && it.RedraftRedundant():
+		v.Redundant = true
 	case !it.HasReview():
 		v.Why = "Review this pull request first: there are no review comments to draft yet."
 	case it.ReplyPending(now, reviewStaleAfter):
@@ -91,10 +94,15 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 }
 
 // draftable reports whether a draft-review request may be added to it now: a pull
-// request on the radar (so not hidden or closed) with a completed review and no reply
-// in flight. It is the button's condition, checked again inside the store update.
-func draftable(it worklist.WorkItem, now time.Time) bool {
-	return it.Type == worklist.TypePullRequest && it.OnRadar() && it.HasReview() && !it.ReplyPending(now, reviewStaleAfter)
+// request on the radar (so not hidden or closed) with a completed review, no reply
+// in flight, and, unless redraft, no draft a new one would only repeat
+// (RedraftRedundant). It is the button's condition, checked again inside the store
+// update. redraft is the result page's "Draft again" after GitHub refused the draft
+// as out of date (the base moved, which gofer cannot see in the item), so a
+// confirmation that failed that way always has a way forward.
+func draftable(it worklist.WorkItem, now time.Time, redraft bool) bool {
+	return it.Type == worklist.TypePullRequest && it.OnRadar() && it.HasReview() && !it.ReplyPending(now, reviewStaleAfter) &&
+		(redraft || !it.RedraftRedundant())
 }
 
 // DraftReview handles POST /items/draft-review, the thread's "Draft Review
@@ -109,7 +117,7 @@ func (h *Handler) DraftReview(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	id := r.FormValue("id")
+	id, redraft := r.FormValue("id"), r.FormValue("redraft") == "1"
 	back := "/items/thread?id=" + url.QueryEscape(id)
 	if id == "" || !connected {
 		http.Redirect(w, r, back, http.StatusSeeOther)
@@ -124,8 +132,8 @@ func (h *Handler) DraftReview(w http.ResponseWriter, r *http.Request) {
 			if current[i].ID != id {
 				continue
 			}
-			if !draftable(current[i], now) {
-				return nil, nil // a stale page: no review yet, a reply in flight, or off the radar
+			if !draftable(current[i], now, redraft) {
+				return nil, nil // a stale page: no review yet, a reply in flight, a draft already last, or off the radar
 			}
 			current[i].Thread = append(current[i].Thread, msg)
 			appended = true
@@ -149,6 +157,7 @@ type draftResult struct {
 	URL      string // the pending review on GitHub, when GitHub gave a link
 	Comments int    // inline comments sent
 	Summary  bool   // the summary was sent
+	Redraft  bool   // GitHub refused the draft as out of date: the page offers drafting again
 	Error    string
 }
 
@@ -281,7 +290,7 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 		settle(nil) // GitHub certainly created nothing: the owner may try again
 	}
 	slog.InfoContext(ctx, "pending review", "user", user.ID, "created", res.Created, "unknown", res.Unknown, "comments", len(rv.Comments))
-	view := draftResult{Item: it, Created: res.Created, Unknown: res.Unknown, URL: res.URL, Comments: len(rv.Comments), Summary: rv.Body != "", Error: res.Error}
+	view := draftResult{Item: it, Created: res.Created, Unknown: res.Unknown, URL: res.URL, Comments: len(rv.Comments), Summary: rv.Body != "", Redraft: res.Stale, Error: res.Error}
 	status := http.StatusOK
 	if !res.Created && !res.Unknown {
 		status = http.StatusConflict

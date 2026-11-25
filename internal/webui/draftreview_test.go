@@ -121,6 +121,79 @@ func TestThreadDraftReviewButton(t *testing.T) {
 	}
 }
 
+// A thread that ends with the draft it offers shows no Draft Review Comments button:
+// drafting again would only repeat it. A turn after it, or a confirmation of it,
+// brings the button back; an unconnected user keeps the connect link.
+func TestThreadHidesRedundantDraftButton(t *testing.T) {
+	old := time.Now().Add(-time.Hour)
+	connected := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	h, _, _ := draftFixture(t, connected, draftedThread(old))
+	page, _ := threadPage(t, h)
+	if strings.Contains(page, `action="/items/draft-review"`) || strings.Contains(page, ">Draft Review Comments<") {
+		t.Error("the thread offers drafting again right under its draft")
+	}
+	if !strings.Contains(page, `action="/items/draft-review/create"`) {
+		t.Error("the draft's selection is gone too")
+	}
+
+	more := append(draftedThread(old), worklist.Message{ID: "m", Role: worklist.RoleUser, Content: "Also check y.", At: old},
+		worklist.Message{ID: "n", ReplyTo: "m", Role: worklist.RoleAgent, Content: "Checked.", At: old})
+	h, _, _ = draftFixture(t, connected, more)
+	if page, _ := threadPage(t, h); !strings.Contains(page, `action="/items/draft-review"`) {
+		t.Error("the conversation moved on since the draft, but no button")
+	}
+
+	confirmed := draftedThread(old)
+	confirmed[3].DraftReceipt = &worklist.DraftReceipt{State: worklist.DraftUnknown, At: old}
+	h, _, _ = draftFixture(t, connected, confirmed)
+	if page, _ := threadPage(t, h); !strings.Contains(page, `action="/items/draft-review"`) {
+		t.Error("a confirmed draft (which says to draft again to start over) left no button")
+	}
+
+	h, _, _ = draftFixture(t, &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true}}, draftedThread(old))
+	if page, _ := threadPage(t, h); !strings.Contains(page, "Connect GitHub to comment") {
+		t.Error("an unconnected user lost the connect link")
+	}
+}
+
+// A stale page's redundant draft request appends and dispatches nothing; the result
+// page's "Draft again" (redraft=1), offered when GitHub refused the draft as out of
+// date, goes through.
+func TestDraftReviewRefusesRedundantRedraft(t *testing.T) {
+	post := func(h *Handler, form url.Values) {
+		req := httptest.NewRequest(http.MethodPost, "/items/draft-review", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		h.DraftReview(httptest.NewRecorder(), req)
+	}
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	th := draftedThread(time.Now().Add(-time.Hour))
+	h, p, store := draftFixture(t, c, th)
+	post(h, url.Values{"id": {draftItemID}})
+	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); len(it.Thread) != len(th) || len(p.turns) != 0 {
+		t.Fatalf("a redundant draft request was appended or dispatched: %d turns, %+v", len(it.Thread), p.turns)
+	}
+	post(h, url.Values{"id": {draftItemID}, "redraft": {"1"}})
+	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); len(it.Thread) != len(th)+1 || len(p.turns) != 1 {
+		t.Errorf("the out-of-date redraft was refused: %d turns, %+v", len(it.Thread), p.turns)
+	}
+}
+
+// When GitHub refuses the draft as out of date, the result page offers drafting
+// again, since the thread hides its button under the draft.
+func TestCreateDraftReviewStaleOffersRedraft(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Stale: true, Error: "The pull request changed."}}
+	th := draftedThread(time.Now().Add(-time.Hour))
+	h, _, _ := draftFixture(t, c, th)
+	rec := postCreate(h, draftConfirmForm(th), "Sec-Fetch-Site", "same-origin")
+	if body := rec.Body.String(); rec.Code != http.StatusConflict || !strings.Contains(body, `name="redraft" value="1"`) || !strings.Contains(body, `action="/items/draft-review"`) {
+		t.Errorf("status %d, no redraft form:\n%s", rec.Code, body)
+	}
+	c.result = comment.ReviewResult{Error: "You already have a pending review."}
+	if body := postCreate(h, draftConfirmForm(th), "Sec-Fetch-Site", "same-origin").Body.String(); strings.Contains(body, `name="redraft"`) {
+		t.Error("a refusal that is not about an out-of-date draft offers drafting again")
+	}
+}
+
 // The newest draft carries the selection form, naming its turn and digest; the
 // thread lets it post its real origin.
 func TestThreadShowsDraftSelection(t *testing.T) {

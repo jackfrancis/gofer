@@ -159,6 +159,50 @@ func TestLatestDraft(t *testing.T) {
 	}
 }
 
+// Drafting again is redundant only while the thread ends with the unconfirmed draft
+// it offers, for the head gofer last read: any visible turn after it, a receipt, a
+// retired draft or a newer head opens drafting again; hidden turns after it do not.
+func TestRedraftRedundant(t *testing.T) {
+	d1 := Message{ID: "d1", Role: RoleUser, Kind: KindDraftReviewRequest, Content: "draft"}
+	a1 := Message{ID: "a1", ReplyTo: "d1", Role: RoleAgent, Content: "drafted", Draft: pinned("x")}
+	if !draftPR(d1, a1).RedraftRedundant() {
+		t.Error("a thread ending with its draft is not redundant to redraft")
+	}
+	q := Message{ID: "q", Role: RoleUser, Content: "what about y?"}
+	if draftPR(d1, a1, q).RedraftRedundant() {
+		t.Error("a turn after the draft left redrafting redundant")
+	}
+	hiddenQ := q
+	hiddenQ.Hidden = true
+	if !draftPR(d1, a1, hiddenQ).RedraftRedundant() {
+		t.Error("a hidden turn after the draft, which the drafter never reads, opened redrafting")
+	}
+	confirmed := a1
+	confirmed.DraftReceipt = &DraftReceipt{State: DraftCreated, At: time.Now()}
+	if draftPR(d1, confirmed).RedraftRedundant() {
+		t.Error("a confirmed draft left redrafting closed")
+	}
+	empty := Message{ID: "a1", ReplyTo: "d1", Role: RoleAgent, Content: "Nothing to draft."}
+	if draftPR(d1, empty).RedraftRedundant() || draftPR(d1).RedraftRedundant() || draftPR().RedraftRedundant() {
+		t.Error("no offered draft, yet redrafting is redundant")
+	}
+	other := draftPR(d1, a1)
+	other.GitHub.Number = 2
+	if other.RedraftRedundant() {
+		t.Error("a draft pinned to another pull request left redrafting closed")
+	}
+	moved := draftPR(d1, a1)
+	moved.GitHub.CI = &CISummary{SHA: strings.Repeat("f", 40)}
+	if moved.RedraftRedundant() {
+		t.Error("a draft anchored to an older head left redrafting closed")
+	}
+	same := draftPR(d1, a1)
+	same.GitHub.CI = &CISummary{SHA: strings.ToUpper(testCommit)}
+	if !same.RedraftRedundant() {
+		t.Error("a draft at the known head is not redundant to redraft")
+	}
+}
+
 // A confirmation is claimed in the store before GitHub is asked: a replay gets the
 // receipt back and writes nothing; a release lets the owner try again; a settle only
 // lands on its own claim; and a draft whose item now names another pull request is
