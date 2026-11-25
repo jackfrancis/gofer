@@ -81,7 +81,8 @@ func PatchDigest(patch string) string {
 }
 
 // PendingReview creates rv as a PENDING review on repo's pull request number. First
-// it checks the repository is public and the user has no pending review there. Then
+// it checks the repository is public, the token's scopes are still exactly
+// public_repo (ErrTokenScopes), and the user has no pending review there. Then
 // it checks every commented file's patch is still the one its comments were anchored
 // to, so a change merged into the base that moved the merge base refuses the review,
 // while one that left these files' hunks alone does not. Last, as close to the write
@@ -114,7 +115,7 @@ func (c *Client) PendingReview(ctx context.Context, token, repo string, number i
 		}
 		want[cm.Path] = d
 	}
-	canon, err := c.PublicRepo(ctx, token, repo)
+	canon, err := c.writeRepo(ctx, token, repo)
 	if err != nil {
 		return "", err
 	}

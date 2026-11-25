@@ -2,11 +2,13 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -32,11 +34,14 @@ const writePath = "/auth/github-write"
 // write grant stored (from the configured client or, where allowed, an unexpired
 // personal access token; no logout pending). TokensAllowed says the deployment lets
 // users connect with a token (ADR 0011); Token and Expires describe a connected one.
+// TokenExpired says a token is stored but has expired (Expires is when): not
+// connected, but gofer still holds a copy the user can replace or disconnect.
 type CommentingState struct {
 	Enabled       bool
 	Connected     bool
 	TokensAllowed bool
 	Token         bool
+	TokenExpired  bool
 	Expires       time.Time
 }
 
@@ -53,8 +58,11 @@ func (h *Handler) CommentingState(ctx context.Context, userID string) Commenting
 	}
 	cred, err := h.vault.Get(ctx, userID, WriteProvider)
 	st.Connected = err == nil && fromConfiguredClient(p, cred) && !tokenExpired(cred, h.now())
-	if st.Connected && isPersonalToken(cred) {
+	switch {
+	case st.Connected && isPersonalToken(cred):
 		st.Token, st.Expires = true, cred.Expiry
+	case err == nil && tokenExpired(cred, h.now()):
+		st.TokenExpired, st.Expires = true, cred.Expiry
 	}
 	return st
 }
@@ -222,6 +230,9 @@ func (h *Handler) ConnectWriteCallback(w http.ResponseWriter, r *http.Request) {
 	case outcome == grantSessionEnded:
 		h.failConnect(ctx, w, p, token, user.ID, http.StatusConflict, "you signed out of gofer while connecting, so the grant was not saved")
 		return
+	case outcome == grantTokenConnected:
+		h.failConnect(ctx, w, p, token, user.ID, http.StatusConflict, "commenting is already connected with your personal access token, so the grant was not saved; disconnect commenting first to switch")
+		return
 	case outcome == grantRevokedMidFlow:
 		writeGrantPage(w, http.StatusConflict, `<p>The grant was revoked while you were connecting it, so it was not saved.</p>`+
 			`<p><a href="`+writePath+`/login">Connect again</a> &middot; <a href="/">Back to radar</a></p>`)
@@ -274,6 +285,15 @@ func (h *Handler) storeWriteGrant(ctx context.Context, p *provider, userID, logi
 	}
 	if !ok {
 		return grantSessionEnded, nil
+	}
+	// A live personal access token connected meanwhile (another tab, ADR 0011) is not
+	// replaced: the user would be left holding a token they no longer know gofer
+	// stopped using. The new OAuth token is discarded instead.
+	switch existing, err := h.vault.Get(lctx, userID, p.name); {
+	case err == nil && isPersonalToken(existing) && !tokenExpired(existing, h.now()):
+		return grantTokenConnected, nil
+	case err != nil && !errors.Is(err, vault.ErrNotFound):
+		return 0, fmt.Errorf("read the write grant: %w", err)
 	}
 	cred := vault.Credential{
 		Provider:    p.name,
@@ -361,9 +381,15 @@ func (h *Handler) DisconnectWrite(w http.ResponseWriter, r *http.Request) {
 	switch res := h.revokeAndDelete(r.Context(), user.ID, WriteProvider, lo); {
 	case res.confirmed:
 		http.Redirect(w, r, "/", http.StatusSeeOther)
-	case len(res.settings) == 1 && res.settings[0] == tokensSettings:
+	case res.cleanupPending:
+		// Not deleted yet: the pending logout keeps it unused and finishes later.
+		http.Redirect(w, r, "/?commenting=disconnect-pending", http.StatusSeeOther)
+	case res.tokenDeleted:
 		// A personal access token: deleted here, and only the user can revoke it.
 		http.Redirect(w, r, "/?commenting=token-deleted", http.StatusSeeOther)
+	case slices.Contains(res.settings, tokensSettings):
+		// gofer could not tell which kind it held.
+		http.Redirect(w, r, "/?commenting=unconfirmed-any", http.StatusSeeOther)
 	default:
 		http.Redirect(w, r, "/?commenting=unconfirmed", http.StatusSeeOther)
 	}
@@ -387,7 +413,11 @@ func (h *Handler) beginWriteDisconnect(ctx context.Context, userID string) (*loc
 // mergeLogout combines two logouts' outcomes: confirmed only if both were, with
 // every settings page either names.
 func mergeLogout(a, b logoutResult) logoutResult {
-	out := logoutResult{confirmed: a.confirmed && b.confirmed}
+	out := logoutResult{
+		confirmed:      a.confirmed && b.confirmed,
+		tokenDeleted:   a.tokenDeleted || b.tokenDeleted,
+		cleanupPending: a.cleanupPending || b.cleanupPending,
+	}
 	if out.confirmed {
 		return out
 	}

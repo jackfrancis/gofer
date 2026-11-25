@@ -31,7 +31,8 @@ data:
   # GITHUB_WRITE_TOKENS=true (with the write client above) also lets each user
   # connect commenting with a classic personal access token (public_repo only, an
   # expiry of 90 days or less) for organizations that block unapproved OAuth apps.
-  # gofer cannot revoke such a token; the user deletes it on GitHub (ADR 0011).
+  # gofer cannot revoke such a token; the user deletes it on GitHub (ADR 0011). It
+  # needs an https BASE_URL (startup fails otherwise, except on loopback).
   # Deliberately absent here, so a deploy never turns it on or off: set it on the
   # live ConfigMap, then restart gofer-0.
   # REFRESH_INTERVAL (a Go duration, at least 1m, e.g. "15m") refreshes every

@@ -26,6 +26,7 @@ type fakeCreds struct {
 	writeCalls     int
 	readErr        error
 	rejected       []string
+	widened        []string // WriteScopesChanged calls
 	readCalls      int
 	mu             sync.Mutex
 }
@@ -56,6 +57,12 @@ func (f *fakeCreds) WriteRejected(_ context.Context, _, version string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rejected = append(f.rejected, version)
+}
+
+func (f *fakeCreds) WriteScopesChanged(_ context.Context, _, version string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.widened = append(f.widened, version)
 }
 
 func (f *fakeCreds) Credential(_ context.Context, _, provider string, _ auth.VendRequest) (vault.Credential, error) {

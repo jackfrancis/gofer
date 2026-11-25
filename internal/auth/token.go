@@ -246,16 +246,17 @@ func scopeList(scopes []string) string {
 
 // Outcomes storeWriteToken adds to grantOutcome.
 const (
-	grantAlreadyConnected grantOutcome = iota + 100 // a write grant is already stored
+	grantAlreadyConnected grantOutcome = iota + 100 // a usable write grant is already stored
 	grantBusy                                       // a disconnect or logout of the write grant is pending
+	grantTokenConnected                             // a live personal access token is stored (the OAuth callback must not replace it)
 )
 
 // storeWriteToken stores a checked personal access token as the user's write grant,
 // strictly (an error stores nothing). Under the credential lock and then the write
 // grant's marker lock, which logout holds while it decides what to revoke, it
 // re-checks the session, and refuses while a logout of the write grant is pending
-// (storing would supersede it, leaving an OAuth grant unrevoked) or while one is
-// stored (disconnect first).
+// (storing would supersede it, leaving an OAuth grant unrevoked) or while a usable
+// grant is stored (disconnect first). An expired token is replaced.
 func (h *Handler) storeWriteToken(ctx context.Context, p *provider, userID, login, token string, expiry time.Time, sessionValid func(context.Context) (bool, error)) (grantOutcome, error) {
 	unlock, err := h.locks.lock(ctx, userID, p.name)
 	if err != nil {
@@ -282,9 +283,12 @@ func (h *Handler) storeWriteToken(ctx context.Context, p *provider, userID, logi
 	if pending {
 		return grantBusy, nil
 	}
-	switch _, err := h.vault.Get(lctx, userID, p.name); {
-	case err == nil:
+	switch existing, err := h.vault.Get(lctx, userID, p.name); {
+	case err == nil && !tokenExpired(existing, h.now()):
 		return grantAlreadyConnected, nil
+	case err == nil:
+		// An expired token works nowhere any more: a new one replaces it, so the user
+		// can renew from the radar without disconnecting first.
 	case !errors.Is(err, vault.ErrNotFound):
 		return 0, fmt.Errorf("read the write grant: %w", err)
 	}
@@ -321,4 +325,32 @@ func sameOriginRequest(r *http.Request) bool {
 	}
 	u, err := url.Parse(o)
 	return o != "null" && err == nil && u.Host != "" && u.Host == r.Host
+}
+
+// WriteScopesChanged handles a write GitHub refused before it was sent because the
+// write grant at version now carries scopes other than exactly public_repo
+// (ghcomment.ErrTokenScopes; GitHub lets a classic token's scopes be edited). A
+// personal access token is deleted, so the radar asks the user to connect again with
+// a narrow one; gofer cannot revoke it, and says so there. An OAuth grant gofer only
+// ever asks public_repo for is left alone: every write with it is still refused while
+// it has more.
+func (h *Handler) WriteScopesChanged(ctx context.Context, userID, version string) {
+	if _, ok := h.providers[WriteProvider]; !ok || h.vault == nil || version == "" {
+		return
+	}
+	unlock, err := h.locks.lock(ctx, userID, WriteProvider)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	cred, err := h.vault.Get(ctx, userID, WriteProvider)
+	if err != nil || cred.Version != version {
+		return
+	}
+	if !isPersonalToken(cred) {
+		slog.WarnContext(ctx, "write grant reports scopes beyond public_repo; writes refused", "user", userID)
+		return
+	}
+	slog.InfoContext(ctx, "commenting token's scopes widened; deleting gofer's copy", "user", userID)
+	h.deleteIfVersion(ctx, userID, cred)
 }

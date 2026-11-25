@@ -344,6 +344,13 @@ type logoutResult struct {
 	// hand when revocation is not confirmed: the issuing client's kind, or both
 	// pages when gofer cannot tell which client issued the credential.
 	settings []string
+	// tokenDeleted: the credential was a personal access token, and its row is gone
+	// (ADR 0011). gofer cannot revoke the token itself, so the user must.
+	tokenDeleted bool
+	// cleanupPending: gofer's copy was not deleted yet (the delete failed, or the
+	// lock was busy and the work was deferred). The pending logout keeps it unused,
+	// and the next credential access or a restart finishes it.
+	cleanupPending bool
 }
 
 // revokeAndDelete runs logout operation lo, begun by beginLogout: under the
@@ -383,7 +390,9 @@ func (h *Handler) revokeAndDelete(ctx context.Context, userID, providerName stri
 		}
 		slog.WarnContext(ctx, "logout: credential lock busy; revocation deferred", "user", userID, "provider", providerName)
 		go h.pendingLogout(context.WithoutCancel(ctx), userID, providerName, lo)
-		return h.unconfirmed(providerName, h.providers[providerName], nil)
+		res := h.unconfirmed(providerName, h.providers[providerName], nil)
+		res.cleanupPending = true
+		return res
 	}
 	defer unlock()
 	return h.runLogout(ctx, userID, providerName, lo)
@@ -425,6 +434,11 @@ func (h *Handler) runLogout(ctx context.Context, userID, providerName string, lo
 		return res
 	}
 	res, deleted := h.logoutLocked(ctx, userID, providerName)
+	if !deleted {
+		// Only the vault's confirmation says the copy is gone: a token's settings page
+		// names its kind, not its deletion.
+		res.tokenDeleted, res.cleanupPending = false, true
+	}
 	h.completeLogout(ctx, userID, providerName, lo, res, deleted)
 	return res
 }
@@ -487,7 +501,7 @@ func (h *Handler) revokeLocked(ctx context.Context, userID, providerName string)
 		// gofer cannot revoke a personal access token (ADR 0011): the row is deleted,
 		// and the user is sent to GitHub's token settings to delete it there.
 		slog.InfoContext(ctx, "logout: a personal access token; gofer deletes its copy and cannot revoke it", "user", userID)
-		return logoutResult{settings: []string{tokensSettings}}
+		return logoutResult{settings: []string{tokensSettings}, tokenDeleted: true} // logoutLocked clears it if the delete fails
 	case !ok:
 		slog.InfoContext(ctx, "logout: the credential's client is not configured; revocation unconfirmed", "user", userID, "provider", providerName)
 		return h.unconfirmed(providerName, nil, &cred)
@@ -540,7 +554,11 @@ func (h *Handler) unconfirmed(providerName string, p *provider, cred *vault.Cred
 	if providerName == WriteProvider {
 		// The write grant is a classic OAuth app's (ADR 0009), or a personal access
 		// token (ADR 0011).
-		if cred != nil && isPersonalToken(*cred) {
+		switch {
+		case cred == nil:
+			// The credential could not be read: it may have been either kind.
+			return logoutResult{settings: []string{oauthAppsSettings, tokensSettings}}
+		case isPersonalToken(*cred):
 			return logoutResult{settings: []string{tokensSettings}}
 		}
 		return logoutResult{settings: []string{oauthAppsSettings}}

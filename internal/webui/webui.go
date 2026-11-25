@@ -316,7 +316,8 @@ type pageData struct {
 	CommentNotice            string              // worklist: the outcome of the last connect/disconnect, for the user
 	CommentTokensAllowed     bool                // worklist: the user may connect commenting with a personal access token (ADR 0011)
 	CommentToken             bool                // worklist: commenting is connected with a personal access token
-	CommentTokenExpires      time.Time           // worklist: when that token expires
+	CommentTokenExpires      time.Time           // worklist: when that token expires (or expired)
+	CommentTokenExpired      bool                // worklist: a stored token has expired; offer a new one and Disconnect
 	Comment                  *commentView        // comment-preview / comment-results views
 	Draft                    *draftThread        // thread: the draft review's button and newest draft (draftreview.go); nil shows neither
 	DraftResult              *draftResult        // draft-review-result view
@@ -1242,6 +1243,7 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 			if d, ok := h.commenter.(commentDetailer); ok {
 				det := d.Details(r.Context(), user.ID)
 				data.CommentTokensAllowed, data.CommentToken, data.CommentTokenExpires = det.TokensAllowed, det.Token, det.Expires
+				data.CommentTokenExpired = det.TokenExpired
 			}
 		}
 		if scope.projects != nil {
@@ -1278,11 +1280,13 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 // commentNotices are the radar's words for the commenting query parameter, set by
 // the redirects that end a connect, disconnect or refused bulk comment.
 var commentNotices = map[string]string{
-	"connect":       "Connect GitHub for commenting first; gofer posts only with that separate grant.",
-	"token":         "Commenting is connected with your personal access token. gofer uses it only for the comments and reviews you confirm, and it stops working when the token expires.",
-	"token-deleted": "Commenting is disconnected, and gofer deleted its copy of your token. gofer cannot revoke a personal access token: delete it in GitHub's settings (Settings, Developer settings, Personal access tokens) if you no longer use it.",
-	"unconfirmed":   "Commenting is disconnected in gofer, but GitHub did not confirm the grant was revoked. Revoke it in GitHub's settings (Settings, Applications, Authorized OAuth Apps) to be sure.",
-	"error":         "gofer could not disconnect commenting right now. Try again in a moment.",
+	"connect":            "Connect GitHub for commenting first; gofer posts only with that separate grant.",
+	"token":              "Commenting is connected with your personal access token. gofer uses it only for the comments and reviews you confirm, and it stops working when the token expires.",
+	"token-deleted":      "Commenting is disconnected, and gofer deleted its copy of your token. gofer cannot revoke a personal access token: delete it in GitHub's settings (Settings, Developer settings, Personal access tokens) if you no longer use it.",
+	"disconnect-pending": "Commenting is disconnected and gofer no longer uses it, but gofer could not finish deleting its stored copy yet; it will retry. To be sure, revoke gofer in GitHub's settings (Authorized OAuth Apps), and delete your personal access token there if you connected with one.",
+	"unconfirmed-any":    "Commenting is disconnected in gofer, but gofer could not tell what GitHub still holds. Check both Authorized OAuth Apps and your personal access tokens in GitHub's settings.",
+	"unconfirmed":        "Commenting is disconnected in gofer, but GitHub did not confirm the grant was revoked. Revoke it in GitHub's settings (Settings, Applications, Authorized OAuth Apps) to be sure.",
+	"error":              "gofer could not disconnect commenting right now. Try again in a moment.",
 }
 
 // refreshCheck is the query parameter of the no-script fallback's reload: that render

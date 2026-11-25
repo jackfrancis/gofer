@@ -85,3 +85,24 @@ func TestAppRestrictionIsExplained(t *testing.T) {
 		t.Errorf("other errors keep their wording under the new outcome: %q", got)
 	}
 }
+
+// A write refused because the token's scopes were widened stops gofer using it, for a
+// bulk comment (the rest of the batch is not attempted) and for a review.
+func TestWidenedScopesStopTheToken(t *testing.T) {
+	creds := &fakeCreds{}
+	gh := &fakeReviewGH{err: ghcomment.ErrTokenScopes}
+	res, err := New(creds, gh).PendingReview(context.Background(), "u", testReview)
+	if err != nil || res.Created || !strings.Contains(res.Error, "scopes beyond public_repo") {
+		t.Errorf("review: %+v %v", res, err)
+	}
+	g := &fakeGH{fail: map[string]error{"a/one": ghcomment.ErrTokenScopes}}
+	s := New(creds, g)
+	s.spacing = 0
+	out, err := s.Post(context.Background(), "u", []Target{{Repo: "a/one", Number: 1}, {Repo: "b/two", Number: 2}}, "hi")
+	if err != nil || out[0].Posted || !strings.Contains(out[1].Error, "Not attempted") || len(g.posts) != 0 {
+		t.Errorf("batch: %+v %v posts %v", out, err, g.posts)
+	}
+	if len(creds.widened) != 2 || creds.widened[0] != "v1" {
+		t.Errorf("WriteScopesChanged calls = %v", creds.widened)
+	}
+}

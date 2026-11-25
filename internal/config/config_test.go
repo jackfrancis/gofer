@@ -304,3 +304,62 @@ func TestValidateGitHubWrite(t *testing.T) {
 		}
 	}
 }
+
+// A secret typed into gofer's page crosses the network only over HTTPS: plain HTTP is
+// allowed on this machine alone.
+func TestSecureOrLoopback(t *testing.T) {
+	for url, want := range map[string]bool{
+		"https://gofer.example.test":    true,
+		"http://localhost:8080":         true,
+		"http://gofer.localhost":        true,
+		"http://127.0.0.1:8080":         true,
+		"http://127.1.2.3":              true,
+		"http://[::1]:8080":             true,
+		"http://gofer.example.test":     false,
+		"http://10.0.0.5:8080":          false,
+		"http://localhost.example.test": false,
+		"ftp://localhost":               false,
+		"not a url":                     false,
+	} {
+		if got := SecureOrLoopback(url); got != want {
+			t.Errorf("%s: %v, want %v", url, got, want)
+		}
+	}
+}
+
+// Tokens need an https (or loopback) BASE_URL, and a bad flag value is never echoed.
+func TestLoadWriteTokens(t *testing.T) {
+	base := func(t *testing.T) {
+		t.Setenv("SESSION_SECRET", "0123456789abcdef0123456789abcdef")
+		t.Setenv("GITHUB_CLIENT_ID", "cid")
+		t.Setenv("GITHUB_CLIENT_SECRET", "csec")
+		t.Setenv("GITHUB_WRITE_CLIENT_ID", "wcid")
+		t.Setenv("GITHUB_WRITE_CLIENT_SECRET", "wsec")
+		t.Setenv("DATA_DIR", "")
+		t.Setenv("MINT_PUBLIC_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	}
+	t.Run("https", func(t *testing.T) {
+		base(t)
+		t.Setenv("BASE_URL", "https://gofer.example.test")
+		t.Setenv("GITHUB_WRITE_TOKENS", "true")
+		if c, err := Load(); err != nil || !c.Providers.GitHubWriteTokens {
+			t.Fatalf("%v", err)
+		}
+	})
+	t.Run("plain http", func(t *testing.T) {
+		base(t)
+		t.Setenv("BASE_URL", "http://gofer.example.test")
+		t.Setenv("GITHUB_WRITE_TOKENS", "true")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "https BASE_URL") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("bad value", func(t *testing.T) {
+		base(t)
+		t.Setenv("BASE_URL", "https://gofer.example.test")
+		t.Setenv("GITHUB_WRITE_TOKENS", "ghp_secretsecretsecret")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "GITHUB_WRITE_TOKENS must be true or false") || strings.Contains(err.Error(), "ghp_") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}

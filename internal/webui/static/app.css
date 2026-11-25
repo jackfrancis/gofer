@@ -365,3 +365,5 @@ body {
 .zz-token-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
 .zz-token-form .zz-compose-hint { flex-basis: 100%; margin: 0; }
 .zz-token-input { flex: 1 1 260px; min-width: 0; padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+.zz-token-expired { margin: 0 0 12px; font-size: 13px; }
+.zz-token-expired p { margin: 0 0 4px; }

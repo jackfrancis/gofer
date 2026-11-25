@@ -27,8 +27,12 @@ Organizations restrict personal access tokens separately. A smoke test (2026-11-
 ### An alternative, not a replacement
 
 A deployment may let users connect commenting with a classic personal access token
-(`GITHUB_WRITE_TOKENS=true`). It is off by default and requires the write client: the
-OAuth grant stays the default way to connect, because gofer can revoke it (at logout
+(`GITHUB_WRITE_TOKENS=true`). It is off by default, requires the write client, and
+requires an `https` `BASE_URL` (plain HTTP only on a loopback address, for local
+development): a token pasted over plain HTTP would cross the network in cleartext, and
+unlike the OAuth grant gofer could not revoke it afterwards. A value that is not a
+boolean is refused without echoing it, since a misplaced token would otherwise reach
+the startup log. The OAuth grant stays the default way to connect, because gofer can revoke it (at logout
 and disconnect, and its owner can revoke every user's grant at once from the app's
 settings) and the user never handles its token. A token is for organizations that
 block the app. No configured secret is replaced or added.
@@ -46,17 +50,23 @@ with `GET /user`, authenticated with it, and stores it only if all hold:
 - it is a **classic** token: it starts `ghp_`, and GitHub's answer carries
   `X-OAuth-Scopes`, which GitHub sends for classic tokens only (a fine-grained token is
   refused with an explanation);
-- its scopes are **exactly** `public_repo`: the narrowest scope that can comment and
-  review on a public repository, and the same reach as the OAuth grant, so a leaked
-  token can do no more than a leaked grant;
+- its scopes are **exactly** `public_repo` when connected: the narrowest scope that
+  can comment and review on a public repository, the same reach as the OAuth grant.
+  This is what gofer observed then, not a lasting limit: GitHub lets a classic token's
+  scopes be edited later, so every write checks again (below);
 - it **expires**, within 90 days (`maxTokenLifetime`, with a day of slack), read from
   `GitHub-Authentication-Token-Expiration`: a token with no expiry is refused, so a
   copy that leaks stops working on its own;
 - it belongs to the **signed-in** GitHub account, which `ALLOWED_GITHUB_LOGINS` still
   admits;
-- commenting is **not already connected**, and no disconnect or logout of it is pending:
-  storing over an OAuth grant would leave that grant unrevoked at GitHub, so the user
-  disconnects first.
+- commenting is **not already connected** with a usable grant, and no disconnect or
+  logout of it is pending: storing over an OAuth grant would leave that grant
+  unrevoked at GitHub, so the user disconnects first. An **expired** token is replaced,
+  so the user renews from the radar without disconnecting.
+
+The rule holds in the other direction too: an OAuth connection that finishes after a
+live token was connected (say, in another tab) does not replace it. The callback
+refuses under the same lock and revokes the OAuth token it was just issued.
 
 The token is never logged, echoed in a page or put in an error. A refused token is not
 kept, and the page says to delete it on GitHub if it will not be used.
@@ -67,8 +77,16 @@ The token is used exactly as the OAuth grant is: only by the web tier, only for 
 the user confirmed, never vended to a run (`Credential` and the broker refuse the
 provider, as before). Further:
 
+- **Scopes, before every write.** The request that precedes each write (the
+  repository's public check) reads GitHub's `X-OAuth-Scopes` for the token. If it is
+  present and not exactly `public_repo`, nothing is written (`ErrTokenScopes`), the
+  batch stops, and a personal access token is deleted (`WriteScopesChanged`), so the
+  radar asks for a narrow one. An OAuth grant, which gofer only ever asks for
+  `public_repo`, is not deleted (that would leave it unrevoked); its writes stay
+  refused while it reports more.
 - **Expiry.** An expired token reads as not connected and is not handed out
-  (`WriteCredential`), so the radar asks the user to connect again.
+  (`WriteCredential`). The radar says it expired, offers a new one, and keeps
+  Disconnect, since gofer still holds the expired copy.
 - **Turned off.** A token stored while tokens were allowed is not used once they are not
   (`fromConfiguredClient`); disconnect and logout still delete it.
 - **Rejected.** A 401 on a token is confirmed with `GET /user` (not the OAuth app's
@@ -76,7 +94,11 @@ provider, as before). Further:
 - **Disconnect and logout.** gofer cannot revoke a personal access token. Both delete
   gofer's copy through the usual revoke-then-delete machinery, skipping the revocation,
   and tell the user to delete the token in GitHub's token settings. The token is never
-  sent to an OAuth app's revoke or check endpoint.
+  sent to an OAuth app's revoke or check endpoint. Deletion is reported only once the
+  vault confirms it (`logoutResult.tokenDeleted`): a failed or deferred delete says
+  cleanup is pending (`cleanupPending`), while the recorded logout keeps the credential
+  unused until it finishes. When the credential could not be read, the user is sent to
+  both the authorized apps and the token settings, since it may have been either kind.
 
 ### Telling the user when an organization blocks the app
 

@@ -145,10 +145,28 @@ func New(base string, transport http.RoundTripper) *Client {
 
 // PublicRepo checks that repo is public and returns its canonical owner/name.
 func (c *Client) PublicRepo(ctx context.Context, token, repo string) (string, error) {
+	return c.publicRepo(ctx, token, repo, false)
+}
+
+// ErrTokenScopes means the write credential now carries scopes other than exactly
+// public_repo, as GitHub reported them on the request before a write. GitHub lets a
+// classic personal access token's scopes be edited after gofer checked it (ADR
+// 0011), so the scope gofer saw at connection is not a lasting limit: every write
+// checks it again, and nothing is written with a token that has more.
+var ErrTokenScopes = errors.New("the commenting token's scopes are no longer exactly public_repo")
+
+// writeRepo is PublicRepo for the request that precedes a write: it also refuses
+// (ErrTokenScopes) when GitHub reports the token's scopes (X-OAuth-Scopes, sent for
+// classic OAuth and personal access tokens) and they are not exactly public_repo.
+func (c *Client) writeRepo(ctx context.Context, token, repo string) (string, error) {
+	return c.publicRepo(ctx, token, repo, true)
+}
+
+func (c *Client) publicRepo(ctx context.Context, token, repo string, write bool) (string, error) {
 	if !ValidRepo(repo) {
 		return "", ErrInvalidRepo
 	}
-	body, err := c.do(ctx, token, http.MethodGet, "/repos/"+repo, nil, http.StatusOK)
+	body, hdr, err := c.doHeader(ctx, token, http.MethodGet, "/repos/"+repo, nil, http.StatusOK, maxResponseBytes)
 	if err != nil {
 		var se *StatusError
 		if errors.As(err, &se) && (se.Status == http.StatusNotFound || se.Status == http.StatusGone) {
@@ -166,7 +184,23 @@ func (c *Client) PublicRepo(ctx context.Context, token, repo string) (string, er
 	if *meta.Private {
 		return "", ErrNotPublic
 	}
+	if write {
+		if v, ok := hdr[http.CanonicalHeaderKey("X-OAuth-Scopes")]; ok && !onlyPublicRepo(strings.Join(v, ",")) {
+			return "", ErrTokenScopes
+		}
+	}
 	return meta.FullName, nil
+}
+
+// onlyPublicRepo reports whether a scopes header lists exactly public_repo.
+func onlyPublicRepo(header string) bool {
+	var scopes []string
+	for _, s := range strings.Split(header, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			scopes = append(scopes, s)
+		}
+	}
+	return len(scopes) == 1 && scopes[0] == "public_repo"
 }
 
 // Comment posts body as a new comment on issue or pull request number in repo, after
@@ -178,7 +212,7 @@ func (c *Client) Comment(ctx context.Context, token, repo string, number int, bo
 	if body == "" || len(body) > MaxBodyBytes {
 		return "", fmt.Errorf("github: a comment must be 1 to %d bytes", MaxBodyBytes)
 	}
-	canon, err := c.PublicRepo(ctx, token, repo)
+	canon, err := c.writeRepo(ctx, token, repo)
 	if err != nil {
 		return "", err
 	}
@@ -250,6 +284,12 @@ var errTooLarge = errors.New("github: response too large")
 // doLimit is do, reading at most limit bytes of the response: a wanted response
 // longer than that is errTooLarge, never a truncated body.
 func (c *Client) doLimit(ctx context.Context, token, method, path string, payload []byte, want, limit int) ([]byte, error) {
+	data, _, err := c.doHeader(ctx, token, method, path, payload, want, limit)
+	return data, err
+}
+
+// doHeader is doLimit, also returning a wanted response's headers.
+func (c *Client) doHeader(ctx context.Context, token, method, path string, payload []byte, want, limit int) ([]byte, http.Header, error) {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 	var wrote atomic.Bool
@@ -262,7 +302,7 @@ func (c *Client) doLimit(ctx context.Context, token, method, path string, payloa
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.base+path, body)
 	if err != nil {
-		return nil, errors.New("github: could not build the request")
+		return nil, nil, errors.New("github: could not build the request")
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -279,51 +319,51 @@ func (c *Client) doLimit(ctx context.Context, token, method, path string, payloa
 		// A transport error can quote the URL; the path is not secret, but keep the
 		// error to its kind.
 		if post && wrote.Load() {
-			return nil, ErrOutcomeUnknown
+			return nil, nil, ErrOutcomeUnknown
 		}
 		if ctx.Err() != nil {
-			return nil, errors.New("github: request timed out")
+			return nil, nil, errors.New("github: request timed out")
 		}
-		return nil, errors.New("github: request failed")
+		return nil, nil, errors.New("github: request failed")
 	}
 	defer resp.Body.Close()
 	data, rerr := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	switch {
 	case resp.StatusCode == want:
 		if rerr != nil {
-			return data, errBodyLost
+			return data, resp.Header, errBodyLost
 		}
 		if len(data) > limit {
 			if post {
-				return nil, errBodyLost // the write happened; only its answer is unreadable
+				return nil, resp.Header, errBodyLost // the write happened; only its answer is unreadable
 			}
-			return nil, errTooLarge
+			return nil, nil, errTooLarge
 		}
-		return data, nil
+		return data, resp.Header, nil
 	case resp.StatusCode == http.StatusUnauthorized:
-		return nil, ErrUnauthorized
+		return nil, nil, ErrUnauthorized
 	case resp.StatusCode >= 300 && resp.StatusCode < 400:
-		return nil, &StatusError{Status: resp.StatusCode, Message: "redirected; gofer follows no redirect"}
+		return nil, nil, &StatusError{Status: resp.StatusCode, Message: "redirected; gofer follows no redirect"}
 	case post && resp.StatusCode >= 500:
 		// A server error does not say the write was rolled back: GitHub (or a
 		// gateway in front of it) can fail after it acted.
-		return nil, ErrOutcomeUnknown
+		return nil, nil, ErrOutcomeUnknown
 	}
 	var msg struct {
 		Message string `json:"message"`
 	}
 	_ = json.Unmarshal(data, &msg)
 	if rl := rateLimit(resp, msg.Message, time.Now()); rl != nil {
-		return nil, rl
+		return nil, nil, rl
 	}
 	if ar := appRestricted(resp.StatusCode, msg.Message); ar != nil {
-		return nil, ar
+		return nil, nil, ar
 	}
 	m := msg.Message
 	if len(m) > 200 {
 		m = m[:200]
 	}
-	return nil, &StatusError{Status: resp.StatusCode, Message: m}
+	return nil, nil, &StatusError{Status: resp.StatusCode, Message: m}
 }
 
 // rateLimit reads GitHub's rate-limit signals from a refusal: 429; or 403 with no

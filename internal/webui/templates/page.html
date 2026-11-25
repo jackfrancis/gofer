@@ -423,6 +423,14 @@
         </form>
       </details>
       {{else}}
+      {{if .CommentTokenExpired}}
+      <div class="zz-token-expired" role="status">
+        <p>Your commenting token expired on {{.CommentTokenExpires.Format "January 2, 2006"}}.{{if .CommentTokensAllowed}} Paste a new one below to keep commenting, or disconnect to delete gofer's copy.{{else}} Disconnect to delete gofer's copy.{{end}}</p>
+        <form class="zz-compose-disconnect" method="post" action="/auth/github-write/disconnect">
+          <button class="zz-linkbtn" type="submit" title="Delete gofer's copy of your expired token">Disconnect commenting</button>
+        </form>
+      </div>
+      {{end}}
       <p class="zz-compose-connect"><a href="/auth/github-write/login">Connect GitHub for commenting</a> to post one comment (such as <code>/assign</code>) to several items at once, or to create pending reviews. It is a separate permission from sign-in, and you can disconnect it at any time.</p>
       {{if .CommentTokensAllowed}}
       <details class="zz-token">

@@ -287,3 +287,54 @@ func TestAppRestricted(t *testing.T) {
 		t.Errorf("no organization named: %+v", e)
 	}
 }
+
+// Every write first checks the token's scopes as GitHub reports them on the request
+// before it: a token widened beyond public_repo after it was connected writes
+// nothing. A read (assignees, with the read credential) does not check, and a token
+// GitHub reports no scopes for is not refused here.
+func TestWritesRefuseWidenedScopes(t *testing.T) {
+	scopeServer := func(t *testing.T, scopes *string, posted *atomic.Int32) *Client {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if scopes != nil {
+				w.Header().Set("X-OAuth-Scopes", *scopes)
+			}
+			switch {
+			case r.Method == http.MethodPost:
+				posted.Add(1)
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"html_url":"https://github.com/o/r/issues/1#c"}`))
+			case strings.HasSuffix(r.URL.Path, "/assignees"):
+				_, _ = w.Write([]byte(`[{"login":"a"}]`))
+			default:
+				_, _ = w.Write([]byte(`{"full_name":"o/r","private":false}`))
+			}
+		}))
+		t.Cleanup(srv.Close)
+		return New(srv.URL, srv.Client().Transport)
+	}
+	str := func(s string) *string { return &s }
+	for name, tc := range map[string]struct {
+		scopes *string
+		ok     bool
+	}{
+		"exactly public_repo": {str("public_repo"), true},
+		"widened":             {str("public_repo, repo"), false},
+		"other scope":         {str("repo"), false},
+		"no header":           {nil, true},
+	} {
+		var posted atomic.Int32
+		c := scopeServer(t, tc.scopes, &posted)
+		_, err := c.Comment(context.Background(), token, "o/r", 1, "hi")
+		if tc.ok != (err == nil) || (!tc.ok && (!errors.Is(err, ErrTokenScopes) || posted.Load() != 0)) {
+			t.Errorf("%s: err = %v, posted %d", name, err, posted.Load())
+		}
+		rv := Review{Commit: "0123456789abcdef0123456789abcdef01234567", BaseRef: "main", Body: "x"}
+		if _, err := c.PendingReview(context.Background(), token, "o/r", 1, rv); !tc.ok && !errors.Is(err, ErrTokenScopes) {
+			t.Errorf("%s: review err = %v", name, err)
+		}
+		if _, _, err := c.Assignees(context.Background(), token, "o/r"); err != nil {
+			t.Errorf("%s: a read checked write scopes: %v", name, err)
+		}
+	}
+}

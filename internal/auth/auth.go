@@ -436,13 +436,20 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	msg := "You are signed out of gofer, but GitHub did not confirm that gofer's access was revoked. Revoke gofer in GitHub's settings to be sure."
-	if slices.Contains(res.settings, tokensSettings) {
+	switch {
+	case res.cleanupPending:
+		// Not deleted yet: the pending logout keeps it unused, and the next credential
+		// access or a restart finishes it. Say so, rather than claim it is gone.
+		msg = "You are signed out of gofer and it no longer uses your GitHub access, but it could not finish deleting its stored copy yet; it will retry. Revoke gofer in GitHub's settings to be sure, and if you connected commenting with a personal access token, delete that token there too."
+	case res.tokenDeleted:
 		// The write grant was a personal access token (ADR 0011): gofer deleted its
 		// copy, and only the user can revoke the token itself.
 		msg = "You are signed out of gofer, and gofer deleted its copy of your commenting token. gofer cannot revoke a personal access token: delete it in GitHub's settings if you no longer use it."
 		if len(res.settings) > 1 {
 			msg += " GitHub also did not confirm that gofer's other access was revoked; revoke it there too."
 		}
+	case slices.Contains(res.settings, tokensSettings):
+		msg = "You are signed out of gofer, but gofer could not confirm what GitHub still holds for it. Check both your authorized apps and your personal access tokens in GitHub's settings."
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

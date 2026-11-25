@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -335,5 +336,174 @@ func TestInspectTokenExpiryFormats(t *testing.T) {
 		if err != nil || got.expiry.Format(time.RFC3339) != "2026-12-24T12:00:00Z" || !got.classic || strconv.Itoa(len(got.scopes)) != "1" {
 			t.Errorf("%s: %+v %v", exp, got, err)
 		}
+	}
+}
+
+// faultyVault fails Delete (or Get of the write grant) on demand, as a database
+// could; everything else reaches the real vault.
+type faultyVault struct {
+	vault.Vault
+	failDelete, failGet bool
+}
+
+func (f *faultyVault) Delete(ctx context.Context, userID, provider string) error {
+	if f.failDelete && provider == WriteProvider {
+		return errors.New("disk on fire")
+	}
+	return f.Vault.Delete(ctx, userID, provider)
+}
+
+func (f *faultyVault) Get(ctx context.Context, userID, provider string) (vault.Credential, error) {
+	if f.failGet && provider == WriteProvider {
+		return vault.Credential{}, errors.New("disk on fire")
+	}
+	return f.Vault.Get(ctx, userID, provider)
+}
+
+func disconnect(h *Handler, signedIn *http.Request) string {
+	req := httptest.NewRequest(http.MethodPost, writePath+"/disconnect", nil)
+	for _, c := range signedIn.Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.DisconnectWrite(rec, req)
+	return rec.Header().Get("Location")
+}
+
+// An expired token reads as expired, and a new one replaces it from the radar without
+// disconnecting first; while it is live it still blocks a replacement.
+func TestExpiredTokenCanBeRenewed(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	later, _ := time.Parse("2006-01-02 15:04:05 MST", "2026-12-24 12:00:01 UTC")
+	h.now = func() time.Time { return later }
+	st := h.CommentingState(bg, user)
+	if st.Connected || !st.TokenExpired || st.Expires.IsZero() {
+		t.Fatalf("state = %+v", st)
+	}
+	renewed := goodPAT()
+	renewed.expiry = "2027-01-24 12:00:00 UTC"
+	pat.set(patToken2, renewed)
+	if rec := postToken(h, signedIn, patToken2); rec.Code != http.StatusSeeOther {
+		t.Fatalf("renew: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); c.AccessToken != patToken2 {
+		t.Error("the expired token was not replaced")
+	}
+	if st := h.CommentingState(bg, user); !st.Connected || !st.Token || st.TokenExpired {
+		t.Errorf("after renewal: %+v", st)
+	}
+}
+
+// An OAuth connection that finishes after a token was connected in another tab does
+// not replace the live token: its new OAuth token is discarded. An expired token it
+// may replace.
+func TestLateOAuthCallbackKeepsALiveToken(t *testing.T) {
+	h, signedIn, pat, gh, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	rec, _, _ := connectWrite(t, h, signedIn)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "personal access token") {
+		t.Fatalf("callback: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); c.AccessToken != patToken {
+		t.Error("the live token was replaced by the OAuth grant")
+	}
+	if gh.tokensRevoked.Load() != 1 {
+		t.Errorf("the refused OAuth token was not discarded: %d revoked", gh.tokensRevoked.Load())
+	}
+	later, _ := time.Parse("2006-01-02 15:04:05 MST", "2026-12-24 12:00:01 UTC")
+	h.now = func() time.Time { return later }
+	if rec, _, _ := connectWrite(t, h, signedIn); rec.Code != http.StatusFound {
+		t.Fatalf("callback over an expired token: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); isPersonalToken(c) {
+		t.Error("the expired token was not replaced by the OAuth grant")
+	}
+}
+
+// Deletion is reported only once the vault confirms it: a failed delete says cleanup
+// is pending (the logout stays recorded, so the token is not used), never "deleted".
+// A credential gofer could not read gets both GitHub settings pages.
+func TestDisconnectReportsDeletionHonestly(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	fv := &faultyVault{Vault: vlt, failDelete: true}
+	h.vault = fv
+	if loc := disconnect(h, signedIn); loc != "/?commenting=disconnect-pending" {
+		t.Fatalf("failed delete: %q", loc)
+	}
+	if _, ok := writeStored(t, vlt); !ok {
+		t.Fatal("test setup: the row should still be there")
+	}
+	if st := h.CommentingState(bg, user); st.Connected {
+		t.Errorf("a token whose disconnect is pending reads as connected: %+v", st)
+	}
+	if _, err := h.WriteCredential(bg, user); err == nil {
+		t.Error("a token whose disconnect is pending was handed out")
+	}
+	fv.failDelete = false
+	if _, err := h.WriteCredential(bg, user); err == nil {
+		t.Error("the next access handed out the token instead of finishing the logout")
+	}
+	if _, ok := writeStored(t, vlt); ok {
+		t.Error("the next credential access did not finish the deletion")
+	}
+
+	// Unreadable: gofer cannot tell which kind it held.
+	h2, signedIn2, pat2, _, vlt2 := newTokenHandler(t)
+	pat2.set(patToken, goodPAT())
+	postToken(h2, signedIn2, patToken)
+	h2.vault = &faultyVault{Vault: vlt2, failGet: true}
+	if loc := disconnect(h2, signedIn2); loc != "/?commenting=unconfirmed-any" {
+		t.Errorf("unreadable: %q", loc)
+	}
+}
+
+// Signing out with a delete that fails says cleanup is pending, not that the token is
+// gone.
+func TestLogoutReportsPendingCleanup(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	h.vault = &faultyVault{Vault: vlt, failDelete: true}
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	for _, c := range signedIn.Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.Logout(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "could not finish deleting") || strings.Contains(rec.Body.String(), "deleted its copy") {
+		t.Fatalf("logout: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// A token whose scopes were widened after it was connected is dropped at the version
+// GitHub reported; an OAuth grant is left alone (gofer only ever asked it for
+// public_repo), and a stale version changes nothing.
+func TestWriteScopesChanged(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	c, _ := writeStored(t, vlt)
+	h.WriteScopesChanged(bg, user, "stale-version")
+	if _, ok := writeStored(t, vlt); !ok {
+		t.Fatal("a stale version dropped the token")
+	}
+	h.WriteScopesChanged(bg, user, c.Version)
+	if _, ok := writeStored(t, vlt); ok {
+		t.Error("a widened token was kept")
+	}
+
+	h2, signedIn2, pat2, gh2, vlt2 := newTokenHandler(t)
+	h2.githubAPIBase = gh2.srv.URL
+	connectWrite(t, h2, signedIn2)
+	h2.githubAPIBase = pat2.srv.URL
+	oauth, _ := writeStored(t, vlt2)
+	h2.WriteScopesChanged(bg, user, oauth.Version)
+	if _, ok := writeStored(t, vlt2); !ok {
+		t.Error("an OAuth grant was deleted without being revoked")
 	}
 }

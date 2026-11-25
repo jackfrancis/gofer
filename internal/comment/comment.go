@@ -44,6 +44,9 @@ type Credentials interface {
 	CommentingState(ctx context.Context, userID string) auth.CommentingState
 	WriteCredential(ctx context.Context, userID string) (vault.Credential, error)
 	WriteRejected(ctx context.Context, userID, version string)
+	// WriteScopesChanged stops gofer using the write grant at version, which GitHub
+	// reported carrying scopes beyond public_repo (ghcomment.ErrTokenScopes).
+	WriteScopesChanged(ctx context.Context, userID, version string)
 	Credential(ctx context.Context, userID, provider string, req auth.VendRequest) (vault.Credential, error)
 }
 
@@ -131,13 +134,14 @@ func (s *Service) State(ctx context.Context, userID string) (enabled, connected 
 type Details struct {
 	TokensAllowed bool
 	Token         bool
+	TokenExpired  bool // a token is stored but has expired: replace or disconnect it
 	Expires       time.Time
 }
 
 // Details reports the user's commenting details.
 func (s *Service) Details(ctx context.Context, userID string) Details {
 	st := s.creds.CommentingState(ctx, userID)
-	return Details{TokensAllowed: st.TokensAllowed, Token: st.Token, Expires: st.Expires}
+	return Details{TokensAllowed: st.TokensAllowed, Token: st.Token, TokenExpired: st.TokenExpired, Expires: st.Expires}
 }
 
 // Post posts body to every target, in order, one at a time and at least spacing
@@ -201,6 +205,10 @@ func (s *Service) Post(ctx context.Context, userID string, targets []Target, bod
 			s.creds.WriteRejected(context.WithoutCancel(ctx), userID, cred.Version)
 			out[i].Error = "Not posted: GitHub rejected gofer's access. Connect commenting again."
 			stopped = "Not attempted: GitHub rejected gofer's access. Connect commenting again."
+		case errors.Is(err, ghcomment.ErrTokenScopes):
+			s.creds.WriteScopesChanged(context.WithoutCancel(ctx), userID, cred.Version)
+			out[i].Error = "Not posted: " + scopesChanged
+			stopped = "Not attempted: " + scopesChanged
 		case errors.As(err, &rl):
 			wait := "a while"
 			if rl.RetryAfter > 0 {
@@ -217,6 +225,9 @@ func (s *Service) Post(ctx context.Context, userID string, targets []Target, bod
 	}
 	return out, nil
 }
+
+// scopesChanged explains ghcomment.ErrTokenScopes.
+const scopesChanged = "your commenting token now has scopes beyond public_repo, so gofer stopped using it and deleted its copy. Connect again with a token that has only public_repo, and delete or narrow the old one on GitHub."
 
 // describe turns a posting error into words for the user.
 func describe(err error) string { return describeAs("Not posted", err) }

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -366,6 +367,28 @@ type Providers struct {
 // the write grant: GitHub sign-in and the separate write client are both configured.
 func (p Providers) CommentingEnabled() bool { return p.GitHub.Enabled() && p.GitHubWrite.Enabled() }
 
+// SecureOrLoopback reports whether a browser reaches gofer at baseURL over HTTPS, or
+// over plain HTTP only on this machine (localhost, a *.localhost name, 127.0.0.0/8 or
+// ::1), so a secret typed into gofer's page never crosses a network in cleartext.
+func SecureOrLoopback(baseURL string) bool {
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	switch u.Scheme {
+	case "https":
+		return true
+	case "http":
+		host := strings.ToLower(u.Hostname())
+		if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+			return true
+		}
+		ip := net.ParseIP(host)
+		return ip != nil && ip.IsLoopback()
+	}
+	return false
+}
+
 // validateGitHubWrite refuses a write client that would put write scope on the
 // sign-in token: a classic OAuth grant accumulates scopes per (user, app), so the
 // write grant must come from a different app than sign-in (ADR 0009).
@@ -483,19 +506,25 @@ func Load() (*Config, error) {
 	if v := strings.TrimSpace(os.Getenv("GITHUB_WRITE_TOKENS")); v != "" {
 		on, err := strconv.ParseBool(v)
 		if err != nil {
-			return nil, fmt.Errorf("GITHUB_WRITE_TOKENS must be true or false, not %q", v)
+			// Never echo the value: an operator who mistook this for a credential
+			// setting may have put a token here, and startup errors are logged.
+			return nil, fmt.Errorf("GITHUB_WRITE_TOKENS must be true or false")
 		}
 		providers.GitHubWriteTokens = on
 	}
 	if err := validateGitHubWrite(providers); err != nil {
 		return nil, err
 	}
+	baseURL := strings.TrimRight(getEnv("BASE_URL", "http://localhost:8080"), "/")
+	if providers.GitHubWriteTokens && !SecureOrLoopback(baseURL) {
+		return nil, fmt.Errorf("GITHUB_WRITE_TOKENS needs an https BASE_URL (or a loopback one for local development): a personal access token pasted over plain HTTP crosses the network in cleartext, and gofer cannot revoke it (ADR 0011)")
+	}
 
 	return &Config{
 		DataDir:             dataDir,
 		VaultKey:            vaultKey,
 		Addr:                getEnv("ADDR", ":8080"),
-		BaseURL:             strings.TrimRight(getEnv("BASE_URL", "http://localhost:8080"), "/"),
+		BaseURL:             baseURL,
 		AllowedOrigins:      splitAndTrim(os.Getenv("ALLOWED_ORIGINS")),
 		SessionSecret:       []byte(secret),
 		CookieSecure:        getEnv("COOKIE_SECURE", "false") == "true",

@@ -60,3 +60,20 @@ func TestRadarTokenControls(t *testing.T) {
 		}
 	}
 }
+
+// An expired token is named on the radar, with a Disconnect for gofer's copy, beside
+// the form to paste a new one.
+func TestRadarExpiredToken(t *testing.T) {
+	expired := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	page, _ := radarPage(t, &detailCommenter{fakeCommenter: fakeCommenter{enabled: true}, details: comment.Details{TokensAllowed: true, TokenExpired: true, Expires: expired}}, "")
+	for _, want := range []string{"Your commenting token expired on November 1, 2026", `action="/auth/github-write/disconnect"`, `action="/auth/github-write/token"`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("expired-token radar lacks %s", want)
+		}
+	}
+	for query, want := range map[string]string{"?commenting=disconnect-pending": "could not finish deleting", "?commenting=unconfirmed-any": "could not tell what GitHub still holds"} {
+		if page, _ := radarPage(t, &detailCommenter{fakeCommenter: fakeCommenter{enabled: true}}, query); !strings.Contains(page, want) {
+			t.Errorf("%s: notice missing", query)
+		}
+	}
+}
