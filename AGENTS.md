@@ -624,7 +624,10 @@ Wired on the web-tier side; they define what a runtime must respect:
   so the original tab and the restored form share one batch, `restoreDraft`) or a
   batch that posted nothing and left the grant gone (never a partial or unknown
   one); it comes back on the next plain radar once connected, never posted without
-  Post. Keys are accepted only in their canonical spelling. A used key is held until it expires; only a batch that posted
+  Post. Keys are accepted only in their canonical spelling. What is kept is bounded by
+  the decoded limits, not the larger request cap: a comment over `maxMessageBytes` is
+  refused without a copy, selections are bounded (`maxPinIDBytes`,
+  `maxPinRepoBytes`), and `maxRecords`/`maxDrafts` cap the count. A used key is held until it expires; only a batch that posted
   nothing is dropped early, and past `maxRecords` gofer refuses to post rather than
   forget one. A batch's results are its owner's to read without a live grant; only
   starting one needs it.

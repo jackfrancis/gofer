@@ -130,7 +130,11 @@ The client keeps the workload's guard rules (ADR 0007, "public-only guard"):
    epoch, i.e. before a web-pod restart; malformed; missing) or that names another
    account shows none of the form's text or selection, which may be someone else's.
    The request-size cap allows the full comment percent-encoded and 50 selections in
-   long-named repositories; the decoded comment and target count are checked apart. Batches are
+   long-named repositories; the decoded comment and target count are checked apart,
+   and what gofer keeps is bounded by them, not by the cap: a comment over 16 KiB is
+   refused without a copy (in no receipt or draft), a selection with an oversized ID
+   or repository name is unreadable, and at most 500 batches and 500 drafts are held,
+   tens of MiB at worst. Batches are
    bounded in all; only one that posted nothing is dropped early, and past the bound
    gofer refuses to post rather than forget a used key.
 4. The request must be same-origin, in addition to SameSite=Lax. A browser

@@ -58,7 +58,16 @@ const (
 	resultTTL = time.Hour
 	// maxRecords bounds the batches held. Only one that posted nothing is ever
 	// dropped before its key expires; past the bound with none such, posting waits.
-	maxRecords = 2000
+	// A batch retains at most a maxMessageBytes comment and MaxTargets selections
+	// and results (each bounded: maxPinIDBytes, maxPinRepoBytes, and the stored
+	// item's fields), about 100 KiB at worst, so the records stay near 50 MiB and the
+	// drafts (maxDrafts, at most a comment and selections each) near 20 MiB.
+	maxRecords = 500
+	maxDrafts  = 500
+	// maxPinIDBytes and maxPinRepoBytes bound a selection's item ID and repository
+	// (a GitHub full name is at most 140 bytes); a longer one is unreadable.
+	maxPinIDBytes   = 256
+	maxPinRepoBytes = 256
 	// mentionsTimeout bounds a suggestion request.
 	mentionsTimeout = 15 * time.Second
 	// maxMentionQuery bounds how many repositories one suggestion request may name.
@@ -339,7 +348,8 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 	}
 	body := strings.ReplaceAll(r.PostForm.Get("content"), "\r\n", "\n")
 	pins, readable := parseSelections(r.PostForm["item"])
-	if valid && !connected {
+	tooLong := len(body) > maxMessageBytes
+	if valid && !connected && !tooLong {
 		// Keep the comment and selection through the connect flow, with the form's
 		// key: the radar offers them again once commenting is connected, under that
 		// same key, so this form and the restored one post at most once between them.
@@ -356,9 +366,14 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 		refusal = &commentView{Error: otherAccountForm}
 	case check == keyUnverified:
 		refusal = &commentView{Error: unverifiedCommentForm}
+	case !valid && tooLong:
+		refusal = &commentView{Error: staleCommentForm}
 	case !valid:
 		// Expired, but this account's own form: its comment is offered again.
 		refusal = &commentView{Body: body, Selected: capPins(pins), Error: staleCommentForm}
+	case tooLong:
+		// Refused without keeping a copy: nothing over the limit is ever retained.
+		refusal = &commentView{Error: messageTooLong}
 	case !readable:
 		refusal = &commentView{Body: body, Selected: capPins(pins), Error: badSelection}
 	case !connected:
@@ -453,11 +468,12 @@ func (h *Handler) runBatch(ctx context.Context, bt *batch, userID, body string, 
 	view := commentView{Body: body, Selected: capPins(pins)}
 	defer func() { bt.finish(view) }()
 	switch {
+	case len(body) > maxMessageBytes:
+		// Comment refuses this first; never retain a body over the limit.
+		view = commentView{Error: messageTooLong}
+		return
 	case strings.TrimSpace(body) == "":
 		view.Error = "Write a comment first."
-		return
-	case len(body) > maxMessageBytes:
-		view.Error = messageTooLong
 		return
 	case len(pins) == 0:
 		view.Error = "Select at least one item to comment on."
@@ -527,8 +543,8 @@ func parseSelections(values []string) (pins []comment.Target, ok bool) {
 	for _, v := range values {
 		q, err := url.ParseQuery(v)
 		n, nerr := strconv.Atoi(q.Get("n"))
-		id := q.Get("id")
-		if err != nil || nerr != nil || id == "" {
+		id, repo := q.Get("id"), q.Get("repo")
+		if err != nil || nerr != nil || id == "" || len(id) > maxPinIDBytes || len(repo) > maxPinRepoBytes {
 			ok = false
 			continue
 		}
@@ -539,7 +555,7 @@ func parseSelections(values []string) (pins []comment.Target, ok bool) {
 		if len(pins) > comment.MaxTargets {
 			break
 		}
-		pins = append(pins, comment.Target{ID: id, Repo: q.Get("repo"), Number: n})
+		pins = append(pins, comment.Target{ID: id, Repo: repo, Number: n})
 	}
 	return pins, ok
 }
@@ -625,7 +641,7 @@ func (b *batches) saveDraft(owner string, d draft, now time.Time) {
 			delete(b.drafts, k)
 		}
 	}
-	for len(b.drafts) >= maxRecords {
+	for len(b.drafts) >= maxDrafts {
 		var oldest string
 		for k, old := range b.drafts {
 			if oldest == "" || old.saved.Before(b.drafts[oldest].saved) {

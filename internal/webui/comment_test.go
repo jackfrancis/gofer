@@ -957,3 +957,45 @@ func TestCommentFormFitsItsLimits(t *testing.T) {
 		t.Errorf("batch = %+v", bt) // read whole: refused only because no such items exist
 	}
 }
+
+// Review P2 (PR #60, round 4): an oversized submission is refused without keeping a
+// copy, in a receipt or a reconnect draft, and an oversized selection is unreadable.
+func TestCommentRetainsNothingOverTheLimits(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	big := strings.Repeat("x", maxMessageBytes+1)
+	form := commentForm(h, big, "github:a/one#1")
+	page := posted(t, h, form)
+	if !strings.Contains(page, "too long") || strings.Contains(page, "xxxxxxxx") {
+		t.Errorf("radar:\n%s", page)
+	}
+	if bt := h.batches.lookup(commentOwner, form.Get("key"), h.now()); bt == nil || bt.view.Body != "" || len(bt.view.Selected) != 0 {
+		t.Errorf("the receipt keeps the oversized input: %d body bytes, %d selections", len(bt.view.Body), len(bt.view.Selected))
+	}
+	expired := commentFixture(t, c)
+	expired.epoch, expired.keySecret = h.epoch, h.keySecret
+	expired.now = func() time.Time { return time.Now().Add(commentKeyTTL + time.Minute) }
+	rec := post(expired, commentForm(h, big, "github:a/one#1"))
+	if bt := expired.batches.lookup(commentOwner, strings.TrimPrefix(rec.Header().Get("Location"), "/?comment="), expired.now()); bt == nil || bt.view.Body != "" {
+		t.Error("an expired form keeps its oversized comment")
+	}
+
+	c.connected = false
+	post(h, commentForm(h, big, "github:a/one#1"))
+	c.connected = true
+	if _, ok := h.batches.takeDraft(commentOwner, h.now()); ok {
+		t.Error("an oversized comment was kept as a draft")
+	}
+
+	long := url.Values{"id": {"github:a/one#1" + strings.Repeat("x", maxPinIDBytes)}, "repo": {"a/one"}, "n": {"1"}}.Encode()
+	if pins, ok := parseSelections([]string{long}); ok || len(pins) != 0 {
+		t.Errorf("an oversized selection was read: %v", pins)
+	}
+	repo := url.Values{"id": {"github:a/one#1"}, "repo": {strings.Repeat("r", maxPinRepoBytes+1)}, "n": {"1"}}.Encode()
+	if _, ok := parseSelections([]string{repo}); ok {
+		t.Error("an oversized repository was read")
+	}
+	if c.postCount() != 0 {
+		t.Errorf("posts = %d", c.postCount())
+	}
+}
