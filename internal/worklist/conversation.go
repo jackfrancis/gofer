@@ -128,6 +128,13 @@ type Message struct {
 	// no HiddenRev either, so its ReadRev of 0 says nothing: such a draft never counts
 	// as redundant (RedraftRedundant). Cleared on a reply, as the revisions are.
 	ReadRevKnown bool `json:"read_rev_known,omitempty"`
+	// Refused and RefusedAttempt record, on a user turn, that the backend certainly
+	// refused the dispatch of attempt RefusedAttempt (ingest.ErrNotAccepted), so no
+	// run exists for it: while that is still the turn's attempt it can no longer be
+	// answered (WorkItem.Ended). A retry starts a new attempt, which they do not
+	// cover. The web tier's alone: AppendReply clears them on a reply.
+	Refused        bool   `json:"refused,omitempty"`
+	RefusedAttempt string `json:"refused_attempt,omitempty"`
 	// Notice marks an agent turn that is a system notice (NoticeReconnect), not an
 	// answer: it does not answer the turn it replies to. Empty on every other turn.
 	Notice string `json:"notice,omitempty"`
@@ -339,10 +346,30 @@ func (w WorkItem) Answered(key string) bool {
 	return ok
 }
 
-// Ended reports whether a system notice ended the current attempt at the user turn
-// with key (noticed): its run is done, so it can no longer answer that attempt.
+// Ended reports whether the current attempt at the user turn with key can no longer
+// be answered: a system notice ended it (noticed), or the backend certainly refused
+// its dispatch (Refused, for that very attempt).
 func (w WorkItem) Ended(key string) bool {
-	return w.noticed()[key]
+	if w.noticed()[key] {
+		return true
+	}
+	i, ok := w.TurnIndex(key)
+	return ok && w.Thread[i].Refused && w.Thread[i].RefusedAttempt == w.Thread[i].Attempt
+}
+
+// MarkRefused records that the backend certainly refused the dispatch of attempt at
+// the user turn with key, so no run exists for it (Ended). It applies only while that
+// attempt is the turn's current one and the turn has no answer, and reports whether
+// it changed anything. The web tier calls it inside the store update that saves it.
+func (w *WorkItem) MarkRefused(key, attempt string) bool {
+	i, ok := w.TurnIndex(key)
+	if !ok || w.Thread[i].Role != RoleUser || w.Thread[i].Attempt != attempt || w.Answered(key) ||
+		(w.Thread[i].Refused && w.Thread[i].RefusedAttempt == attempt) {
+		return false
+	}
+	w.Thread = slices.Clone(w.Thread)
+	w.Thread[i].Refused, w.Thread[i].RefusedAttempt = true, attempt
+	return true
 }
 
 // TurnIndex returns the position of the turn with key.
@@ -439,12 +466,11 @@ func (w WorkItem) Reviewed(rev Revision) bool {
 // is stale, and drafting again (never counted redundant once a turn follows it) is
 // the way forward, not another review. A draft reply without a revision, a hidden
 // one, or a notice says nothing.
-func (w WorkItem) ReviewOutdated() bool { return w.ReviewOutdatedAt() >= 0 }
+func (w WorkItem) ReviewOutdated() bool { return w.reviewOutdatedAt() >= 0 }
 
-// ReviewOutdatedAt returns the position of the draft reply that makes the latest
-// review outdated (ReviewOutdated), or -1. Review requests after it are the ones
-// asked for the current revision.
-func (w WorkItem) ReviewOutdatedAt() int {
+// reviewOutdatedAt returns the position of the draft reply that makes the latest
+// review outdated (ReviewOutdated), or -1.
+func (w WorkItem) reviewOutdatedAt() int {
 	for i := len(w.Thread) - 1; i >= 0; i-- {
 		if !w.IsDraftReviewRequest(i) {
 			continue

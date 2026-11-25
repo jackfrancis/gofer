@@ -236,7 +236,7 @@
           <input type="hidden" name="id" value="{{$.Item.ID}}">
           {{with .AgainKey}}<input type="hidden" name="review" value="retry">
           <input type="hidden" name="turn" value="{{.}}">{{else}}<input type="hidden" name="review" value="again">{{end}}
-          <button class="btn btn-sm" type="submit"{{if not .ReviewReady}} disabled title="{{.AgainWhy}}"{{else if .AgainKey}} title="Runs the review of the current revision asked for earlier again."{{else}} title="Reviews the pull request as it stands now, keeping this conversation."{{end}}>{{if .AgainKey}}Retry the review of the current revision{{else}}Review the current revision{{end}}</button>
+          <button class="btn btn-sm" type="submit"{{if not .ReviewReady}} disabled title="{{.AgainWhy}}"{{else if .AgainKey}} title="Runs the review asked for earlier again, as it was asked; a review reads the pull request as it stands."{{else}} title="Reviews the pull request as it stands now, keeping this conversation."{{end}}>{{if .AgainKey}}Retry the earlier review{{else}}Review the current revision{{end}}</button>
         </form>
         {{if not .ReviewReady}}<p class="zz-meta zz-why">{{.AgainWhy}}</p>{{end}}
       </div>

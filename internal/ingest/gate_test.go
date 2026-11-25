@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -397,5 +398,26 @@ func TestRetryWindowStartsWhenSubmitSucceeds(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// A converse dispatch the backend certainly refused names its turn (RunRefusedError,
+// still matching ErrNotAccepted), alone or inside a batch's joined errors.
+func TestRefusedRunsNameTheirTurns(t *testing.T) {
+	d := &gateDispatcher{phase: "Succeeded", failNext: true}
+	ig := New(d, "", "", nil, "", "")
+	ref := worklist.TurnRef{Item: "github:o/r#1", Turn: "q", Attempt: "a1"}
+	err := ig.Converse(context.Background(), "github:1", ref, "", "")
+	if !errors.Is(err, ErrNotAccepted) {
+		t.Fatalf("err = %v", err)
+	}
+	if got := RefusedRuns(err); len(got) != 1 || got[0] != ref {
+		t.Errorf("RefusedRuns = %+v", got)
+	}
+	if got := RefusedRuns(errors.Join(errors.New("other"), err)); len(got) != 1 || got[0] != ref {
+		t.Errorf("RefusedRuns of a joined error = %+v", got)
+	}
+	if got := RefusedRuns(errors.New("uncertain")); len(got) != 0 {
+		t.Errorf("an uncertain error named a refused run: %+v", got)
 	}
 }

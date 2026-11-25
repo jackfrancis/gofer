@@ -41,9 +41,12 @@ review's text is written by a model, so this feature needs that rule amended.
    hidden request is not retried until the user unhides it, and a 2nd opinion only
    blind, by a model it may use, so an older ordinary request is offered past a 2nd
    opinion no model can run. A request that may still answer but cannot be retried
-   blocks a new one; once a notice ended its run it no longer can, and a new ordinary
-   review may be asked for. "Review the current revision" retries a re-review already
-   asked for in the same way. A dispatch the backend certainly refused is said so on
+   blocks a new one; once its current attempt can no longer answer (a notice ended its
+   run, or the backend certainly refused its dispatch, which the turn records,
+   `Message.Refused`), a new ordinary review may be asked for. "Review the current
+   revision" retries any unanswered review request in the same way, wherever it sits:
+   a request records no revision, so a later draft of the same revision does not make
+   an outstanding re-review a stranger. A dispatch the backend certainly refused is said so on
    the thread (about that attempt, and not while a later one runs) and leaves the turn
    retryable at once; an uncertain one stays pending.
    It is not shown while drafting again would only repeat the offered draft

@@ -1104,7 +1104,7 @@ func TestRefusedReReviewIsRetried(t *testing.T) {
 		t.Fatalf("thread after the refused re-review: %+v", it.Thread)
 	}
 	page := pageAt(t, h, rec.Header().Get("Location"))
-	if !strings.Contains(page, ">Retry the review of the current revision</button>") || !strings.Contains(page, `name="turn" value="`+asked.ID+`"`) || !strings.Contains(page, "That review attempt did not start") {
+	if !strings.Contains(page, ">Retry the earlier review</button>") || !strings.Contains(page, `name="turn" value="`+asked.ID+`"`) || !strings.Contains(page, "That review attempt did not start") {
 		t.Errorf("the refused re-review is not offered for retry:\n%s", page)
 	}
 	postReview(h, "again") // the old form, clicked again during the outage
@@ -1121,5 +1121,72 @@ func TestRefusedReReviewIsRetried(t *testing.T) {
 	// running, it shows no refusal.
 	if page := pageAt(t, h, rec.Header().Get("Location")); strings.Contains(page, "That review attempt did not start") {
 		t.Error("a superseded refusal is still shown while the retry runs")
+	}
+}
+
+// An outstanding re-review stays the one to retry even after a later draft read the
+// same revision: requests record no revision, so any unanswered one, wherever it sits,
+// is retried rather than a second asked for while the first can still finish.
+func TestOutstandingReReviewSurvivesARedraft(t *testing.T) {
+	const pushed = "fedcba9876543210fedcba9876543210fedcba98"
+	ago := func(d time.Duration) time.Time { return time.Now().Add(-d) }
+	th := draftedThread(ago(time.Hour))
+	th[1].Head, th[1].Base = draftCommit, "main"
+	th[3].Head, th[3].Base = pushed, "main"
+	th = append(th,
+		worklist.Message{ID: "rr", Role: worklist.RoleUser, Content: reviewAgainPrompt, Kind: worklist.KindReviewRequest, At: ago(12 * time.Minute)},
+		worklist.Message{ID: "d2", Role: worklist.RoleUser, Content: draftReviewPrompt, Kind: worklist.KindDraftReviewRequest, At: ago(6 * time.Minute)},
+		worklist.Message{ID: "a2", ReplyTo: "d2", Role: worklist.RoleAgent, Content: "The latest review is out of date.", Head: pushed, Base: "main", At: ago(6 * time.Minute)},
+	)
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	h, p, store := draftFixture(t, c, th)
+	page, _ := threadPage(t, h)
+	if !strings.Contains(page, `name="turn" value="rr"`) || !strings.Contains(page, ">Retry the earlier review</button>") || strings.Contains(page, `name="review" value="again"`) {
+		t.Errorf("the outstanding re-review is not the one offered:\n%s", page)
+	}
+	postReview(h, "again")
+	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); len(it.Thread) != len(th) || len(p.turns) != 0 {
+		t.Fatalf("a second re-review was asked for: %d turns, dispatched %+v", len(it.Thread), p.turns)
+	}
+	postReview(h, "retry", "rr")
+	if len(p.turns) != 1 || p.turns[0].Turn != "rr" {
+		t.Errorf("the outstanding re-review was not retried: %+v", p.turns)
+	}
+}
+
+// A dispatch the backend certainly refused is recorded on the turn for that attempt,
+// so a 2nd opinion whose only attempts never ran blocks nothing, even with no model
+// left to retry it; a later attempt is not covered by an earlier refusal.
+func TestRefusedSecondOpinionDoesNotBlock(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	// The 2nd opinion submission itself records the refusal.
+	h, p, store := draftFixture(t, c, draftedThread(time.Now().Add(-time.Hour))[:2])
+	p.err = ingest.ErrNotAccepted
+	req := httptest.NewRequest(http.MethodPost, "/items/second-opinion", strings.NewReader(url.Values{"id": {draftItemID}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.SecondOpinion(httptest.NewRecorder(), req)
+	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+	last := it.Thread[len(it.Thread)-1]
+	if !last.IsPanelReview() || !last.Refused || last.RefusedAttempt != "" || !it.Ended(last.ID) {
+		t.Fatalf("the refused 2nd opinion was not recorded: %+v", last)
+	}
+	// A day later, with no model left to retry it, it blocks nothing.
+	panel := worklist.Message{ID: "q", Role: worklist.RoleUser, Content: worklist.IndependentReviewPrompt, Kind: worklist.KindReviewRequest, Refused: true, At: time.Now().Add(-24 * time.Hour)}
+	h, p, _ = draftFixture(t, c, []worklist.Message{panel})
+	h.options = nil
+	if page, _ := threadPage(t, h); !strings.Contains(page, ">Review this pull request</button>") {
+		t.Errorf("a refused 2nd opinion still blocks a first review:\n%s", page)
+	}
+	postReview(h, "first")
+	if len(p.converses) != 1 || len(p.secondOpinions) != 0 {
+		t.Errorf("first review beside a refused 2nd opinion: converses %v, second opinions %v", p.converses, p.secondOpinions)
+	}
+	// A refusal covers only its attempt: a retry's new attempt may still answer.
+	retried := panel
+	retried.Attempt = "a2"
+	h, p, _ = draftFixture(t, c, []worklist.Message{retried})
+	h.options = nil
+	if page, _ := threadPage(t, h); strings.Contains(page, ">Review this pull request</button>") {
+		t.Error("a refusal of an earlier attempt unblocked a later one")
 	}
 }

@@ -624,6 +624,37 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, back, http.StatusSeeOther)
 }
 
+// markRefused records on each turn in refs that the backend certainly refused the
+// dispatch of that attempt (worklist.WorkItem.MarkRefused), so a request whose only
+// attempt never ran is known to be unable to answer and blocks nothing. It runs
+// detached from the request, under undoRetryTimeout; a failure only logs, and the
+// turn's outcome then stays unknown.
+func (h *Handler) markRefused(ctx context.Context, ownerID string, refs []worklist.TurnRef) {
+	if len(refs) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoRetryTimeout)
+	defer cancel()
+	err := h.store.Update(ctx, ownerID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		var changed []worklist.WorkItem
+		for _, it := range current {
+			marked := false
+			for _, ref := range refs {
+				if ref.Item == it.ID && it.MarkRefused(ref.Turn, ref.Attempt) {
+					marked = true
+				}
+			}
+			if marked {
+				changed = append(changed, it)
+			}
+		}
+		return changed, nil
+	})
+	if err != nil {
+		slog.WarnContext(ctx, "dispatch refused, and recording it failed", "user", ownerID, "err", err)
+	}
+}
+
 // undoRefusedRetry puts back the turn a retry re-stamped (stamp) after the backend
 // refused its dispatch (ingest.ErrNotAccepted), so the page offers it again at once,
 // reporting whether it did. It runs detached from the request, under
@@ -943,6 +974,7 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		opt, _ := h.resolveOption(strings.TrimSpace(r.FormValue("choice")))
 		err := h.pipeline.ReviewAll(r.Context(), user.ID, refs, opt.Endpoint, opt.Model)
 		h.revertShared(r.Context(), user.ID, err, retries)
+		h.markRefused(r.Context(), user.ID, ingest.RefusedRuns(err))
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
@@ -1024,7 +1056,10 @@ func (h *Handler) SecondOpinion(w http.ResponseWriter, r *http.Request) {
 		return true
 	}
 	if h.appendTurnIf(r.Context(), user.ID, id, msg, ready) {
-		_ = h.pipeline.SecondOpinion(r.Context(), user.ID, worklist.TurnRef{Item: id, Turn: msg.ID}, opt.Endpoint, opt.Model)
+		ref := worklist.TurnRef{Item: id, Turn: msg.ID}
+		if err := h.pipeline.SecondOpinion(r.Context(), user.ID, ref, opt.Endpoint, opt.Model); errors.Is(err, ingest.ErrNotAccepted) {
+			h.markRefused(r.Context(), user.ID, []worklist.TurnRef{ref})
+		}
 	}
 	http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
 }
@@ -1112,10 +1147,13 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 		for i, d := range plan {
 			refs[i] = d.ref
 		}
-		_ = h.pipeline.SecondOpinionAll(r.Context(), user.ID, refs, plan[0].opt.Endpoint, plan[0].opt.Model)
+		err := h.pipeline.SecondOpinionAll(r.Context(), user.ID, refs, plan[0].opt.Endpoint, plan[0].opt.Model)
+		h.markRefused(r.Context(), user.ID, ingest.RefusedRuns(err))
 	} else {
 		for _, d := range plan {
-			_ = h.pipeline.SecondOpinion(r.Context(), user.ID, d.ref, d.opt.Endpoint, d.opt.Model)
+			if err := h.pipeline.SecondOpinion(r.Context(), user.ID, d.ref, d.opt.Endpoint, d.opt.Model); errors.Is(err, ingest.ErrNotAccepted) {
+				h.markRefused(r.Context(), user.ID, []worklist.TurnRef{d.ref})
+			}
 		}
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)

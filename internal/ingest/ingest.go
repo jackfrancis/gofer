@@ -78,6 +78,41 @@ func (e *RunSharedError) Error() string {
 // Is matches ErrRunShared.
 func (e *RunSharedError) Is(target error) bool { return target == ErrRunShared }
 
+// RunRefusedError reports that the backend certainly refused the dispatch for Ref
+// (it wraps an error matching ErrNotAccepted), so no run exists for that attempt.
+type RunRefusedError struct {
+	Ref worklist.TurnRef
+	Err error
+}
+
+func (e *RunRefusedError) Error() string {
+	return fmt.Sprintf("item %s, turn %s: %v", e.Ref.Item, e.Ref.Turn, e.Err)
+}
+
+func (e *RunRefusedError) Unwrap() error { return e.Err }
+
+// RefusedRuns returns the turns err reports as certainly refused (RunRefusedError):
+// err may be one dispatch's error or a batch's joined errors.
+func RefusedRuns(err error) []worklist.TurnRef {
+	var out []worklist.TurnRef
+	var walk func(error)
+	walk = func(err error) {
+		switch e := err.(type) {
+		case nil:
+		case *RunRefusedError:
+			out = append(out, e.Ref)
+		case interface{ Unwrap() []error }:
+			for _, inner := range e.Unwrap() {
+				walk(inner)
+			}
+		case interface{ Unwrap() error }:
+			walk(e.Unwrap())
+		}
+	}
+	walk(err)
+	return out
+}
+
 // SharedRuns returns the turns err reports as sharing a run already in flight: err
 // may be one dispatch's error or a batch's joined errors.
 func SharedRuns(err error) []worklist.TurnRef {
@@ -666,6 +701,9 @@ func (i *Ingestor) dispatchConverse(ctx context.Context, ownerID string, ref wor
 		Deadline:   converseDeadline,
 	})
 	i.settle(key, mine, id, err)
+	if errors.Is(err, ErrNotAccepted) {
+		return &RunRefusedError{Ref: ref, Err: err} // still matches ErrNotAccepted
+	}
 	return err
 }
 

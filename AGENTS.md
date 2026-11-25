@@ -695,9 +695,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   turn: same turn, new attempt, so the gate shares a run in flight and the store keeps
   one answer), for the newest one it can retry (`retryCandidate`: visible, a 2nd
   opinion only blind), and a request that may still answer but cannot be retried
-  (hidden, or a 2nd opinion no model may run) blocks a new one until a notice ends it
-  (`reviewBlocker`, `WorkItem.Ended`); "Review the current revision" likewise retries
-  a re-review already asked for (`WorkItem.ReviewOutdatedAt`); a definite dispatch
+  (hidden, or a 2nd opinion no model may run) blocks a new one until its attempt can
+  no longer answer (`reviewBlocker`, `WorkItem.Ended`: a notice ended it, or the
+  backend certainly refused it, recorded by `WorkItem.MarkRefused` from every review
+  dispatch site, batches through `ingest.RefusedRuns`); "Review the current revision"
+  likewise retries any unanswered review request, wherever it sits (requests record
+  no revision), instead of asking again; a definite dispatch
   refusal shows on the thread (`review_refused`, describing that attempt, hidden
   while a later one runs) and leaves the turn retryable at once (a disabled draft
   button says why in text: Safari
