@@ -630,7 +630,13 @@ Wired on the web-tier side; they define what a runtime must respect:
   agrees the pull request is ready to approve: the review body then ends with
   `worklist.ApprovalCommands`, `/lgtm` and `/approve` on lines of their own, a flag
   apart from the summary so its bound never cuts them, offered as its own checkbox
-  and joined by `worklist.ReviewBody`), pinned to the repository, number, head
+  and joined by `worklist.ReviewBody`; an approval stands only on a draft pinned to
+  the commit the latest visible review read, `WorkItem.ReviewedHead` from the
+  `Message.Head` every converse reply on a pull request records, checked by the run
+  and again by `AppendReply`; model-written draft text has every bot-command line
+  made inert, `worklist.NeutralizeCommands` in `BoundDraft`, so the checkbox is the
+  only source of a command; GitHub's submit dialog can replace the body, so the body
+  sent is kept on the receipt, `DraftReceipt.Body`, and shown to copy), pinned to the repository, number, head
   commit and base branch it was anchored to, with each commented file's patch digest
   (`DraftReview.Patches`, `worklist.PatchDigest` = `ghcomment.PatchDigest`). Context lines anchor RIGHT only, as
   GitHub defines them, and the annotated diff stays within its byte budget, notices

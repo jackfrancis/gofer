@@ -358,6 +358,10 @@ body {
 .zz-draft-text { margin: 0 0 0 22px; padding: 6px 8px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; background: var(--bg-subtle); border-radius: 6px; }
 .zz-draft-receipt { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); font-size: 13px; }
 .zz-draft-receipt a { color: var(--accent); }
+.zz-review-body { margin: 10px 0; display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.zz-review-body p { margin: 0; }
+.zz-review-body .zz-draft-text { margin: 0; }
+.zz-review-body .zz-copy { align-self: flex-start; }
 
 /* Commenting with a personal access token (ADR 0011). */
 .zz-token { margin: -6px 0 12px; font-size: 13px; }

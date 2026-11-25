@@ -286,3 +286,98 @@ func TestApprovingDraft(t *testing.T) {
 		}
 	}
 }
+
+// The store keeps an approval only on a draft pinned to the commit the latest
+// visible review read, whatever the run sent: a review of an earlier head, one that
+// recorded none, or one the owner hid since does not approve this commit. A reply's
+// head is kept only when it is a full commit id.
+func TestAppendReplyApprovalNeedsTheReviewedHead(t *testing.T) {
+	const older = "fedcba9876543210fedcba9876543210fedcba98"
+	approving := func(comments ...DraftComment) *DraftReview {
+		d := pinned("", comments...)
+		d.Approve = true
+		return d
+	}
+	thread := func(reviewHead string) WorkItem {
+		return draftPR(
+			Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+			Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: reviewHead},
+			Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest},
+		)
+	}
+	item := thread(testCommit)
+	if _, err := AppendReply(&item, "d", Message{ID: "a", Content: "approve", Draft: approving()}); err != nil {
+		t.Fatal(err)
+	}
+	if d := item.Thread[3].Draft; d == nil || !d.Approve {
+		t.Fatalf("approval of the reviewed head = %+v", d)
+	}
+	for name, it := range map[string]WorkItem{"older head": thread(older), "no head": thread("")} {
+		if _, err := AppendReply(&it, "d", Message{ID: "a", Content: "approve", Draft: approving()}); err != nil {
+			t.Fatal(err)
+		}
+		if d := it.Thread[3].Draft; d != nil {
+			t.Errorf("%s: approval-only draft kept: %+v", name, d)
+		}
+	}
+	it := thread(older)
+	if _, err := AppendReply(&it, "d", Message{ID: "a", Content: "approve", Draft: approving(DraftComment{Path: "a.go", Line: 1, Body: "nit"})}); err != nil {
+		t.Fatal(err)
+	}
+	if d := it.Thread[3].Draft; d == nil || d.Approve || len(d.Comments) != 1 {
+		t.Errorf("stale approval beside a comment: %+v", d)
+	}
+	// A newer review of another head, landing after the approved one, is the latest.
+	it = draftPR(
+		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "q2", Role: RoleUser, Content: IndependentReviewPrompt, Kind: KindReviewRequest},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit},
+		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: older},
+	)
+	if got := it.ReviewedHead(); got != older {
+		t.Errorf("ReviewedHead = %q, want the review that landed last", got)
+	}
+	it.Thread[3].Hidden = true
+	if got := it.ReviewedHead(); got != testCommit {
+		t.Errorf("ReviewedHead with the latest hidden = %q", got)
+	}
+	// Heads are normalized or dropped on the way in.
+	it = draftPR(Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest}, Message{ID: "q2", Role: RoleUser, Content: "again", Kind: KindReviewRequest})
+	if _, err := AppendReply(&it, "q", Message{ID: "a", Content: "ok", Head: strings.ToUpper(testCommit)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AppendReply(&it, "q2", Message{ID: "b", Content: "ok", Head: "main"}); err != nil {
+		t.Fatal(err)
+	}
+	if it.Thread[2].Head != testCommit || it.Thread[3].Head != "" {
+		t.Errorf("heads stored: %q, %q", it.Thread[2].Head, it.Thread[3].Head)
+	}
+}
+
+// Model-written draft text never carries a live bot command: a line a bot would
+// read as one (any command, approval or not) has its command wrapped in backticks,
+// in the summary and in every comment, so the approval checkbox is the only source
+// of /lgtm and /approve. Paths and ordinary prose are left alone.
+func TestDraftTextCarriesNoCommands(t *testing.T) {
+	for in, want := range map[string]string{
+		"/lgtm":                          "`/lgtm`",
+		"Looks good.\n/approve\nThanks!": "Looks good.\n`/approve`\nThanks!",
+		"  /LGTM cancel":                 "  `/LGTM` cancel",
+		"/hold\r\n/retest":               "`/hold`\r\n`/retest`",
+		"/usr/bin/env is fine":           "/usr/bin/env is fine",
+		"run `/lgtm` when ready":         "run `/lgtm` when ready",
+		"- /approve once tests pass":     "- /approve once tests pass",
+		"// a Go comment":                "// a Go comment",
+		"```suggestion\n/approve\n```":   "```suggestion\n`/approve`\n```",
+		"ratio is a/b":                   "ratio is a/b",
+	} {
+		if got := NeutralizeCommands(in); got != want {
+			t.Errorf("NeutralizeCommands(%q) = %q, want %q", in, got, want)
+		}
+	}
+	d := pinned("Ship it.\n/lgtm", DraftComment{Path: "a.go", Line: 1, Body: "nit\n/approve"})
+	got := BoundDraft(d)
+	if got.Body != "Ship it.\n`/lgtm`" || got.Comments[0].Body != "nit\n`/approve`" || got.Approve {
+		t.Errorf("bounded draft = %+v", got)
+	}
+}

@@ -41,6 +41,8 @@ func draftGitHub(t *testing.T, state string) string {
 				"state": state, "head": map[string]any{"sha": draftHead},
 				"base": map[string]any{"ref": "main", "repo": map[string]any{"full_name": "o/r"}},
 			})
+		case "/repos/o/r/issues/1":
+			_, _ = w.Write([]byte(`{"body":"desc"}`))
 		case "/repos/o/r/pulls/1/files":
 			_ = json.NewEncoder(w).Encode([]map[string]any{
 				{"filename": "a.go", "status": "modified", "patch": draftPatch},
@@ -60,7 +62,7 @@ func draftItem() worklist.WorkItem {
 		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, Title: "t"},
 		Thread: []worklist.Message{
 			{ID: "q", Role: worklist.RoleUser, Content: "review?", Kind: worklist.KindReviewRequest},
-			{ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "rename new1", Model: "m1"},
+			{ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "rename new1", Model: "m1", Head: draftHead},
 			{ID: "h", Role: worklist.RoleUser, Content: "secret aside", Hidden: true},
 			{ID: "d", Role: worklist.RoleUser, Content: "draft", Kind: worklist.KindDraftReviewRequest},
 		},
@@ -199,6 +201,72 @@ func TestRunConverseDraftsApproval(t *testing.T) {
 		if !strings.Contains(m.Content, want) {
 			t.Errorf("reply lacks %q:\n%s", want, m.Content)
 		}
+	}
+}
+
+// An approval is of the commit the latest review read: when the head moved since,
+// or that review recorded no commit, the run drafts no approval and says why, while
+// the agreed comments still stand.
+func TestRunConverseWithholdsStaleApproval(t *testing.T) {
+	for name, head := range map[string]string{"pushed since": "fedcba9876543210fedcba9876543210fedcba98", "unrecorded": ""} {
+		t.Run(name, func(t *testing.T) {
+			item := draftItem()
+			item.Thread[1].Head = head
+			sink := &memSink{items: []worklist.WorkItem{item}}
+			fd := &fakeDrafter{prop: worklist.DraftProposal{Approve: true}}
+			err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: item.ID, Turn: "d", Converser: &fakeConverser{}, Drafter: fd},
+				fakeVendor{token: "t"}, sink)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fd.got.Head != draftHead {
+				t.Errorf("drafter told head %q", fd.got.Head)
+			}
+			th := sink.items[0].Thread
+			m := th[len(th)-1]
+			if m.Draft != nil {
+				t.Fatalf("stale approval drafted: %+v", m.Draft)
+			}
+			for _, want := range []string{"No approval drafted", "`0123456789ab`", "Review the pull request again"} {
+				if !strings.Contains(m.Content, want) {
+					t.Errorf("reply lacks %q:\n%s", want, m.Content)
+				}
+			}
+			if strings.Contains(m.Content, "Nothing to draft") {
+				t.Errorf("reply says nothing to draft:\n%s", m.Content)
+			}
+		})
+	}
+	item := draftItem()
+	item.Thread[1].Head = "fedcba9876543210fedcba9876543210fedcba98"
+	sink := &memSink{items: []worklist.WorkItem{item}}
+	fd := &fakeDrafter{prop: worklist.DraftProposal{Approve: true, Comments: []worklist.DraftComment{{Path: "a.go", Line: 11, Side: "RIGHT", Body: "Rename."}}}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: item.ID, Turn: "d", Converser: &fakeConverser{}, Drafter: fd},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	th := sink.items[0].Thread
+	if d := th[len(th)-1].Draft; d == nil || d.Approve || len(d.Comments) != 1 {
+		t.Errorf("comments beside a stale approval = %+v", d)
+	}
+}
+
+// A review's reply records the head commit the run read, which a later approval
+// must match.
+func TestRunConverseRecordsReviewedHead(t *testing.T) {
+	item := draftItem()
+	item.Thread = item.Thread[:1]
+	sink := &memSink{items: []worklist.WorkItem{item}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: item.ID, Turn: "q", Converser: &fakeConverser{reply: "LGTM"}},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	th := sink.items[0].Thread
+	if m := th[len(th)-1]; m.ReplyTo != "q" || m.Head != draftHead {
+		t.Fatalf("reply = %+v", m)
+	}
+	if got := sink.items[0].ReviewedHead(); got != draftHead {
+		t.Errorf("ReviewedHead = %q", got)
 	}
 }
 

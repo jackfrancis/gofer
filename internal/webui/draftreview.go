@@ -152,7 +152,11 @@ type draftResult struct {
 	Comments int    // inline comments sent
 	Summary  bool   // the summary was sent
 	Approve  bool   // the approval commands were sent
-	Error    string
+	// Body is the review body sent (the summary and approval kept), shown to copy:
+	// GitHub's dialog for submitting a pending review can open with an empty summary
+	// that replaces it.
+	Body  string
+	Error string
 }
 
 // CreateDraftReview handles POST /items/draft-review/create (same-origin only). It
@@ -281,14 +285,14 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusBadGateway, "gofer could not create the pending review right now; nothing was created. Try again in a moment.")
 		return
 	case res.Created:
-		settle(&worklist.DraftReceipt{State: worklist.DraftCreated, URL: res.URL, At: claimedAt})
+		settle(&worklist.DraftReceipt{State: worklist.DraftCreated, URL: res.URL, Body: rv.Body, At: claimedAt})
 	case res.Unknown:
-		settle(&worklist.DraftReceipt{State: worklist.DraftUnknown, At: claimedAt})
+		settle(&worklist.DraftReceipt{State: worklist.DraftUnknown, Body: rv.Body, At: claimedAt})
 	default:
 		settle(nil) // GitHub certainly created nothing: the owner may try again
 	}
 	slog.InfoContext(ctx, "pending review", "user", user.ID, "created", res.Created, "unknown", res.Unknown, "comments", len(rv.Comments), "approve", approve)
-	view := draftResult{Item: it, Created: res.Created, Unknown: res.Unknown, URL: res.URL, Comments: len(rv.Comments), Summary: summary != "", Approve: approve, Error: res.Error}
+	view := draftResult{Item: it, Created: res.Created, Unknown: res.Unknown, URL: res.URL, Comments: len(rv.Comments), Summary: summary != "", Approve: approve, Body: rv.Body, Error: res.Error}
 	status := http.StatusOK
 	if !res.Created && !res.Unknown {
 		status = http.StatusConflict
@@ -325,7 +329,7 @@ func (v draftResult) Parts() string {
 // renderReceipt answers a confirmation of a draft already confirmed: what the
 // earlier one did, with nothing sent to GitHub now.
 func (h *Handler) renderReceipt(w http.ResponseWriter, user *session.User, it worklist.WorkItem, rec *worklist.DraftReceipt) {
-	view := draftResult{Item: it, Repeat: true, Created: rec.State == worklist.DraftCreated, URL: rec.URL}
+	view := draftResult{Item: it, Repeat: true, Created: rec.State == worklist.DraftCreated, URL: rec.URL, Body: rec.Body}
 	if !view.Created {
 		view.Unknown = true
 		view.Error = "An earlier confirmation of this draft may have created a pending review: its answer was lost, or it was interrupted. Check the pull request on GitHub. gofer will not create another review from this draft; draft the comments again to start over."

@@ -125,6 +125,32 @@ approval out, or the reverse. The flag is part of the draft, so its `Digest` cov
 The review is still created pending: the commands take effect only when the owner
 submits it on GitHub.
 
+**An approval is of the commit the reviews read.** Every converse reply on a pull
+request records the head commit its run read (`Message.Head`, a full commit id or
+nothing). `WorkItem.ReviewedHead` is the head the latest visible review read (the
+visible answer to a visible review request that landed last). An approval stands only
+on a draft pinned to that commit: the run withholds one when the head moved since, or
+the review recorded none, and says so ("review again"), and `AppendReply` clears the
+flag on the same rule, whatever the run sent. The drafter is also told the head and
+the commit each assistant turn read. So a push between the review and the draft never
+turns an approval of the old commit into one of the new; the draft's own pin (head
+checked against GitHub before creating) covers a push after it.
+
+**The checkbox is the only source of a command.** Model-written text is stored with
+every line a bot would read as a command (`/word` at the start of a line: `/lgtm`,
+`/approve`, `/hold`, `/retest`, ...) made inert, its command wrapped in backticks
+(`worklist.NeutralizeCommands`, in `BoundDraft`, so the preview shows the stored
+text). Unchecking the approval therefore leaves no approval command in what is sent.
+A path such as `/usr/bin/env` is not a command line and stays as written.
+
+**GitHub's submit dialog can drop the body.** GitHub's "Finish your review" dialog can
+open with an empty summary, and submitting it replaces the body gofer created, while
+inline comments survive: the review looks submitted, and the approval commands never
+reach Prow. gofer keeps the review pending, records the body it sent on the receipt
+(`DraftReceipt.Body`), and shows it, with a copy button and that warning, on the
+result page, on a replay, and in the thread's receipt, to paste into the dialog's
+summary before submitting. The same applies to any summary.
+
 ### Once per draft
 
 ADR 0009's confirm consumes a one-time nonce held in memory. GitHub's

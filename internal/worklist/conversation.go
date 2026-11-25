@@ -122,7 +122,13 @@ type Message struct {
 	// DraftReceipt records the owner's confirmation of Draft (draft.go): written by
 	// the web tier only (ClaimDraft, SettleDraft), never by a run.
 	DraftReceipt *DraftReceipt `json:"draft_receipt,omitempty"`
-	At           time.Time     `json:"at"`
+	// Head is the pull request's head commit a converse run read before it wrote
+	// this agent turn (a full commit id; AppendReply drops anything else). An
+	// approving draft stands only on the head its latest review read (ReviewedHead).
+	// Empty on user turns, on non-pull-request items, and on replies stored before it
+	// was recorded.
+	Head string    `json:"head,omitempty"`
+	At   time.Time `json:"at"`
 }
 
 // ParseVerdict extracts the leading verdict token the consensus synthesis is asked to
@@ -347,6 +353,25 @@ func (w WorkItem) hasCompletedRequest(kind string) bool {
 // HasReview reports whether the item has at least one completed review (a review
 // request answered by the assistant).
 func (w WorkItem) HasReview() bool { return w.hasCompletedRequest(KindReviewRequest) }
+
+// ReviewedHead returns the head commit the latest review read: the Head of the
+// visible answer to a visible review request that landed last in the thread. It is
+// "" when there is no such review, or when that answer recorded no head. An
+// approval drafted from the conversation approves that commit and no other.
+func (w WorkItem) ReviewedHead() string {
+	latest := -1
+	for key, j := range w.replies() {
+		i, ok := w.TurnIndex(key)
+		if !ok || w.Thread[i].Role != RoleUser || w.Thread[i].Kind != KindReviewRequest || w.Thread[i].Hidden || w.Thread[j].Hidden {
+			continue
+		}
+		latest = max(latest, j)
+	}
+	if latest < 0 {
+		return ""
+	}
+	return w.Thread[latest].Head
+}
 
 // FirstReviewModel returns the chat model that produced the item's first visible
 // completed review — the Model stamped on the answer to the first review request

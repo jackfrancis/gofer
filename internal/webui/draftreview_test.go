@@ -482,3 +482,55 @@ func TestCreateDraftReviewApprovalOnly(t *testing.T) {
 		t.Errorf("result page:\n%s", rec.Body.String())
 	}
 }
+
+// GitHub's submit dialog can open with an empty summary that replaces the review's
+// body, so the body sent is recorded on the receipt and shown, with a copy button
+// and the warning, on the result page, on a replay, and on the thread afterwards; an
+// unknown outcome shows it too. A review of inline comments only has no body to show.
+func TestCreateDraftReviewShowsTheBodyToPaste(t *testing.T) {
+	const want = "- Add a test.\n\n/lgtm\n/approve"
+	th := draftedThread(time.Now().Add(-time.Hour))
+	th[3].Draft.Approve = true
+	form := url.Values{"id": {draftItemID}, "msg": {"a"}, "digest": {th[3].Draft.Digest()}, "summary": {"1"}, "approve": {"1"}}
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true, URL: "https://github.com/o/r/pull/1#pullrequestreview-9"}}
+	h, _, store := draftFixture(t, c, th)
+	shows := func(t *testing.T, where, page string) {
+		t.Helper()
+		for _, s := range []string{
+			"<pre class=\"zz-draft-text\">" + want + "</pre>",
+			`data-copy="- Add a test.` + "\n\n" + `/lgtm` + "\n" + `/approve"`,
+			"Finish your review", "the approval commands would never reach the pull request",
+		} {
+			if !strings.Contains(page, s) {
+				t.Errorf("%s lacks %q", where, s)
+			}
+		}
+	}
+	rec := postCreate(h, form, "Sec-Fetch-Site", "same-origin")
+	shows(t, "result page", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), `<script src="/static/copy.js" defer></script>`) {
+		t.Error("the result page does not load copy.js")
+	}
+	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+	if r := it.Thread[3].DraftReceipt; r == nil || r.State != worklist.DraftCreated || r.Body != want {
+		t.Fatalf("receipt = %+v", r)
+	}
+	page, _ := threadPage(t, h)
+	shows(t, "thread", page)
+	shows(t, "replay", postCreate(h, form, "Sec-Fetch-Site", "same-origin").Body.String())
+
+	th = draftedThread(time.Now().Add(-time.Hour))
+	c = &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Unknown: true, Error: "lost"}}
+	h, _, _ = draftFixture(t, c, th)
+	out := postCreate(h, url.Values{"id": {draftItemID}, "msg": {"a"}, "digest": {th[3].Draft.Digest()}, "summary": {"1"}}, "Sec-Fetch-Site", "same-origin").Body.String()
+	if !strings.Contains(out, "<pre class=\"zz-draft-text\">- Add a test.</pre>") || strings.Contains(out, "approval commands would never") {
+		t.Errorf("unknown outcome page:\n%s", out)
+	}
+
+	th = draftedThread(time.Now().Add(-time.Hour))
+	c = &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true}}
+	h, _, _ = draftFixture(t, c, th)
+	if out := postCreate(h, url.Values{"id": {draftItemID}, "msg": {"a"}, "digest": {th[3].Draft.Digest()}, "c": {"0"}}, "Sec-Fetch-Site", "same-origin").Body.String(); strings.Contains(out, "zz-review-body") {
+		t.Error("a review with no body shows one to paste")
+	}
+}

@@ -93,9 +93,14 @@ type DraftComment struct {
 // nothing, across a restart too; then settled to what happened, or removed when
 // GitHub certainly created nothing, so the owner can try again.
 type DraftReceipt struct {
-	State string    `json:"state"` // DraftCreating | DraftCreated | DraftUnknown
-	URL   string    `json:"url,omitempty"`
-	At    time.Time `json:"at"`
+	State string `json:"state"` // DraftCreating | DraftCreated | DraftUnknown
+	URL   string `json:"url,omitempty"`
+	// Body is the review body sent (ReviewBody of what the owner kept), recorded when
+	// the claim settles to DraftCreated or DraftUnknown. GitHub's dialog for
+	// submitting a pending review can open with an empty summary that replaces it,
+	// so the thread shows it to copy into that dialog.
+	Body string    `json:"body,omitempty"`
+	At   time.Time `json:"at"`
 }
 
 // DraftReceipt states.
@@ -144,9 +149,9 @@ var draftRepo = regexp.MustCompile(`^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`)
 // BoundDraft returns d normalized to what may be stored: nil when its pin (repo,
 // number, full commit id, base branch) is invalid or nothing is left to post;
 // comments with an empty body, an invalid path, a line below 1, an unknown side, or
-// no valid patch digest for their file dropped; text cut to its bound; at most
-// MaxDraftComments comments; patch digests kept for commented files only. A side
-// left empty is RIGHT.
+// no valid patch digest for their file dropped; command lines in the text
+// neutralized (NeutralizeCommands); text cut to its bound; at most MaxDraftComments
+// comments; patch digests kept for commented files only. A side left empty is RIGHT.
 func BoundDraft(d *DraftReview) *DraftReview {
 	if d == nil || !validCommit(d.Commit) || !draftRepo.MatchString(d.Repo) || d.Number <= 0 ||
 		d.BaseRef == "" || len(d.BaseRef) > maxDraftRefBytes || !utf8.ValidString(d.BaseRef) {
@@ -154,7 +159,7 @@ func BoundDraft(d *DraftReview) *DraftReview {
 	}
 	out := &DraftReview{
 		Repo: d.Repo, Number: d.Number, Commit: strings.ToLower(d.Commit), BaseRef: d.BaseRef,
-		Body:    cutText(strings.TrimSpace(d.Body), MaxDraftBodyBytes),
+		Body:    cutText(NeutralizeCommands(strings.TrimSpace(d.Body)), MaxDraftBodyBytes),
 		Approve: d.Approve,
 	}
 	for _, c := range d.Comments {
@@ -170,7 +175,7 @@ func BoundDraft(d *DraftReview) *DraftReview {
 		if body == "" || c.Line < 1 || (side != SideRight && side != SideLeft) || !ValidDraftPath(c.Path) || len(digest) != 64 || !isHex(digest) {
 			continue
 		}
-		out.Comments = append(out.Comments, DraftComment{Path: c.Path, Line: c.Line, Side: side, Body: cutText(body, MaxDraftCommentBytes)})
+		out.Comments = append(out.Comments, DraftComment{Path: c.Path, Line: c.Line, Side: side, Body: cutText(NeutralizeCommands(body), MaxDraftCommentBytes)})
 		if out.Patches == nil {
 			out.Patches = map[string]string{}
 		}
@@ -180,6 +185,21 @@ func BoundDraft(d *DraftReview) *DraftReview {
 		return nil
 	}
 	return out
+}
+
+// commandLine matches a line a bot such as Prow reads as a command: a slash and a
+// command word at the start of the line (after any indentation), then the end of
+// the line or a space. A path such as /usr/bin/x is not one: its word runs into
+// another slash.
+var commandLine = regexp.MustCompile(`(?m)^([ \t]*)(/[A-Za-z][A-Za-z0-9_-]*)([ \t\r].*)?$`)
+
+// NeutralizeCommands returns model-written review text with every command line
+// (commandLine: /lgtm, /approve, /hold, ...) made inert by wrapping its command in
+// backticks, so it reads the same but no longer starts with a slash. A drafted
+// review acts on a pull request only through what the owner selects: its approval
+// commands come from DraftReview.Approve alone, never from the text.
+func NeutralizeCommands(s string) string {
+	return commandLine.ReplaceAllString(s, "$1`$2`$3")
 }
 
 // ValidDraftPath reports whether p can name a file in a diff: a relative path
@@ -360,6 +380,9 @@ type DraftInput struct {
 	ViewerLogin string
 	History     []Message
 	Diff        string
+	// Head is the pull request's head commit the diff shows, which the draft is
+	// anchored to; a history turn's Head is the commit it read.
+	Head string
 }
 
 // DraftProposal is a ReviewDrafter's answer, before the run checks it against the
