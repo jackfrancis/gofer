@@ -1,8 +1,12 @@
 package webui
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackfrancis/gofer/internal/comment"
 	"github.com/jackfrancis/gofer/internal/session"
@@ -21,8 +26,9 @@ import (
 )
 
 // This file is the bulk comment (ADR 0009): select items on the radar, write one
-// comment, preview it, confirm, and gofer posts it to each item as the user, with the
-// separate write grant. Posting happens here in the web tier; nothing is dispatched.
+// comment, press Post, and gofer posts it to each item as the user, with the separate
+// write grant, then shows the results on the radar. Posting happens here in the web
+// tier; nothing is dispatched.
 
 // Commenter posts comments and suggests mentions (comment.Service).
 type Commenter interface {
@@ -32,19 +38,38 @@ type Commenter interface {
 }
 
 const (
-	// maxCommentForm bounds a bulk comment form: the comment, up to MaxTargets ids,
-	// and the hidden fields.
-	maxCommentForm = 2*maxMessageBytes + comment.MaxTargets*512 + 4<<10
+	// maxCommentForm bounds a bulk comment form as sent: the comment percent-encoded
+	// (up to three bytes per byte), up to MaxTargets selections (each its item,
+	// repository and number, encoded twice: a query string inside a form field), and
+	// the hidden fields. The decoded comment and target count are checked apart.
+	maxCommentForm = 3*maxMessageBytes + comment.MaxTargets*maxSelectionBytes + 4<<10
+	// maxSelectionBytes bounds one encoded selection: an ID and a repository of at
+	// most about 150 bytes each, nine bytes apiece once encoded twice, plus the rest.
+	maxSelectionBytes = 3 << 10
 	// postTimeout bounds a whole batch. It runs detached from the browser request,
 	// so a closed tab does not leave a batch half-reported.
 	postTimeout = 5 * time.Minute
-	// previewTTL is how long a preview can be confirmed.
-	previewTTL = 30 * time.Minute
-	// resultTTL is how long a confirmed batch's results are kept against a resubmit.
+	// commentKeyTTL is how long a radar page's comment form can post: its key is
+	// refused after that, and a used key is remembered at least that long, so a
+	// resubmitted form never posts twice.
+	commentKeyTTL = 12 * time.Hour
+	// commentKeySkew is how far ahead of gofer's clock a key's issue time may be.
+	commentKeySkew = time.Minute
+	// resultTTL is the least time a batch's results are kept for the radar to show.
 	resultTTL = time.Hour
-	// maxPreviewsPerOwner and maxRecords bound the previews and results held.
-	maxPreviewsPerOwner = 20
-	maxRecords          = 2000
+	// maxRecords bounds the batches held. Only one that posted nothing is ever
+	// dropped before its key expires; past the bound with none such, posting waits.
+	// A batch retains at most a maxMessageBytes comment, MaxTargets selections
+	// (maxPinIDBytes, maxPinRepoBytes) and results and skipped rows with bounded
+	// display fields (receiptView), about 100 KiB at worst, all in their own
+	// allocations (never the request's buffer), so the records stay near 50 MiB and
+	// the drafts (maxDrafts, at most a comment and selections each) near 20 MiB.
+	maxRecords = 500
+	maxDrafts  = 500
+	// maxPinIDBytes and maxPinRepoBytes bound a selection's item ID and repository
+	// (a GitHub full name is at most 140 bytes); a longer one is unreadable.
+	maxPinIDBytes   = 256
+	maxPinRepoBytes = 256
 	// mentionsTimeout bounds a suggestion request.
 	mentionsTimeout = 15 * time.Second
 	// maxMentionQuery bounds how many repositories one suggestion request may name.
@@ -61,17 +86,25 @@ type commentDetailer interface {
 // UseCommenter turns the bulk comment on.
 func (h *Handler) UseCommenter(c Commenter) { h.commenter = c }
 
-// commentView is the preview and results views' data.
+// commentView is a batch's outcome, shown on the radar.
 type commentView struct {
-	Body    string
-	Targets []comment.Target // what the comment goes (or went) to
-	Skipped []skippedTarget  // selected items it will not go to, and why
-	Nonce   string           // the preview's one-time token, posted back by Confirm
-	Results []comment.Result // results view only
-	Posted  int              // results view: how many were posted
-	Unknown int              // results view: how many may or may not have been posted
-	Repeat  bool             // results view: a resubmit of a batch already posted
-	Error   string           // why nothing was posted
+	Body     string
+	Selected []comment.Target // the rows the form checked (item, repo, number), re-checked when nothing was posted
+	Total    int              // how many items the comment went to
+	Skipped  []skippedTarget  // selected items it did not go to, and why
+	Results  []comment.Result
+	Posted   int    // how many were posted
+	Unknown  int    // how many may or may not have been posted
+	Repeat   bool   // the radar was reached by resubmitting a form already used
+	Running  bool   // the batch is still posting
+	Error    string // why nothing (more) was posted
+}
+
+// Retry reports whether the batch is done and certainly put nothing on GitHub, with
+// a comment to offer again: the radar then shows the comment box open with the same
+// comment and selection, and the reason beside it.
+func (v *commentView) Retry() bool {
+	return v != nil && !v.Running && v.Posted == 0 && v.Unknown == 0 && v.Body != ""
 }
 
 type skippedTarget struct {
@@ -79,69 +112,135 @@ type skippedTarget struct {
 	Reason string
 }
 
-// commentRecord is one previewed comment, registered under its nonce when the
-// preview renders: the comment and the items it previewed, for its owner. Confirm
-// posts exactly what the preview showed, once: the record is consumed (batch set)
-// atomically, and a nonce gofer does not hold (expired, or from before a restart)
-// is refused, never posted.
+// commentRecord is one used comment form, held under the owner and the form's
+// one-time key: a resubmit of the same form shows this batch's results and posts
+// nothing more. A key gofer could not have issued in this process (from before a
+// restart) or that expired is refused, never posted, so a used key never posts
+// twice: it is remembered until it expires.
 type commentRecord struct {
-	owner   string
-	body    string
-	targets []comment.Target // the destinations the preview showed: item, repo, number
 	created time.Time
-	batch   *batch // set once confirmed
+	until   time.Time // when the record can be dropped: no sooner than its key expires
+	batch   *batch
 }
 
-// batch is a confirmed record's run: its results, once done is closed.
+// batch is a used form's run: its results, once done is closed.
 type batch struct {
-	done      chan struct{}
-	view      commentView // valid once done is closed
-	confirmed time.Time
+	done chan struct{}
+	view commentView // valid once done is closed
+}
+
+// finish records view as bt's outcome, bounded for keeping (receiptView).
+func (bt *batch) finish(view commentView) {
+	bt.view = receiptView(view)
+	close(bt.done)
+}
+
+const (
+	// maxReceiptTitle, maxReceiptRepo, maxReceiptText and maxReceiptURL bound the
+	// display fields a receipt keeps from the stored items and GitHub's answers,
+	// which nothing else bounds (a stored title can be any size). A longer text is
+	// cut; a longer link is dropped, as is one that is not http(s).
+	maxReceiptTitle = 200
+	maxReceiptRepo  = 160
+	maxReceiptText  = 300
+	maxReceiptURL   = 256
+)
+
+// receiptView is v as a receipt keeps it: every display field bounded, and no item
+// IDs but the selection's (already bounded). The outcome (Total, Posted, Unknown,
+// and each result's status) is kept whole.
+func receiptView(v commentView) commentView {
+	v.Error = receiptText(v.Error, maxReceiptText)
+	if v.Results != nil {
+		results := make([]comment.Result, len(v.Results))
+		for i, res := range v.Results {
+			results[i] = comment.Result{
+				Target: comment.Target{
+					Repo: receiptText(res.Repo, maxReceiptRepo), Number: res.Number,
+					Title: receiptText(res.Title, maxReceiptTitle), URL: receiptURL(res.URL),
+				},
+				Posted: res.Posted, Unknown: res.Unknown,
+				CommentURL: receiptURL(res.CommentURL), Error: receiptText(res.Error, maxReceiptText),
+			}
+		}
+		v.Results = results
+	}
+	if v.Skipped != nil {
+		skipped := make([]skippedTarget, len(v.Skipped))
+		for i, sk := range v.Skipped {
+			skipped[i] = skippedTarget{Label: receiptText(sk.Label, maxReceiptText), Reason: receiptText(sk.Reason, maxReceiptText)}
+		}
+		v.Skipped = skipped
+	}
+	return v
+}
+
+// receiptText is s cut to at most max bytes, on a character boundary, with an
+// ellipsis, in its own allocation so it does not hold the longer original alive.
+func receiptText(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max - len("…")
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return strings.Clone(s[:cut]) + "…"
+}
+
+// receiptURL is u if it is a short http(s) link, else "" (shown without a link).
+func receiptURL(u string) string {
+	if len(u) > maxReceiptURL || !(strings.HasPrefix(u, "https://") || strings.HasPrefix(u, "http://")) {
+		return ""
+	}
+	return u
+}
+
+// postedNothing reports whether bt is done and posted nothing, so dropping it early
+// cannot let anything post twice.
+func (bt *batch) postedNothing() bool {
+	select {
+	case <-bt.done:
+		return bt.view.Posted == 0 && bt.view.Unknown == 0
+	default:
+		return false
+	}
 }
 
 type batches struct {
-	mu sync.Mutex
-	m  map[string]*commentRecord
+	mu     sync.Mutex
+	m      map[string]*commentRecord // by owner + "\x00" + key
+	drafts map[string]draft          // by owner: an unsent comment kept through reconnecting
 }
 
-// expired reports whether rec can be dropped at now.
-func (rec *commentRecord) expired(now time.Time) bool {
-	if rec.batch != nil {
-		return now.Sub(rec.batch.confirmed) > resultTTL
-	}
-	return now.Sub(rec.created) > previewTTL
-}
+func recordKey(owner, key string) string { return owner + "\x00" + key }
 
-// register records a preview and returns its nonce. It keeps at most
-// maxPreviewsPerOwner unconfirmed previews per owner and maxRecords in all, dropping
-// the oldest unconfirmed first: a dropped preview can no longer be confirmed, which
-// is safe (the user previews again); a kept result guards a resubmit.
-func (b *batches) register(owner, body string, targets []comment.Target, now time.Time) string {
+// claim starts the batch for the owner's form key, or returns the batch already
+// started under it (mine=false). ok is false when gofer is holding too many batches
+// to take another without forgetting a used key.
+func (b *batches) claim(owner, key string, until, now time.Time) (bt *batch, mine, ok bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.m == nil {
 		b.m = map[string]*commentRecord{}
 	}
-	ownPending := 0
-	for k, rec := range b.m {
-		if rec.expired(now) {
-			delete(b.m, k)
-		} else if rec.owner == owner && rec.batch == nil {
-			ownPending++
+	k := recordKey(owner, key)
+	for rk, rec := range b.m {
+		if now.After(rec.until) {
+			delete(b.m, rk)
 		}
 	}
-	for ownPending >= maxPreviewsPerOwner {
-		b.dropOldestLocked(func(r *commentRecord) bool { return r.owner == owner && r.batch == nil })
-		ownPending--
+	if rec := b.m[k]; rec != nil {
+		return rec.batch, false, true
 	}
 	for len(b.m) >= maxRecords {
-		if !b.dropOldestLocked(func(r *commentRecord) bool { return r.batch == nil }) {
-			b.dropOldestLocked(func(*commentRecord) bool { return true })
+		if !b.dropOldestLocked(func(r *commentRecord) bool { return r.batch.postedNothing() }) {
+			return nil, false, false
 		}
 	}
-	nonce := newNonce()
-	b.m[nonce] = &commentRecord{owner: owner, body: body, targets: targets, created: now}
-	return nonce
+	bt = &batch{done: make(chan struct{})}
+	b.m[k] = &commentRecord{created: now, until: until, batch: bt}
+	return bt, true, true
 }
 
 func (b *batches) dropOldestLocked(match func(*commentRecord) bool) bool {
@@ -158,63 +257,93 @@ func (b *batches) dropOldestLocked(match func(*commentRecord) bool) bool {
 	return true
 }
 
-// confirm consumes the owner's preview under nonce. ok is false when gofer holds no
-// such preview (never issued, expired, dropped, from before a restart, or another
-// owner's). A preview confirmed before returns its batch with mine=false; otherwise
-// a new batch is started (mine=true) and the caller runs it.
-func (b *batches) confirm(nonce, owner string, now time.Time) (rec *commentRecord, bt *batch, mine, ok bool) {
+// lookup returns the owner's batch under key, running or done, or nil. Reading a
+// batch needs no write grant, only the session that owns it.
+func (b *batches) lookup(owner, key string, now time.Time) *batch {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	rec = b.m[nonce]
-	if rec == nil || rec.owner != owner || rec.expired(now) {
-		return nil, nil, false, false
-	}
-	if rec.batch != nil {
-		return rec, rec.batch, false, true
-	}
-	rec.batch = &batch{done: make(chan struct{}), confirmed: now}
-	return rec, rec.batch, true, true
-}
-
-// receipt returns the batch of the owner's preview under nonce if it was already
-// confirmed (its results, or a run still going), else nil. Reading a receipt needs no
-// write grant, only the session that owns it.
-func (b *batches) receipt(nonce, owner string, now time.Time) *batch {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	rec := b.m[nonce]
-	if rec == nil || rec.owner != owner || rec.batch == nil || rec.expired(now) {
+	rec := b.m[recordKey(owner, key)]
+	if rec == nil || now.After(rec.until) {
 		return nil
 	}
 	return rec.batch
 }
 
-// reopen returns a confirmed preview whose batch attempted nothing (no grant, an
-// error before the first post) to its unconfirmed state, so the same preview can be
-// confirmed again, until it expires.
-func (b *batches) reopen(nonce string, bt *batch) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if rec := b.m[nonce]; rec != nil && rec.batch == bt {
-		rec.batch = nil
-	}
-}
+// A comment key is the process's epoch (8 bytes, random at startup), the time it
+// was issued (8 bytes, Unix seconds), 16 random bytes, and a MAC (16 bytes) binding
+// those to the account the radar was rendered for, in hex. The epoch makes a form
+// from before a restart, whose earlier use gofer has forgotten, unusable; the issue
+// time bounds how long a used key must be remembered; the MAC keeps a form loaded as
+// one account from posting as another (the browser signed in again in another tab).
+const commentKeyLen = 96
 
-func newNonce() string {
-	buf := make([]byte, 16)
+// keyCheck is what commentKeyIssued found.
+type keyCheck int
+
+const (
+	keyOK           keyCheck = iota
+	keyUnverified            // malformed, missing, or from another process: whose it was is unknown
+	keyOtherAccount          // issued to another account than the session's
+	keyExpired               // issued to this account, but no longer usable to post
+)
+
+func randomBytes(n int) []byte {
+	buf := make([]byte, n)
 	if _, err := rand.Read(buf); err != nil {
 		panic("webui: failed to read random bytes: " + err.Error())
 	}
+	return buf
+}
+
+func newEpoch() (e [8]byte) {
+	copy(e[:], randomBytes(len(e)))
+	return e
+}
+
+func newKeySecret() (k [32]byte) {
+	copy(k[:], randomBytes(len(k)))
+	return k
+}
+
+// commentKeyMAC binds a key's first 32 bytes to owner.
+func (h *Handler) commentKeyMAC(head []byte, owner string) []byte {
+	m := hmac.New(sha256.New, h.keySecret[:])
+	m.Write(head)
+	m.Write([]byte(owner))
+	return m.Sum(nil)[:16]
+}
+
+// newCommentKey mints a radar comment form's one-time key for owner.
+func (h *Handler) newCommentKey(owner string, now time.Time) string {
+	buf := make([]byte, 32, commentKeyLen/2)
+	copy(buf, h.epoch[:])
+	binary.BigEndian.PutUint64(buf[8:16], uint64(now.Unix()))
+	copy(buf[16:], randomBytes(16))
+	buf = append(buf, h.commentKeyMAC(buf, owner)...)
 	return hex.EncodeToString(buf)
 }
 
-// validNonce reports whether s looks like a nonce newNonce made.
-func validNonce(s string) bool {
-	if len(s) != 32 {
-		return false
+// commentKeyIssued returns when key was issued, if this process issued it to owner
+// and it has not expired at now. Only keyOK and keyExpired verified the owner.
+func (h *Handler) commentKeyIssued(key, owner string, now time.Time) (time.Time, keyCheck) {
+	if len(key) != commentKeyLen {
+		return time.Time{}, keyUnverified
 	}
-	_, err := hex.DecodeString(s)
-	return err == nil
+	buf, err := hex.DecodeString(key)
+	// Only the canonical (lowercase) spelling: batches are held by the key's text,
+	// so two spellings of one key must never both pass.
+	if err != nil || hex.EncodeToString(buf) != key || !bytes.Equal(buf[:8], h.epoch[:]) {
+		// Another process's secret signed it, if anyone's: its owner cannot be checked.
+		return time.Time{}, keyUnverified
+	}
+	if !hmac.Equal(buf[32:], h.commentKeyMAC(buf[:32], owner)) {
+		return time.Time{}, keyOtherAccount
+	}
+	issued := time.Unix(int64(binary.BigEndian.Uint64(buf[8:16])), 0)
+	if issued.After(now.Add(commentKeySkew)) || now.Sub(issued) > commentKeyTTL {
+		return issued, keyExpired
+	}
+	return issued, keyOK
 }
 
 // commentState is the radar's commenting state for user.
@@ -225,17 +354,32 @@ func (h *Handler) commentState(ctx context.Context, user *session.User) (enabled
 	return h.commenter.State(ctx, user.ID)
 }
 
-// expiredPreview answers a confirmation gofer does not hold. gofer knows only that it
-// posted nothing for this request, not what an earlier confirmation of the same
-// preview did (its results are gone after resultTTL or a restart).
-const expiredPreview = "gofer no longer has this preview: it expired, or gofer restarted since it was shown. Nothing was posted for this request, but gofer cannot tell whether an earlier confirmation of it posted. If you confirmed it before, check the items on GitHub before previewing the comment again."
+// staleCommentForm answers a form whose key gofer refuses. gofer knows only that it
+// posted nothing for this request, not what an earlier use of the same form did.
+const staleCommentForm = "Nothing was posted: this page was loaded too long ago, or gofer restarted since. gofer cannot tell whether an earlier submission of this form posted, so check the items on GitHub before you post again."
 
-// Comment handles POST /items/comment. Without confirm=1 it renders the preview:
-// the comment and every item it will go to, registered under a one-time nonce, and
-// posts nothing. With confirm=1 and that nonce (same-origin only) it consumes the
-// preview and posts its comment to each of its items still on the radar, in order,
-// and renders the results. A nonce already confirmed shows that batch's results; one
-// gofer does not hold is refused, so nothing is ever posted twice from one preview.
+// unverifiedCommentForm answers a form gofer cannot tie to an account (from before a
+// restart, or unreadable): its text and selection are not shown, since they may be
+// another account's.
+const unverifiedCommentForm = "Nothing was posted: gofer restarted since this page was loaded, or could not read it, so it cannot tell which account wrote this comment or whether an earlier submission of the form posted. Your comment is not shown here; if it is yours, go back to copy it, check the items on GitHub, and post again from this page."
+
+// otherAccountForm answers a form rendered for another account than the session's.
+const otherAccountForm = "Nothing was posted: this page was loaded while you were signed in to gofer as another GitHub account. Check which account you are signed in as, the comment, and the items, then post again."
+
+// draftRestored introduces a comment kept while commenting was reconnected.
+const draftRestored = "Your comment is back from before you connected commenting. Nothing was posted: check it and the items, then press Post."
+
+// badSelection answers a form whose selections gofer cannot read.
+const badSelection = "Nothing was posted: gofer could not read the selected items. Reload the radar and select them again."
+
+// Comment handles POST /items/comment, the radar's Post button (same-origin only).
+// It posts the comment to each selected item still on the radar, in order, then
+// redirects to the radar, which shows the results (/?comment=<key>). The form's
+// one-time key (minted with the radar page) makes it post at most once: a resubmit
+// of a used form shows that batch's results and posts nothing, and a key gofer does
+// not hold (expired, from before a restart, or rendered for another account) is
+// refused. Each checked row names the destination it showed, and a row whose item
+// now names another is skipped.
 func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
 	enabled, connected := h.commentState(r.Context(), user)
@@ -248,123 +392,166 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 		h.commentFailure(w, user, http.StatusBadRequest, "gofer could not read that form. Go back and try again.")
 		return
 	}
-	if r.PostForm.Get("confirm") == "1" {
-		// A live grant is needed only to start posting: the results of a batch
-		// already confirmed (one a dead grant cut short, say) are the owner's to read
-		// without connecting again.
-		h.confirmComment(w, r, user, connected)
-		return
-	}
-	if !connected {
-		http.Redirect(w, r, "/?commenting=connect", http.StatusSeeOther)
-		return
-	}
-
-	body := strings.ReplaceAll(r.PostForm.Get("content"), "\r\n", "\n")
-	if strings.TrimSpace(body) == "" {
-		h.commentFailure(w, user, http.StatusBadRequest, "Write a comment first.")
-		return
-	}
-	if len(body) > maxMessageBytes {
-		h.commentFailure(w, user, http.StatusRequestEntityTooLarge, messageTooLong)
-		return
-	}
-	ids := dedupeIDs(r.PostForm["item"])
-	switch {
-	case len(ids) == 0:
-		h.commentFailure(w, user, http.StatusBadRequest, "Select at least one item to comment on.")
-		return
-	case len(ids) > comment.MaxTargets:
-		h.commentFailure(w, user, http.StatusBadRequest, "Select at most 50 items for one comment.")
-		return
-	}
-	targets, skipped, err := h.commentTargets(r.Context(), user.ID, ids)
-	if err != nil {
-		h.commentFailure(w, user, http.StatusBadGateway, "gofer could not read your worklist right now. Try again in a moment.")
-		return
-	}
-	view := commentView{Body: body, Targets: targets, Skipped: skipped}
-	if len(targets) == 0 {
-		view.Error = "None of the selected items can take a comment now."
-	} else {
-		// Only the destinations shown as eligible are registered, each as the item
-		// and the repository and number shown for it: confirming may drop one that
-		// left the radar, or whose destination changed, since, but never adds or
-		// redirects one.
-		view.Nonce = h.batches.register(user.ID, body, targets, h.now())
-	}
-	// The page's default policy (no-referrer) makes a form POST from it send
-	// "Origin: null"; same-origin lets the Confirm button send its real origin, which
-	// confirmComment checks on browsers without fetch metadata.
-	w.Header().Set("Referrer-Policy", "same-origin")
-	h.render(w, http.StatusOK, pageData{View: "comment-preview", User: user, Comment: &view})
-}
-
-// confirmComment consumes a preview and posts it (Comment, confirm=1), or shows the
-// results of one already confirmed. Starting a batch needs a live write grant
-// (connected); reading a receipt does not.
-func (h *Handler) confirmComment(w http.ResponseWriter, r *http.Request, user *session.User, connected bool) {
 	if !sameOrigin(r) {
 		http.Error(w, "cross-site request refused", http.StatusForbidden)
 		return
 	}
-	nonce := r.PostForm.Get("nonce")
-	if !validNonce(nonce) {
-		h.commentFailure(w, user, http.StatusBadRequest, expiredPreview)
+	now := h.now()
+	key := r.PostForm.Get("key")
+	issued, check := h.commentKeyIssued(key, user.ID, now)
+	valid := check == keyOK
+	if valid || check == keyExpired {
+		// A used form's results are the owner's to see again without a live grant;
+		// only starting a batch needs one. Results outlive the key's expiry, so an
+		// expired key looks for them before it is refused.
+		if bt := h.batches.lookup(user.ID, key, now); bt != nil {
+			h.awaitBatch(w, r, bt, key, true)
+			return
+		}
+	}
+	// Copied: a parsed form value may share the whole request's buffer, which a
+	// kept receipt or draft would otherwise hold alive.
+	body := strings.Clone(strings.ReplaceAll(r.PostForm.Get("content"), "\r\n", "\n"))
+	pins, readable := parseSelections(r.PostForm["item"])
+	tooLong := len(body) > maxMessageBytes
+	if valid && !connected && !tooLong {
+		// Keep the comment and selection through the connect flow, with the form's
+		// key: the radar offers them again once commenting is connected, under that
+		// same key, so this form and the restored one post at most once between them.
+		// Only a form verified as this account's, and unused, is kept.
+		h.batches.saveDraft(user.ID, draft{body: body, pins: capPins(pins), key: strings.Clone(key)}, now)
+		http.Redirect(w, r, "/?commenting=connect", http.StatusSeeOther)
 		return
 	}
-	var (
-		bt   = h.batches.receipt(nonce, user.ID, h.now())
-		mine bool
-	)
-	if bt == nil {
-		if !connected {
-			http.Redirect(w, r, "/?commenting=connect", http.StatusSeeOther)
-			return
-		}
-		var rec *commentRecord
-		var ok bool
-		rec, bt, mine, ok = h.batches.confirm(nonce, user.ID, h.now())
-		if !ok {
-			h.commentFailure(w, user, http.StatusConflict, expiredPreview)
-			return
-		}
-		if mine {
-			// The destinations are checked again: one hidden, closed or moved since
-			// the preview is skipped now.
-			go h.runBatch(context.WithoutCancel(r.Context()), nonce, bt, user.ID, rec.body, rec.targets)
+	// A refusal is shown whether or not commenting is connected, and needs no grant.
+	var refusal *commentView
+	switch {
+	case check == keyOtherAccount:
+		// Another account's form: none of its text or selection is shown to this one.
+		refusal = &commentView{Error: otherAccountForm}
+	case check == keyUnverified:
+		refusal = &commentView{Error: unverifiedCommentForm}
+	case !valid && tooLong:
+		refusal = &commentView{Error: staleCommentForm}
+	case !valid:
+		// Expired, but this account's own form: its comment is offered again.
+		refusal = &commentView{Body: body, Selected: capPins(pins), Error: staleCommentForm}
+	case tooLong:
+		// Refused without keeping a copy: nothing over the limit is ever retained.
+		refusal = &commentView{Error: messageTooLong}
+	case !readable:
+		refusal = &commentView{Body: body, Selected: capPins(pins), Error: badSelection}
+	case !connected:
+		http.Redirect(w, r, "/?commenting=connect", http.StatusSeeOther)
+		return
+	}
+	until := issued.Add(commentKeyTTL)
+	if !valid {
+		// Posts nothing, but keeps the comment and selection for the radar to offer
+		// again, under a key of gofer's own.
+		key = h.newCommentKey(user.ID, now)
+		until = now
+	}
+	if min := now.Add(resultTTL); until.Before(min) {
+		until = min
+	}
+	bt, mine, ok := h.batches.claim(user.ID, key, until, now)
+	if !ok {
+		h.commentFailure(w, user, http.StatusServiceUnavailable, "gofer is holding too many recent comments to post another right now. Try again later.")
+		return
+	}
+	if mine {
+		if refusal != nil {
+			bt.finish(*refusal)
+		} else {
+			// A comment being posted supersedes any kept for after reconnecting.
+			h.batches.dropDraft(user.ID)
+			go h.runBatch(context.WithoutCancel(r.Context()), bt, user.ID, body, pins)
 		}
 	}
+	h.awaitBatch(w, r, bt, key, !mine)
+}
+
+// awaitBatch waits for bt, then sends the browser to the radar to see its results.
+// A browser that gives up first leaves the batch running; its results show when the
+// radar is next reached under the same key.
+func (h *Handler) awaitBatch(w http.ResponseWriter, r *http.Request, bt *batch, key string, repeat bool) {
 	select {
 	case <-bt.done:
 	case <-r.Context().Done():
-		return // the batch carries on; a resubmit shows its results
+		return
 	}
-	view := bt.view
-	view.Repeat = !mine
-	status := http.StatusOK
-	if view.Error != "" && view.Posted == 0 && view.Unknown == 0 {
-		status = http.StatusBadGateway
+	loc := "/?comment=" + key
+	if repeat {
+		loc += "&again=1"
 	}
-	h.render(w, status, pageData{View: "comment-results", User: user, Comment: &view})
+	http.Redirect(w, r, loc, http.StatusSeeOther)
 }
 
-// runBatch posts one confirmed preview and records its outcome on bt. A batch that
-// attempted nothing reopens its preview, so it can be confirmed again.
-func (h *Handler) runBatch(ctx context.Context, nonce string, bt *batch, userID, body string, pinned []comment.Target) {
+// commentOutcome is the radar's view of the owner's batch under the comment query
+// parameter, or nil.
+func (h *Handler) commentOutcome(r *http.Request, user *session.User) *commentView {
+	q := r.URL.Query()
+	key := q.Get("comment")
+	if key == "" || user == nil {
+		return nil
+	}
+	bt := h.batches.lookup(user.ID, key, h.now())
+	if bt == nil {
+		return &commentView{Error: "gofer no longer holds the results of that comment. Check the items on GitHub to see what was posted."}
+	}
+	select {
+	case <-bt.done:
+	default:
+		return &commentView{Running: true}
+	}
+	view := bt.view
+	view.Repeat = q.Get("again") == "1"
+	return &view
+}
+
+// commentReturnURL is the radar URL that shows the bulk comment outcome r names, or
+// "" (the plain radar).
+func commentReturnURL(r *http.Request) string {
+	q := r.URL.Query()
+	key := q.Get("comment")
+	if key == "" {
+		return ""
+	}
+	out := url.Values{"comment": {key}}
+	if q.Get("again") == "1" {
+		out.Set("again", "1")
+	}
+	return "/?" + out.Encode()
+}
+
+// runBatch checks the form, resolves its items against the owner's radar now, posts,
+// and records the outcome on bt.
+func (h *Handler) runBatch(ctx context.Context, bt *batch, userID, body string, pins []comment.Target) {
 	ctx, cancel := context.WithTimeout(ctx, postTimeout)
 	defer cancel()
-	view := commentView{Body: body}
-	defer func() {
-		bt.view = view
-		close(bt.done)
-	}()
-	targets, skipped, err := h.pinnedTargets(ctx, userID, pinned)
-	view.Targets, view.Skipped = targets, skipped
+	view := commentView{Body: body, Selected: capPins(pins)}
+	defer func() { bt.finish(view) }()
+	switch {
+	case len(body) > maxMessageBytes:
+		// Comment refuses this first; never retain a body over the limit.
+		view = commentView{Error: messageTooLong}
+		return
+	case strings.TrimSpace(body) == "":
+		view.Error = "Write a comment first."
+		return
+	case len(pins) == 0:
+		view.Error = "Select at least one item to comment on."
+		return
+	case len(pins) > comment.MaxTargets:
+		view.Error = "Select at most 50 items for one comment."
+		return
+	}
+	targets, skipped, err := h.pinnedTargets(ctx, userID, pins)
+	view.Total, view.Skipped = len(targets), skipped
 	switch {
 	case err != nil:
 		view.Error = "gofer could not read your worklist right now; nothing was posted. Try again in a moment."
-		h.batches.reopen(nonce, bt)
 		return
 	case len(targets) == 0:
 		view.Error = "None of the selected items can take a comment now; nothing was posted."
@@ -374,11 +561,9 @@ func (h *Handler) runBatch(ctx context.Context, nonce string, bt *batch, userID,
 	switch {
 	case errors.Is(err, comment.ErrNotConnected):
 		view.Error = "gofer has no GitHub access to post with. Connect commenting, then try again; nothing was posted."
-		h.batches.reopen(nonce, bt)
 	case err != nil:
 		slog.WarnContext(ctx, "bulk comment failed", "user", userID, "err", err)
 		view.Error = "gofer could not post right now; nothing was posted. Try again in a moment."
-		h.batches.reopen(nonce, bt)
 	}
 	view.Results = results
 	for _, res := range results {
@@ -389,20 +574,86 @@ func (h *Handler) runBatch(ctx context.Context, nonce string, bt *batch, userID,
 			view.Unknown++
 		}
 	}
+	if view.Posted == 0 && view.Unknown == 0 && (errors.Is(err, comment.ErrNotConnected) || !h.connectedNow(ctx, userID)) {
+		// Nothing reached GitHub and the grant is gone (missing, or a 401 GitHub
+		// confirmed, which deletes it): the radar shows the connect prompt, not the
+		// comment box, so keep the comment for after reconnecting. Its form's key is
+		// used, so the restored form gets a fresh one. A partial or unknown batch is
+		// never kept: posting it again could post twice.
+		h.batches.saveDraft(userID, draft{body: body, pins: capPins(pins)}, h.now())
+	}
 	slog.InfoContext(ctx, "bulk comment", "user", userID, "targets", len(targets), "posted", view.Posted, "unknown", view.Unknown)
 }
 
-// pinnedTargets checks a confirmed preview's destinations against the owner's stored
-// items now. A destination is kept only if its item is still on the radar AND still
-// names the repository and number the preview showed: a write-back may have changed
-// an item's GitHub fields under the same ID, and the user approved the destination,
-// not the row. It never adds a destination, and posts to the pinned one.
-func (h *Handler) pinnedTargets(ctx context.Context, ownerID string, pinned []comment.Target) ([]comment.Target, []skippedTarget, error) {
-	ids := make([]string, len(pinned))
-	for i, p := range pinned {
+// connectedNow reports whether the user's write grant is usable now.
+func (h *Handler) connectedNow(ctx context.Context, userID string) bool {
+	_, connected := h.commenter.State(ctx, userID)
+	return connected
+}
+
+// selectionValue is a radar checkbox's value: the item and the destination the row
+// showed, so a write-back that changes the item's repository or number under the
+// same ID is caught, never followed (pinnedTargets).
+func selectionValue(it worklist.WorkItem) string {
+	return url.Values{"id": {it.ID}, "repo": {it.GitHub.Repo}, "n": {strconv.Itoa(it.GitHub.Number)}}.Encode()
+}
+
+// parseSelections reads the checked rows, first per item. ok is false if any could
+// not be read (a page from before rows carried their destination); the readable ones
+// are still returned, to check again on the radar. At most MaxTargets+1 are kept:
+// one more is enough to refuse the form.
+func parseSelections(values []string) (pins []comment.Target, ok bool) {
+	ok = true
+	seen := map[string]bool{}
+	for _, v := range values {
+		q, err := url.ParseQuery(v)
+		n, nerr := strconv.Atoi(q.Get("n"))
+		id, repo := q.Get("id"), q.Get("repo")
+		if err != nil || nerr != nil || id == "" || len(id) > maxPinIDBytes || len(repo) > maxPinRepoBytes {
+			ok = false
+			continue
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if len(pins) > comment.MaxTargets {
+			break
+		}
+		// Copied, like the comment: these are kept in receipts and drafts.
+		pins = append(pins, comment.Target{ID: strings.Clone(id), Repo: strings.Clone(repo), Number: n})
+	}
+	return pins, ok
+}
+
+// pinIDs is the item ids of pins.
+func pinIDs(pins []comment.Target) []string {
+	ids := make([]string, len(pins))
+	for i, p := range pins {
 		ids[i] = p.ID
 	}
-	current, skipped, err := h.commentTargets(ctx, ownerID, ids)
+	return ids
+}
+
+// capPins bounds the rows kept to re-check on the radar.
+func capPins(pins []comment.Target) []comment.Target {
+	if len(pins) > comment.MaxTargets {
+		return pins[:comment.MaxTargets]
+	}
+	return pins
+}
+
+// pinMatches reports whether it still names the destination pin was checked for.
+func pinMatches(pin comment.Target, it worklist.WorkItem) bool {
+	return pin.ID == it.ID && strings.EqualFold(pin.Repo, it.GitHub.Repo) && pin.Number == it.GitHub.Number
+}
+
+// pinnedTargets resolves the checked rows against the owner's stored items now. A
+// row is kept only if its item is still on the radar AND still names the repository
+// and number the row showed: a write-back may have changed an item's GitHub fields
+// under the same ID, and the user checked the destination, not the ID.
+func (h *Handler) pinnedTargets(ctx context.Context, ownerID string, pins []comment.Target) ([]comment.Target, []skippedTarget, error) {
+	current, skipped, err := h.commentTargets(ctx, ownerID, pinIDs(pins))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -411,21 +662,101 @@ func (h *Handler) pinnedTargets(ctx context.Context, ownerID string, pinned []co
 		now[t.ID] = t
 	}
 	var targets []comment.Target
-	for _, p := range pinned {
+	for _, p := range pins {
 		t, ok := now[p.ID]
 		switch {
 		case !ok:
 			// skipped by commentTargets already (gone, hidden, closed)
 		case !strings.EqualFold(t.Repo, p.Repo) || t.Number != p.Number:
 			skipped = append(skipped, skippedTarget{
-				Label:  p.Repo + " #" + itoa(p.Number) + " " + p.Title,
-				Reason: "now points at " + t.Repo + " #" + itoa(t.Number) + "; not the destination you previewed",
+				Label:  p.Repo + " #" + itoa(p.Number),
+				Reason: "now points at " + t.Repo + " #" + itoa(t.Number) + "; not the item you checked",
 			})
 		default:
-			targets = append(targets, p)
+			targets = append(targets, t)
 		}
 	}
 	return targets, skipped, nil
+}
+
+// draft is an unsent comment kept through reconnecting commenting.
+type draft struct {
+	body  string
+	pins  []comment.Target // the rows it was for (item, repo, number)
+	key   string           // its form's key, still unused when kept; "" for a used one
+	saved time.Time
+}
+
+// draftTTL is how long an unsent comment is kept for the owner to reconnect.
+const draftTTL = 2 * time.Hour
+
+// saveDraft keeps the owner's unsent comment (the newest only), if it has any text
+// or selection.
+func (b *batches) saveDraft(owner string, d draft, now time.Time) {
+	if strings.TrimSpace(d.body) == "" && len(d.pins) == 0 {
+		return
+	}
+	d.saved = now
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.drafts == nil {
+		b.drafts = map[string]draft{}
+	}
+	for k, old := range b.drafts {
+		if now.Sub(old.saved) > draftTTL {
+			delete(b.drafts, k)
+		}
+	}
+	for len(b.drafts) >= maxDrafts {
+		var oldest string
+		for k, old := range b.drafts {
+			if oldest == "" || old.saved.Before(b.drafts[oldest].saved) {
+				oldest = k
+			}
+		}
+		delete(b.drafts, oldest)
+	}
+	b.drafts[owner] = d
+}
+
+// takeDraft removes and returns the owner's unsent comment, if one is kept.
+func (b *batches) takeDraft(owner string, now time.Time) (draft, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	d, ok := b.drafts[owner]
+	delete(b.drafts, owner)
+	return d, ok && now.Sub(d.saved) <= draftTTL
+}
+
+// dropDraft forgets the owner's unsent comment.
+func (b *batches) dropDraft(owner string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.drafts, owner)
+}
+
+// restoreDraft is the owner's kept comment for the radar to offer again, and the
+// key its form must carry, or ok=false. A draft kept with its form's key comes back
+// under that key, so the form it was kept from and the restored one share one batch;
+// if that form has posted meanwhile, the draft is spent and dropped. A key that has
+// expired can post from neither, so the restored form gets a fresh one.
+func (h *Handler) restoreDraft(owner string, now time.Time) (view *commentView, key string, ok bool) {
+	d, ok := h.batches.takeDraft(owner, now)
+	if !ok {
+		return nil, "", false
+	}
+	if d.key != "" {
+		if _, check := h.commentKeyIssued(d.key, owner, now); check == keyOK {
+			if h.batches.lookup(owner, d.key, now) != nil {
+				return nil, "", false
+			}
+			key = d.key
+		}
+	}
+	if key == "" {
+		key = h.newCommentKey(owner, now)
+	}
+	return &commentView{Body: d.body, Selected: d.pins, Error: draftRestored}, key, true
 }
 
 // commentTargets resolves the selected ids against the owner's stored items. Only
@@ -534,19 +865,6 @@ func sameOrigin(r *http.Request) bool {
 	}
 	u, err := url.Parse(o)
 	return o != "null" && err == nil && u.Host != "" && u.Host == r.Host
-}
-
-func dedupeIDs(in []string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(in))
-	for _, id := range in {
-		if id == "" || seen[id] {
-			continue
-		}
-		seen[id] = true
-		out = append(out, id)
-	}
-	return out
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }

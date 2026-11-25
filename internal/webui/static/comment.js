@@ -1,6 +1,8 @@
 // Bulk comment box (ADR 0009). Progressive enhancement over a plain form: without
-// this script the checkboxes and the textarea still post, and the server previews.
-// With it, the box shows how many items are checked, and typing "@" suggests logins
+// this script the checkboxes and the textarea still post, and the server checks the
+// form and posts it. With it, the box shows how many items are checked, Post refuses
+// to send with none checked and says "Posting…" while gofer posts (a second click
+// would only show the same results: the form's key posts once), and typing "@" suggests logins
 // that can be assigned in the checked items' repositories (GET /items/mentions),
 // ranked by how many of them can assign each. The count is always against every
 // selected repository: one that cannot be assigned in all of them says so, since a
@@ -32,6 +34,40 @@
     }
   });
   updateCount();
+
+  var post = form.querySelector("[data-comment-post]");
+  var postNote = null;
+  function say(text) {
+    if (!post) {
+      return;
+    }
+    if (!postNote) {
+      postNote = document.createElement("span");
+      postNote.className = "zz-compose-note";
+      postNote.setAttribute("role", "status");
+      post.parentNode.insertBefore(postNote, post);
+    }
+    postNote.textContent = text;
+  }
+  form.addEventListener("submit", function (e) {
+    if (!checked().length) {
+      e.preventDefault();
+      say("Check at least one item to comment on.");
+      return;
+    }
+    if (post) {
+      say("");
+      post.disabled = true;
+      post.textContent = "Posting…";
+    }
+  });
+  // A page restored from the back/forward cache keeps the disabled button.
+  window.addEventListener("pageshow", function (e) {
+    if (e.persisted && post) {
+      post.disabled = false;
+      post.textContent = "Post";
+    }
+  });
 
   if (!box || !window.fetch) {
     return;

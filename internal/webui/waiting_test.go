@@ -2,6 +2,7 @@ package webui
 
 import (
 	"context"
+	"html/template"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -97,7 +98,7 @@ func TestWaitingItemTakesABulkComment(t *testing.T) {
 	h.Index(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 	page := rec.Body.String()
 	section := page[strings.Index(page, "zz-waiting-head"):]
-	if !strings.Contains(section, `value="github:o/r#9" form="zz-bulk-comment"`) {
+	if !strings.Contains(section, `value="`+template.HTMLEscapeString(selectionValue(wait))+`" form="zz-bulk-comment"`) {
 		t.Fatal("the waiting item has no bulk-comment checkbox")
 	}
 	targets, skipped, err := h.commentTargets(context.Background(), "github:42", []string{wait.ID})

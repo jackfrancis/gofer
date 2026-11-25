@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackfrancis/gofer/internal/comment"
 	"github.com/jackfrancis/gofer/internal/ingest"
 	"github.com/jackfrancis/gofer/internal/markdown"
 	"github.com/jackfrancis/gofer/internal/session"
@@ -110,7 +111,9 @@ type Handler struct {
 	options     []ModelOption // model picker options, default first (options[0]); nil when AI is disabled
 	reconnect   Reconnector   // nil: never prompt to sign in again
 	commenter   Commenter     // nil: no bulk comment (comment.go)
-	batches     batches       // confirmed bulk comments, by nonce
+	batches     batches       // bulk comment batches, by owner and form key (comment.go)
+	epoch       [8]byte       // this process's part of every comment form key
+	keySecret   [32]byte      // binds a comment form key to its account (comment.go)
 	now         func() time.Time
 }
 
@@ -130,6 +133,8 @@ func New(sessions Sessions, store worklist.Store, pipeline Pipeline, providers P
 		providers:   providers,
 		convEnabled: convEnabled,
 		options:     options,
+		epoch:       newEpoch(),
+		keySecret:   newKeySecret(),
 		now:         time.Now,
 	}
 	if rc, ok := providers.(Reconnector); ok {
@@ -263,67 +268,69 @@ type pageData struct {
 	User                     *session.User
 	Providers                []string
 	Items                    []worklist.WorkItem
-	Waiting                  []worklist.WorkItem // worklist: items waiting on someone else, after Items (same filter)
-	HiddenItems              []worklist.WorkItem // worklist: the hidden section, most recently hidden first, unscored
-	ItemHidden               bool                // thread: the item is hidden, so its thread is read-only until it is unhidden
-	Assistant                bool                // thread: the assistant is configured (ConvEnabled is off on a hidden item's page)
-	LabelCSS                 string              // the stylesheet coloring the shown items' GitHub labels, if any
-	Item                     worklist.WorkItem   // the single item, for the thread view
-	ConvEnabled              bool                // whether the assistive conversation is available
-	ModelOptions             []ModelOption       // conversation picker options (default first)
-	SecondOpinionEnabled     bool                // whether a second-opinion model is configured
-	SecondOpinionOptions     []ModelOption       // alternative options offered in the 2nd-opinion picker
-	ReviewCount              int                 // PRs needing a first review; gates/labels "Review all PRs"
-	ReviewModelOptions       []ModelOption       // models for the "Review all PRs" dropdown; nil = plain button (<=1 model)
-	SecondOpinionCount       int                 // PRs reviewed once without a 2nd opinion; gates/labels "Get 2nd Opinion"
-	SecondOpinionMode        string              // "" hidden | "menu" (pick a model) | "auto" (heterogeneous first reviews, immediate)
-	SecondOpinionMenuOptions []ModelOption       // menu-mode models (every model except the single first-review model)
-	ResetCount               int                 // stored items carrying a conversation (hidden and closed too: Reset clears them all); gates/labels "Reset Conversations"
-	RefreshSecs              int                 // when > 0, the page auto-refreshes after this many seconds
-	WatchRefresh             bool                // worklist: watch the refresh state (reload.js) and reload once a pass that started after this render has ended
-	RefreshDone              uint64              // worklist: the refresh version read before the items were (every run up to it had ended)
-	Refreshing               bool                // worklist: a refresh was in flight before the items were read
-	PollSecs, IdlePollSecs   int                 // worklist: how often reload.js polls while a refresh runs, and while none does
-	FallbackURL              string              // worklist, no script: where the <noscript> refresh goes while a refresh runs (refreshCheck)
-	ReplyPending             bool                // a reply is plausibly in flight (thread view): shown as working, no new review panel
-	ReplyStalled             bool                // a pending reply has not arrived within reviewStaleAfter (thread view)
-	StalledTurn              string              // the stalled turn's key, which the Retry form names; "" offers no Retry (thread view)
-	RetryOptions             []ModelOption       // the models Retry may use (retryChoices); a picker when more than one
-	RetryRefused             bool                // the last Retry was refused by the backend, so no run started
-	StalledHidden            bool                // the stalled turn is hidden: unhide it to retry
-	StalledSynthesis         bool                // the turn offered for Retry is a consensus synthesis (thread view)
-	SynthesisTooLarge        bool                // a stalled synthesis's reviews are too large to read together: no Retry (thread view)
-	Message                  string              // failure detail rendered on the error view
-	Failure                  string              // a failed user action, rendered on the error view in place of the discovery wording
-	RetryURL                 string              // where the error view's "Try again" goes; empty = the radar
-	SignInRequired           bool                // gofer holds no usable credential: prompt the user to sign in again
-	Projects                 []ProjectOption     // the project filter's checklist, by name (worklist view)
-	ProjectsFiltered         bool                // some project is deselected: Items is a subset of the radar
-	SelectedProjects         int                 // projects shown, for the filter's label
-	TotalItems               int                 // items on the whole radar, before the project and label filters
-	ProjectScope             string              // the shown selection, posted back by each bulk form ("" = every project)
-	ProjectsError            string              // why the last project selection was not saved
-	ProjectsOffered          string              // the project checklist's options, posted back by its Apply (form "offered")
-	Labels                   []LabelOption       // the label filter's checklist: every label on the radar, by name (worklist view)
-	LabelsFiltered           bool                // some label is deselected: Items is a subset of the project-filtered radar
-	SelectedLabels           int                 // label options shown, for the filter's label
-	LabelScope               string              // the shown label selection, posted back by each bulk form ("" = every label)
-	LabelsOffered            string              // the label checklist's options, posted back by its Apply (form "offered")
-	LabelsError              string              // why the last label selection was not saved
-	Filtered                 bool                // the project or the label filter narrows the radar
-	CommentEnabled           bool                // worklist: the deployment offers bulk comments (ADR 0009)
-	CommentConnected         bool                // worklist: the user connected the write grant
-	CommentNotice            string              // worklist: the outcome of the last connect/disconnect, for the user
-	CommentTokensAllowed     bool                // worklist: the user may connect commenting with a personal access token (ADR 0011)
-	CommentToken             bool                // worklist: commenting is connected with a personal access token
-	CommentTokenExpires      time.Time           // worklist: when that token expires (or expired)
-	CommentTokenExpired      bool                // worklist: a stored token has expired; offer a new one and Disconnect
-	CommentTokenDisabled     bool                // worklist: a token is stored while tokens are not allowed; offer Disconnect
-	CommentOtherClient       bool                // worklist: a grant from another commenting app is stored; offer Disconnect
-	CommentCleanupPending    bool                // worklist: a disconnect has not finished deleting gofer's copy; offer a retry
-	Comment                  *commentView        // comment-preview / comment-results views
-	Draft                    *draftThread        // thread: the draft review's button and newest draft (draftreview.go); nil shows neither
-	DraftResult              *draftResult        // draft-review-result view
+	Waiting                  []worklist.WorkItem       // worklist: items waiting on someone else, after Items (same filter)
+	HiddenItems              []worklist.WorkItem       // worklist: the hidden section, most recently hidden first, unscored
+	ItemHidden               bool                      // thread: the item is hidden, so its thread is read-only until it is unhidden
+	Assistant                bool                      // thread: the assistant is configured (ConvEnabled is off on a hidden item's page)
+	LabelCSS                 string                    // the stylesheet coloring the shown items' GitHub labels, if any
+	Item                     worklist.WorkItem         // the single item, for the thread view
+	ConvEnabled              bool                      // whether the assistive conversation is available
+	ModelOptions             []ModelOption             // conversation picker options (default first)
+	SecondOpinionEnabled     bool                      // whether a second-opinion model is configured
+	SecondOpinionOptions     []ModelOption             // alternative options offered in the 2nd-opinion picker
+	ReviewCount              int                       // PRs needing a first review; gates/labels "Review all PRs"
+	ReviewModelOptions       []ModelOption             // models for the "Review all PRs" dropdown; nil = plain button (<=1 model)
+	SecondOpinionCount       int                       // PRs reviewed once without a 2nd opinion; gates/labels "Get 2nd Opinion"
+	SecondOpinionMode        string                    // "" hidden | "menu" (pick a model) | "auto" (heterogeneous first reviews, immediate)
+	SecondOpinionMenuOptions []ModelOption             // menu-mode models (every model except the single first-review model)
+	ResetCount               int                       // stored items carrying a conversation (hidden and closed too: Reset clears them all); gates/labels "Reset Conversations"
+	RefreshSecs              int                       // when > 0, the page auto-refreshes after this many seconds
+	WatchRefresh             bool                      // worklist: watch the refresh state (reload.js) and reload once a pass that started after this render has ended
+	RefreshDone              uint64                    // worklist: the refresh version read before the items were (every run up to it had ended)
+	Refreshing               bool                      // worklist: a refresh was in flight before the items were read
+	PollSecs, IdlePollSecs   int                       // worklist: how often reload.js polls while a refresh runs, and while none does
+	FallbackURL              string                    // worklist, no script: where the <noscript> refresh goes while a refresh runs (refreshCheck)
+	ReplyPending             bool                      // a reply is plausibly in flight (thread view): shown as working, no new review panel
+	ReplyStalled             bool                      // a pending reply has not arrived within reviewStaleAfter (thread view)
+	StalledTurn              string                    // the stalled turn's key, which the Retry form names; "" offers no Retry (thread view)
+	RetryOptions             []ModelOption             // the models Retry may use (retryChoices); a picker when more than one
+	RetryRefused             bool                      // the last Retry was refused by the backend, so no run started
+	StalledHidden            bool                      // the stalled turn is hidden: unhide it to retry
+	StalledSynthesis         bool                      // the turn offered for Retry is a consensus synthesis (thread view)
+	SynthesisTooLarge        bool                      // a stalled synthesis's reviews are too large to read together: no Retry (thread view)
+	Message                  string                    // failure detail rendered on the error view
+	Failure                  string                    // a failed user action, rendered on the error view in place of the discovery wording
+	RetryURL                 string                    // where the error view's "Try again" goes; empty = the radar
+	SignInRequired           bool                      // gofer holds no usable credential: prompt the user to sign in again
+	Projects                 []ProjectOption           // the project filter's checklist, by name (worklist view)
+	ProjectsFiltered         bool                      // some project is deselected: Items is a subset of the radar
+	SelectedProjects         int                       // projects shown, for the filter's label
+	TotalItems               int                       // items on the whole radar, before the project and label filters
+	ProjectScope             string                    // the shown selection, posted back by each bulk form ("" = every project)
+	ProjectsError            string                    // why the last project selection was not saved
+	ProjectsOffered          string                    // the project checklist's options, posted back by its Apply (form "offered")
+	Labels                   []LabelOption             // the label filter's checklist: every label on the radar, by name (worklist view)
+	LabelsFiltered           bool                      // some label is deselected: Items is a subset of the project-filtered radar
+	SelectedLabels           int                       // label options shown, for the filter's label
+	LabelScope               string                    // the shown label selection, posted back by each bulk form ("" = every label)
+	LabelsOffered            string                    // the label checklist's options, posted back by its Apply (form "offered")
+	LabelsError              string                    // why the last label selection was not saved
+	Filtered                 bool                      // the project or the label filter narrows the radar
+	CommentEnabled           bool                      // worklist: the deployment offers bulk comments (ADR 0009)
+	CommentConnected         bool                      // worklist: the user connected the write grant
+	CommentNotice            string                    // worklist: the outcome of the last connect/disconnect, for the user
+	CommentTokensAllowed     bool                      // worklist: the user may connect commenting with a personal access token (ADR 0011)
+	CommentToken             bool                      // worklist: commenting is connected with a personal access token
+	CommentTokenExpires      time.Time                 // worklist: when that token expires (or expired)
+	CommentTokenExpired      bool                      // worklist: a stored token has expired; offer a new one and Disconnect
+	CommentTokenDisabled     bool                      // worklist: a token is stored while tokens are not allowed; offer Disconnect
+	CommentOtherClient       bool                      // worklist: a grant from another commenting app is stored; offer Disconnect
+	CommentCleanupPending    bool                      // worklist: a disconnect has not finished deleting gofer's copy; offer a retry
+	Comment                  *commentView              // worklist: the outcome of the bulk comment the radar was sent back from
+	CommentKey               string                    // worklist: the comment form's one-time key
+	CommentChecked           map[string]comment.Target // worklist: rows to show checked again, by item, with the destination each was checked for
+	Draft                    *draftThread              // thread: the draft review's button and newest draft (draftreview.go); nil shows neither
+	DraftResult              *draftResult              // draft-review-result view
 }
 
 // Index handles GET /. It renders the sign-in view for anonymous visitors, the
@@ -331,9 +338,9 @@ type pageData struct {
 // ranked worklist.
 func (h *Handler) Index(w http.ResponseWriter, r *http.Request) {
 	data, status := h.view(r)
-	if data.CommentTokensAllowed && !data.CommentConnected {
-		// The token form posts same-origin only; this lets it send its real Origin on
-		// a browser without fetch metadata (see Comment).
+	if data.CommentConnected || data.CommentTokensAllowed {
+		// The comment and token forms post same-origin only; this lets them send their
+		// real Origin on a browser without fetch metadata (see sameOrigin).
 		w.Header().Set("Referrer-Policy", "same-origin")
 	}
 	h.render(w, status, data)
@@ -416,7 +423,7 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 				data.Draft = h.draftThreadView(r.Context(), user, it, now)
 				if data.Draft != nil && data.Draft.Index >= 0 {
 					// The draft's Create button posts same-origin only; this lets it send
-					// its real Origin on a browser without fetch metadata (see Comment).
+					// its real Origin on a browser without fetch metadata (see sameOrigin).
 					w.Header().Set("Referrer-Policy", "same-origin")
 				}
 			}
@@ -1162,7 +1169,9 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 	}
 	res, err := worklist.Resolve(r.Context(), h.store, h.pipeline, h.now(), user.ID, worklist.DefaultSort, true)
 	if err != nil {
-		return pageData{View: "error", User: user}, http.StatusBadGateway
+		// Try again keeps a bulk comment's results, and its comment and selection to
+		// offer again, which the radar shows once the worklist reads.
+		return pageData{View: "error", User: user, RetryURL: commentReturnURL(r)}, http.StatusBadGateway
 	}
 	switch res.Status {
 	case worklist.StatusProcessing:
@@ -1242,6 +1251,26 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		data.CommentEnabled, data.CommentConnected = h.commentState(r.Context(), user)
 		if data.CommentEnabled {
 			data.CommentNotice = commentNotices[r.URL.Query().Get("commenting")]
+			if data.CommentConnected {
+				data.CommentKey = h.newCommentKey(user.ID, h.now())
+			}
+			data.Comment = h.commentOutcome(r, user)
+			if data.CommentConnected && data.Comment == nil {
+				// An unsent comment kept through reconnecting comes back once, to post
+				// with an explicit Post. A page showing an outcome leaves it kept.
+				if view, key, ok := h.restoreDraft(user.ID, h.now()); ok {
+					data.Comment, data.CommentKey = view, key
+				}
+			}
+			if data.Comment.Retry() {
+				// Nothing went to GitHub: offer the same comment and selection again. A
+				// row is checked again only while it names the destination it was
+				// checked for.
+				data.CommentChecked = make(map[string]comment.Target, len(data.Comment.Selected))
+				for _, p := range data.Comment.Selected {
+					data.CommentChecked[p.ID] = p
+				}
+			}
 			if d, ok := h.commenter.(commentDetailer); ok {
 				det := d.Details(r.Context(), user.ID)
 				data.CommentTokensAllowed, data.CommentToken, data.CommentTokenExpires = det.TokensAllowed, det.Token, det.Expires
@@ -1358,6 +1387,7 @@ var funcs = template.FuncMap{
 	"discussBadge":           discussBadge,
 	"discussTitle":           discussTitle,
 	"row":                    newItemRow,
+	"selection":              selectionValue,
 	"waitingBadge":           waitingBadge,
 	"waitingTitle":           waitingTitle,
 	"isSecondOpinionRequest": isSecondOpinionRequest,
@@ -1530,10 +1560,12 @@ type itemRow struct {
 	Item             worklist.WorkItem
 	ConvEnabled      bool
 	CommentConnected bool
+	Checked          bool // selected for a bulk comment (one that posted nothing, offered again)
 }
 
-func newItemRow(it worklist.WorkItem, convEnabled, commentConnected bool) itemRow {
-	return itemRow{Item: it, ConvEnabled: convEnabled, CommentConnected: commentConnected}
+func newItemRow(it worklist.WorkItem, convEnabled, commentConnected bool, checked map[string]comment.Target) itemRow {
+	pin, ok := checked[it.ID]
+	return itemRow{Item: it, ConvEnabled: convEnabled, CommentConnected: commentConnected, Checked: ok && pinMatches(pin, it)}
 }
 
 // waitingBadge labels an item waiting on someone else: who, and for how long ("" for

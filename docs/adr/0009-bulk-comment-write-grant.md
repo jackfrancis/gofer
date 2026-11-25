@@ -1,7 +1,7 @@
 # ADR 0009 — An opt-in write grant for posting the user's own comments
 
 Status: proposed — implemented; not yet run against real GitHub.
-Amended by: ADR 0010 (draft review comments created as a pending review); ADR 0011 (the write grant can also be a classic personal access token).
+Amended by: ADR 0010 (draft review comments created as a pending review); ADR 0011 (the write grant can also be a classic personal access token); the bulk comment flow below (November 2026: Post in one step on the radar, replacing the preview and confirm pages).
 Date: 2026-11-23
 
 ## Context
@@ -99,37 +99,76 @@ The client keeps the workload's guard rules (ADR 0007, "public-only guard"):
 
 1. Each item on the radar gets a checkbox. The compose box takes the comment
    (at most 16 KiB) for up to 50 selected items.
-2. Submitting renders a **preview**: the exact comment and every target, with any
-   items it will skip (gone, hidden or closed since the page rendered, since bulk
-   actions never act on items off the radar). Nothing is posted yet. The preview
-   registers the comment and the destinations it showed as eligible (never those it
-   listed as skipped), each as its item and the repository and number shown for it,
-   for its owner, under a one-time nonce (in memory, bounded per owner
-   and in all, for 30 minutes).
-3. **Confirm** sends only that nonce. It atomically consumes the registered preview
-   and posts its comment to each pinned destination whose item is still on the radar
-   and still names that repository and number (a write-back can change an item's
-   GitHub fields under the same ID; such an item is dropped, never redirected).
-   Confirming may drop a destination, never add or replace one. Posts go in order, one at a time, at least a second apart: GitHub asks for serial content creation, spaced
-   out. A nonce gofer does not hold (never issued, expired, or from before a web-pod
-   restart) is refused, never posted, so no resubmit can post a second time. The
-   refusal says gofer cannot tell what an earlier confirmation did, and to check the
-   items on GitHub before previewing again. A nonce
-   already confirmed shows that batch's results again (kept for an hour), to its owner,
-   with or without a live grant: only starting a batch needs one, so a user whose
-   grant died mid-batch can still see which comments landed. A batch that attempted
-   nothing (no grant, the worklist unreadable) reopens its preview.
-4. The confirm request must be same-origin, in addition to SameSite=Lax. A browser
+2. **Post** posts at once; there is no preview step. The radar names the account it
+   posts as and says a posted comment cannot be taken back. Each checkbox carries
+   its item and the repository and number its row showed. The comment and selection
+   are checked, then resolved against the owner's stored items at that moment: only
+   items on the radar take the comment; any that are gone, hidden or closed since
+   the page rendered are skipped and listed (bulk actions never act on items off the
+   radar), and so is one whose item now names another repository or number (a
+   write-back can change an item's GitHub fields under the same ID): the user checked
+   a destination, so the comment is never redirected. Posts go in order, one at a time, at least a second apart: GitHub asks
+   for serial content creation, spaced out.
+3. Each radar render mints a **one-time form key**: this process's epoch (random at
+   startup), the time it was issued, random bytes, and a MAC (under a per-process
+   secret) binding them to the account the radar was rendered for. A form rendered
+   for one account never posts as another (the browser signed in as someone else in
+   another tab): it posts nothing and says so, and none of its text or selection is
+   shown to the account now signed in. Only the canonical (lowercase hex) spelling of
+   a key is accepted, so one key never names two batches. The first submission of a key
+   claims it for its owner, atomically, and runs the batch; any later submission of
+   the same key (a double click, a back-button resubmit) shows that batch's results
+   and posts nothing, to its owner, with or without a live grant: only starting a
+   batch needs one, so a user whose grant died mid-batch can still see which
+   comments landed. A used key is remembered (in memory) until it expires, 12 hours
+   after it was issued, and results at least an hour (an expired key of this account
+   still shows its batch's results while they are kept). A key gofer cannot vouch for
+   posts nothing, and the radar says gofer cannot tell what an earlier submission of
+   that form did, and to check the items on GitHub before posting again. Only an
+   expired key whose MAC verifies against this account gets its comment and
+   selection offered again; a key whose account cannot be checked (from another
+   epoch, i.e. before a web-pod restart; malformed; missing) or that names another
+   account shows none of the form's text or selection, which may be someone else's.
+   The request-size cap allows the full comment percent-encoded and 50 selections in
+   long-named repositories; the decoded comment and target count are checked apart,
+   and what gofer keeps is bounded by them, not by the cap: a comment over 16 KiB is
+   refused without a copy (in no receipt or draft), a selection with an oversized ID
+   or repository name is unreadable, a receipt keeps only bounded display text
+   (titles, repositories and reasons cut, links over 256 bytes or not http(s)
+   dropped; the outcome counts and each result's status whole), every retained
+   string is copied out of the request so none holds the request buffer alive, and
+   at most 500 batches and 500 drafts are held, tens of MiB at worst. Batches are
+   bounded in all; only one that posted nothing is dropped early, and past the bound
+   gofer refuses to post rather than forget a used key.
+4. The request must be same-origin, in addition to SameSite=Lax. A browser
    that sends fetch metadata decides (`Sec-Fetch-Site: same-origin`): gofer's
    `Referrer-Policy: no-referrer` makes a form POST send `Origin: null`. Without
-   fetch metadata, an `Origin` must name gofer's host; `null` is refused. The preview
-   response itself sets `Referrer-Policy: same-origin`, so its Confirm button sends a
+   fetch metadata, an `Origin` must name gofer's host; `null` is refused. A radar that
+   carries the comment form sets `Referrer-Policy: same-origin`, so Post sends a
    real origin.
-5. The results page shows each target as posted (with a link to the comment, when
+5. The request waits for the batch, then redirects to the radar (`/?comment=<key>`),
+   which shows each target as posted (with a link to the comment, when
    GitHub's answer arrived whole), unknown, or not posted (with the reason). A 201 is
    posted even if its body was lost. A POST whose answer was lost after the request
    was written, or that got a server error (any 5xx, amended by ADR 0010: a 500 does not say the write was rolled back either), is **unknown**: it may
-   have been posted, and the page says to check before posting again. A 401 confirmed
+   have been posted, and the radar says to check before posting again. A batch that
+   posted nothing (a refused form, no grant, the worklist unreadable, nothing
+   eligible, every target refused) reopens the comment box with the same comment and
+   selection, the reason, and each target's own reason (a rate limit says when to try
+   again). A row is checked again only while it still names the repository and number
+   it was checked for. The results show whether or not commenting is still connected:
+   a grant lost mid-batch leaves the connect prompt and the receipt of what landed.
+   An unsent comment is kept for after reconnecting (in memory, the newest per user,
+   for two hours) in two cases only: a verified, unused form of this account posted
+   without a grant, kept with its form's key; and a batch that put nothing on GitHub
+   and left the grant gone (missing, or a 401 GitHub confirmed, which deletes it),
+   kept without one, since its key is used. A partial or unknown batch is never kept.
+   It comes back in the box on the next plain radar once commenting is connected (a
+   page showing an outcome leaves it kept), to post with an explicit Post, under its
+   form's key when it has one: the original tab and the restored form then share one
+   batch, and a draft whose form posted meanwhile is dropped. Posting any comment
+   drops the kept one. If the worklist cannot be read on the way back, the error
+   page's Try again keeps the results URL. A 401 confirmed
    by GitHub's check-token deletes the stored grant. A rate limit (429, or 403 with
    GitHub's rate-limit signals) stops the batch, says when to try again, and leaves
    the rest unattempted. The grant is read again before every post after the first,

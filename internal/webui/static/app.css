@@ -348,6 +348,15 @@ body {
 .zz-target-ok .zz-target-status { color: var(--success); }
 .zz-target-fail .zz-target-status { color: var(--danger); }
 .zz-target-unknown .zz-target-status { color: var(--attention); }
+.zz-comment-outcome { margin: 0 0 16px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 8px; }
+.zz-comment-outcome h2 { font-size: 15px; margin: 0 0 6px; }
+.zz-comment-outcome > p { margin: 0 0 6px; font-size: 14px; }
+.zz-comment-outcome .zz-meta { display: block; }
+.zz-comment-dismiss { margin: 8px 0 0; font-size: 13px; }
+.zz-comment-dismiss a { color: var(--accent); }
+.zz-compose-form .zz-stalled { margin: 0; }
+.zz-compose-form h2 { font-size: 14px; margin: 0; }
+.zz-compose-note { color: var(--attention); font-size: 13px; }
 
 /* Draft review (ADR 0010): the button at the bottom of a thread, and the selection under the newest draft. */
 .zz-draft-review { margin: 12px 0; }

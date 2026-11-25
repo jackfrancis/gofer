@@ -177,8 +177,8 @@ func New(cfg *config.Config, log *slog.Logger, dispatcher ingest.Dispatcher, vlt
 	// Batch action: run the review panel on every PR reviewed once but not yet given a
 	// second opinion.
 	mux.Handle("POST /items/second-opinion-all", http.HandlerFunc(webHandler.SecondOpinionAllPRs))
-	// Bulk comment (ADR 0009): preview, then confirm, posted by the web tier with the
-	// user's write grant; and the @ suggestions for the comment box.
+	// Bulk comment (ADR 0009): posted in one step from the radar by the web tier with
+	// the user's write grant; and the @ suggestions for the comment box.
 	mux.Handle("POST /items/comment", http.HandlerFunc(webHandler.Comment))
 	// Draft review comments (ADR 0010): ask for the agreed comments, then create a
 	// pending review on GitHub from the stored draft.
