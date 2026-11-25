@@ -16,7 +16,7 @@ import (
 // as delimited data, asks for JSON, and parses the answer, fenced or not.
 func TestReviewDrafter(t *testing.T) {
 	var req chatRequest
-	answer := "```json\n" + `{"comments":[{"path":" a.go ","line":3,"side":"RIGHT","body":"Rename."}],"general":["Add a test."," "],"excluded":["Naming: m1 and m2 disagree."]}` + "\n```"
+	answer := "```json\n" + `{"comments":[{"path":" a.go ","line":3,"side":"RIGHT","body":"Rename."}],"general":["Add a test."," "],"excluded":["Naming: m1 and m2 disagree."],"approve":true}` + "\n```"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(body, &req)
@@ -42,6 +42,9 @@ func TestReviewDrafter(t *testing.T) {
 	}
 	if len(got.Comments) != 1 || got.Comments[0].Path != "a.go" || got.Comments[0].Line != 3 {
 		t.Errorf("comments = %+v", got.Comments)
+	}
+	if !got.Approve {
+		t.Error("the approval was not parsed")
 	}
 	if len(got.General) != 1 || len(got.Excluded) != 1 {
 		t.Errorf("general %v, excluded %v", got.General, got.Excluded)

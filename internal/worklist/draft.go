@@ -38,9 +38,15 @@ const (
 	SideLeft  = "LEFT"
 )
 
+// ApprovalCommands is the review text an approving draft adds (DraftReview.Approve):
+// Prow's approval commands, each on its own line, as Prow's lgtm and approve plugins
+// read them from a submitted review's body.
+const ApprovalCommands = "/lgtm\n/approve"
+
 // DraftReview is the structured result of a draft-review run: inline comments
-// anchored to lines of one pull request's diff, and a summary Body for the agreed
-// points no diff line carries. It rides on the agent reply (Message.Draft).
+// anchored to lines of one pull request's diff, a summary Body for the agreed points
+// no diff line carries, and Approve when the conversation agrees the pull request is
+// ready to approve. It rides on the agent reply (Message.Draft).
 //
 // Repo, Number, Commit and BaseRef pin what the comments were anchored to. They are
 // part of the draft, so its Digest binds them: the web tier creates the review only
@@ -53,6 +59,11 @@ type DraftReview struct {
 	BaseRef  string         `json:"base_ref"`
 	Body     string         `json:"body,omitempty"`
 	Comments []DraftComment `json:"comments,omitempty"`
+	// Approve marks a draft whose conversation agrees the pull request is ready to
+	// approve: the review then carries ApprovalCommands as a general comment (in its
+	// body, after the summary; ReviewBody), which the owner may leave out like any
+	// other part. It is kept apart from Body so the summary's bound never cuts it.
+	Approve bool `json:"approve,omitempty"`
 	// Patches maps every commented file to the PatchDigest of the patch its comments
 	// were anchored to. The web tier re-reads those patches before it creates the
 	// review and refuses if one changed: a related change merged into the base can
@@ -96,7 +107,19 @@ const (
 
 // Empty reports whether the draft has nothing to post.
 func (d *DraftReview) Empty() bool {
-	return d == nil || (strings.TrimSpace(d.Body) == "" && len(d.Comments) == 0)
+	return d == nil || (strings.TrimSpace(d.Body) == "" && len(d.Comments) == 0 && !d.Approve)
+}
+
+// ReviewBody is the body of the review created from a draft: the summary, if kept,
+// then ApprovalCommands, if kept, on lines of their own.
+func ReviewBody(summary string, approve bool) string {
+	switch {
+	case !approve:
+		return summary
+	case summary == "":
+		return ApprovalCommands
+	}
+	return summary + "\n\n" + ApprovalCommands
 }
 
 // Digest identifies the draft: its content and the pull request, commit and base it
@@ -131,7 +154,8 @@ func BoundDraft(d *DraftReview) *DraftReview {
 	}
 	out := &DraftReview{
 		Repo: d.Repo, Number: d.Number, Commit: strings.ToLower(d.Commit), BaseRef: d.BaseRef,
-		Body: cutText(strings.TrimSpace(d.Body), MaxDraftBodyBytes),
+		Body:    cutText(strings.TrimSpace(d.Body), MaxDraftBodyBytes),
+		Approve: d.Approve,
 	}
 	for _, c := range d.Comments {
 		if len(out.Comments) == MaxDraftComments {
@@ -339,13 +363,15 @@ type DraftInput struct {
 }
 
 // DraftProposal is a ReviewDrafter's answer, before the run checks it against the
-// diff: inline comments, agreed points that belong to no diff line (General), and
-// the points it left out because the conversation does not agree on them (Excluded),
-// one short line each, which the reply shows so the owner sees what was held back.
+// diff: inline comments, agreed points that belong to no diff line (General), the
+// points it left out because the conversation does not agree on them (Excluded),
+// one short line each, which the reply shows so the owner sees what was held back,
+// and Approve when the conversation agrees the pull request is ready to approve.
 type DraftProposal struct {
 	Comments []DraftComment
 	General  []string
 	Excluded []string
+	Approve  bool
 }
 
 // ReviewDrafter drafts the review comments a conversation agrees on. It is

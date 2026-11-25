@@ -3,10 +3,12 @@ package webui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackfrancis/gofer/internal/comment"
@@ -149,13 +151,15 @@ type draftResult struct {
 	URL      string // the pending review on GitHub, when GitHub gave a link
 	Comments int    // inline comments sent
 	Summary  bool   // the summary was sent
+	Approve  bool   // the approval commands were sent
 	Error    string
 }
 
 // CreateDraftReview handles POST /items/draft-review/create (same-origin only). It
 // creates a PENDING review on GitHub from the thread's offered draft, with the
-// comments the owner kept checked (form "c", by position) and the summary if checked
-// (form "summary").
+// comments the owner kept checked (form "c", by position), the summary if checked
+// (form "summary"), and, for an approving draft, its approval commands if checked
+// (form "approve"; worklist.ReviewBody puts them after the summary).
 //
 // The draft is read from the store, never from the form: the form names the turn and
 // the draft's digest, and the draft must still be the one the thread offers
@@ -225,11 +229,14 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 		rv.Comments = append(rv.Comments, ghcomment.ReviewComment{Path: c.Path, Line: c.Line, Side: c.Side, Body: c.Body})
 		rv.Patches[c.Path] = draft.Patches[c.Path]
 	}
+	summary := ""
 	if r.PostForm.Get("summary") == "1" {
-		rv.Body = draft.Body
+		summary = draft.Body
 	}
+	approve := draft.Approve && r.PostForm.Get("approve") == "1"
+	rv.Body = worklist.ReviewBody(summary, approve)
 	if len(rv.Comments) == 0 && rv.Body == "" {
-		fail(http.StatusBadRequest, "Select at least one comment, or the summary, to create a pending review.")
+		fail(http.StatusBadRequest, "Select at least one comment, the summary or the approval to create a pending review.")
 		return
 	}
 	// Claim the confirmation. The claim re-checks, atomically, that the draft is the
@@ -280,13 +287,39 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 	default:
 		settle(nil) // GitHub certainly created nothing: the owner may try again
 	}
-	slog.InfoContext(ctx, "pending review", "user", user.ID, "created", res.Created, "unknown", res.Unknown, "comments", len(rv.Comments))
-	view := draftResult{Item: it, Created: res.Created, Unknown: res.Unknown, URL: res.URL, Comments: len(rv.Comments), Summary: rv.Body != "", Error: res.Error}
+	slog.InfoContext(ctx, "pending review", "user", user.ID, "created", res.Created, "unknown", res.Unknown, "comments", len(rv.Comments), "approve", approve)
+	view := draftResult{Item: it, Created: res.Created, Unknown: res.Unknown, URL: res.URL, Comments: len(rv.Comments), Summary: summary != "", Approve: approve, Error: res.Error}
 	status := http.StatusOK
 	if !res.Created && !res.Unknown {
 		status = http.StatusConflict
 	}
 	h.render(w, status, pageData{View: "draft-review-result", User: user, Item: it, DraftResult: &view})
+}
+
+// Parts names what the review was created with, for the result page: "2 inline
+// comments, a summary and the approval commands", "the approval commands", ...
+func (v draftResult) Parts() string {
+	var parts []string
+	if v.Comments > 0 {
+		noun := "inline comments"
+		if v.Comments == 1 {
+			noun = "inline comment"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", v.Comments, noun))
+	}
+	if v.Summary {
+		parts = append(parts, "a summary")
+	}
+	if v.Approve {
+		parts = append(parts, "the approval commands")
+	}
+	switch len(parts) {
+	case 0:
+		return "nothing selected"
+	case 1:
+		return parts[0]
+	}
+	return strings.Join(parts[:len(parts)-1], ", ") + " and " + parts[len(parts)-1]
 }
 
 // renderReceipt answers a confirmation of a draft already confirmed: what the

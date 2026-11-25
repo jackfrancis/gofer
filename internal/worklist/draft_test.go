@@ -252,3 +252,37 @@ func TestDraftDigest(t *testing.T) {
 		t.Error("a nil draft has a digest or content")
 	}
 }
+
+// An approving draft with nothing else is still a draft: its approval is kept apart
+// from the summary, so the summary's bound never cuts it, and the review body puts
+// the commands after the summary, each on a line of its own.
+func TestApprovingDraft(t *testing.T) {
+	d := pinned("")
+	d.Approve = true
+	got := BoundDraft(d)
+	if got == nil || !got.Approve || got.Body != "" || len(got.Comments) != 0 {
+		t.Fatalf("approval-only draft = %+v", got)
+	}
+	long := pinned(strings.Repeat("b", MaxDraftBodyBytes+10))
+	long.Approve = true
+	if got := BoundDraft(long); !got.Approve || len(got.Body) > MaxDraftBodyBytes {
+		t.Fatalf("long approving draft: approve %v, body %d bytes", got.Approve, len(got.Body))
+	}
+	if d.Digest() == pinned("").Digest() {
+		t.Error("the approval is not covered by the digest")
+	}
+	for _, tc := range []struct {
+		summary string
+		approve bool
+		want    string
+	}{
+		{"", false, ""},
+		{"- Add a test.", false, "- Add a test."},
+		{"", true, "/lgtm\n/approve"},
+		{"- Add a test.", true, "- Add a test.\n\n/lgtm\n/approve"},
+	} {
+		if got := ReviewBody(tc.summary, tc.approve); got != tc.want {
+			t.Errorf("ReviewBody(%q, %v) = %q, want %q", tc.summary, tc.approve, got, tc.want)
+		}
+	}
+}

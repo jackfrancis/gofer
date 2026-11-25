@@ -92,7 +92,7 @@
         {{if .Repeat}}<p class="zz-meta">This draft was already confirmed, so gofer sent nothing to GitHub now. This is what the earlier confirmation did.</p>{{end}}
         <p class="zz-meta"><a href="{{.Item.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.Item.GitHub.Repo}} #{{.Item.GitHub.Number}}</a> {{.Item.GitHub.Title}}</p>
         {{if .Created}}
-        <p>{{if .Repeat}}gofer created a pending review from this draft.{{else}}gofer created a pending review with {{.Comments}} inline comment{{if ne .Comments 1}}s{{end}}{{if .Summary}} and a summary{{end}}.{{end}} It is a draft only you can see until you submit it: open it on GitHub to edit, submit or discard it.</p>
+        <p>{{if .Repeat}}gofer created a pending review from this draft.{{else}}gofer created a pending review with {{.Parts}}.{{end}} It is a draft only you can see until you submit it: open it on GitHub to edit, submit or discard it.</p>
         <div class="zz-actions"><a class="btn btn-primary" href="{{with .URL}}{{.}}{{else}}{{$.Item.GitHub.URL}}/files{{end}}" target="_blank" rel="noopener noreferrer">Open on GitHub</a></div>
         {{else}}
         <p class="zz-stalled" role="alert">{{.Error}}</p>
@@ -197,6 +197,12 @@
                   <pre class="zz-draft-text">{{$m.Draft.Body}}</pre>
                 </div>
                 {{end}}
+                {{if $m.Draft.Approve}}
+                <div class="zz-draft-pick">
+                  <label><input type="checkbox" name="approve" value="1" checked> Approval (a general comment, after the summary)</label>
+                  <pre class="zz-draft-text">{{approvalCommands}}</pre>
+                </div>
+                {{end}}
               </fieldset>
               <button class="btn btn-sm btn-primary" type="submit" title="Creates a pending review on GitHub as you. It is a draft only you can see until you submit it on GitHub.">Create pending review on GitHub</button>
               <p class="zz-meta">gofer creates the review as a draft (pending) on GitHub, as you{{with userHandle $.User}} ({{.}}){{end}}, once per draft. Nothing is submitted: open the pull request on GitHub to edit, submit or discard it.</p>
@@ -253,7 +259,7 @@
         {{if .Connected}}
         <form method="post" action="/items/draft-review">
           <input type="hidden" name="id" value="{{$.Item.ID}}">
-          <button class="btn btn-sm" type="submit"{{if not .Ready}} disabled title="{{.Why}}"{{else}} title="Drafts review comments for the points this conversation agrees on. Nothing is posted until you create the pending review."{{end}}>Draft Review Comments</button>
+          <button class="btn btn-sm" type="submit"{{if not .Ready}} disabled title="{{.Why}}"{{else}} title="Drafts review comments for the points this conversation agrees on, and an approval (/lgtm, /approve) when it agrees the pull request is ready. Nothing is posted until you create the pending review."{{end}}>Draft Review Comments</button>
         </form>
         {{else}}
         <p class="zz-meta"><a href="/auth/github-write/login">Connect GitHub to comment</a> to draft review comments from this conversation as a pending review on GitHub.</p>

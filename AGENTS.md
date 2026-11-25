@@ -626,7 +626,11 @@ Wired on the web-tier side; they define what a runtime must respect:
   points the visible conversation agrees on (the user's own messages decide; an
   unsettled disagreement is left out and listed), keeps inline only comments on a line
   the diff showed (others move into the summary), and replies with a
-  `worklist.DraftReview` on `Message.Draft`, pinned to the repository, number, head
+  `worklist.DraftReview` on `Message.Draft` (marked `Approve` when the conversation
+  agrees the pull request is ready to approve: the review body then ends with
+  `worklist.ApprovalCommands`, `/lgtm` and `/approve` on lines of their own, a flag
+  apart from the summary so its bound never cuts them, offered as its own checkbox
+  and joined by `worklist.ReviewBody`), pinned to the repository, number, head
   commit and base branch it was anchored to, with each commented file's patch digest
   (`DraftReview.Patches`, `worklist.PatchDigest` = `ghcomment.PatchDigest`). Context lines anchor RIGHT only, as
   GitHub defines them, and the annotated diff stays within its byte budget, notices

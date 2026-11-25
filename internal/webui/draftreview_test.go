@@ -407,3 +407,78 @@ func (s ctxStore) Update(ctx context.Context, ownerID string, fn func([]worklist
 	}
 	return s.Store.Update(ctx, ownerID, fn)
 }
+
+// An approving draft offers its approval as its own checkbox, showing the exact
+// commands; confirming it sends them in the review body after the summary, leaving
+// it unchecked sends none, and a draft that does not approve never sends them,
+// whatever the form says.
+func TestCreateDraftReviewApproval(t *testing.T) {
+	approving := func() []worklist.Message {
+		th := draftedThread(time.Now().Add(-time.Hour))
+		th[3].Draft.Approve = true
+		return th
+	}
+	create := func(t *testing.T, th []worklist.Message, form url.Values) (comment.Review, string) {
+		t.Helper()
+		c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true}}
+		h, _, _ := draftFixture(t, c, th)
+		form.Set("id", draftItemID)
+		form.Set("msg", "a")
+		form.Set("digest", th[3].Draft.Digest())
+		rec := postCreate(h, form, "Sec-Fetch-Site", "same-origin")
+		if rec.Code != http.StatusOK || len(c.reviews) != 1 {
+			t.Fatalf("status %d, reviews %+v\n%s", rec.Code, c.reviews, rec.Body.String())
+		}
+		return c.reviews[0], rec.Body.String()
+	}
+
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	h, _, _ := draftFixture(t, c, approving())
+	page, _ := threadPage(t, h)
+	for _, want := range []string{`name="approve" value="1" checked`, "<pre class=\"zz-draft-text\">/lgtm\n/approve</pre>"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("thread lacks %q", want)
+		}
+	}
+	h, _, _ = draftFixture(t, c, draftedThread(time.Now().Add(-time.Hour)))
+	if page, _ := threadPage(t, h); strings.Contains(page, `name="approve"`) {
+		t.Error("a draft that does not approve offers an approval")
+	}
+
+	rv, body := create(t, approving(), url.Values{"summary": {"1"}, "approve": {"1"}})
+	if rv.Body != "- Add a test.\n\n/lgtm\n/approve" || len(rv.Comments) != 0 {
+		t.Errorf("summary and approval: body %q, %d comments", rv.Body, len(rv.Comments))
+	}
+	if !strings.Contains(body, "a summary and the approval commands") {
+		t.Errorf("result page:\n%s", body)
+	}
+	if rv, _ := create(t, approving(), url.Values{"approve": {"1"}}); rv.Body != worklist.ApprovalCommands {
+		t.Errorf("approval only: body %q", rv.Body)
+	}
+	if rv, _ := create(t, approving(), url.Values{"summary": {"1"}}); rv.Body != "- Add a test." {
+		t.Errorf("approval left out: body %q", rv.Body)
+	}
+	if rv, _ := create(t, draftedThread(time.Now().Add(-time.Hour)), url.Values{"summary": {"1"}, "approve": {"1"}}); rv.Body != "- Add a test." {
+		t.Errorf("a draft that does not approve sent: %q", rv.Body)
+	}
+}
+
+// A draft that only approves (no comment, no summary) is offered and creates a
+// review whose body is the approval commands.
+func TestCreateDraftReviewApprovalOnly(t *testing.T) {
+	th := draftedThread(time.Now().Add(-time.Hour))
+	th[3].Draft = &worklist.DraftReview{Repo: "o/r", Number: 1, Commit: draftCommit, BaseRef: "main", Approve: true}
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true}}
+	h, _, _ := draftFixture(t, c, th)
+	page, _ := threadPage(t, h)
+	if !strings.Contains(page, `name="approve" value="1" checked`) || strings.Contains(page, `name="summary"`) {
+		t.Fatalf("approval-only draft not offered as such")
+	}
+	rec := postCreate(h, url.Values{"id": {draftItemID}, "msg": {"a"}, "digest": {th[3].Draft.Digest()}, "approve": {"1"}}, "Sec-Fetch-Site", "same-origin")
+	if rec.Code != http.StatusOK || len(c.reviews) != 1 || c.reviews[0].Body != "/lgtm\n/approve" || len(c.reviews[0].Comments) != 0 {
+		t.Fatalf("status %d, reviews %+v", rec.Code, c.reviews)
+	}
+	if !strings.Contains(rec.Body.String(), "created a pending review with the approval commands.") {
+		t.Errorf("result page:\n%s", rec.Body.String())
+	}
+}

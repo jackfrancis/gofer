@@ -165,6 +165,43 @@ func TestRunConverseDraftsNothing(t *testing.T) {
 	}
 }
 
+// A conversation that agrees the pull request is ready to approve drafts the
+// approval as a general comment, alone or beside agreed nits, and says so.
+func TestRunConverseDraftsApproval(t *testing.T) {
+	run := func(t *testing.T, prop worklist.DraftProposal) worklist.Message {
+		t.Helper()
+		sink := &memSink{items: []worklist.WorkItem{draftItem()}}
+		err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: "github:o/r#1", Turn: "d", Converser: &fakeConverser{}, Drafter: &fakeDrafter{prop: prop}},
+			fakeVendor{token: "t"}, sink)
+		if err != nil {
+			t.Fatal(err)
+		}
+		th := sink.items[0].Thread
+		return th[len(th)-1]
+	}
+	m := run(t, worklist.DraftProposal{Approve: true})
+	if d := m.Draft; d == nil || !d.Approve || d.Body != "" || len(d.Comments) != 0 || d.Commit != draftHead {
+		t.Fatalf("approval-only draft = %+v", m.Draft)
+	}
+	for _, want := range []string{"Drafted an approval", "/lgtm\n/approve"} {
+		if !strings.Contains(m.Content, want) {
+			t.Errorf("reply lacks %q:\n%s", want, m.Content)
+		}
+	}
+	if strings.Contains(m.Content, "Nothing to draft") {
+		t.Errorf("an approval read as nothing to draft:\n%s", m.Content)
+	}
+	m = run(t, worklist.DraftProposal{Approve: true, Comments: []worklist.DraftComment{{Path: "a.go", Line: 11, Side: "RIGHT", Body: "Nit: rename."}}})
+	if d := m.Draft; d == nil || !d.Approve || len(d.Comments) != 1 {
+		t.Fatalf("approval with a nit = %+v", m.Draft)
+	}
+	for _, want := range []string{"Drafted 1 inline review comment", "ready to approve", "**Approval**"} {
+		if !strings.Contains(m.Content, want) {
+			t.Errorf("reply lacks %q:\n%s", want, m.Content)
+		}
+	}
+}
+
 // Without GitHub there is no diff to anchor to: the run says so and drafts nothing.
 func TestRunConverseDraftWithoutGitHub(t *testing.T) {
 	sink := &memSink{items: []worklist.WorkItem{draftItem()}}

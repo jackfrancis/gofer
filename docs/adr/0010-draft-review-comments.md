@@ -100,6 +100,31 @@ is evidence, but each point is judged on its own. With a single undisputed revie
 its actionable points are agreed. This is a model judgment; the user's review of the
 exact text before anything is created is the check on it.
 
+### Approval
+
+When the conversation agrees the pull request is ready to approve as it stands, the
+drafter says so (`"approve": true`; `DraftProposal.Approve`), and the draft is marked
+`DraftReview.Approve`. The review then carries `worklist.ApprovalCommands`,
+`/lgtm` and `/approve` each on a line of their own, as a general comment: in the
+review body, after the summary (`worklist.ReviewBody`), never on a file and line.
+Those are Prow's commands, which its lgtm and approve plugins read from a submitted
+review's body; on a repository without Prow they are only text.
+
+The bar is the same as for a comment: the reviews (or the settled outcome of their
+disagreement) recommend approving, no agreed point asks the author for a change before
+it merges, nothing about whether it should merge is unsettled, and the user's own
+messages decide. Non-blocking nits may still be drafted beside an approval; when in
+doubt, the drafter does not approve. An approving draft with no comment and no summary
+is still a draft (`DraftReview.Empty` counts the approval), so an approved pull request
+no longer answers "nothing to draft".
+
+The approval is a flag, not text in `Body`: the summary's bound (8 KiB, cut at the end)
+can never cut the commands, and the thread offers the approval as its own checkbox,
+showing exactly the text it sends, so the owner can keep the comments and leave the
+approval out, or the reverse. The flag is part of the draft, so its `Digest` covers it.
+The review is still created pending: the commands take effect only when the owner
+submits it on GitHub.
+
 ### Once per draft
 
 ADR 0009's confirm consumes a one-time nonce held in memory. GitHub's

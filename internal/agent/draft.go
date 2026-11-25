@@ -169,10 +169,11 @@ func renderDiff(files []github.DiffFile, budget int) (string, map[string]map[anc
 // model's proposal: a comment stays inline
 // only if its line is one the diff showed it (anchors); any other, and any past
 // MaxDraftComments, moves into the review summary with its location, so an agreed
-// point is never lost to a bad anchor. moved counts those. It returns nil when there
-// is nothing to post.
+// point is never lost to a bad anchor. moved counts those. An approving proposal
+// marks the draft Approve (the review then carries worklist.ApprovalCommands). It
+// returns nil when there is nothing to post.
 func anchorDraft(prop worklist.DraftProposal, anchors map[string]map[anchor]bool, pin worklist.DraftReview) (*worklist.DraftReview, int) {
-	d := &worklist.DraftReview{Repo: pin.Repo, Number: pin.Number, Commit: pin.Commit, BaseRef: pin.BaseRef, Patches: pin.Patches}
+	d := &worklist.DraftReview{Repo: pin.Repo, Number: pin.Number, Commit: pin.Commit, BaseRef: pin.BaseRef, Patches: pin.Patches, Approve: prop.Approve}
 	general := append([]string(nil), prop.General...)
 	moved := 0
 	for _, c := range prop.Comments {
@@ -210,13 +211,20 @@ func anchorDraft(prop worklist.DraftProposal, anchors map[string]map[anchor]bool
 // not be placed. It is also what later runs read of the draft.
 func draftContent(d *worklist.DraftReview, excluded []string, moved, omitted int, complete bool) string {
 	var b strings.Builder
-	if d.Empty() {
+	switch {
+	case d.Empty():
 		b.WriteString("**Nothing to draft.** The conversation has no agreed, actionable point to turn into a review comment yet.\n")
-	} else {
+	case len(d.Comments) == 0 && d.Body == "":
+		fmt.Fprintf(&b, "**Drafted an approval** of commit `%s`: this conversation agrees the pull request is ready to approve, and has no comment for the author.", shortSHA(d.Commit))
+		b.WriteString(" Nothing is posted until you create the pending review below, and on GitHub it stays a draft only you can see until you submit it there.\n")
+	default:
 		n := len(d.Comments)
 		fmt.Fprintf(&b, "**Drafted %d inline review comment%s** from the points this conversation agrees on, anchored to commit `%s`.", n, plural(n), shortSHA(d.Commit))
 		if d.Body != "" {
 			b.WriteString(" Points no diff line carries are in the review summary.")
+		}
+		if d.Approve {
+			b.WriteString(" The conversation also agrees the pull request is ready to approve.")
 		}
 		b.WriteString(" Nothing is posted until you create the pending review below, and on GitHub it stays a draft only you can see until you submit it there.\n")
 		for i, c := range d.Comments {
@@ -225,6 +233,9 @@ func draftContent(d *worklist.DraftReview, excluded []string, moved, omitted int
 		if d.Body != "" {
 			fmt.Fprintf(&b, "\n**Review summary**\n\n%s\n", d.Body)
 		}
+	}
+	if d != nil && d.Approve {
+		fmt.Fprintf(&b, "\n**Approval** (a general comment, on lines of its own)\n\n```\n%s\n```\n", worklist.ApprovalCommands)
 	}
 	if len(excluded) > 0 {
 		b.WriteString("\n**Left out — no consensus yet**\n\n")
