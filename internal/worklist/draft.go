@@ -95,10 +95,11 @@ type DraftComment struct {
 type DraftReceipt struct {
 	State string `json:"state"` // DraftCreating | DraftCreated | DraftUnknown
 	URL   string `json:"url,omitempty"`
-	// Body is the review body sent (ReviewBody of what the owner kept), recorded when
-	// the claim settles to DraftCreated or DraftUnknown. GitHub's dialog for
-	// submitting a pending review can open with an empty summary that replaces it,
-	// so the thread shows it to copy into that dialog.
+	// Body is the review body sent (ReviewBody of what the owner kept), recorded in
+	// the claim, before gofer contacts GitHub, so a confirmation interrupted after
+	// GitHub created the review still shows it. GitHub's dialog for submitting a
+	// pending review can open with an empty summary that replaces it, so the thread
+	// shows it to copy into that dialog.
 	Body string    `json:"body,omitempty"`
 	At   time.Time `json:"at"`
 }
@@ -153,8 +154,7 @@ var draftRepo = regexp.MustCompile(`^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$`)
 // neutralized (NeutralizeCommands); text cut to its bound; at most MaxDraftComments
 // comments; patch digests kept for commented files only. A side left empty is RIGHT.
 func BoundDraft(d *DraftReview) *DraftReview {
-	if d == nil || !validCommit(d.Commit) || !draftRepo.MatchString(d.Repo) || d.Number <= 0 ||
-		d.BaseRef == "" || len(d.BaseRef) > maxDraftRefBytes || !utf8.ValidString(d.BaseRef) {
+	if d == nil || !validCommit(d.Commit) || !draftRepo.MatchString(d.Repo) || d.Number <= 0 || !validRef(d.BaseRef) {
 		return nil
 	}
 	out := &DraftReview{
@@ -187,19 +187,95 @@ func BoundDraft(d *DraftReview) *DraftReview {
 	return out
 }
 
+// validRef reports whether s can be a stored branch name: non-empty, bounded, UTF-8.
+func validRef(s string) bool {
+	return s != "" && len(s) <= maxDraftRefBytes && utf8.ValidString(s)
+}
+
+// Current reports whether d is what BoundDraft would store today. A draft stored
+// under older rules (before command lines were neutralized, say) is not: the thread
+// does not offer it and a confirmation of it is refused (OfferedDraft), so it can
+// never send text today's rules would change. Drafting again replaces it.
+func (d *DraftReview) Current() bool {
+	b := BoundDraft(d)
+	return b != nil && b.Digest() == d.Digest()
+}
+
 // commandLine matches a line a bot such as Prow reads as a command: a slash and a
 // command word at the start of the line (after any indentation), then the end of
 // the line or a space. A path such as /usr/bin/x is not one: its word runs into
 // another slash.
-var commandLine = regexp.MustCompile(`(?m)^([ \t]*)(/[A-Za-z][A-Za-z0-9_-]*)([ \t\r].*)?$`)
+var commandLine = regexp.MustCompile(`^([ \t]*)(/[A-Za-z][A-Za-z0-9_-]*)([ \t\r].*)?$`)
+
+// fenceOpen matches a fenced code block's opening line: up to three spaces, three or
+// more backticks or tildes, and an info string whose first word is the language.
+var fenceOpen = regexp.MustCompile("^( {0,3})(`{3,}|~{3,})[ \t]*([^ \t`\r]*)")
+
+// SuggestionNote follows a suggestion block NeutralizeCommands turned into a plain
+// code block.
+const SuggestionNote = "_(gofer did not offer this as a suggested change: a line in it would act as a bot command on GitHub, so it is shown as plain code.)_"
 
 // NeutralizeCommands returns model-written review text with every command line
 // (commandLine: /lgtm, /approve, /hold, ...) made inert by wrapping its command in
 // backticks, so it reads the same but no longer starts with a slash. A drafted
 // review acts on a pull request only through what the owner selects: its approval
 // commands come from DraftReview.Approve alone, never from the text.
+//
+// A GitHub suggestion block is applied verbatim, so it is never altered and left a
+// suggestion: one holding a command line (a .gitignore's /dist, say) becomes a
+// plain code block, with SuggestionNote after it, so the author cannot apply the
+// altered text. Every other block keeps its lines unless they are command lines. The
+// result is a fixed point: neutralizing it again changes nothing.
 func NeutralizeCommands(s string) string {
-	return commandLine.ReplaceAllString(s, "$1`$2`$3")
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); i++ {
+		m := fenceOpen.FindStringSubmatch(lines[i])
+		if m == nil {
+			out = append(out, neutralizeLine(lines[i]))
+			continue
+		}
+		end := i + 1 // the closing fence, or len(lines) for a block left open
+		for end < len(lines) && !closesFence(lines[end], m[2]) {
+			end++
+		}
+		body := lines[i+1 : end]
+		unsafe := false
+		for _, l := range body {
+			unsafe = unsafe || commandLine.MatchString(l)
+		}
+		suggestion := unsafe && strings.EqualFold(m[3], "suggestion")
+		if suggestion {
+			out = append(out, m[1]+m[2]+"text")
+		} else {
+			out = append(out, lines[i])
+		}
+		for _, l := range body {
+			out = append(out, neutralizeLine(l))
+		}
+		if end < len(lines) {
+			out = append(out, lines[end])
+		}
+		if suggestion {
+			out = append(out, SuggestionNote)
+		}
+		i = end
+	}
+	return strings.Join(out, "\n")
+}
+
+func neutralizeLine(l string) string {
+	return commandLine.ReplaceAllString(l, "$1`$2`$3")
+}
+
+// closesFence reports whether line closes a block opened by fence: the same
+// character, at least as many, and nothing after but spaces.
+func closesFence(line, fence string) bool {
+	t := strings.TrimRight(strings.TrimLeft(line, " "), " \t\r")
+	if len(line)-len(strings.TrimLeft(line, " ")) > 3 || len(t) < len(fence) {
+		return false
+	}
+	return strings.Trim(t, fence[:1]) == ""
 }
 
 // ValidDraftPath reports whether p can name a file in a diff: a relative path
@@ -301,7 +377,7 @@ func (w WorkItem) RedraftRedundant() bool {
 	if i < 0 {
 		return false
 	}
-	if !w.Thread[i].Draft.For(w) || w.Thread[i].DraftReceipt != nil {
+	if !w.Thread[i].Draft.For(w) || !w.Thread[i].Draft.Current() || w.Thread[i].DraftReceipt != nil {
 		return false
 	}
 	if !w.Thread[req].ReadRevKnown {
@@ -349,11 +425,12 @@ func (w *WorkItem) SetHidden(i int, hidden bool) bool {
 
 // OfferedDraft returns the position of the draft turn key names if it is the draft
 // the thread offers now (LatestDraft), its digest is digest, and it is pinned to the
-// item's pull request as it stands (DraftReview.For). A receipt on it does not
-// matter here: the caller decides what a confirmed draft means.
+// item's pull request as it stands (DraftReview.For), and it is what today's rules
+// would store (DraftReview.Current). A receipt on it does not matter here: the
+// caller decides what a confirmed draft means.
 func (w WorkItem) OfferedDraft(key, digest string) (int, bool) {
 	i := w.LatestDraft()
-	if i < 0 || w.TurnKey(i) != key || w.Thread[i].Draft.Digest() != digest || !w.Thread[i].Draft.For(w) {
+	if i < 0 || w.TurnKey(i) != key || w.Thread[i].Draft.Digest() != digest || !w.Thread[i].Draft.For(w) || !w.Thread[i].Draft.Current() {
 		return 0, false
 	}
 	return i, true
@@ -365,12 +442,14 @@ func (w WorkItem) OfferedDraft(key, digest string) (int, bool) {
 var ErrDraftNotOffered = errors.New("the draft is no longer offered")
 
 // ClaimDraft claims ownerID's draft (item itemID, turn key, digest) for creation at
-// at, in one Store.Update: it records a DraftCreating receipt unless the draft
-// already has a receipt, which it returns instead (prior), with nothing written. It
+// at, in one Store.Update: it records a DraftCreating receipt carrying body (the
+// review body about to be sent, so an interrupted confirmation can still show it)
+// unless the draft already has a receipt, which it returns instead (prior), with
+// nothing written. It
 // returns the item as stored (with the claim when claimed) so the caller creates the
 // review from the stored draft. ErrDraftNotOffered when the draft is not offered or
 // the item is off the radar.
-func ClaimDraft(ctx context.Context, store Store, ownerID, itemID, key, digest string, at time.Time) (item WorkItem, prior *DraftReceipt, err error) {
+func ClaimDraft(ctx context.Context, store Store, ownerID, itemID, key, digest, body string, at time.Time) (item WorkItem, prior *DraftReceipt, err error) {
 	err = store.Update(ctx, ownerID, func(current []WorkItem) ([]WorkItem, error) {
 		item, prior = WorkItem{}, nil
 		for n := range current {
@@ -389,7 +468,7 @@ func ClaimDraft(ctx context.Context, store Store, ownerID, itemID, key, digest s
 				prior, item = &cp, current[n]
 				return nil, nil
 			}
-			current[n].Thread[i].DraftReceipt = &DraftReceipt{State: DraftCreating, At: at}
+			current[n].Thread[i].DraftReceipt = &DraftReceipt{State: DraftCreating, Body: body, At: at}
 			item = current[n]
 			return current[n : n+1], nil
 		}
@@ -461,9 +540,10 @@ type DraftInput struct {
 	ViewerLogin string
 	History     []Message
 	Diff        string
-	// Head is the pull request's head commit the diff shows, which the draft is
-	// anchored to; a history turn's Head is the commit it read.
-	Head string
+	// Head and Base are the pull request's head commit and base branch the diff
+	// shows, which the draft is anchored to; a history turn's Head and Base are the
+	// revision it read.
+	Head, Base string
 }
 
 // DraftProposal is a ReviewDrafter's answer, before the run checks it against the

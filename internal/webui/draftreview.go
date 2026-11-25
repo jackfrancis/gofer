@@ -28,6 +28,12 @@ import (
 // draftReviewPrompt is the request turn the button posts.
 const draftReviewPrompt = "Draft review comments for the points this conversation agrees on."
 
+// reviewAgainPrompt is the review request "Review the current revision" posts.
+const reviewAgainPrompt = "Review this PR again as it stands now: it changed since the earlier review."
+
+// outdatedDraft refuses a draft stored under older rules (DraftReview.Current).
+const outdatedDraft = "This draft was saved before gofer's current checks on drafted text, so gofer will not send it as it is. Nothing was created; draft the review comments again."
+
 // draftReviewTimeout bounds creating the pending review: a few GitHub calls. It runs
 // detached from the browser request, so a closed tab does not cut it short midway.
 var draftReviewTimeout = 60 * time.Second // a variable so tests can shorten it
@@ -56,6 +62,14 @@ type draftThread struct {
 	// than draftReviewTimeout, whose request gofer never settled.
 	Receipt     *worklist.DraftReceipt
 	Interrupted bool
+	// Outdated marks a newest draft stored under older rules (DraftReview.Current):
+	// it is not offered, and the thread says to draft again.
+	Outdated bool
+	// ReviewOutdated marks a newest draft that read a revision other than the one
+	// the latest review read (WorkItem.ReviewOutdated): the thread offers a review
+	// of the current revision, enabled while no reply is in flight (ReviewReady).
+	ReviewOutdated bool
+	ReviewReady    bool
 }
 
 // reviewCreator returns the commenter's pending-review side, if it has one.
@@ -84,9 +98,17 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 	default:
 		v.Ready = true
 	}
+	v.ReviewOutdated = it.ReviewOutdated()
+	v.ReviewReady = v.ReviewOutdated && it.HasReview() && !it.ReplyPending(now, reviewStaleAfter)
 	// Only a draft pinned to the item's pull request as it stands is offered: a
-	// write-back that changed the item's destination retires it.
+	// write-back that changed the item's destination retires it. A draft stored under
+	// older rules is not offered either, though its receipt, if it was confirmed,
+	// still shows.
 	if i := it.LatestDraft(); i >= 0 && connected && it.Thread[i].Draft.For(it) {
+		if !it.Thread[i].Draft.Current() && it.Thread[i].DraftReceipt == nil {
+			v.Outdated = true
+			return v
+		}
 		v.Index = i
 		v.Digest = it.Thread[i].Draft.Digest()
 		v.Receipt = it.Thread[i].DraftReceipt
@@ -170,6 +192,51 @@ func (h *Handler) DraftReview(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, back, http.StatusSeeOther)
 }
 
+// ReviewAgain handles POST /items/review-again, the thread's "Review the current
+// revision": offered when the newest draft read a pull request revision other than
+// the one the latest review read (WorkItem.ReviewOutdated), so no approval could be
+// drafted from it. It appends a review request, keeping the conversation, and
+// dispatches it to the default model; its answer records the revision it read, so a
+// draft afterwards can approve it. A stale page (the review already current, a reply
+// in flight, the item off the radar) appends nothing.
+func (h *Handler) ReviewAgain(w http.ResponseWriter, r *http.Request) {
+	user := h.sessions.CurrentUser(r)
+	if user == nil || !h.convEnabled {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	id := r.FormValue("id")
+	back := "/items/thread?id=" + url.QueryEscape(id)
+	if id == "" {
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	now := h.now().UTC()
+	msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: reviewAgainPrompt, Kind: worklist.KindReviewRequest, At: now}
+	appended := false
+	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		appended = false
+		for i := range current {
+			it := current[i]
+			if it.ID != id {
+				continue
+			}
+			if it.Type != worklist.TypePullRequest || !it.OnRadar() || !it.ReviewOutdated() || it.ReplyPending(now, reviewStaleAfter) {
+				return nil, nil
+			}
+			current[i].Thread = append(current[i].Thread, msg)
+			appended = true
+			return current[i : i+1], nil
+		}
+		return nil, nil
+	})
+	if err == nil && appended {
+		opt, _ := h.defaultOption()
+		_ = h.pipeline.Converse(r.Context(), user.ID, worklist.TurnRef{Item: id, Turn: msg.ID}, opt.Endpoint, opt.Model)
+	}
+	http.Redirect(w, r, back, http.StatusSeeOther)
+}
+
 // draftResult is the result view's data.
 type draftResult struct {
 	Item     worklist.WorkItem
@@ -238,13 +305,19 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusConflict, "This pull request is no longer on your radar, so gofer created nothing.")
 		return
 	}
+	if j := it.LatestDraft(); j >= 0 && it.TurnKey(j) == key && it.Thread[j].Draft.Digest() == digest && it.Thread[j].Draft.For(it) {
+		if prior := it.Thread[j].DraftReceipt; prior != nil {
+			h.renderReceipt(w, user, it, prior) // confirmed before, under whatever rules: nothing is sent
+			return
+		}
+		if !it.Thread[j].Draft.Current() {
+			fail(http.StatusConflict, outdatedDraft)
+			return
+		}
+	}
 	i, offered := it.OfferedDraft(key, digest)
 	if !offered {
 		fail(http.StatusConflict, notOffered)
-		return
-	}
-	if prior := it.Thread[i].DraftReceipt; prior != nil {
-		h.renderReceipt(w, user, it, prior)
 		return
 	}
 	if !connected {
@@ -280,7 +353,7 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), draftReviewTimeout)
 	defer cancel()
 	claimedAt := h.now().UTC()
-	it, prior, err := worklist.ClaimDraft(ctx, h.store, user.ID, id, key, digest, claimedAt)
+	it, prior, err := worklist.ClaimDraft(ctx, h.store, user.ID, id, key, digest, rv.Body, claimedAt)
 	switch {
 	case errors.Is(err, worklist.ErrDraftNotOffered):
 		fail(http.StatusConflict, notOffered)

@@ -224,10 +224,10 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 		reply.Attempt = "" // only a notice names the attempt it ended
 	}
 	reply.ReplyTo = replyTo
-	if validCommit(reply.Head) {
+	if validCommit(reply.Head) && validRef(reply.Base) {
 		reply.Head = strings.ToLower(reply.Head)
 	} else {
-		reply.Head = ""
+		reply.Head, reply.Base = "", ""
 	}
 	found := false // the answered turn is still in the thread
 	for i, m := range item.Thread {
@@ -255,9 +255,9 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 		if reply.Draft = BoundDraft(reply.Draft); !reply.Draft.For(*item) {
 			reply.Draft = nil
 		}
-		// An approval approves the commit the latest review read, so it stands only
-		// on a draft pinned to that commit, whatever the run decided.
-		if d := reply.Draft; d != nil && d.Approve && item.ReviewedHead() != d.Commit {
+		// An approval approves the revision the latest review read, so it stands only
+		// on a draft pinned to that head and base, whatever the run decided.
+		if d := reply.Draft; d != nil && d.Approve && !item.Reviewed(d.Commit, d.BaseRef) {
 			d.Approve = false
 			if d.Empty() {
 				reply.Draft = nil

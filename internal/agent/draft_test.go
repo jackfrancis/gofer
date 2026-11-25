@@ -62,7 +62,7 @@ func draftItem() worklist.WorkItem {
 		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, Title: "t"},
 		Thread: []worklist.Message{
 			{ID: "q", Role: worklist.RoleUser, Content: "review?", Kind: worklist.KindReviewRequest},
-			{ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "rename new1", Model: "m1", Head: draftHead},
+			{ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "rename new1", Model: "m1", Head: draftHead, Base: "main"},
 			{ID: "h", Role: worklist.RoleUser, Content: "secret aside", Hidden: true},
 			{ID: "d", Role: worklist.RoleUser, Content: "draft", Kind: worklist.KindDraftReviewRequest},
 		},
@@ -227,7 +227,7 @@ func TestRunConverseWithholdsStaleApproval(t *testing.T) {
 			if m.Draft != nil {
 				t.Fatalf("stale approval drafted: %+v", m.Draft)
 			}
-			for _, want := range []string{"No approval drafted", "`0123456789ab`", "Review the pull request again"} {
+			for _, want := range []string{"No approval drafted", "is now commit `0123456789ab` against `main`", "Review the current revision"} {
 				if !strings.Contains(m.Content, want) {
 					t.Errorf("reply lacks %q:\n%s", want, m.Content)
 				}
@@ -251,6 +251,47 @@ func TestRunConverseWithholdsStaleApproval(t *testing.T) {
 	}
 }
 
+// A drafter that correctly declines to approve an old head still leaves the owner
+// a way forward: the reply says the latest review is out of date, the draft reply
+// records the revision it read, and the thread offers a review of the current one.
+// A retarget (same head, new base) is out of date too.
+func TestRunConverseFlagsStaleReviewWithoutApproval(t *testing.T) {
+	for name, set := range map[string]func(*worklist.Message){
+		"pushed":     func(m *worklist.Message) { m.Head = "fedcba9876543210fedcba9876543210fedcba98" },
+		"retargeted": func(m *worklist.Message) { m.Base = "release" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			item := draftItem()
+			set(&item.Thread[1])
+			sink := &memSink{items: []worklist.WorkItem{item}}
+			if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: item.ID, Turn: "d", Converser: &fakeConverser{}, Drafter: &fakeDrafter{}},
+				fakeVendor{token: "t"}, sink); err != nil {
+				t.Fatal(err)
+			}
+			th := sink.items[0].Thread
+			m := th[len(th)-1]
+			for _, want := range []string{"The latest review is out of date", "Review the current revision"} {
+				if !strings.Contains(m.Content, want) {
+					t.Errorf("reply lacks %q:\n%s", want, m.Content)
+				}
+			}
+			if m.Head != draftHead || m.Base != "main" || !sink.items[0].ReviewOutdated() {
+				t.Errorf("draft reply revision %q %q; ReviewOutdated %v", m.Head, m.Base, sink.items[0].ReviewOutdated())
+			}
+		})
+	}
+	// A current review: no note, and nothing outdated.
+	sink := &memSink{items: []worklist.WorkItem{draftItem()}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: "github:o/r#1", Turn: "d", Converser: &fakeConverser{}, Drafter: &fakeDrafter{}},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	th := sink.items[0].Thread
+	if m := th[len(th)-1]; strings.Contains(m.Content, "out of date") || sink.items[0].ReviewOutdated() {
+		t.Errorf("a current review was flagged:\n%s", m.Content)
+	}
+}
+
 // A review's reply records the head commit the run read, which a later approval
 // must match.
 func TestRunConverseRecordsReviewedHead(t *testing.T) {
@@ -262,11 +303,11 @@ func TestRunConverseRecordsReviewedHead(t *testing.T) {
 		t.Fatal(err)
 	}
 	th := sink.items[0].Thread
-	if m := th[len(th)-1]; m.ReplyTo != "q" || m.Head != draftHead {
+	if m := th[len(th)-1]; m.ReplyTo != "q" || m.Head != draftHead || m.Base != "main" {
 		t.Fatalf("reply = %+v", m)
 	}
-	if got := sink.items[0].ReviewedHead(); got != draftHead {
-		t.Errorf("ReviewedHead = %q", got)
+	if !sink.items[0].Reviewed(draftHead, "main") {
+		t.Errorf("Reviewed(head, base) = false: %+v", th[len(th)-1])
 	}
 }
 

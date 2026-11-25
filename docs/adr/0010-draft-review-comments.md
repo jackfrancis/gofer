@@ -149,16 +149,29 @@ approval out, or the reverse. The flag is part of the draft, so its `Digest` cov
 The review is still created pending: the commands take effect only when the owner
 submits it on GitHub.
 
-**An approval is of the commit the reviews read.** Every converse reply on a pull
-request records the head commit its run read (`Message.Head`, a full commit id or
-nothing). `WorkItem.ReviewedHead` is the head the latest visible review read (the
-visible answer to a visible review request that landed last). An approval stands only
-on a draft pinned to that commit: the run withholds one when the head moved since, or
-the review recorded none, and says so ("review again"), and `AppendReply` clears the
-flag on the same rule, whatever the run sent. The drafter is also told the head and
-the commit each assistant turn read. So a push between the review and the draft never
-turns an approval of the old commit into one of the new; the draft's own pin (head
-checked against GitHub before creating) covers a push after it.
+**An approval is of the revision the reviews read.** Every converse reply on a pull
+request records the revision its run read: the head commit and the base branch
+(`Message.Head` and `Base`, kept only as a valid pair). `WorkItem.ReviewedRevision` is
+the revision the latest visible review read (the visible answer to a visible review
+request that landed last). An approval stands only on a draft pinned to that head
+against that base (`WorkItem.Reviewed`): `AppendReply` clears the flag otherwise,
+whatever the run sent. A push changes what would merge, and so does a retarget, which
+leaves the head alone. The drafter is told the head and base, and the revision each
+assistant turn read. So neither a push nor a retarget between the review and the draft
+turns an approval of the old revision into one of the new; the draft's own pin (head
+and base branch checked against GitHub before creating) covers one after it.
+
+**A stale review is always flagged, and recoverable.** The run compares the latest
+review's revision with the one it read whatever the drafter answered, so a drafter
+that rightly declines to approve still leaves the owner a reason: the reply says the
+latest review is out of date ("No approval drafted" when the drafter had proposed
+one). The draft reply records the revision it read too, so the thread can tell
+(`WorkItem.ReviewOutdated`) and offers "Review the current revision"
+(`webui.ReviewAgain`, `POST /items/review-again`): a review request appended to the
+conversation, which is kept, and sent to the default model. Review all skips a
+reviewed pull request and a second opinion needs another model, so without this a
+single-model deployment had no way back short of clearing the conversation. Once that
+review lands, the button goes and drafting again can approve.
 
 **The checkbox is the only source of a command.** Model-written text is stored with
 every line a bot would read as a command (`/word` at the start of a line: `/lgtm`,
@@ -167,13 +180,28 @@ every line a bot would read as a command (`/word` at the start of a line: `/lgtm
 text). Unchecking the approval therefore leaves no approval command in what is sent.
 A path such as `/usr/bin/env` is not a command line and stays as written.
 
+A GitHub `suggestion` block is applied verbatim, so its text is never altered while it
+stays a suggestion: one holding a command-shaped line (a `.gitignore`'s `/dist`, say)
+becomes a plain `text` code block with a note after it
+(`worklist.SuggestionNote`), so the author reads the point but cannot apply edited
+code. A suggestion with no such line is kept exactly. The rewrite is a fixed point.
+
+Drafts stored before a rule existed are held to it too: `DraftReview.Current` reports
+whether `BoundDraft` would store the draft unchanged today. One that is not is not
+offered (the thread says to draft again, and drafting again is never counted as
+redundant over it) and a confirmation of it is refused (`OfferedDraft`), so an older
+draft can never send text today's rules would change. A draft already confirmed still
+shows its receipt.
+
 **GitHub's submit dialog can drop the body.** GitHub's "Finish your review" dialog can
 open with an empty summary, and submitting it replaces the body gofer created, while
 inline comments survive: the review looks submitted, and the approval commands never
-reach Prow. gofer keeps the review pending, records the body it sent on the receipt
-(`DraftReceipt.Body`), and shows it, with a copy button and that warning, on the
-result page, on a replay, and in the thread's receipt, to paste into the dialog's
-summary before submitting. The same applies to any summary.
+reach Prow. gofer keeps the review pending, records the body it is about to send on
+the receipt (`DraftReceipt.Body`) in the claim itself, before it contacts GitHub, and
+shows it, with a copy button and that warning, on the result page, on a replay, and in
+the thread's receipt, to paste into the dialog's summary before submitting. Saving it
+in the claim means a confirmation cut off after GitHub created the review (still
+`creating`) shows it too. The same applies to any summary.
 
 ### Once per draft
 

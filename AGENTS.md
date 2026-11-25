@@ -643,12 +643,17 @@ Wired on the web-tier side; they define what a runtime must respect:
   `worklist.ApprovalCommands`, `/lgtm` and `/approve` on lines of their own, a flag
   apart from the summary so its bound never cuts them, offered as its own checkbox
   and joined by `worklist.ReviewBody`; an approval stands only on a draft pinned to
-  the commit the latest visible review read, `WorkItem.ReviewedHead` from the
-  `Message.Head` every converse reply on a pull request records, checked by the run
-  and again by `AppendReply`; model-written draft text has every bot-command line
-  made inert, `worklist.NeutralizeCommands` in `BoundDraft`, so the checkbox is the
-  only source of a command; GitHub's submit dialog can replace the body, so the body
-  sent is kept on the receipt, `DraftReceipt.Body`, and shown to copy), pinned to the repository, number, head
+  the head and base the latest visible review read, `WorkItem.Reviewed` over the
+  `Message.Head`/`Base` every converse reply on a pull request records, checked by
+  `AppendReply` whatever the run sent; the run flags a stale review whatever the
+  model answered, and the thread then offers "Review the current revision",
+  `WorkItem.ReviewOutdated`, `POST /items/review-again`; model-written draft text has
+  every bot-command line made inert, `worklist.NeutralizeCommands` in `BoundDraft`,
+  a suggestion block holding one turned into plain code rather than altered, so the
+  checkbox is the only source of a command; a stored draft `BoundDraft` would change
+  today is neither offered nor confirmable, `DraftReview.Current`; GitHub's submit
+  dialog can replace the body, so the body is saved on the receipt in the claim,
+  before GitHub is contacted, `DraftReceipt.Body`, and shown to copy), pinned to the repository, number, head
   commit and base branch it was anchored to, with each commented file's patch digest
   (`DraftReview.Patches`, `worklist.PatchDigest` = `ghcomment.PatchDigest`). Context lines anchor RIGHT only, as
   GitHub defines them, and the annotated diff stays within its byte budget, notices

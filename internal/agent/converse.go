@@ -89,7 +89,7 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		tools         worklist.ToolBox
 		holder        *tokenHolder
 		noGitHub      bool
-		head          string // the pull request's head commit, as the discussion read showed it
+		head, base    string // the pull request's head commit and base branch, as the discussion read showed them
 	)
 	provider := p.Provider
 	if provider == "" {
@@ -122,7 +122,7 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		if disc, derr := gh.Discussion(ctx, token, item.GitHub.Repo, item.GitHub.Number, isPR); derr == nil {
 			sourceContext = formatDiscussion(disc)
 			if isPR {
-				head = disc.HeadSHA
+				head, base = disc.HeadSHA, disc.BaseRef
 			}
 		}
 		// The token was vended unexpired but GitHub refused it, and the broker
@@ -134,7 +134,7 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 			// GitHub refused the token and the broker could not be asked for a new
 			// one: the same as a failed vend.
 			p.logger().Warn("converse: GitHub unavailable for this turn; answering from stored context", "err", ferr)
-			viewerLogin, sourceContext, head, noGitHub = "", "", "", true
+			viewerLogin, sourceContext, head, base, noGitHub = "", "", "", "", true
 		} else {
 			box := newGitHubToolBox(gh, token, item.GitHub.Repo)
 			// Repository checkouts live on the sandbox's scratch disk for this turn only.
@@ -193,7 +193,8 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		Content: content,
 		Model:   p.Model,
 		Verdict: verdict,
-		Head:    head, // what a review read: an approval drafted later must be of this commit
+		Head:    head, // what a review read: an approval drafted later must be of this revision
+		Base:    base,
 		At:      time.Now().UTC(),
 	}
 	// Append the reply to the thread as stored now, not to the copy read above: the

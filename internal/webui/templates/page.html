@@ -267,8 +267,18 @@
         <p>The reviews this consensus compares are too large to read together, so it can&rsquo;t be retried. Hide some of them and get another 2nd opinion for a smaller comparison.</p>
       </div>
       {{end}}
+      {{with .Draft}}{{if .ReviewOutdated}}
+      <div class="zz-draft-review">
+        <p class="zz-meta">The latest review read an earlier revision of this pull request (it was pushed or retargeted since), so no approval can be drafted from it. Review the current revision, then draft again.</p>
+        <form method="post" action="/items/review-again">
+          <input type="hidden" name="id" value="{{$.Item.ID}}">
+          <button class="btn btn-sm" type="submit"{{if not .ReviewReady}} disabled title="Wait for the reply in progress."{{else}} title="Reviews the pull request as it stands now, keeping this conversation."{{end}}>Review the current revision</button>
+        </form>
+      </div>
+      {{end}}{{end}}
       {{with .Draft}}{{if not .Redundant}}
       <div class="zz-draft-review">
+        {{if .Outdated}}<p class="zz-meta">The last draft was saved before gofer's current checks on drafted text, so it is not offered. Draft the review comments again.</p>{{end}}
         {{if .Connected}}
         <form method="post" action="/items/draft-review">
           <input type="hidden" name="id" value="{{$.Item.ID}}">

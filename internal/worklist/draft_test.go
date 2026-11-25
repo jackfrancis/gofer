@@ -272,15 +272,15 @@ func TestClaimAndSettleDraft(t *testing.T) {
 	))
 	digest := draft.Digest()
 	t1 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	if _, _, err := ClaimDraft(ctx, store, "o", "github:o/r#1", "a", "stale", t1); !errors.Is(err, ErrDraftNotOffered) {
+	if _, _, err := ClaimDraft(ctx, store, "o", "github:o/r#1", "a", "stale", "", t1); !errors.Is(err, ErrDraftNotOffered) {
 		t.Fatalf("a stale digest was claimed: %v", err)
 	}
-	it, prior, err := ClaimDraft(ctx, store, "o", "github:o/r#1", "a", digest, t1)
+	it, prior, err := ClaimDraft(ctx, store, "o", "github:o/r#1", "a", digest, "", t1)
 	if err != nil || prior != nil || it.Thread[1].DraftReceipt == nil || it.Thread[1].DraftReceipt.State != DraftCreating {
 		t.Fatalf("claim: %+v %v %v", it.Thread[1].DraftReceipt, prior, err)
 	}
 	// A replay while the claim stands writes nothing and gets it back.
-	if _, prior, err := ClaimDraft(ctx, store, "o", "github:o/r#1", "a", digest, t1.Add(time.Second)); err != nil || prior == nil || prior.State != DraftCreating {
+	if _, prior, err := ClaimDraft(ctx, store, "o", "github:o/r#1", "a", digest, "", t1.Add(time.Second)); err != nil || prior == nil || prior.State != DraftCreating {
 		t.Fatalf("replay: %+v %v", prior, err)
 	}
 	// Someone else's settle (another claim time) changes nothing.
@@ -290,7 +290,7 @@ func TestClaimAndSettleDraft(t *testing.T) {
 		t.Fatal(err)
 	}
 	t2 := t1.Add(time.Minute)
-	if _, prior, err := ClaimDraft(ctx, store, "o", "github:o/r#1", "a", digest, t2); err != nil || prior != nil {
+	if _, prior, err := ClaimDraft(ctx, store, "o", "github:o/r#1", "a", digest, "", t2); err != nil || prior != nil {
 		t.Fatalf("reclaim after release: %+v %v", prior, err)
 	}
 	created := &DraftReceipt{State: DraftCreated, URL: "https://github.com/o/r/pull/1#pullrequestreview-1", At: t2}
@@ -298,7 +298,7 @@ func TestClaimAndSettleDraft(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Replayed after the review was submitted or discarded on GitHub: still the receipt.
-	if _, prior, err := ClaimDraft(ctx, store, "o", "github:o/r#1", "a", digest, t2.Add(time.Hour)); err != nil || prior == nil || prior.State != DraftCreated || prior.URL != created.URL {
+	if _, prior, err := ClaimDraft(ctx, store, "o", "github:o/r#1", "a", digest, "", t2.Add(time.Hour)); err != nil || prior == nil || prior.State != DraftCreated || prior.URL != created.URL {
 		t.Fatalf("replay after creation: %+v %v", prior, err)
 	}
 	// The item now names another pull request: the draft is not offered.
@@ -307,7 +307,7 @@ func TestClaimAndSettleDraft(t *testing.T) {
 		cur[0].Thread[1].DraftReceipt = nil
 		return cur, nil
 	})
-	if _, _, err := ClaimDraft(ctx, store, "o", "github:o/r#1", "a", digest, t2.Add(2*time.Hour)); !errors.Is(err, ErrDraftNotOffered) {
+	if _, _, err := ClaimDraft(ctx, store, "o", "github:o/r#1", "a", digest, "", t2.Add(2*time.Hour)); !errors.Is(err, ErrDraftNotOffered) {
 		t.Fatalf("a retargeted item's draft was claimed: %v", err)
 	}
 }
@@ -400,7 +400,7 @@ func TestAppendReplyApprovalNeedsTheReviewedHead(t *testing.T) {
 	thread := func(reviewHead string) WorkItem {
 		return draftPR(
 			Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
-			Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: reviewHead},
+			Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: reviewHead, Base: "main"},
 			Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest},
 		)
 	}
@@ -430,26 +430,105 @@ func TestAppendReplyApprovalNeedsTheReviewedHead(t *testing.T) {
 	it = draftPR(
 		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
 		Message{ID: "q2", Role: RoleUser, Content: IndependentReviewPrompt, Kind: KindReviewRequest},
-		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit},
-		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: older},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main"},
+		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: older, Base: "main"},
 	)
-	if got := it.ReviewedHead(); got != older {
-		t.Errorf("ReviewedHead = %q, want the review that landed last", got)
+	if got, _ := it.ReviewedRevision(); got != older {
+		t.Errorf("ReviewedRevision = %q, want the review that landed last", got)
 	}
 	it.Thread[3].Hidden = true
-	if got := it.ReviewedHead(); got != testCommit {
-		t.Errorf("ReviewedHead with the latest hidden = %q", got)
+	if got, _ := it.ReviewedRevision(); got != testCommit {
+		t.Errorf("ReviewedRevision with the latest hidden = %q", got)
 	}
-	// Heads are normalized or dropped on the way in.
-	it = draftPR(Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest}, Message{ID: "q2", Role: RoleUser, Content: "again", Kind: KindReviewRequest})
-	if _, err := AppendReply(&it, "q", Message{ID: "a", Content: "ok", Head: strings.ToUpper(testCommit)}); err != nil {
+	// Revisions are normalized or dropped, as a pair, on the way in.
+	it = draftPR(
+		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "q2", Role: RoleUser, Content: "again", Kind: KindReviewRequest},
+		Message{ID: "q3", Role: RoleUser, Content: "and again", Kind: KindReviewRequest},
+	)
+	for key, m := range map[string]Message{
+		"q":  {ID: "a", Content: "ok", Head: strings.ToUpper(testCommit), Base: "main"},
+		"q2": {ID: "b", Content: "ok", Head: "main", Base: "main"},
+		"q3": {ID: "c", Content: "ok", Head: testCommit},
+	} {
+		if _, err := AppendReply(&it, key, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, m := range it.Thread[3:] {
+		switch m.ID {
+		case "a":
+			if m.Head != testCommit || m.Base != "main" {
+				t.Errorf("valid revision stored as %q %q", m.Head, m.Base)
+			}
+		default:
+			if m.Head != "" || m.Base != "" {
+				t.Errorf("reply %s kept an invalid revision %q %q", m.ID, m.Head, m.Base)
+			}
+		}
+	}
+}
+
+// A retarget changes what would merge without moving the head: an approval of the
+// head against the old base does not stand on a draft against the new one.
+func TestAppendReplyApprovalNeedsTheReviewedBase(t *testing.T) {
+	it := draftPR(
+		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main"},
+		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest},
+	)
+	d := pinned("")
+	d.Approve, d.BaseRef = true, "release"
+	if _, err := AppendReply(&it, "d", Message{ID: "a", Content: "approve", Draft: d, Head: testCommit, Base: "release"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := AppendReply(&it, "q2", Message{ID: "b", Content: "ok", Head: "main"}); err != nil {
-		t.Fatal(err)
+	if it.Thread[3].Draft != nil {
+		t.Fatalf("approval against a retargeted base kept: %+v", it.Thread[3].Draft)
 	}
-	if it.Thread[2].Head != testCommit || it.Thread[3].Head != "" {
-		t.Errorf("heads stored: %q, %q", it.Thread[2].Head, it.Thread[3].Head)
+	// The draft reply recorded the revision it read, which the latest review did
+	// not: the thread offers a review of the current revision until one lands.
+	if !it.ReviewOutdated() {
+		t.Error("ReviewOutdated = false after a retarget")
+	}
+	it.Thread = append(it.Thread,
+		Message{ID: "q2", Role: RoleUser, Content: "again", Kind: KindReviewRequest},
+		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "release"},
+	)
+	if it.ReviewOutdated() {
+		t.Error("ReviewOutdated = true after a review of the current revision")
+	}
+}
+
+// A draft stored under older rules (here, before command lines were neutralized) is
+// not offered or confirmable, and drafting again is not redundant; one stored under
+// today's rules is.
+func TestOutdatedDraftIsNotOffered(t *testing.T) {
+	old := pinned("Ship it.\n/lgtm")
+	if old.Current() {
+		t.Fatal("a draft with a live command is current")
+	}
+	if !BoundDraft(old).Current() {
+		t.Fatal("a bounded draft is not current")
+	}
+	thread := func(d *DraftReview) WorkItem {
+		return draftPR(
+			Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+			Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM"},
+			Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true},
+			Message{ID: "a", ReplyTo: "d", Role: RoleAgent, Content: "drafted", Draft: d},
+		)
+	}
+	it := thread(old)
+	if _, ok := it.OfferedDraft("a", old.Digest()); ok {
+		t.Error("an outdated draft is offered")
+	}
+	if it.RedraftRedundant() {
+		t.Error("drafting again over an outdated draft counts as redundant")
+	}
+	cur := BoundDraft(old)
+	it = thread(cur)
+	if _, ok := it.OfferedDraft("a", cur.Digest()); !ok || !it.RedraftRedundant() {
+		t.Error("a current draft is not offered, or a redraft over it is not redundant")
 	}
 }
 
@@ -467,11 +546,29 @@ func TestDraftTextCarriesNoCommands(t *testing.T) {
 		"run `/lgtm` when ready":         "run `/lgtm` when ready",
 		"- /approve once tests pass":     "- /approve once tests pass",
 		"// a Go comment":                "// a Go comment",
-		"```suggestion\n/approve\n```":   "```suggestion\n`/approve`\n```",
 		"ratio is a/b":                   "ratio is a/b",
 	} {
 		if got := NeutralizeCommands(in); got != want {
 			t.Errorf("NeutralizeCommands(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// A suggestion is applied verbatim, so one holding a command line is never altered
+	// and left applicable: it becomes plain code, with a note. One without stays as
+	// written, and so does a plain block's ordinary code.
+	for in, want := range map[string]string{
+		"Ignore the build output:\n```suggestion\n/dist\nnode_modules/\n```": "Ignore the build output:\n```text\n`/dist`\nnode_modules/\n```\n" + SuggestionNote,
+		"````Suggestion\n/approve\n````\nafter":                              "````text\n`/approve`\n````\n" + SuggestionNote + "\nafter",
+		"```suggestion\nreturn nil\n```":                                     "```suggestion\nreturn nil\n```",
+		"```go\nx := a / b\n```":                                             "```go\nx := a / b\n```",
+		"```\n/hold\n```":                                                    "```\n`/hold`\n```",
+		"```suggestion\n/approve":                                            "```text\n`/approve`\n" + SuggestionNote,
+	} {
+		got := NeutralizeCommands(in)
+		if got != want {
+			t.Errorf("NeutralizeCommands(%q) = %q, want %q", in, got, want)
+		}
+		if again := NeutralizeCommands(got); again != got {
+			t.Errorf("NeutralizeCommands is not a fixed point on %q: %q", got, again)
 		}
 	}
 	d := pinned("Ship it.\n/lgtm", DraftComment{Path: "a.go", Line: 1, Body: "nit\n/approve"})

@@ -138,12 +138,14 @@ type Message struct {
 	// DraftReceipt records the owner's confirmation of Draft (draft.go): written by
 	// the web tier only (ClaimDraft, SettleDraft), never by a run.
 	DraftReceipt *DraftReceipt `json:"draft_receipt,omitempty"`
-	// Head is the pull request's head commit a converse run read before it wrote
-	// this agent turn (a full commit id; AppendReply drops anything else). An
-	// approving draft stands only on the head its latest review read (ReviewedHead).
-	// Empty on user turns, on non-pull-request items, and on replies stored before it
-	// was recorded.
+	// Head and Base are the pull request's revision a converse run read before it
+	// wrote this agent turn: its head commit (a full commit id) and its base branch.
+	// AppendReply keeps them only as a valid pair. An approving draft stands only on
+	// the revision its latest review read (ReviewedRevision), since a push or a
+	// retarget changes what would merge. Empty on user turns, on non-pull-request
+	// items, and on replies stored before they were recorded.
 	Head string    `json:"head,omitempty"`
+	Base string    `json:"base,omitempty"`
 	At   time.Time `json:"at"`
 }
 
@@ -370,11 +372,12 @@ func (w WorkItem) hasCompletedRequest(kind string) bool {
 // request answered by the assistant).
 func (w WorkItem) HasReview() bool { return w.hasCompletedRequest(KindReviewRequest) }
 
-// ReviewedHead returns the head commit the latest review read: the Head of the
-// visible answer to a visible review request that landed last in the thread. It is
-// "" when there is no such review, or when that answer recorded no head. An
-// approval drafted from the conversation approves that commit and no other.
-func (w WorkItem) ReviewedHead() string {
+// ReviewedRevision returns the pull request revision the latest review read: the
+// Head and Base of the visible answer to a visible review request that landed last
+// in the thread. Both are "" when there is no such review, or when that answer
+// recorded none. An approval drafted from the conversation approves that head
+// against that base, and nothing else.
+func (w WorkItem) ReviewedRevision() (head, base string) {
 	latest := -1
 	for key, j := range w.replies() {
 		i, ok := w.TurnIndex(key)
@@ -384,9 +387,36 @@ func (w WorkItem) ReviewedHead() string {
 		latest = max(latest, j)
 	}
 	if latest < 0 {
-		return ""
+		return "", ""
 	}
-	return w.Thread[latest].Head
+	return w.Thread[latest].Head, w.Thread[latest].Base
+}
+
+// Reviewed reports whether the latest review read exactly head against base
+// (ReviewedRevision), so an approval of that revision stands.
+func (w WorkItem) Reviewed(head, base string) bool {
+	h, b := w.ReviewedRevision()
+	return h != "" && h == strings.ToLower(head) && b == base
+}
+
+// ReviewOutdated reports whether the newest draft request was answered by a run
+// that read a pull request revision other than the one the latest review read: the
+// head was pushed or the base retargeted since that review, so no approval can be
+// drafted from it until the pull request is reviewed again. The draft reply
+// records the revision it read (Message.Head and Base); a reply without one, a
+// hidden one, or a notice says nothing.
+func (w WorkItem) ReviewOutdated() bool {
+	for i := len(w.Thread) - 1; i >= 0; i-- {
+		if !w.IsDraftReviewRequest(i) {
+			continue
+		}
+		j, ok := w.replies()[w.TurnKey(i)]
+		if w.Thread[i].Hidden || !ok || w.Thread[j].Hidden || w.Thread[j].Head == "" {
+			return false
+		}
+		return !w.Reviewed(w.Thread[j].Head, w.Thread[j].Base)
+	}
+	return false
 }
 
 // FirstReviewModel returns the chat model that produced the item's first visible

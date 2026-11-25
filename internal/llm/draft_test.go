@@ -30,13 +30,14 @@ func TestReviewDrafter(t *testing.T) {
 		ViewerLogin: "octocat",
 		History: []worklist.Message{
 			{Role: worklist.RoleUser, Content: "review?"},
-			{Role: worklist.RoleAgent, Content: "rename it", Model: "m1", Head: "0123456789abcdef0123456789abcdef01234567"},
+			{Role: worklist.RoleAgent, Content: "rename it", Model: "m1", Head: "0123456789abcdef0123456789abcdef01234567", Base: "main"},
 			{Role: worklist.RoleAgent, Content: "older answer"},
 			{Role: worklist.RoleUser, Content: "hidden aside", Hidden: true},
 			{Role: worklist.RoleAgent, Content: "sign in", Notice: worklist.NoticeReconnect},
 		},
 		Diff: "### a.go (modified)\n[R3] +x\n",
 		Head: "89abcdef0123456789abcdef0123456789abcdef",
+		Base: "main",
 	}
 	got, err := d.DraftReview(context.Background(), in)
 	if err != nil {
@@ -55,7 +56,7 @@ func TestReviewDrafter(t *testing.T) {
 		t.Errorf("request = %+v", req)
 	}
 	prompt := req.Messages[1].Content
-	for _, want := range []string{"o/r #1", "[user]: review?", "[assistant, model m1, read commit 0123456789abcdef0123456789abcdef01234567]: rename it", "[assistant, read commit unknown]: older answer", "Head commit (the diff below and any approval are of this commit): 89abcdef0123456789abcdef0123456789abcdef", "<<<BEGIN DIFF>>>\n### a.go (modified)\n[R3] +x\n<<<END DIFF>>>", "octocat"} {
+	for _, want := range []string{"o/r #1", "[user]: review?", "[assistant, model m1, read commit 0123456789abcdef0123456789abcdef01234567 against main]: rename it", "Base branch (any approval is of the head against this branch): main", "[assistant, read commit unknown]: older answer", "Head commit (the diff below and any approval are of this commit): 89abcdef0123456789abcdef0123456789abcdef", "<<<BEGIN DIFF>>>\n### a.go (modified)\n[R3] +x\n<<<END DIFF>>>", "octocat"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("prompt lacks %q:\n%s", want, prompt)
 		}

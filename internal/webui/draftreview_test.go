@@ -704,3 +704,106 @@ func TestCreateDraftReviewShowsTheBodyToPaste(t *testing.T) {
 		t.Error("a review with no body shows one to paste")
 	}
 }
+
+// When the newest draft read a revision the latest review did not (a push or a
+// retarget since), the thread offers "Review the current revision": it appends a
+// review request, keeping the conversation, and dispatches it to the default model.
+// With the review current, or a reply in flight, it does nothing.
+func TestReviewAgain(t *testing.T) {
+	const pushed = "fedcba9876543210fedcba9876543210fedcba98"
+	post := func(h *Handler) {
+		req := httptest.NewRequest(http.MethodPost, "/items/review-again", strings.NewReader(url.Values{"id": {draftItemID}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		h.ReviewAgain(rec, req)
+		if rec.Code != http.StatusSeeOther {
+			t.Fatalf("status %d", rec.Code)
+		}
+	}
+	outdated := func() []worklist.Message {
+		th := draftedThread(time.Now().Add(-time.Hour))
+		th[1].Head, th[1].Base = draftCommit, "main"
+		th[3].Head, th[3].Base = pushed, "main"
+		return th
+	}
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	h, p, store := draftFixture(t, c, outdated())
+	page, _ := threadPage(t, h)
+	if !strings.Contains(page, `action="/items/review-again"`) || !strings.Contains(page, "Review the current revision") {
+		t.Fatal("an outdated review offers no review of the current revision")
+	}
+	post(h)
+	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+	last := it.Thread[len(it.Thread)-1]
+	if last.Kind != worklist.KindReviewRequest || last.Content != reviewAgainPrompt || len(p.turns) != 1 || p.turns[0].Turn != last.ID || p.converseModels[0] != "m0" {
+		t.Fatalf("appended %+v, dispatched %+v models %v", last, p.turns, p.converseModels)
+	}
+	if len(it.Thread) != 5 {
+		t.Errorf("the conversation was not kept: %d turns", len(it.Thread))
+	}
+	post(h) // the review is now pending
+	if len(p.turns) != 1 {
+		t.Error("a second click dispatched again")
+	}
+
+	th := outdated()
+	th[3].Head = draftCommit // the draft read what the review read
+	h, p, _ = draftFixture(t, c, th)
+	if page, _ := threadPage(t, h); strings.Contains(page, "/items/review-again") {
+		t.Error("a current review offers another")
+	}
+	post(h)
+	if len(p.turns) != 0 {
+		t.Error("a current review was reviewed again")
+	}
+}
+
+// A draft stored under older rules (here, with a live command in its text) is not
+// offered and cannot be confirmed; the thread says to draft again. A confirmed one
+// still shows its receipt.
+func TestOutdatedDraftIsRefused(t *testing.T) {
+	th := draftedThread(time.Now().Add(-time.Hour))
+	th[3].Draft.Body = "Ship it.\n/lgtm"
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true}}
+	h, _, _ := draftFixture(t, c, th)
+	page, _ := threadPage(t, h)
+	if strings.Contains(page, `action="/items/draft-review/create"`) || !strings.Contains(page, "saved before gofer's current checks") {
+		t.Errorf("outdated draft offered, or no note:\n%s", page)
+	}
+	if !strings.Contains(page, `action="/items/draft-review"`) {
+		t.Error("drafting again is not offered over an outdated draft")
+	}
+	rec := postCreate(h, url.Values{"id": {draftItemID}, "msg": {"a"}, "digest": {th[3].Draft.Digest()}, "summary": {"1"}}, "Sec-Fetch-Site", "same-origin")
+	if rec.Code != http.StatusConflict || len(c.reviews) != 0 || !strings.Contains(rec.Body.String(), "draft the review comments again") {
+		t.Fatalf("status %d, reviews %+v\n%s", rec.Code, c.reviews, rec.Body.String())
+	}
+	th[3].DraftReceipt = &worklist.DraftReceipt{State: worklist.DraftCreated, URL: "https://github.com/o/r/pull/1#pullrequestreview-1", At: time.Now()}
+	h, _, _ = draftFixture(t, c, th)
+	if page, _ := threadPage(t, h); !strings.Contains(page, "Pending review created on GitHub") {
+		t.Error("a confirmed outdated draft hides its receipt")
+	}
+}
+
+// The body is saved in the claim, before GitHub is contacted, so a confirmation cut
+// off after GitHub created the review still shows the text to paste.
+func TestClaimSavesTheBody(t *testing.T) {
+	th := draftedThread(time.Now().Add(-time.Hour))
+	th[3].Draft.Approve = true
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true}}
+	h, _, store := draftFixture(t, c, th)
+	var during *worklist.DraftReceipt
+	c.during = func() {
+		it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+		during = it.Thread[3].DraftReceipt
+	}
+	postCreate(h, url.Values{"id": {draftItemID}, "msg": {"a"}, "digest": {th[3].Draft.Digest()}, "approve": {"1"}}, "Sec-Fetch-Site", "same-origin")
+	if during == nil || during.State != worklist.DraftCreating || during.Body != worklist.ApprovalCommands {
+		t.Fatalf("claim while GitHub was asked = %+v", during)
+	}
+	// Interrupted there: the thread shows the body with the warning.
+	th[3].DraftReceipt = during
+	h, _, _ = draftFixture(t, c, th)
+	if page, _ := threadPage(t, h); !strings.Contains(page, "<pre class=\"zz-draft-text\">/lgtm\n/approve</pre>") || !strings.Contains(page, "Finish your review") {
+		t.Errorf("an interrupted claim shows no body:\n%s", page)
+	}
+}
