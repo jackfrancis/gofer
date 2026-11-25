@@ -301,14 +301,20 @@ func TestCommentStaleFormPostsNothing(t *testing.T) {
 		"malformed": {h, url.Values{"key": {"nope"}, "content": {"/lgtm"}, "item": selections("github:a/one#1")}},
 	} {
 		page := posted(t, tc.h, tc.form)
-		if !strings.Contains(page, "cannot tell whether an earlier submission") || !strings.Contains(page, "check the items on GitHub") {
+		if !strings.Contains(page, "whether an earlier submission") || !strings.Contains(page, "check the items on GitHub") {
 			t.Errorf("%s: radar:\n%s", name, page)
+		}
+		// Review P1 (PR #60, round 3): a form whose account cannot be verified
+		// (another process's, or unreadable) shows none of its text or selection.
+		verified := name == "expired" || name == "future"
+		if shown := strings.Contains(page, "/lgtm"); shown != verified {
+			t.Errorf("%s: comment shown = %v, want %v", name, shown, verified)
 		}
 	}
 	if c.postCount() != 0 {
 		t.Errorf("posted %d times", c.postCount())
 	}
-	page := posted(t, restarted, form)
+	page := posted(t, expired, form)
 	if !strings.Contains(page, "<details class=\"zz-compose\" data-compose open>") || !strings.Contains(page, ">/lgtm</textarea>") ||
 		!strings.Contains(page, `data-repo="a/one" checked`) || strings.Contains(page, `data-repo="b/two" checked`) {
 		t.Errorf("the refused comment is not offered again:\n%s", page)
@@ -755,7 +761,7 @@ func TestCommentRefusedFormsKeepNoDraft(t *testing.T) {
 		t.Errorf("foreign refusal:\n%s", page)
 	}
 	rec = post(h, stale)
-	if page := radar(t, h, rec.Header().Get("Location")); !strings.Contains(page, "cannot tell whether an earlier submission") {
+	if page := radar(t, h, rec.Header().Get("Location")); !strings.Contains(page, "whether an earlier submission") || strings.Contains(page, "/from-before") {
 		t.Errorf("stale refusal:\n%s", page)
 	}
 	c.connected = true
@@ -832,7 +838,7 @@ func TestCommentKeyIsCanonical(t *testing.T) {
 	form := commentForm(h, "/lgtm", "github:a/one#1")
 	posted(t, h, form)
 	upper := url.Values{"key": {strings.ToUpper(form.Get("key"))}, "content": {"/lgtm"}, "item": form["item"]}
-	if _, check := h.commentKeyIssued(upper.Get("key"), commentOwner, h.now()); check != keyStale {
+	if _, check := h.commentKeyIssued(upper.Get("key"), commentOwner, h.now()); check != keyUnverified {
 		t.Errorf("uppercase key check = %v", check)
 	}
 	post(h, upper)
@@ -880,5 +886,74 @@ func TestCommentOutcomePageKeepsDraft(t *testing.T) {
 	}
 	if page := radar(t, h, "/"); !strings.Contains(page, ">/kept</textarea>") {
 		t.Errorf("the draft was lost:\n%s", page)
+	}
+}
+
+// Review P1 (PR #60, round 3): after a restart and an account switch, the old form's
+// text never reaches the account now signed in.
+func TestCommentRestartAndAccountSwitchShowsNothing(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	before := commentFixture(t, c)
+	form := commentForm(before, "/secret note", "github:a/one#1") // account github:42, old process
+	h := commentFixture(t, c)
+	h.store.(*worklist.MemoryStore).Seed("github:7", worklist.WorkItem{
+		ID: "github:a/one#1", Source: "github", Type: worklist.TypePullRequest,
+		GitHub: worklist.GitHubRef{Repo: "a/one", Number: 1, Title: "title-1", URL: "https://github.com/a/one/pull/1", State: "open"},
+		Meta:   worklist.Metadata{Origin: worklist.OriginUser, Rank: 0.5},
+	})
+	h.sessions = fakeSessions{&session.User{ID: "github:7", Provider: "github", Login: "other"}}
+	page := posted(t, h, form)
+	if strings.Contains(page, "secret note") || strings.Contains(page, " checked aria-label") {
+		t.Errorf("the old form's contents reached another account:\n%s", page)
+	}
+	if c.postCount() != 0 {
+		t.Error("posted")
+	}
+}
+
+// Review P2 (PR #60, round 3): a form resubmitted after its key expired still shows
+// the results its batch left, while they are kept, and posts nothing.
+func TestCommentExpiredKeyShowsItsReceipt(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	start := time.Now()
+	h.now = func() time.Time { return start }
+	form := commentForm(h, "/lgtm", "github:a/one#1")
+	h.now = func() time.Time { return start.Add(commentKeyTTL - time.Minute) }
+	posted(t, h, form)
+	h.now = func() time.Time { return start.Add(commentKeyTTL + time.Minute) }
+	rec := post(h, form)
+	if loc := rec.Header().Get("Location"); !strings.HasSuffix(loc, "&again=1") {
+		t.Fatalf("resubmit after expiry went to %q", loc)
+	}
+	if page := radar(t, h, rec.Header().Get("Location")); !strings.Contains(page, "Already posted: 1 of 1") {
+		t.Errorf("radar:\n%s", page)
+	}
+	if c.postCount() != 1 {
+		t.Errorf("posts = %d", c.postCount())
+	}
+}
+
+// Review P3 (PR #60, round 3): the advertised limits fit in one form: a 16 KiB
+// comment of multi-byte characters and 50 selections in long-named repositories.
+func TestCommentFormFitsItsLimits(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	repo := strings.Repeat("o", 39) + "/" + strings.Repeat("ü", 50) // 100 bytes of name
+	ids := make([]string, comment.MaxTargets)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("github:%s#%d", repo, 100000+i)
+	}
+	body := strings.Repeat("é", maxMessageBytes/2) // 16 KiB of two-byte characters
+	form := commentForm(h, body, ids...)
+	if n := len(form.Encode()); n <= 62464 {
+		t.Fatalf("form is only %d bytes; the test no longer exercises the old cap", n)
+	}
+	rec := post(h, form)
+	if rec.Code != http.StatusSeeOther || !strings.HasPrefix(rec.Header().Get("Location"), "/?comment=") {
+		t.Fatalf("post = %d\n%s", rec.Code, rec.Body)
+	}
+	if bt := h.batches.lookup(commentOwner, form.Get("key"), h.now()); bt == nil || !strings.Contains(bt.view.Error, "None of the selected items") {
+		t.Errorf("batch = %+v", bt) // read whole: refused only because no such items exist
 	}
 }

@@ -37,9 +37,14 @@ type Commenter interface {
 }
 
 const (
-	// maxCommentForm bounds a bulk comment form: the comment, up to MaxTargets ids,
-	// and the hidden fields.
-	maxCommentForm = 2*maxMessageBytes + comment.MaxTargets*512 + 4<<10
+	// maxCommentForm bounds a bulk comment form as sent: the comment percent-encoded
+	// (up to three bytes per byte), up to MaxTargets selections (each its item,
+	// repository and number, encoded twice: a query string inside a form field), and
+	// the hidden fields. The decoded comment and target count are checked apart.
+	maxCommentForm = 3*maxMessageBytes + comment.MaxTargets*maxSelectionBytes + 4<<10
+	// maxSelectionBytes bounds one encoded selection: an ID and a repository of at
+	// most about 150 bytes each, nine bytes apiece once encoded twice, plus the rest.
+	maxSelectionBytes = 3 << 10
 	// postTimeout bounds a whole batch. It runs detached from the browser request,
 	// so a closed tab does not leave a batch half-reported.
 	postTimeout = 5 * time.Minute
@@ -205,8 +210,9 @@ type keyCheck int
 
 const (
 	keyOK           keyCheck = iota
-	keyStale                 // malformed, missing, expired, or from another process
+	keyUnverified            // malformed, missing, or from another process: whose it was is unknown
 	keyOtherAccount          // issued to another account than the session's
+	keyExpired               // issued to this account, but no longer usable to post
 )
 
 func randomBytes(n int) []byte {
@@ -246,23 +252,24 @@ func (h *Handler) newCommentKey(owner string, now time.Time) string {
 }
 
 // commentKeyIssued returns when key was issued, if this process issued it to owner
-// and it has not expired at now.
+// and it has not expired at now. Only keyOK and keyExpired verified the owner.
 func (h *Handler) commentKeyIssued(key, owner string, now time.Time) (time.Time, keyCheck) {
 	if len(key) != commentKeyLen {
-		return time.Time{}, keyStale
+		return time.Time{}, keyUnverified
 	}
 	buf, err := hex.DecodeString(key)
 	// Only the canonical (lowercase) spelling: batches are held by the key's text,
 	// so two spellings of one key must never both pass.
 	if err != nil || hex.EncodeToString(buf) != key || !bytes.Equal(buf[:8], h.epoch[:]) {
-		return time.Time{}, keyStale
+		// Another process's secret signed it, if anyone's: its owner cannot be checked.
+		return time.Time{}, keyUnverified
 	}
 	if !hmac.Equal(buf[32:], h.commentKeyMAC(buf[:32], owner)) {
 		return time.Time{}, keyOtherAccount
 	}
 	issued := time.Unix(int64(binary.BigEndian.Uint64(buf[8:16])), 0)
 	if issued.After(now.Add(commentKeySkew)) || now.Sub(issued) > commentKeyTTL {
-		return time.Time{}, keyStale
+		return issued, keyExpired
 	}
 	return issued, keyOK
 }
@@ -278,6 +285,11 @@ func (h *Handler) commentState(ctx context.Context, user *session.User) (enabled
 // staleCommentForm answers a form whose key gofer refuses. gofer knows only that it
 // posted nothing for this request, not what an earlier use of the same form did.
 const staleCommentForm = "Nothing was posted: this page was loaded too long ago, or gofer restarted since. gofer cannot tell whether an earlier submission of this form posted, so check the items on GitHub before you post again."
+
+// unverifiedCommentForm answers a form gofer cannot tie to an account (from before a
+// restart, or unreadable): its text and selection are not shown, since they may be
+// another account's.
+const unverifiedCommentForm = "Nothing was posted: gofer restarted since this page was loaded, or could not read it, so it cannot tell which account wrote this comment or whether an earlier submission of the form posted. Your comment is not shown here; if it is yours, go back to copy it, check the items on GitHub, and post again from this page."
 
 // otherAccountForm answers a form rendered for another account than the session's.
 const otherAccountForm = "Nothing was posted: this page was loaded while you were signed in to gofer as another GitHub account. Check which account you are signed in as, the comment, and the items, then post again."
@@ -316,9 +328,10 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 	key := r.PostForm.Get("key")
 	issued, check := h.commentKeyIssued(key, user.ID, now)
 	valid := check == keyOK
-	if valid {
+	if valid || check == keyExpired {
 		// A used form's results are the owner's to see again without a live grant;
-		// only starting a batch needs one.
+		// only starting a batch needs one. Results outlive the key's expiry, so an
+		// expired key looks for them before it is refused.
 		if bt := h.batches.lookup(user.ID, key, now); bt != nil {
 			h.awaitBatch(w, r, bt, key, true)
 			return
@@ -341,7 +354,10 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 	case check == keyOtherAccount:
 		// Another account's form: none of its text or selection is shown to this one.
 		refusal = &commentView{Error: otherAccountForm}
+	case check == keyUnverified:
+		refusal = &commentView{Error: unverifiedCommentForm}
 	case !valid:
+		// Expired, but this account's own form: its comment is offered again.
 		refusal = &commentView{Body: body, Selected: capPins(pins), Error: staleCommentForm}
 	case !readable:
 		refusal = &commentView{Body: body, Selected: capPins(pins), Error: badSelection}

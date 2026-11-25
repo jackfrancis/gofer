@@ -612,7 +612,10 @@ Wired on the web-tier side; they define what a runtime must respect:
   claims it for its owner, a resubmit shows that batch and posts nothing, and a key
   gofer cannot vouch for (another epoch, i.e. before a restart; older than
   `commentKeyTTL`; another account's) posts nothing, so nothing posts twice from one
-  form, across a restart included, and never as another account. Each checkbox
+  form, across a restart included, and never as another account. An expired key of
+  this account still finds its results first; only it gets its comment offered
+  again, never a key whose account cannot be verified (`keyUnverified`) or another
+  account's. Each checkbox
   carries its row's repository and number (`selectionValue`), and a row whose item
   now names another is skipped, never redirected (`pinnedTargets`). A refill
   re-checks a row only while it names the destination it was checked for

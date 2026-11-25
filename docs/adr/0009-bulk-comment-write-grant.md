@@ -121,11 +121,16 @@ The client keeps the workload's guard rules (ADR 0007, "public-only guard"):
    and posts nothing, to its owner, with or without a live grant: only starting a
    batch needs one, so a user whose grant died mid-batch can still see which
    comments landed. A used key is remembered (in memory) until it expires, 12 hours
-   after it was issued, and results at least an hour; a key gofer cannot vouch for
-   (from another epoch, i.e. before a web-pod restart; expired; malformed; missing;
-   another account's)
+   after it was issued, and results at least an hour (an expired key of this account
+   still shows its batch's results while they are kept). A key gofer cannot vouch for
    posts nothing, and the radar says gofer cannot tell what an earlier submission of
-   that form did, and to check the items on GitHub before posting again. Batches are
+   that form did, and to check the items on GitHub before posting again. Only an
+   expired key whose MAC verifies against this account gets its comment and
+   selection offered again; a key whose account cannot be checked (from another
+   epoch, i.e. before a web-pod restart; malformed; missing) or that names another
+   account shows none of the form's text or selection, which may be someone else's.
+   The request-size cap allows the full comment percent-encoded and 50 selections in
+   long-named repositories; the decoded comment and target count are checked apart. Batches are
    bounded in all; only one that posted nothing is dropped early, and past the bound
    gofer refuses to post rather than forget a used key.
 4. The request must be same-origin, in addition to SameSite=Lax. A browser
