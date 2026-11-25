@@ -83,4 +83,4 @@ data:
   # Optional model gateway (docs/adr/0008-model-gateway.md): `make model-gateway-apply`
   # moves the key to agentgateway, sets AI_GATEWAY_URL here and rewrites these
   # endpoints to the gateway's. gofer then holds no model key.
-  AI_CONNECTIONS: '[{"endpoint":"https://api.githubcopilot.com/chat/completions","models":["claude-opus-5.5","gemini-4-carbon"]},{"endpoint":"https://api.githubcopilot.com/responses","models":["gpt-6.2-astra"]}]'
+  AI_CONNECTIONS: '[{"endpoint":"https://api.githubcopilot.com/chat/completions","models":["claude-opus-5.5","gemini-4-neon"]},{"endpoint":"https://api.githubcopilot.com/responses","models":["gpt-6.2-astra"]}]'
