@@ -73,7 +73,7 @@ func (h *Handler) UseCommenter(c Commenter) { h.commenter = c }
 // commentView is a batch's outcome, shown on the radar.
 type commentView struct {
 	Body     string
-	Selected []string         // the item ids the form selected, re-checked when nothing was posted
+	Selected []comment.Target // the rows the form checked (item, repo, number), re-checked when nothing was posted
 	Targets  []comment.Target // what the comment went to
 	Skipped  []skippedTarget  // selected items it did not go to, and why
 	Results  []comment.Result
@@ -252,7 +252,9 @@ func (h *Handler) commentKeyIssued(key, owner string, now time.Time) (time.Time,
 		return time.Time{}, keyStale
 	}
 	buf, err := hex.DecodeString(key)
-	if err != nil || !bytes.Equal(buf[:8], h.epoch[:]) {
+	// Only the canonical (lowercase) spelling: batches are held by the key's text,
+	// so two spellings of one key must never both pass.
+	if err != nil || hex.EncodeToString(buf) != key || !bytes.Equal(buf[:8], h.epoch[:]) {
 		return time.Time{}, keyStale
 	}
 	if !hmac.Equal(buf[32:], h.commentKeyMAC(buf[:32], owner)) {
@@ -324,10 +326,26 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 	}
 	body := strings.ReplaceAll(r.PostForm.Get("content"), "\r\n", "\n")
 	pins, readable := parseSelections(r.PostForm["item"])
-	if !connected {
-		// Keep the comment and selection through the connect flow: the radar offers
-		// them again once commenting is connected, to post with an explicit Post.
-		h.batches.saveDraft(user.ID, body, pinIDs(pins), now)
+	if valid && !connected {
+		// Keep the comment and selection through the connect flow, with the form's
+		// key: the radar offers them again once commenting is connected, under that
+		// same key, so this form and the restored one post at most once between them.
+		// Only a form verified as this account's, and unused, is kept.
+		h.batches.saveDraft(user.ID, draft{body: body, pins: capPins(pins), key: key}, now)
+		http.Redirect(w, r, "/?commenting=connect", http.StatusSeeOther)
+		return
+	}
+	// A refusal is shown whether or not commenting is connected, and needs no grant.
+	var refusal *commentView
+	switch {
+	case check == keyOtherAccount:
+		// Another account's form: none of its text or selection is shown to this one.
+		refusal = &commentView{Error: otherAccountForm}
+	case !valid:
+		refusal = &commentView{Body: body, Selected: capPins(pins), Error: staleCommentForm}
+	case !readable:
+		refusal = &commentView{Body: body, Selected: capPins(pins), Error: badSelection}
+	case !connected:
 		http.Redirect(w, r, "/?commenting=connect", http.StatusSeeOther)
 		return
 	}
@@ -347,14 +365,11 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if mine {
-		switch {
-		case check == keyOtherAccount:
-			bt.finish(commentView{Body: body, Selected: pinIDs(pins), Error: otherAccountForm})
-		case !valid:
-			bt.finish(commentView{Body: body, Selected: pinIDs(pins), Error: staleCommentForm})
-		case !readable:
-			bt.finish(commentView{Body: body, Selected: pinIDs(pins), Error: badSelection})
-		default:
+		if refusal != nil {
+			bt.finish(*refusal)
+		} else {
+			// A comment being posted supersedes any kept for after reconnecting.
+			h.batches.dropDraft(user.ID)
 			go h.runBatch(context.WithoutCancel(r.Context()), bt, user.ID, body, pins)
 		}
 	}
@@ -419,8 +434,7 @@ func commentReturnURL(r *http.Request) string {
 func (h *Handler) runBatch(ctx context.Context, bt *batch, userID, body string, pins []comment.Target) {
 	ctx, cancel := context.WithTimeout(ctx, postTimeout)
 	defer cancel()
-	ids := pinIDs(pins)
-	view := commentView{Body: body, Selected: ids}
+	view := commentView{Body: body, Selected: capPins(pins)}
 	defer func() { bt.finish(view) }()
 	switch {
 	case strings.TrimSpace(body) == "":
@@ -450,9 +464,6 @@ func (h *Handler) runBatch(ctx context.Context, bt *batch, userID, body string, 
 	switch {
 	case errors.Is(err, comment.ErrNotConnected):
 		view.Error = "gofer has no GitHub access to post with. Connect commenting, then try again; nothing was posted."
-		// The radar shows the connect prompt, not the comment box: keep the comment
-		// for after reconnecting.
-		h.batches.saveDraft(userID, body, ids, h.now())
 	case err != nil:
 		slog.WarnContext(ctx, "bulk comment failed", "user", userID, "err", err)
 		view.Error = "gofer could not post right now; nothing was posted. Try again in a moment."
@@ -466,7 +477,21 @@ func (h *Handler) runBatch(ctx context.Context, bt *batch, userID, body string, 
 			view.Unknown++
 		}
 	}
+	if view.Posted == 0 && view.Unknown == 0 && (errors.Is(err, comment.ErrNotConnected) || !h.connectedNow(ctx, userID)) {
+		// Nothing reached GitHub and the grant is gone (missing, or a 401 GitHub
+		// confirmed, which deletes it): the radar shows the connect prompt, not the
+		// comment box, so keep the comment for after reconnecting. Its form's key is
+		// used, so the restored form gets a fresh one. A partial or unknown batch is
+		// never kept: posting it again could post twice.
+		h.batches.saveDraft(userID, draft{body: body, pins: capPins(pins)}, h.now())
+	}
 	slog.InfoContext(ctx, "bulk comment", "user", userID, "targets", len(targets), "posted", view.Posted, "unknown", view.Unknown)
+}
+
+// connectedNow reports whether the user's write grant is usable now.
+func (h *Handler) connectedNow(ctx context.Context, userID string) bool {
+	_, connected := h.commenter.State(ctx, userID)
+	return connected
 }
 
 // selectionValue is a radar checkbox's value: the item and the destination the row
@@ -503,16 +528,26 @@ func parseSelections(values []string) (pins []comment.Target, ok bool) {
 	return pins, ok
 }
 
-// pinIDs is the item ids of pins, at most MaxTargets, to re-check on the radar.
+// pinIDs is the item ids of pins.
 func pinIDs(pins []comment.Target) []string {
-	ids := make([]string, 0, len(pins))
+	ids := make([]string, len(pins))
 	for i, p := range pins {
-		if i == comment.MaxTargets {
-			break
-		}
-		ids = append(ids, p.ID)
+		ids[i] = p.ID
 	}
 	return ids
+}
+
+// capPins bounds the rows kept to re-check on the radar.
+func capPins(pins []comment.Target) []comment.Target {
+	if len(pins) > comment.MaxTargets {
+		return pins[:comment.MaxTargets]
+	}
+	return pins
+}
+
+// pinMatches reports whether it still names the destination pin was checked for.
+func pinMatches(pin comment.Target, it worklist.WorkItem) bool {
+	return pin.ID == it.ID && strings.EqualFold(pin.Repo, it.GitHub.Repo) && pin.Number == it.GitHub.Number
 }
 
 // pinnedTargets resolves the checked rows against the owner's stored items now. A
@@ -548,9 +583,10 @@ func (h *Handler) pinnedTargets(ctx context.Context, ownerID string, pins []comm
 
 // draft is an unsent comment kept through reconnecting commenting.
 type draft struct {
-	body     string
-	selected []string
-	saved    time.Time
+	body  string
+	pins  []comment.Target // the rows it was for (item, repo, number)
+	key   string           // its form's key, still unused when kept; "" for a used one
+	saved time.Time
 }
 
 // draftTTL is how long an unsent comment is kept for the owner to reconnect.
@@ -558,30 +594,31 @@ const draftTTL = 2 * time.Hour
 
 // saveDraft keeps the owner's unsent comment (the newest only), if it has any text
 // or selection.
-func (b *batches) saveDraft(owner, body string, selected []string, now time.Time) {
-	if strings.TrimSpace(body) == "" && len(selected) == 0 {
+func (b *batches) saveDraft(owner string, d draft, now time.Time) {
+	if strings.TrimSpace(d.body) == "" && len(d.pins) == 0 {
 		return
 	}
+	d.saved = now
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.drafts == nil {
 		b.drafts = map[string]draft{}
 	}
-	for k, d := range b.drafts {
-		if now.Sub(d.saved) > draftTTL {
+	for k, old := range b.drafts {
+		if now.Sub(old.saved) > draftTTL {
 			delete(b.drafts, k)
 		}
 	}
 	for len(b.drafts) >= maxRecords {
 		var oldest string
-		for k, d := range b.drafts {
-			if oldest == "" || d.saved.Before(b.drafts[oldest].saved) {
+		for k, old := range b.drafts {
+			if oldest == "" || old.saved.Before(b.drafts[oldest].saved) {
 				oldest = k
 			}
 		}
 		delete(b.drafts, oldest)
 	}
-	b.drafts[owner] = draft{body: body, selected: selected, saved: now}
+	b.drafts[owner] = d
 }
 
 // takeDraft removes and returns the owner's unsent comment, if one is kept.
@@ -591,6 +628,37 @@ func (b *batches) takeDraft(owner string, now time.Time) (draft, bool) {
 	d, ok := b.drafts[owner]
 	delete(b.drafts, owner)
 	return d, ok && now.Sub(d.saved) <= draftTTL
+}
+
+// dropDraft forgets the owner's unsent comment.
+func (b *batches) dropDraft(owner string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.drafts, owner)
+}
+
+// restoreDraft is the owner's kept comment for the radar to offer again, and the
+// key its form must carry, or ok=false. A draft kept with its form's key comes back
+// under that key, so the form it was kept from and the restored one share one batch;
+// if that form has posted meanwhile, the draft is spent and dropped. A key that has
+// expired can post from neither, so the restored form gets a fresh one.
+func (h *Handler) restoreDraft(owner string, now time.Time) (view *commentView, key string, ok bool) {
+	d, ok := h.batches.takeDraft(owner, now)
+	if !ok {
+		return nil, "", false
+	}
+	if d.key != "" {
+		if _, check := h.commentKeyIssued(d.key, owner, now); check == keyOK {
+			if h.batches.lookup(owner, d.key, now) != nil {
+				return nil, "", false
+			}
+			key = d.key
+		}
+	}
+	if key == "" {
+		key = h.newCommentKey(owner, now)
+	}
+	return &commentView{Body: d.body, Selected: d.pins, Error: draftRestored}, key, true
 }
 
 // commentTargets resolves the selected ids against the owner's stored items. Only

@@ -614,9 +614,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   `commentKeyTTL`; another account's) posts nothing, so nothing posts twice from one
   form, across a restart included, and never as another account. Each checkbox
   carries its row's repository and number (`selectionValue`), and a row whose item
-  now names another is skipped, never redirected (`pinnedTargets`). An unsent
-  comment refused for want of a grant is kept per owner (`saveDraft`) and comes back
-  in the box once connected, never posted without Post. A used key is held until it expires; only a batch that posted
+  now names another is skipped, never redirected (`pinnedTargets`). A refill
+  re-checks a row only while it names the destination it was checked for
+  (`pinMatches`). An unsent comment is kept per owner (`saveDraft`) only from a
+  verified, unused form of that account posted without a grant (kept with its key,
+  so the original tab and the restored form share one batch, `restoreDraft`) or a
+  batch that posted nothing and left the grant gone (never a partial or unknown
+  one); it comes back on the next plain radar once connected, never posted without
+  Post. Keys are accepted only in their canonical spelling. A used key is held until it expires; only a batch that posted
   nothing is dropped early, and past `maxRecords` gofer refuses to post rather than
   forget one. A batch's results are its owner's to read without a live grant; only
   starting one needs it.

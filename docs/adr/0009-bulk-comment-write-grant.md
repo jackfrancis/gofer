@@ -113,7 +113,9 @@ The client keeps the workload's guard rules (ADR 0007, "public-only guard"):
    startup), the time it was issued, random bytes, and a MAC (under a per-process
    secret) binding them to the account the radar was rendered for. A form rendered
    for one account never posts as another (the browser signed in as someone else in
-   another tab): it posts nothing, says so, and offers the comment again. The first submission of a key
+   another tab): it posts nothing and says so, and none of its text or selection is
+   shown to the account now signed in. Only the canonical (lowercase hex) spelling of
+   a key is accepted, so one key never names two batches. The first submission of a key
    claims it for its owner, atomically, and runs the batch; any later submission of
    the same key (a double click, a back-button resubmit) shows that batch's results
    and posts nothing, to its owner, with or without a live grant: only starting a
@@ -141,12 +143,20 @@ The client keeps the workload's guard rules (ADR 0007, "public-only guard"):
    posted nothing (a refused form, no grant, the worklist unreadable, nothing
    eligible, every target refused) reopens the comment box with the same comment and
    selection, the reason, and each target's own reason (a rate limit says when to try
-   again). The results show whether or not commenting is still connected: a grant lost
-   mid-batch leaves the connect prompt and the receipt of what landed. A comment that
-   could not start for want of a grant (or lost it before the first post) is kept, in
-   memory, for two hours, and comes back in the box once commenting is connected, to
-   post with an explicit Post. If the worklist cannot be read on the way back, the
-   error page's Try again keeps the results URL. A 401 confirmed
+   again). A row is checked again only while it still names the repository and number
+   it was checked for. The results show whether or not commenting is still connected:
+   a grant lost mid-batch leaves the connect prompt and the receipt of what landed.
+   An unsent comment is kept for after reconnecting (in memory, the newest per user,
+   for two hours) in two cases only: a verified, unused form of this account posted
+   without a grant, kept with its form's key; and a batch that put nothing on GitHub
+   and left the grant gone (missing, or a 401 GitHub confirmed, which deletes it),
+   kept without one, since its key is used. A partial or unknown batch is never kept.
+   It comes back in the box on the next plain radar once commenting is connected (a
+   page showing an outcome leaves it kept), to post with an explicit Post, under its
+   form's key when it has one: the original tab and the restored form then share one
+   batch, and a draft whose form posted meanwhile is dropped. Posting any comment
+   drops the kept one. If the worklist cannot be read on the way back, the error
+   page's Try again keeps the results URL. A 401 confirmed
    by GitHub's check-token deletes the stored grant. A rate limit (429, or 403 with
    GitHub's rate-limit signals) stops the batch, says when to try again, and leaves
    the rest unattempted. The grant is read again before every post after the first,

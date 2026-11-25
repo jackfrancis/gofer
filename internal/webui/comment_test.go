@@ -24,7 +24,9 @@ import (
 type fakeCommenter struct {
 	enabled, connected bool
 	postErr            error
-	refuseAll          string // every target refused with this reason, and no batch error
+	refuseAll          string // targets refused with this reason, and no batch error
+	refuseAfter        int    // with refuseAll: how many targets post before the refusals
+	dropGrant          bool   // with refuseAll: the refusal is a confirmed 401, which deletes the grant
 
 	mu       sync.Mutex
 	posts    [][]comment.Target
@@ -32,7 +34,11 @@ type fakeCommenter struct {
 	mentions []string // the repos the last Mentions call named
 }
 
-func (f *fakeCommenter) State(context.Context, string) (bool, bool) { return f.enabled, f.connected }
+func (f *fakeCommenter) State(context.Context, string) (bool, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.enabled, f.connected
+}
 
 func (f *fakeCommenter) Post(_ context.Context, _ string, targets []comment.Target, body string) ([]comment.Result, error) {
 	f.mu.Lock()
@@ -43,7 +49,17 @@ func (f *fakeCommenter) Post(_ context.Context, _ string, targets []comment.Targ
 	out := make([]comment.Result, len(targets))
 	if f.refuseAll != "" {
 		for i, t := range targets {
-			out[i] = comment.Result{Target: t, Error: f.refuseAll}
+			if i < f.refuseAfter {
+				out[i] = comment.Result{Target: t, Posted: true}
+			} else {
+				out[i] = comment.Result{Target: t, Error: f.refuseAll}
+			}
+		}
+		if f.refuseAfter > 0 {
+			f.posts = append(f.posts, targets[:f.refuseAfter])
+		}
+		if f.dropGrant {
+			f.connected = false
 		}
 		return out, nil
 	}
@@ -334,8 +350,13 @@ func TestCommentKeyIsBoundToItsAccount(t *testing.T) {
 	if c.postCount() != 0 {
 		t.Fatalf("posted as another account: %+v", c.posts)
 	}
-	if !strings.Contains(page, "signed in to gofer as another GitHub account") || !strings.Contains(page, ">/lgtm</textarea>") {
+	if !strings.Contains(page, "signed in to gofer as another GitHub account") {
 		t.Errorf("radar:\n%s", page)
+	}
+	// Review P1 (PR #60, round 2): none of the other account's text or selection
+	// is shown to this one.
+	if strings.Contains(page, "/lgtm") || strings.Contains(page, " checked aria-label") {
+		t.Errorf("the other account's comment is shown:\n%s", page)
 	}
 	// Posting again from the radar the second account now sees is a fresh, explicit act.
 	posted(t, h, url.Values{"key": {formKey(t, page)}, "content": {"/lgtm"}, "item": selections("github:a/one#1")})
@@ -637,7 +658,8 @@ func TestCommentAllRefusedShowsReasons(t *testing.T) {
 func TestCommentDraftSurvivesReconnect(t *testing.T) {
 	c := &fakeCommenter{enabled: true}
 	h := commentFixture(t, c)
-	rec := post(h, commentForm(h, "/assign @a", "github:b/two#2"))
+	form := commentForm(h, "/assign @a", "github:b/two#2")
+	rec := post(h, form)
 	if rec.Header().Get("Location") != "/?commenting=connect" {
 		t.Fatalf("location %q", rec.Header().Get("Location"))
 	}
@@ -646,7 +668,7 @@ func TestCommentDraftSurvivesReconnect(t *testing.T) {
 	}
 	c.connected = true
 	page := radar(t, h, "/")
-	for _, want := range []string{"Your comment is back", ">/assign @a</textarea>", `data-repo="b/two" checked`, "data-compose open"} {
+	for _, want := range []string{"Your comment is back", ">/assign @a</textarea>", `data-repo="b/two" checked`, "data-compose open", `name="key" value="` + form.Get("key") + `"`} {
 		if !strings.Contains(page, want) {
 			t.Errorf("radar after reconnecting lacks %q", want)
 		}
@@ -714,5 +736,149 @@ func TestCommentOutcomeSurvivesWorklistError(t *testing.T) {
 	fail.Store(false)
 	if page := radar(t, h, loc); !strings.Contains(page, ">/lgtm</textarea>") || !strings.Contains(page, "could not read your worklist") {
 		t.Errorf("radar after recovery:\n%s", page)
+	}
+}
+
+// Review P1 (PR #60, round 2): only a verified, same-account form is kept through
+// reconnecting. Another account's form, or a stale one that may already have
+// posted, is refused (whether or not commenting is connected) and kept for nobody.
+func TestCommentRefusedFormsKeepNoDraft(t *testing.T) {
+	c := &fakeCommenter{enabled: true}
+	h := commentFixture(t, c)
+	foreign := url.Values{"key": {h.newCommentKey("github:7", h.now())}, "content": {"/from-seven"}, "item": selections("github:a/one#1")}
+	stale := commentForm(commentFixture(t, c), "/from-before", "github:a/one#1") // another process
+	rec := post(h, foreign)
+	if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "/?comment=") {
+		t.Fatalf("foreign form while disconnected went to %q", loc)
+	}
+	if page := radar(t, h, rec.Header().Get("Location")); !strings.Contains(page, "another GitHub account") || strings.Contains(page, "/from-seven") {
+		t.Errorf("foreign refusal:\n%s", page)
+	}
+	rec = post(h, stale)
+	if page := radar(t, h, rec.Header().Get("Location")); !strings.Contains(page, "cannot tell whether an earlier submission") {
+		t.Errorf("stale refusal:\n%s", page)
+	}
+	c.connected = true
+	if page := radar(t, h, "/"); strings.Contains(page, "/from-seven") || strings.Contains(page, "/from-before") || strings.Contains(page, "Your comment is back") {
+		t.Errorf("a refused form was kept as a draft:\n%s", page)
+	}
+}
+
+// Review P1 (PR #60, round 2): a row skipped because its destination changed is
+// not checked again when the comment is offered again.
+func TestCommentRefillKeepsPins(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true, refuseAll: "Not posted: refused."}
+	h := commentFixture(t, c)
+	form := commentForm(h, "/lgtm", "github:a/one#1", "github:b/two#2")
+	err := h.store.Update(context.Background(), commentOwner, func(items []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		for _, it := range items {
+			if it.ID == "github:a/one#1" {
+				it.GitHub.Repo, it.GitHub.Number = "other/repo", 99
+				return []worklist.WorkItem{it}, nil
+			}
+		}
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := posted(t, h, form)
+	if !strings.Contains(page, "data-compose open") || !strings.Contains(page, `data-repo="b/two" checked`) {
+		t.Fatalf("the comment is not offered again:\n%s", page)
+	}
+	if strings.Contains(page, `data-repo="other/repo" checked`) {
+		t.Error("the row whose destination changed is checked again")
+	}
+}
+
+// Review P2 (PR #60, round 2): the form a draft was kept from and the restored form
+// share one key, so between them they post once, in either order.
+func TestCommentDraftSharesItsFormsKey(t *testing.T) {
+	t.Run("restored first", func(t *testing.T) {
+		c := &fakeCommenter{enabled: true}
+		h := commentFixture(t, c)
+		form := commentForm(h, "/lgtm", "github:a/one#1")
+		post(h, form)
+		c.connected = true
+		page := radar(t, h, "/")
+		restored := url.Values{"key": {formKey(t, page)}, "content": {"/lgtm"}, "item": selections("github:a/one#1")}
+		posted(t, h, restored)
+		post(h, form) // the original tab
+		if c.postCount() != 1 {
+			t.Errorf("posts = %d", c.postCount())
+		}
+	})
+	t.Run("original first", func(t *testing.T) {
+		c := &fakeCommenter{enabled: true}
+		h := commentFixture(t, c)
+		form := commentForm(h, "/lgtm", "github:a/one#1")
+		post(h, form)
+		c.connected = true
+		posted(t, h, form) // the original tab, after reconnecting
+		if page := radar(t, h, "/"); strings.Contains(page, "Your comment is back") {
+			t.Error("a draft already posted from its own form came back")
+		}
+		if c.postCount() != 1 {
+			t.Errorf("posts = %d", c.postCount())
+		}
+	})
+}
+
+// Review P2 (PR #60, round 2): only the canonical spelling of a key is accepted, so
+// one key never names two batches.
+func TestCommentKeyIsCanonical(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	form := commentForm(h, "/lgtm", "github:a/one#1")
+	posted(t, h, form)
+	upper := url.Values{"key": {strings.ToUpper(form.Get("key"))}, "content": {"/lgtm"}, "item": form["item"]}
+	if _, check := h.commentKeyIssued(upper.Get("key"), commentOwner, h.now()); check != keyStale {
+		t.Errorf("uppercase key check = %v", check)
+	}
+	post(h, upper)
+	if c.postCount() != 1 {
+		t.Errorf("posts = %d", c.postCount())
+	}
+}
+
+// Review P2 (PR #60, round 2): a first write GitHub rejects with a confirmed 401
+// (which deletes the grant) keeps the comment for after reconnecting, as long as
+// nothing was posted.
+func TestCommentRejectedGrantKeepsDraft(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true, refuseAll: "Not posted: GitHub rejected the commenting grant.", dropGrant: true}
+	h := commentFixture(t, c)
+	rec := post(h, commentForm(h, "/lgtm", "github:a/one#1", "github:b/two#2"))
+	if page := radar(t, h, rec.Header().Get("Location")); !strings.Contains(page, "rejected the commenting grant") {
+		t.Errorf("receipt:\n%s", page)
+	}
+	c.connected, c.refuseAll = true, ""
+	if page := radar(t, h, "/"); !strings.Contains(page, ">/lgtm</textarea>") || !strings.Contains(page, "Your comment is back") {
+		t.Errorf("the comment did not come back:\n%s", page)
+	}
+
+	// A partial batch is never kept: posting it again would post twice.
+	c2 := &fakeCommenter{enabled: true, connected: true, refuseAll: "Not posted: GitHub rejected the commenting grant.", refuseAfter: 1, dropGrant: true}
+	h2 := commentFixture(t, c2)
+	post(h2, commentForm(h2, "/partial", "github:a/one#1", "github:b/two#2"))
+	c2.connected = true
+	if page := radar(t, h2, "/"); strings.Contains(page, "/partial") {
+		t.Error("a partial batch was kept as a draft")
+	}
+}
+
+// Review P2 (PR #60, round 2): a page showing an outcome leaves a kept draft for
+// the next plain radar.
+func TestCommentOutcomePageKeepsDraft(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	older := post(h, commentForm(h, "/older", "github:a/one#1")).Header().Get("Location")
+	c.connected = false
+	post(h, commentForm(h, "/kept", "github:b/two#2"))
+	c.connected = true
+	if page := radar(t, h, older); !strings.Contains(page, "/older") || strings.Contains(page, "/kept") {
+		t.Errorf("older receipt:\n%s", page)
+	}
+	if page := radar(t, h, "/"); !strings.Contains(page, ">/kept</textarea>") {
+		t.Errorf("the draft was lost:\n%s", page)
 	}
 }
