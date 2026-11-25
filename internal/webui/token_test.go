@@ -77,3 +77,25 @@ func TestRadarExpiredToken(t *testing.T) {
 		}
 	}
 }
+
+// Review (round 3): a token stored while tokens were allowed, once they are not, gets
+// a Disconnect and no OAuth connect link (the callback would refuse while it is
+// held); a disconnect whose cleanup is pending gets a Retry disconnect.
+func TestRadarStrandedCredentials(t *testing.T) {
+	disabled, _ := radarPage(t, &detailCommenter{fakeCommenter: fakeCommenter{enabled: true}, details: comment.Details{TokenDisabled: true, Expires: time.Date(2026, 12, 24, 0, 0, 0, 0, time.UTC)}}, "")
+	if !strings.Contains(disabled, "no longer accepts personal access tokens") || !strings.Contains(disabled, `action="/auth/github-write/disconnect"`) {
+		t.Error("a disabled token is not offered Disconnect")
+	}
+	if strings.Contains(disabled, `href="/auth/github-write/login"`) {
+		t.Error("the connect link is offered while a disabled token is in its way")
+	}
+	pending, _ := radarPage(t, &detailCommenter{fakeCommenter: fakeCommenter{enabled: true}, details: comment.Details{TokensAllowed: true, CleanupPending: true}}, "")
+	for _, want := range []string{"Retry disconnect", `action="/auth/github-write/disconnect"`, `href="/auth/github-write/login"`, `action="/auth/github-write/token"`} {
+		if !strings.Contains(pending, want) {
+			t.Errorf("cleanup-pending radar lacks %s", want)
+		}
+	}
+	if page, _ := radarPage(t, &detailCommenter{fakeCommenter: fakeCommenter{enabled: true}}, "?commenting=revoked-pending"); !strings.Contains(page, "access is revoked, but gofer could not finish deleting") {
+		t.Error("revoked-pending notice missing")
+	}
+}

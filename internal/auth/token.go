@@ -231,6 +231,9 @@ func (h *Handler) ConnectWriteToken(w http.ResponseWriter, r *http.Request) {
 	case outcome == grantBusy:
 		fail(http.StatusConflict, "gofer is still disconnecting commenting. Try again in a moment.")
 		return
+	case outcome == grantCleanupFailed:
+		fail(http.StatusServiceUnavailable, "gofer could not finish deleting your previous commenting credential, so the token was not saved. Try again later.")
+		return
 	}
 	slog.InfoContext(ctx, "commenting connected with a personal access token", "user", user.ID, "expires", info.expiry)
 	http.Redirect(w, r, "/?commenting=token", http.StatusSeeOther)
@@ -249,6 +252,7 @@ const (
 	grantAlreadyConnected grantOutcome = iota + 100 // a usable write grant is already stored
 	grantBusy                                       // a disconnect or logout of the write grant is pending
 	grantTokenConnected                             // a live personal access token is stored (the OAuth callback must not replace it)
+	grantCleanupFailed                              // a pending disconnect was retried and still could not delete gofer's copy
 )
 
 // storeWriteToken stores a checked personal access token as the user's write grant,
@@ -256,13 +260,31 @@ const (
 // grant's marker lock, which logout holds while it decides what to revoke, it
 // re-checks the session, and refuses while a logout of the write grant is pending
 // (storing would supersede it, leaving an OAuth grant unrevoked) or while a usable
-// grant is stored (disconnect first). An expired token is replaced.
+// grant is stored (disconnect first). A pending logout nobody here is running is
+// finished first (claimLogout, runLogout), and the token is stored once it deleted
+// the old copy. An expired token is replaced.
 func (h *Handler) storeWriteToken(ctx context.Context, p *provider, userID, login, token string, expiry time.Time, sessionValid func(context.Context) (bool, error)) (grantOutcome, error) {
 	unlock, err := h.locks.lock(ctx, userID, p.name)
 	if err != nil {
 		return 0, err
 	}
 	defer unlock()
+	// A disconnect or logout of the write grant that no operation here is running (its
+	// delete failed, its background wait gave up, or it began before a restart) is
+	// finished first, holding the lock, as the broker finishes one: the user retrying
+	// is what gets it done, so a vault that has recovered never keeps refusing. One an
+	// operation here is running owns the credential; the user tries again shortly.
+	pending, mine, err := h.claimLogout(ctx, userID, p.name)
+	switch {
+	case err != nil:
+		return 0, fmt.Errorf("read pending logout: %w", err)
+	case pending && mine == nil:
+		return grantBusy, nil
+	case pending:
+		if res := h.runLogout(ctx, userID, p.name, mine); res.cleanupPending {
+			return grantCleanupFailed, nil
+		}
+	}
 	defer h.locks.markerLock(userID, p.name)()
 	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
 	defer cancel()
@@ -273,10 +295,11 @@ func (h *Handler) storeWriteToken(ctx context.Context, p *provider, userID, logi
 	if !ok {
 		return grantSessionEnded, nil
 	}
+	// A disconnect or logout begun since (it takes only the marker lock to record).
 	if h.locks.currentLogout(userID, p.name) != nil {
 		return grantBusy, nil
 	}
-	pending, err := h.ledger.LogoutPending(lctx, userID, p.name)
+	pending, err = h.ledger.LogoutPending(lctx, userID, p.name)
 	if err != nil {
 		return 0, fmt.Errorf("read pending logout: %w", err)
 	}
@@ -333,24 +356,25 @@ func sameOriginRequest(r *http.Request) bool {
 // personal access token is deleted, so the radar asks the user to connect again with
 // a narrow one; gofer cannot revoke it, and says so there. An OAuth grant gofer only
 // ever asks public_repo for is left alone: every write with it is still refused while
-// it has more.
-func (h *Handler) WriteScopesChanged(ctx context.Context, userID, version string) {
+// it has more, and the user disconnects it. It reports whether gofer's copy was
+// deleted, which only the vault's confirmation says.
+func (h *Handler) WriteScopesChanged(ctx context.Context, userID, version string) (deleted bool) {
 	if _, ok := h.providers[WriteProvider]; !ok || h.vault == nil || version == "" {
-		return
+		return false
 	}
 	unlock, err := h.locks.lock(ctx, userID, WriteProvider)
 	if err != nil {
-		return
+		return false
 	}
 	defer unlock()
 	cred, err := h.vault.Get(ctx, userID, WriteProvider)
 	if err != nil || cred.Version != version {
-		return
+		return false
 	}
 	if !isPersonalToken(cred) {
 		slog.WarnContext(ctx, "write grant reports scopes beyond public_repo; writes refused", "user", userID)
-		return
+		return false
 	}
 	slog.InfoContext(ctx, "commenting token's scopes widened; deleting gofer's copy", "user", userID)
-	h.deleteIfVersion(ctx, userID, cred)
+	return h.deleteIfVersion(ctx, userID, cred)
 }

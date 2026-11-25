@@ -532,18 +532,21 @@ func (h *Handler) putIfVersion(ctx context.Context, userID, expect string, cred 
 }
 
 // deleteIfVersion deletes the credential only if the row still holds cred's
-// version, so a failed refresh never deletes what a newer sign-in wrote.
-func (h *Handler) deleteIfVersion(ctx context.Context, userID string, cred vault.Credential) {
+// version, so a failed refresh never deletes what a newer sign-in wrote. It reports
+// whether the vault confirmed the deletion.
+func (h *Handler) deleteIfVersion(ctx context.Context, userID string, cred vault.Credential) bool {
 	if pending, err := h.logoutPending(ctx, userID, cred.Provider); pending || err != nil {
-		return // a pending logout deletes it, after trying to revoke with it
+		return false // a pending logout deletes it, after trying to revoke with it
 	}
 	cur, err := h.vault.Get(ctx, userID, cred.Provider)
 	if err != nil || cur.Version != cred.Version {
-		return
+		return false
 	}
 	if err := h.vault.Delete(ctx, userID, cred.Provider); err != nil {
 		slog.WarnContext(ctx, "deleting a dead credential failed", "user", userID, "provider", cred.Provider, "err", err)
+		return false
 	}
+	return true
 }
 
 func (h *Handler) forcedUsed(runID string) bool {

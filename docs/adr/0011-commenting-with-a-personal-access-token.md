@@ -79,16 +79,21 @@ provider, as before). Further:
 
 - **Scopes, before every write.** The request that precedes each write (the
   repository's public check) reads GitHub's `X-OAuth-Scopes` for the token. If it is
-  present and not exactly `public_repo`, nothing is written (`ErrTokenScopes`), the
-  batch stops, and a personal access token is deleted (`WriteScopesChanged`), so the
-  radar asks for a narrow one. An OAuth grant, which gofer only ever asks for
-  `public_repo`, is not deleted (that would leave it unrevoked); its writes stay
-  refused while it reports more.
+  not exactly `public_repo`, nothing is written (`ErrTokenScopes`), the batch stops,
+  and a personal access token is deleted (`WriteScopesChanged`), so the radar asks for
+  a narrow one. An OAuth grant, which gofer only ever asks for `public_repo`, is not
+  deleted (that would leave it unrevoked); its writes stay refused while it reports
+  more, and the user is told to disconnect it. The user is told gofer's copy was
+  deleted only when the vault confirmed it. If the header is missing, gofer cannot
+  confirm the scope: nothing is written (`ErrScopesUnknown`), and the credential is
+  kept, since a missing header says nothing against it.
 - **Expiry.** An expired token reads as not connected and is not handed out
   (`WriteCredential`). The radar says it expired, offers a new one, and keeps
   Disconnect, since gofer still holds the expired copy.
 - **Turned off.** A token stored while tokens were allowed is not used once they are not
-  (`fromConfiguredClient`); disconnect and logout still delete it.
+  (`fromConfiguredClient`); disconnect and logout still delete it. Until then it stands
+  in the OAuth grant's way (the callback refuses while it is held), so the radar names
+  it and offers Disconnect instead of the connect link.
 - **Rejected.** A 401 on a token is confirmed with `GET /user` (not the OAuth app's
   check-token, which knows nothing of tokens) before gofer drops its copy.
 - **Disconnect and logout.** gofer cannot revoke a personal access token. Both delete
@@ -97,7 +102,10 @@ provider, as before). Further:
   sent to an OAuth app's revoke or check endpoint. Deletion is reported only once the
   vault confirms it (`logoutResult.tokenDeleted`): a failed or deferred delete says
   cleanup is pending (`cleanupPending`), while the recorded logout keeps the credential
-  unused until it finishes. When the credential could not be read, the user is sent to
+  unused until it finishes, even when GitHub confirmed an OAuth grant's revocation
+  (then both are said). Nothing leaves the user stuck: the radar offers Retry
+  disconnect while cleanup is pending, and connecting a token first finishes a pending
+  disconnect nobody is running, storing the token only once the old copy is gone. When the credential could not be read, the user is sent to
   both the authorized apps and the token settings, since it may have been either kind.
 
 ### Telling the user when an organization blocks the app

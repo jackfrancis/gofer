@@ -488,11 +488,21 @@ func TestWriteScopesChanged(t *testing.T) {
 	pat.set(patToken, goodPAT())
 	postToken(h, signedIn, patToken)
 	c, _ := writeStored(t, vlt)
-	h.WriteScopesChanged(bg, user, "stale-version")
+	if h.WriteScopesChanged(bg, user, "stale-version") {
+		t.Error("a stale version reported a deletion")
+	}
 	if _, ok := writeStored(t, vlt); !ok {
 		t.Fatal("a stale version dropped the token")
 	}
-	h.WriteScopesChanged(bg, user, c.Version)
+	fv := &faultyVault{Vault: vlt, failDelete: true}
+	h.vault = fv
+	if h.WriteScopesChanged(bg, user, c.Version) {
+		t.Error("a failed delete reported a deletion")
+	}
+	fv.failDelete = false
+	if !h.WriteScopesChanged(bg, user, c.Version) {
+		t.Error("a confirmed delete was not reported")
+	}
 	if _, ok := writeStored(t, vlt); ok {
 		t.Error("a widened token was kept")
 	}
@@ -502,8 +512,127 @@ func TestWriteScopesChanged(t *testing.T) {
 	connectWrite(t, h2, signedIn2)
 	h2.githubAPIBase = pat2.srv.URL
 	oauth, _ := writeStored(t, vlt2)
-	h2.WriteScopesChanged(bg, user, oauth.Version)
+	if h2.WriteScopesChanged(bg, user, oauth.Version) {
+		t.Error("an OAuth grant reported a deletion")
+	}
 	if _, ok := writeStored(t, vlt2); !ok {
 		t.Error("an OAuth grant was deleted without being revoked")
+	}
+}
+
+// Review (round 3): a token stored while tokens were allowed, once they are not, is
+// unused but still in the OAuth grant's way. The radar offers Disconnect for it; the
+// callback keeps refusing until then, and connects once it is gone.
+func TestDisabledTokenCanBeDisconnected(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	h.providers[WriteProvider].tokens = false
+	h.cfg.Providers.GitHubWriteTokens = false
+	if st := h.CommentingState(bg, user); st.Connected || !st.TokenDisabled || st.TokensAllowed || st.Expires.IsZero() {
+		t.Fatalf("state = %+v", st)
+	}
+	if rec, _, _ := connectWrite(t, h, signedIn); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "disconnect commenting") {
+		t.Fatalf("callback over a disabled token: %d %s", rec.Code, rec.Body)
+	}
+	if loc := disconnect(h, signedIn); loc != "/?commenting=token-deleted" {
+		t.Fatalf("disconnect: %q", loc)
+	}
+	if st := h.CommentingState(bg, user); st.TokenDisabled || st.CleanupPending {
+		t.Errorf("after disconnect: %+v", st)
+	}
+	if rec, _, _ := connectWrite(t, h, signedIn); rec.Code != http.StatusFound {
+		t.Fatalf("callback after disconnect: %d %s", rec.Code, rec.Body)
+	}
+	if c, ok := writeStored(t, vlt); !ok || isPersonalToken(c) {
+		t.Error("the OAuth grant was not stored")
+	}
+}
+
+// Review (round 3): a disconnect whose delete failed leaves the radar a retry, and
+// connecting a token resumes the abandoned deletion instead of refusing for good:
+// while the vault still fails nothing is stored, and once it recovers the old copy
+// is deleted and the new token stored.
+func TestPendingCleanupCanBeRetried(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	pat.set(patToken2, goodPAT())
+	postToken(h, signedIn, patToken)
+	fv := &faultyVault{Vault: vlt, failDelete: true}
+	h.vault = fv
+	if loc := disconnect(h, signedIn); loc != "/?commenting=disconnect-pending" {
+		t.Fatalf("failed delete: %q", loc)
+	}
+	if st := h.CommentingState(bg, user); !st.CleanupPending || st.Connected {
+		t.Fatalf("state = %+v", st)
+	}
+	if rec := postToken(h, signedIn, patToken2); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("connect while the vault still fails: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); c.AccessToken != patToken {
+		t.Fatal("a token was stored over a copy gofer could not delete")
+	}
+	fv.failDelete = false
+	if rec := postToken(h, signedIn, patToken2); rec.Code != http.StatusSeeOther {
+		t.Fatalf("connect once the vault recovered: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); c.AccessToken != patToken2 {
+		t.Error("the new token was not stored")
+	}
+	if st := h.CommentingState(bg, user); !st.Connected || st.CleanupPending {
+		t.Errorf("after reconnecting: %+v", st)
+	}
+
+	// Retry disconnect from the radar finishes it too.
+	h2, signedIn2, pat2, _, vlt2 := newTokenHandler(t)
+	pat2.set(patToken, goodPAT())
+	postToken(h2, signedIn2, patToken)
+	fv2 := &faultyVault{Vault: vlt2, failDelete: true}
+	h2.vault = fv2
+	disconnect(h2, signedIn2)
+	fv2.failDelete = false
+	if loc := disconnect(h2, signedIn2); loc != "/?commenting=token-deleted" {
+		t.Errorf("retry: %q", loc)
+	}
+	if _, ok := writeStored(t, vlt2); ok {
+		t.Error("the retry did not delete the copy")
+	}
+	if st := h2.CommentingState(bg, user); st.CleanupPending {
+		t.Errorf("after the retry: %+v", st)
+	}
+}
+
+// Review (round 3): GitHub can confirm an OAuth grant's revocation while the vault
+// fails to delete gofer's copy. Disconnect and logout report both outcomes.
+func TestRevokedButCleanupPending(t *testing.T) {
+	for _, via := range []string{"disconnect", "logout"} {
+		gh := newFakeGitHub(t)
+		h, _, _, vlt := newWriteHandler(t, gh)
+		_, signedIn := signIn(t, h)
+		connectWrite(t, h, signedIn)
+		h.vault = &faultyVault{Vault: vlt, failDelete: true}
+		if via == "disconnect" {
+			if loc := disconnect(h, signedIn); loc != "/?commenting=revoked-pending" {
+				t.Errorf("disconnect: %q", loc)
+			}
+		} else {
+			req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+			for _, c := range signedIn.Cookies() {
+				req.AddCookie(c)
+			}
+			rec := httptest.NewRecorder()
+			h.Logout(rec, req)
+			var out struct{ Revocation, Cleanup, Message string }
+			if err := json.NewDecoder(rec.Body).Decode(&out); err != nil || rec.Code != http.StatusOK ||
+				out.Revocation != "confirmed" || out.Cleanup != "pending" || !strings.Contains(out.Message, "could not finish deleting") {
+				t.Errorf("logout: %d %+v %v", rec.Code, out, err)
+			}
+		}
+		if gh.revokedOther.Load() != 1 {
+			t.Errorf("%s: the write grant was not revoked: %d", via, gh.revokedOther.Load())
+		}
+		if _, ok := writeStored(t, vlt); !ok {
+			t.Fatalf("%s: test setup: the row should still be there", via)
+		}
 	}
 }

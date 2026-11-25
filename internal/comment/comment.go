@@ -45,8 +45,10 @@ type Credentials interface {
 	WriteCredential(ctx context.Context, userID string) (vault.Credential, error)
 	WriteRejected(ctx context.Context, userID, version string)
 	// WriteScopesChanged stops gofer using the write grant at version, which GitHub
-	// reported carrying scopes beyond public_repo (ghcomment.ErrTokenScopes).
-	WriteScopesChanged(ctx context.Context, userID, version string)
+	// reported carrying scopes beyond public_repo (ghcomment.ErrTokenScopes), and
+	// reports whether gofer's copy was deleted (only a personal access token is, and
+	// only the vault's confirmation counts).
+	WriteScopesChanged(ctx context.Context, userID, version string) (deleted bool)
 	Credential(ctx context.Context, userID, provider string, req auth.VendRequest) (vault.Credential, error)
 }
 
@@ -132,16 +134,25 @@ func (s *Service) State(ctx context.Context, userID string) (enabled, connected 
 // connect with a personal access token, and whether the connected grant is one, with
 // its expiry (ADR 0011).
 type Details struct {
-	TokensAllowed bool
-	Token         bool
-	TokenExpired  bool // a token is stored but has expired: replace or disconnect it
-	Expires       time.Time
+	TokensAllowed  bool
+	Token          bool
+	TokenExpired   bool // a token is stored but has expired: replace or disconnect it
+	TokenDisabled  bool // a token is stored while tokens are not allowed: disconnect it
+	CleanupPending bool // a disconnect has not finished deleting gofer's copy: retry it
+	Expires        time.Time
 }
 
 // Details reports the user's commenting details.
 func (s *Service) Details(ctx context.Context, userID string) Details {
 	st := s.creds.CommentingState(ctx, userID)
-	return Details{TokensAllowed: st.TokensAllowed, Token: st.Token, TokenExpired: st.TokenExpired, Expires: st.Expires}
+	return Details{
+		TokensAllowed:  st.TokensAllowed,
+		Token:          st.Token,
+		TokenExpired:   st.TokenExpired,
+		TokenDisabled:  st.TokenDisabled,
+		CleanupPending: st.CleanupPending,
+		Expires:        st.Expires,
+	}
 }
 
 // Post posts body to every target, in order, one at a time and at least spacing
@@ -206,9 +217,12 @@ func (s *Service) Post(ctx context.Context, userID string, targets []Target, bod
 			out[i].Error = "Not posted: GitHub rejected gofer's access. Connect commenting again."
 			stopped = "Not attempted: GitHub rejected gofer's access. Connect commenting again."
 		case errors.Is(err, ghcomment.ErrTokenScopes):
-			s.creds.WriteScopesChanged(context.WithoutCancel(ctx), userID, cred.Version)
-			out[i].Error = "Not posted: " + scopesChanged
-			stopped = "Not attempted: " + scopesChanged
+			why := scopesChanged(s.creds.WriteScopesChanged(context.WithoutCancel(ctx), userID, cred.Version))
+			out[i].Error = "Not posted: " + why
+			stopped = "Not attempted: " + why
+		case errors.Is(err, ghcomment.ErrScopesUnknown):
+			out[i].Error = "Not posted: " + scopesUnknown
+			stopped = "Not attempted: " + scopesUnknown
 		case errors.As(err, &rl):
 			wait := "a while"
 			if rl.RetryAfter > 0 {
@@ -226,8 +240,19 @@ func (s *Service) Post(ctx context.Context, userID string, targets []Target, bod
 	return out, nil
 }
 
-// scopesChanged explains ghcomment.ErrTokenScopes.
-const scopesChanged = "your commenting token now has scopes beyond public_repo, so gofer stopped using it and deleted its copy. Connect again with a token that has only public_repo, and delete or narrow the old one on GitHub."
+// scopesChanged explains ghcomment.ErrTokenScopes. It says gofer's copy was deleted
+// only when WriteScopesChanged confirmed it; otherwise (an OAuth grant, which gofer
+// keeps so it can still revoke it, or a token whose deletion failed) the user is sent
+// to Disconnect, which revokes or deletes it.
+func scopesChanged(deleted bool) string {
+	if deleted {
+		return "your commenting token now has scopes beyond public_repo, so gofer wrote nothing and deleted its copy. Delete or narrow the token on GitHub, and connect again with a token that has only public_repo."
+	}
+	return "GitHub reports that gofer's commenting access now has scopes beyond public_repo, so gofer wrote nothing. Disconnect commenting on the radar, then connect again with only public_repo."
+}
+
+// scopesUnknown explains ghcomment.ErrScopesUnknown.
+const scopesUnknown = "GitHub did not report what gofer's commenting access may do, so gofer could not confirm it is limited to public_repo and wrote nothing. Try again later."
 
 // describe turns a posting error into words for the user.
 func describe(err error) string { return describeAs("Not posted", err) }

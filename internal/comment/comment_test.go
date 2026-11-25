@@ -27,6 +27,7 @@ type fakeCreds struct {
 	readErr        error
 	rejected       []string
 	widened        []string // WriteScopesChanged calls
+	widenDeletes   bool     // WriteScopesChanged reports gofer's copy deleted
 	readCalls      int
 	mu             sync.Mutex
 }
@@ -59,10 +60,11 @@ func (f *fakeCreds) WriteRejected(_ context.Context, _, version string) {
 	f.rejected = append(f.rejected, version)
 }
 
-func (f *fakeCreds) WriteScopesChanged(_ context.Context, _, version string) {
+func (f *fakeCreds) WriteScopesChanged(_ context.Context, _, version string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.widened = append(f.widened, version)
+	return f.widenDeletes
 }
 
 func (f *fakeCreds) Credential(_ context.Context, _, provider string, _ auth.VendRequest) (vault.Credential, error) {

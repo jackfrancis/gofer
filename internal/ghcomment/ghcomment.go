@@ -155,9 +155,17 @@ func (c *Client) PublicRepo(ctx context.Context, token, repo string) (string, er
 // checks it again, and nothing is written with a token that has more.
 var ErrTokenScopes = errors.New("the commenting token's scopes are no longer exactly public_repo")
 
-// writeRepo is PublicRepo for the request that precedes a write: it also refuses
-// (ErrTokenScopes) when GitHub reports the token's scopes (X-OAuth-Scopes, sent for
-// classic OAuth and personal access tokens) and they are not exactly public_repo.
+// ErrScopesUnknown means GitHub's answer to the request before a write carried no
+// X-OAuth-Scopes, so gofer could not confirm the credential is still limited to
+// public_repo. Nothing is written; it says nothing about the credential itself, which
+// is kept.
+var ErrScopesUnknown = errors.New("github did not report the commenting credential's scopes")
+
+// writeRepo is PublicRepo for the request that precedes a write: it also checks the
+// token's scopes as GitHub reports them (X-OAuth-Scopes, which GitHub sends for the
+// classic OAuth and personal access tokens gofer writes with). It refuses when they
+// are not exactly public_repo (ErrTokenScopes), and when the header is missing
+// (ErrScopesUnknown): an answer that does not say is never taken as a yes.
 func (c *Client) writeRepo(ctx context.Context, token, repo string) (string, error) {
 	return c.publicRepo(ctx, token, repo, true)
 }
@@ -185,7 +193,11 @@ func (c *Client) publicRepo(ctx context.Context, token, repo string, write bool)
 		return "", ErrNotPublic
 	}
 	if write {
-		if v, ok := hdr[http.CanonicalHeaderKey("X-OAuth-Scopes")]; ok && !onlyPublicRepo(strings.Join(v, ",")) {
+		v, ok := hdr[http.CanonicalHeaderKey("X-OAuth-Scopes")]
+		switch {
+		case !ok:
+			return "", ErrScopesUnknown
+		case !onlyPublicRepo(strings.Join(v, ",")):
 			return "", ErrTokenScopes
 		}
 	}

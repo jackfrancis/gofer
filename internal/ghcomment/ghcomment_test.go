@@ -32,6 +32,7 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 	f.postedTo.Store("")
 	f.postedBody.Store("")
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-OAuth-Scopes", "public_repo") // as GitHub sends for a classic token
 		if r.Header.Get("Authorization") != "Bearer "+token {
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"message":"Bad credentials"}`))
@@ -185,6 +186,7 @@ func TestAssignees(t *testing.T) {
 func postServer(t *testing.T, respond func(w http.ResponseWriter, r *http.Request)) *Client {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-OAuth-Scopes", "public_repo")
 		if r.Method == http.MethodGet {
 			_, _ = w.Write([]byte(`{"full_name":"o/r","private":false}`))
 			return
@@ -321,16 +323,22 @@ func TestWritesRefuseWidenedScopes(t *testing.T) {
 		"exactly public_repo": {str("public_repo"), true},
 		"widened":             {str("public_repo, repo"), false},
 		"other scope":         {str("repo"), false},
-		"no header":           {nil, true},
+		"no header":           {nil, false},
 	} {
 		var posted atomic.Int32
 		c := scopeServer(t, tc.scopes, &posted)
 		_, err := c.Comment(context.Background(), token, "o/r", 1, "hi")
-		if tc.ok != (err == nil) || (!tc.ok && (!errors.Is(err, ErrTokenScopes) || posted.Load() != 0)) {
+		// No header is unknown, never a yes: refused as ErrScopesUnknown, which says
+		// nothing against the credential.
+		want := ErrTokenScopes
+		if tc.scopes == nil {
+			want = ErrScopesUnknown
+		}
+		if tc.ok != (err == nil) || (!tc.ok && (!errors.Is(err, want) || posted.Load() != 0)) {
 			t.Errorf("%s: err = %v, posted %d", name, err, posted.Load())
 		}
 		rv := Review{Commit: "0123456789abcdef0123456789abcdef01234567", BaseRef: "main", Body: "x"}
-		if _, err := c.PendingReview(context.Background(), token, "o/r", 1, rv); !tc.ok && !errors.Is(err, ErrTokenScopes) {
+		if _, err := c.PendingReview(context.Background(), token, "o/r", 1, rv); !tc.ok && !errors.Is(err, want) {
 			t.Errorf("%s: review err = %v", name, err)
 		}
 		if _, _, err := c.Assignees(context.Background(), token, "o/r"); err != nil {
