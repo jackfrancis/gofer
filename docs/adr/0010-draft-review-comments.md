@@ -154,9 +154,18 @@ the base branch, and the digest of the whole diff GitHub shows
 (`worklist.Revision`; `github.DiffDigest`: SHA-256 over the files sorted by path, one
 line each of path, previous path, status, blob SHA and the patch's SHA-256). Every
 converse reply on a pull request records the head and base it read (`Message.Head`
-and `Base`, kept only as a valid pair), and a review also reads the whole diff
-(`github.PullDiff`) and records its digest (`Message.Diff`; none when the list was cut
-at 3000 files). `WorkItem.ReviewedRevision` is the revision the latest visible review
+and `Base`, kept only as a valid pair), and a review also records the digest of the
+whole diff (`Message.Diff`). A review reads one settled snapshot first
+(`github.PullDiff`: the pull request, every file, then the pull request again, settled
+only when its head and base are unchanged) and shows the model that snapshot's head
+and file list, so what the model is told it reviews and what gofer records are the
+same read. The model's tools read GitHub live, so after it answers the run reads the
+pull request once more: if the head or base moved while it worked, the review vouches
+for no diff. A diff gofer cannot identify has no digest either
+(`PullDiff.Unverifiable`): a list not read whole, a snapshot that did not settle, or a
+file other than a new one that GitHub shows no patch for (a binary change), since its
+entry names only the head blob and a merge base that moved under it would leave the
+digest unchanged. `WorkItem.ReviewedRevision` is the revision the latest visible review
 read (the visible answer to a visible review request that landed last). An approval
 stands only on a draft pinned to exactly that revision, read whole
 (`WorkItem.Reviewed`): `AppendReply` clears the flag otherwise, whatever the run sent.
@@ -169,10 +178,16 @@ An approving draft carries the diff digest it approves (`DraftReview.Diff`; with
 valid one it approves nothing). When the owner keeps the approval, the web tier sends
 it with the review (`ghcomment.Review.Diff`), and `PendingReview` reads every file the
 pull request lists and refuses (out of date, "draft again") unless they hash to that
-digest (`ghcomment.DiffDigest`, the same formula; a test holds the two equal). So
+digest (`ghcomment.DiffDigest`, the same formula; a test holds the two equal), every
+commented path is among them, and the final read of the pull request reports as many
+files as were read. Both sides read files the same way, 100 a page up to GitHub's 3000,
+complete only when as many were read as the pull request reports (`changed_files`),
+so a comparison the workload read whole is read whole here, and one it could not is
+never offered. A withheld approval clears its digest with it, so the comments beside
+it stay a current, confirmable draft. So
 neither a push, a retarget nor a moved merge base, before the draft or after it,
-turns an approval of one diff into one of another. A pull request with more files
-than gofer reads gets no approval, and the reply says why.
+turns an approval of one diff into one of another. A pull request whose diff gofer
+cannot identify gets no approval, and the reply says why.
 
 **A stale review is always flagged, and recoverable.** The run compares the latest
 review's revision with the one it read whatever the drafter answered, so a drafter

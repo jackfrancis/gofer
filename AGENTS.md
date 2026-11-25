@@ -651,9 +651,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   apart from the summary so its bound never cuts them, offered as its own checkbox
   and joined by `worklist.ReviewBody`; an approval stands only on a draft pinned to
   the revision the latest visible review read, head, base and whole-diff digest,
-  `WorkItem.Reviewed` over the `Message.Head`/`Base`/`Diff` a review records
-  (`github.DiffDigest`, matched by `ghcomment.DiffDigest`, which `PendingReview`
-  checks against every file before creating an approval, `ghcomment.Review.Diff`),
+  `WorkItem.Reviewed` over the `Message.Head`/`Base`/`Diff` a review records from
+  one settled snapshot that is also what its model is shown (`github.PullDiff`; no
+  digest if the pull request moved while the model worked, or for a diff
+  `PullDiff.Unverifiable` names: cut, unsettled, or a binary change with no patch;
+  `github.DiffDigest`, matched by `ghcomment.DiffDigest`, which `PendingReview`
+  checks against every file, read 100 a page to `changed_files` as the workload
+  reads them, with every commented path, before creating an approval,
+  `ghcomment.Review.Diff`),
   checked by `AppendReply` whatever the run sent; the run flags a stale review
   whatever the model answered, and while the latest review is older than the draft
   the thread offers "Review the current revision", `WorkItem.ReviewOutdated`,

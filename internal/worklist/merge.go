@@ -262,7 +262,7 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 		// An approval approves the revision the latest review read, so it stands only
 		// on a draft pinned to that head, base and diff, whatever the run decided.
 		if d := reply.Draft; d != nil && d.Approve && !item.Reviewed(Revision{d.Commit, d.BaseRef, d.Diff}) {
-			d.Approve = false
+			d.Approve, d.Diff = false, "" // as BoundDraft stores a draft that does not approve, so it stays Current
 			if d.Empty() {
 				reply.Draft = nil
 			}

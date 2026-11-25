@@ -87,13 +87,14 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 	// recorded none), it approves nothing here, and the reply says so whatever the
 	// model answered, so the owner knows to review again: the store applies the same
 	// rule (worklist.AppendReply), and the thread offers a review of the current
-	// revision (WorkItem.ReviewOutdated). A diff too long to read whole is never
-	// vouched for: an approval of it is withheld, and said so.
+	// revision (WorkItem.ReviewOutdated). A diff gofer cannot identify (too long to
+	// read whole, moving while read, a binary change with no patch) is never vouched
+	// for: an approval of it is withheld, and the reply says why.
 	var stale *staleReview
 	switch {
-	case !diff.Complete:
+	case diff.Unverifiable() != "":
 		if prop.Approve {
-			stale = &staleReview{tooLarge: true, approved: true}
+			stale = &staleReview{unverifiable: diff.Unverifiable(), approved: true}
 		}
 		prop.Approve = false
 	case !item.Reviewed(rev):
@@ -106,12 +107,12 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 }
 
 // staleReview is a latest review that read another revision (reviewed; zero when
-// it recorded none) than the one the draft is anchored to (now), or, with tooLarge,
-// a diff too long to read whole. approved marks an approval the drafter proposed
-// and the run withheld for it.
+// it recorded none) than the one the draft is anchored to (now), or, with
+// unverifiable (why), a diff gofer cannot identify. approved marks an approval the
+// drafter proposed and the run withheld for it.
 type staleReview struct {
 	reviewed, now worklist.Revision
-	tooLarge      bool
+	unverifiable  string
 	approved      bool
 }
 
@@ -297,8 +298,8 @@ func draftContent(d *worklist.DraftReview, excluded []string, moved, omitted int
 	}
 	switch {
 	case stale == nil:
-	case stale.tooLarge:
-		b.WriteString("\n**No approval drafted.** The conversation agrees on approving, but this pull request has more files than gofer reads, so gofer cannot check that an approval covers exactly what was reviewed.\n")
+	case stale.unverifiable != "":
+		fmt.Fprintf(&b, "\n**No approval drafted.** The conversation agrees on approving, but %s, so gofer cannot check that an approval covers exactly what was reviewed.\n", stale.unverifiable)
 	default:
 		lead := "**The latest review is out of date.** It"
 		if stale.approved {

@@ -44,7 +44,7 @@ func draftGitHub(t *testing.T, state string) string {
 			_, _ = w.Write([]byte(`{"login":"octocat"}`))
 		case "/repos/o/r/pulls/1":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"state": state, "head": map[string]any{"sha": draftHead},
+				"state": state, "head": map[string]any{"sha": draftHead}, "changed_files": 2,
 				"base": map[string]any{"ref": "main", "repo": map[string]any{"full_name": "o/r"}},
 			})
 		case "/repos/o/r/issues/1":
@@ -345,6 +345,56 @@ func TestRunConverseApprovalNeedsTheReviewedDiff(t *testing.T) {
 	th = sink.items[0].Thread
 	if d := th[len(th)-1].Draft; d == nil || !d.Approve || d.Diff != draftDiff {
 		t.Errorf("approval of the reviewed diff = %+v", d)
+	}
+}
+
+// A review's context and its recorded revision are one snapshot: the model is told
+// the head and files gofer records, even when a push lands while it works, and then
+// the review vouches for no diff (the model's tools may have read the new head), so
+// no approval can stand on it.
+func TestRunConverseReviewRecordsItsSnapshot(t *testing.T) {
+	const pushed = "fedcba9876543210fedcba9876543210fedcba98"
+	reads := 0
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"octocat"}`))
+		case "/repos/o/r/issues/1":
+			_, _ = w.Write([]byte(`{"body":"desc"}`))
+		case "/repos/o/r/pulls/1":
+			head := draftHead // the snapshot's two reads; every read after is the push
+			if reads >= 2 {
+				head = pushed
+			}
+			reads++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"state": "open", "head": map[string]any{"sha": head}, "changed_files": 2,
+				"base": map[string]any{"ref": "main", "repo": map[string]any{"full_name": "o/r"}},
+			})
+		case "/repos/o/r/pulls/1/files":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"filename": "a.go", "status": "modified", "sha": "blob-a", "patch": draftPatch},
+				{"filename": "logo.png", "status": "added", "sha": "blob-logo"},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	item := draftItem()
+	item.Thread = item.Thread[:1]
+	sink := &memSink{items: []worklist.WorkItem{item}}
+	fc := &fakeConverser{reply: "LGTM"}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: srv.URL, ItemID: item.ID, Turn: "q", Converser: fc}, fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fc.gotSource, "Head commit: "+draftHead) || strings.Contains(fc.gotSource, pushed) {
+		t.Errorf("the model was not shown the snapshot's head:\n%s", fc.gotSource)
+	}
+	th := sink.items[0].Thread
+	if m := th[len(th)-1]; m.Head != draftHead || m.Diff != "" {
+		t.Errorf("a review that saw the pull request move vouches for a diff: %+v", m)
 	}
 }
 

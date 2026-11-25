@@ -91,6 +91,9 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		noGitHub      bool
 		head, base    string // the pull request's head commit and base branch, as the discussion read showed them
 		diffDigest    string // a review's: the digest of the whole diff it read (github.PullDiff.Digest)
+		// unmoved re-reads the pull request after the model answered: true when its
+		// head and base are still the ones recorded. Set only with a diff to vouch for.
+		unmoved func(context.Context) bool
 	)
 	provider := p.Provider
 	if provider == "" {
@@ -120,18 +123,32 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 			return runDraftReview(ctx, p, sink, item, triggerKey, history, gh, holder, viewerLogin)
 		}
 		isPR := item.Type == worklist.TypePullRequest
-		if disc, derr := gh.Discussion(ctx, token, item.GitHub.Repo, item.GitHub.Number, isPR); derr == nil {
-			sourceContext = formatDiscussion(disc)
-			if isPR {
-				head, base = disc.HeadSHA, disc.BaseRef
+		// A review records the revision it read, whole diff included, so an approval
+		// drafted later stands only on that (a stacked pull request's diff can change
+		// with its head and base name). It reads one settled snapshot first and shows
+		// the model that snapshot's head and files, so what the model is told it
+		// reviews and what is recorded are the same read.
+		var snap *github.PullDiff
+		if isPR && triggerKind == worklist.KindReviewRequest {
+			if d, derr := gh.PullDiff(ctx, token, item.GitHub.Repo, item.GitHub.Number); derr == nil {
+				snap = &d
 			}
 		}
-		if isPR && triggerKind == worklist.KindReviewRequest {
-			// A review records the whole diff it read, with the head and base of the
-			// same read, so an approval drafted later stands only on that diff: a
-			// stacked pull request's diff can change with its head and base name.
-			if d, derr := gh.PullDiff(ctx, token, item.GitHub.Repo, item.GitHub.Number); derr == nil {
-				head, base, diffDigest = d.HeadSHA, d.BaseRef, d.Digest()
+		if disc, derr := gh.Discussion(ctx, token, item.GitHub.Repo, item.GitHub.Number, isPR); derr == nil {
+			switch {
+			case snap != nil:
+				disc.HeadSHA, disc.ChangedFiles = snap.HeadSHA, snap.ChangedPaths()
+				head, base, diffDigest = snap.HeadSHA, snap.BaseRef, snap.Digest()
+			case isPR:
+				head, base = disc.HeadSHA, disc.BaseRef
+			}
+			sourceContext = formatDiscussion(disc)
+		}
+		if diffDigest != "" {
+			repo, number := item.GitHub.Repo, item.GitHub.Number
+			unmoved = func(ctx context.Context) bool {
+				h, b, err := gh.PullRevision(ctx, holder.Token(), repo, number)
+				return err == nil && strings.EqualFold(h, head) && b == base
 			}
 		}
 		// The token was vended unexpired but GitHub refused it, and the broker
@@ -187,6 +204,11 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	content, verdict := reply, ""
 	if triggerKind == worklist.KindSynthesisRequest {
 		verdict, content = worklist.ParseVerdict(reply)
+	}
+	// The model's tools read GitHub live: if the pull request moved while it worked,
+	// it may have reviewed more than the snapshot, so the review vouches for no diff.
+	if diffDigest != "" && (unmoved == nil || !unmoved(ctx)) {
+		diffDigest = ""
 	}
 	switch {
 	case noGitHub:

@@ -426,8 +426,8 @@ func TestAppendReplyApprovalNeedsTheReviewedHead(t *testing.T) {
 	if _, err := AppendReply(&it, "d", Message{ID: "a", Content: "approve", Draft: approving(DraftComment{Path: "a.go", Line: 1, Body: "nit"})}); err != nil {
 		t.Fatal(err)
 	}
-	if d := it.Thread[3].Draft; d == nil || d.Approve || len(d.Comments) != 1 {
-		t.Errorf("stale approval beside a comment: %+v", d)
+	if d := it.Thread[3].Draft; d == nil || d.Approve || d.Diff != "" || len(d.Comments) != 1 || !d.Current() {
+		t.Errorf("stale approval beside a comment: %+v (current %v)", d, d.Current())
 	}
 	// A newer review of another head, landing after the approved one, is the latest.
 	it = draftPR(

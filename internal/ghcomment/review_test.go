@@ -45,7 +45,11 @@ func (a *reviewAPI) server(t *testing.T) *httptest.Server {
 			if base == "" {
 				base = "main"
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"state": a.state, "head": map[string]any{"sha": a.head}, "base": map[string]any{"ref": base}})
+			n := len(a.patches)
+			if a.patches == nil {
+				n = 1
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": a.state, "head": map[string]any{"sha": a.head}, "base": map[string]any{"ref": base}, "changed_files": a.filler + n})
 		case r.URL.Path == "/repos/Org/Public/pulls/7/files":
 			patches := a.patches
 			if patches == nil {
@@ -236,6 +240,23 @@ func TestPendingReviewChecksTheApprovedDiff(t *testing.T) {
 	api = &reviewAPI{state: "open", head: reviewHead, filler: 120}
 	if _, err := New(api.server(t).URL, nil).PendingReview(context.Background(), token, "org/public", 7, approvalOnly); err != nil {
 		t.Fatalf("approval-only review refused: %v", err)
+	}
+	// The workload's boundary: 3000 files, thirty full pages, is read whole.
+	api = &reviewAPI{state: "open", head: reviewHead, filler: 2999}
+	big := approvalOnly
+	big.Diff = DiffDigest(files(map[string]string{"a.go": reviewPatch}, 2999))
+	if _, err := New(api.server(t).URL, nil).PendingReview(context.Background(), token, "org/public", 7, big); err != nil {
+		t.Fatalf("a matching 3000-file diff refused: %v", err)
+	}
+	// A comment on a path the approved diff does not list is refused, though the
+	// diff itself matches.
+	api = &reviewAPI{state: "open", head: reviewHead, filler: 120}
+	stray := testReview("/lgtm\n/approve")
+	stray.Diff = reviewed
+	stray.Comments = append(stray.Comments, ReviewComment{Path: "elsewhere.go", Line: 1, Side: "RIGHT", Body: "x"})
+	stray.Patches["elsewhere.go"] = PatchDigest("@@ -1 +1 @@\n-x\n+y")
+	if _, err := New(api.server(t).URL, nil).PendingReview(context.Background(), token, "org/public", 7, stray); !errors.Is(err, ErrHeadMoved) || api.created != nil {
+		t.Errorf("a comment off the approved diff: err %v, created %v", err, api.created)
 	}
 	for name, patches := range map[string]map[string]string{
 		"dependency's file now in the diff": {"a.go": reviewPatch, "dep.go": "@@ -0,0 +1 @@\n+dep"},

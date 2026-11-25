@@ -156,10 +156,11 @@ func (c *Client) PendingReview(ctx context.Context, token, repo string, number i
 	if pending {
 		return "", ErrPendingExists
 	}
+	read := -1 // files read for an approval's diff, checked against the final read
 	if rv.Diff != "" {
 		// An approval: the whole diff must still be the one reviewed, and that read
 		// covers the commented files' patches too.
-		if err := c.checkDiff(ctx, token, pull, rv.Diff, want); err != nil {
+		if read, err = c.checkDiff(ctx, token, pull, rv.Diff, want); err != nil {
 			return "", err
 		}
 	} else if err := c.checkPatches(ctx, token, pull, want); err != nil {
@@ -180,6 +181,7 @@ func (c *Client) PendingReview(ctx context.Context, token, repo string, number i
 		Base struct {
 			Ref string `json:"ref"`
 		} `json:"base"`
+		ChangedFiles int `json:"changed_files"`
 	}
 	if err := json.Unmarshal(raw, &pr); err != nil {
 		return "", errors.New("github: unreadable pull request")
@@ -187,7 +189,7 @@ func (c *Client) PendingReview(ctx context.Context, token, repo string, number i
 	if !strings.EqualFold(pr.State, "open") {
 		return "", ErrNotOpen
 	}
-	if !strings.EqualFold(pr.Head.SHA, rv.Commit) || pr.Base.Ref != rv.BaseRef {
+	if !strings.EqualFold(pr.Head.SHA, rv.Commit) || pr.Base.Ref != rv.BaseRef || (read >= 0 && pr.ChangedFiles != read) {
 		return "", ErrHeadMoved
 	}
 	// No "event": GitHub creates the review PENDING.
@@ -260,34 +262,69 @@ func (c *Client) checkPatches(ctx context.Context, token, pull string, want map[
 	return errors.New("github: too many files to check the commented ones")
 }
 
-// checkDiff reads every file of the pull request and refuses (ErrHeadMoved) unless
-// their DiffDigest is diff and every path in want has a patch with that
-// PatchDigest. A list too long to read whole is an error, never a pass.
-func (c *Client) checkDiff(ctx context.Context, token, pull, diff string, want map[string]string) error {
+// diffFilesPerPage and maxDiffFilePages read an approved diff exactly as the
+// workload's github.PullDiff reads the diff it records: 100 files a page, up to the
+// 3000 GitHub lists, complete only when as many files were read as the pull request
+// reports (changed_files). The same boundary on both sides means a comparison the
+// workload read whole is read whole here too, and one it could not is never offered.
+const (
+	diffFilesPerPage = 100
+	maxDiffFilePages = 30
+)
+
+// checkDiff reads the pull request's changed-file count, then every file, and
+// refuses (ErrHeadMoved) unless they are all of them, their DiffDigest is diff, and
+// every path in want is among them with a patch of that PatchDigest. It returns how
+// many files it read, which the caller checks against the pull request's count
+// again right before the write. A list longer than GitHub lists is an error, never
+// a pass.
+func (c *Client) checkDiff(ctx context.Context, token, pull, diff string, want map[string]string) (int, error) {
+	raw, err := c.do(ctx, token, http.MethodGet, pull, nil, http.StatusOK)
+	if err != nil {
+		return 0, err
+	}
+	var pr struct {
+		ChangedFiles int `json:"changed_files"`
+	}
+	if err := json.Unmarshal(raw, &pr); err != nil {
+		return 0, errors.New("github: unreadable pull request")
+	}
+	if pr.ChangedFiles > diffFilesPerPage*maxDiffFilePages {
+		return 0, errors.New("github: too many files to check the approved diff")
+	}
 	var all []File
-	for page := 1; page <= maxFilePages; page++ {
-		raw, err := c.doLimit(ctx, token, http.MethodGet, pull+"/files?per_page="+strconv.Itoa(filesPerPage)+"&page="+strconv.Itoa(page), nil, http.StatusOK, maxFilesPageBytes)
+	for page := 1; page <= maxDiffFilePages && len(all) < pr.ChangedFiles; page++ {
+		raw, err := c.doLimit(ctx, token, http.MethodGet, pull+"/files?per_page="+strconv.Itoa(diffFilesPerPage)+"&page="+strconv.Itoa(page), nil, http.StatusOK, maxFilesPageBytes)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		var files []File
 		if err := json.Unmarshal(raw, &files); err != nil {
-			return errors.New("github: unreadable file list")
+			return 0, errors.New("github: unreadable file list")
 		}
 		all = append(all, files...)
-		if len(files) < filesPerPage {
-			if DiffDigest(all) != diff {
-				return ErrHeadMoved
-			}
-			for _, f := range all {
-				if d, ok := want[f.Filename]; ok && (f.Patch == "" || PatchDigest(f.Patch) != d) {
-					return ErrHeadMoved
-				}
-			}
-			return nil // the digest covers every file, so a commented file left out would have changed it
+		if len(files) < diffFilesPerPage {
+			break
 		}
 	}
-	return errors.New("github: too many files to check the approved diff")
+	if len(all) != pr.ChangedFiles || DiffDigest(all) != diff {
+		return 0, ErrHeadMoved
+	}
+	found := 0
+	for _, f := range all {
+		d, ok := want[f.Filename]
+		if !ok {
+			continue
+		}
+		if f.Patch == "" || PatchDigest(f.Patch) != d {
+			return 0, ErrHeadMoved
+		}
+		found++
+	}
+	if found != len(want) {
+		return 0, ErrHeadMoved // a commented file is not in the diff
+	}
+	return len(all), nil
 }
 
 // hasPendingReview reports whether the pull request (its API path) has a pending
