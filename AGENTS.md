@@ -620,7 +620,19 @@ Wired on the web-tier side; they define what a runtime must respect:
 - Draft review comments (ADR 0010): at the bottom of a reviewed pull request's
   thread, "Draft Review Comments" (offered only with commenting configured; a connect
   link without the grant) posts a `KindDraftReviewRequest` turn and dispatches a
-  converse run by the default model. The run (`internal/agent/draft.go`) reads the
+  converse run by the default model. The button is not shown, and the handler refuses
+  the request, while a redraft would only repeat the offered draft
+  (`WorkItem.RedraftRedundant`: unconfirmed, no visible turn after its request but the
+  draft itself, and no earlier turn hidden or unhidden since the request was saved).
+  That order is by stored revision, never time: a toggle's `Message.HiddenRev` (only
+  `WorkItem.SetHidden` writes it, inside the saving update) against the request's
+  `Message.ReadRev` (read inside its update, marked `ReadRevKnown`; a retry keeps
+  it). A request with no such mark (saved before revisions) never counts as redundant.
+  `AppendReply` clears all three on a reply. The draft's head is not compared with the item's (no ordered
+  observation); a confirmation refused as out of date (`comment.ReviewResult.Stale`)
+  offers drafting again on the result page, bound to that draft's turn and digest
+  (`redraft=1`), admitted only while that draft is still offered and otherwise
+  refused, never judged by the button's check. The run (`internal/agent/draft.go`) reads the
   head commit and patches (`github.Client.PullDiff`), annotates the lines a comment
   may anchor to, asks `worklist.ReviewDrafter` (`llm.ReviewDrafter`) for only the
   points the visible conversation agrees on (the user's own messages decide; an

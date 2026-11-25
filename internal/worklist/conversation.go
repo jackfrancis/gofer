@@ -112,6 +112,22 @@ type Message struct {
 	// a long review thread can be pared down to its definitive turns without deleting
 	// the history. It is reversible — the user can unhide it.
 	Hidden bool `json:"hidden,omitempty"`
+	// HiddenRev is the thread's visibility revision (WorkItem.VisibilityRev) the
+	// user's last hide or unhide of this turn made: one more than any in the thread at
+	// the time, assigned inside the store update that saved it (WorkItem.SetHidden).
+	// Zero for a turn never toggled, or toggled before gofer recorded it.
+	HiddenRev int `json:"hidden_rev,omitempty"`
+	// ReadRev is, on a draft-review request, the thread's visibility revision when the
+	// request was saved, read inside that store update: a turn before it with a higher
+	// HiddenRev was hidden or unhidden since, so the draft may have read it otherwise
+	// (RedraftRedundant). A retry (Restamp) leaves it as it is. Zero on other turns.
+	// Both revisions are the web tier's alone: AppendReply clears them on a reply.
+	ReadRev int `json:"read_rev,omitempty"`
+	// ReadRevKnown marks a draft-review request whose ReadRev was recorded. A request
+	// saved before gofer recorded revisions has none, and toggles of that time carry
+	// no HiddenRev either, so its ReadRev of 0 says nothing: such a draft never counts
+	// as redundant (RedraftRedundant). Cleared on a reply, as the revisions are.
+	ReadRevKnown bool `json:"read_rev_known,omitempty"`
 	// Notice marks an agent turn that is a system notice (NoticeReconnect), not an
 	// answer: it does not answer the turn it replies to. Empty on every other turn.
 	Notice string `json:"notice,omitempty"`

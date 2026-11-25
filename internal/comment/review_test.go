@@ -55,6 +55,10 @@ func TestPendingReviewOutcomes(t *testing.T) {
 		if err != nil || res.Created || res.Unknown != tc.unknown || !strings.Contains(res.Error, tc.want) {
 			t.Errorf("%s: res %+v, err %v", name, res, err)
 		}
+		// Only an out-of-date draft asks to be drafted again.
+		if res.Stale != (tc.err == ghcomment.ErrHeadMoved) {
+			t.Errorf("%s: Stale = %v", name, res.Stale)
+		}
 	}
 	if len(creds.rejected) != 1 || creds.rejected[0] != "v1" {
 		t.Errorf("rejected = %v", creds.rejected)

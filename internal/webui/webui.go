@@ -751,10 +751,9 @@ func (h *Handler) HideMessage(w http.ResponseWriter, r *http.Request) {
 				return nil, nil
 			}
 			j, ok := current[i].TurnIndex(key)
-			if !ok {
+			if !ok || !current[i].SetHidden(j, hidden) {
 				return nil, nil
 			}
-			current[i].Thread[j].Hidden = hidden
 			return current[i : i+1], nil
 		}
 		return nil, nil

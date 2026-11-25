@@ -30,6 +30,7 @@ type Review struct {
 type ReviewResult struct {
 	Created bool
 	Unknown bool
+	Stale   bool // nothing created: the pull request moved since the draft was anchored, so it must be drafted again
 	URL     string
 	Error   string
 }
@@ -70,7 +71,7 @@ func (s *Service) PendingReview(ctx context.Context, userID string, rv Review) (
 	case errors.Is(err, ghcomment.ErrPendingExists):
 		return ReviewResult{Error: "You already have a pending review on this pull request, and GitHub allows one. Submit or discard it on GitHub, then try again."}, nil
 	case errors.Is(err, ghcomment.ErrHeadMoved):
-		return ReviewResult{Error: "The pull request changed since these comments were drafted (new commits, a new base branch, or a change merged into its base that touched these files), so their lines may mean something else now. Nothing was created; draft the review comments again."}, nil
+		return ReviewResult{Stale: true, Error: "The pull request changed since these comments were drafted (new commits, a new base branch, or a change merged into its base that touched these files), so their lines may mean something else now. Nothing was created; draft the review comments again."}, nil
 	case errors.Is(err, ghcomment.ErrNotOpen):
 		return ReviewResult{Error: "The pull request is no longer open."}, nil
 	case errors.As(err, &rl):

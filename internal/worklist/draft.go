@@ -206,20 +206,101 @@ func (w WorkItem) IsDraftReviewRequest(i int) bool {
 // the draft before it, and a late reply to an older request never supersedes a newer
 // result. A hidden request or reply offers nothing.
 func (w WorkItem) LatestDraft() int {
+	_, j := w.latestDraft()
+	return j
+}
+
+// latestDraft returns the positions of the newest draft request and of the reply
+// carrying the draft the thread offers (LatestDraft), or -1, -1.
+func (w WorkItem) latestDraft() (req, reply int) {
 	for i := len(w.Thread) - 1; i >= 0; i-- {
 		if !w.IsDraftReviewRequest(i) {
 			continue
 		}
 		if w.Thread[i].Hidden {
-			return -1
+			return -1, -1
 		}
 		j, ok := w.replies()[w.TurnKey(i)]
 		if !ok || w.Thread[j].Hidden || w.Thread[j].Draft == nil {
-			return -1
+			return -1, -1
 		}
-		return j
+		return i, j
 	}
-	return -1
+	return -1, -1
+}
+
+// RedraftRedundant reports whether drafting again would only repeat the draft the
+// thread offers (LatestDraft), because the conversation the drafter reads is the one
+// it read: the draft is unconfirmed and still pinned to the item's pull request
+// (DraftReview.For); no turn after its request but the draft itself is visible (the
+// drafter read only the turns before its request, so a correction posted while it
+// worked, even one answered before the draft landed, is new to it); and no turn
+// before the request was hidden or unhidden since the request was saved (a HiddenRev
+// above the request's ReadRev), so hiding or unhiding an earlier instruction opens
+// drafting again. Revisions, not times, order the two: each is assigned inside the
+// store update that saved it, and a retry of the request keeps its ReadRev, so a
+// slow first run's draft is still judged by what it could have read. A request
+// saved before revisions were recorded (no ReadRevKnown) cannot be judged so, and
+// its draft never counts as redundant: the thread keeps the button, as it did then.
+// A toggle after
+// the request but before its run read the thread counts too, which errs toward
+// offering the button. A confirmed draft (any receipt) is used up: the thread says to
+// draft again to start over. A retired draft (an empty redraft, a hidden request or
+// reply, another pull request) leaves drafting open.
+//
+// The head the draft is anchored to is not compared with the item's: gofer has no
+// observation of the head it can order against the drafter's own read. A draft that
+// GitHub finds out of date is refused when confirmed (comment.ReviewResult.Stale),
+// and that result offers drafting again.
+func (w WorkItem) RedraftRedundant() bool {
+	req, i := w.latestDraft()
+	if i < 0 {
+		return false
+	}
+	if !w.Thread[i].Draft.For(w) || w.Thread[i].DraftReceipt != nil {
+		return false
+	}
+	if !w.Thread[req].ReadRevKnown {
+		return false
+	}
+	read := w.Thread[req].ReadRev
+	for j := range w.Thread {
+		switch {
+		case j < req:
+			if w.Thread[j].HiddenRev > read {
+				return false
+			}
+		case j > req && j != i && !w.Thread[j].Hidden:
+			return false
+		}
+	}
+	return true
+}
+
+// VisibilityRev is the thread's visibility revision: the highest HiddenRev in it, or
+// 0. Turns are only appended (clearing removes them all), so it only grows while the
+// thread stands. Read it inside the store update whose result depends on it.
+func (w WorkItem) VisibilityRev() int {
+	rev := 0
+	for _, m := range w.Thread {
+		rev = max(rev, m.HiddenRev)
+	}
+	return rev
+}
+
+// SetHidden hides (or unhides) turn i, reporting whether its visibility changed. A
+// change takes the thread's next visibility revision (HiddenRev), so a draft whose
+// request was saved before it no longer counts as reading the conversation as it
+// stands (RedraftRedundant). Call it inside the store update that saves the change,
+// so the revision follows the order of the saved writes.
+func (w *WorkItem) SetHidden(i int, hidden bool) bool {
+	if i < 0 || i >= len(w.Thread) || w.Thread[i].Hidden == hidden {
+		return false
+	}
+	rev := w.VisibilityRev() + 1
+	w.Thread[i].Hidden = hidden
+	w.Thread[i].HiddenRev = rev
+	return true
 }
 
 // OfferedDraft returns the position of the draft turn key names if it is the draft
