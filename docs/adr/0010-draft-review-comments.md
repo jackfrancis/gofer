@@ -102,7 +102,7 @@ exact text before anything is created is the check on it.
 
 ### Once per draft
 
-ADR 0009's confirm consumes a one-time nonce held in memory. GitHub's
+ADR 0009's bulk comment form carries a one-time key held in memory. GitHub's
 one-pending-review rule alone is not enough here: it protects only while the first
 review is still pending, so a replayed confirmation after the user submitted or
 discarded the review on GitHub would create another. The receipt (step 7) makes a draft

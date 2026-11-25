@@ -58,32 +58,6 @@
         <div class="zz-actions"><a class="btn btn-primary" href="{{with .RetryURL}}{{.}}{{else}}/{{end}}">Try again</a></div>
       </div>
 
-    {{else if eq .View "comment-preview"}}
-      <p><a href="/">&larr; Back to radar</a></p>
-      <div class="zz-comment-page">
-        <h1>Post this comment?</h1>
-        <p class="zz-meta">gofer will post it on GitHub as you{{with userHandle .User}} ({{.}}){{end}}, on each item below, one at a time. gofer cannot take it back once it is posted.</p>
-        <pre class="zz-comment-body">{{.Comment.Body}}</pre>
-        {{with .Comment.Error}}<p class="zz-stalled" role="alert">{{.}}</p>{{end}}
-        {{if .Comment.Targets}}
-        <h2>{{len .Comment.Targets}} item{{if ne (len .Comment.Targets) 1}}s{{end}}</h2>
-        <ul class="zz-targets">
-          {{range .Comment.Targets}}<li><a href="{{.URL}}" target="_blank" rel="noopener noreferrer">{{.Repo}} #{{.Number}}</a> <span>{{.Title}}</span></li>{{end}}
-        </ul>
-        {{end}}
-        {{template "skipped" .Comment.Skipped}}
-        <div class="zz-actions">
-          {{if .Comment.Targets}}
-          <form method="post" action="/items/comment">
-            <input type="hidden" name="confirm" value="1">
-            {{/* The nonce names the comment and items this preview registered; Confirm posts exactly those. */}}<input type="hidden" name="nonce" value="{{.Comment.Nonce}}">
-            <button class="btn btn-primary" type="submit">Post to {{len .Comment.Targets}} item{{if ne (len .Comment.Targets) 1}}s{{end}}</button>
-          </form>
-          {{end}}
-          <a class="btn" href="/">Cancel</a>
-        </div>
-      </div>
-
     {{else if eq .View "draft-review-result"}}
       <p><a href="/items/thread?id={{.Item.ID | urlquery}}">&larr; Back to the conversation</a></p>
       <div class="zz-comment-page">
@@ -99,22 +73,6 @@
         <div class="zz-actions"><a class="btn btn-primary" href="{{.Item.GitHub.URL}}" target="_blank" rel="noopener noreferrer">Open on GitHub</a></div>
         {{end}}
         {{end}}
-      </div>
-
-    {{else if eq .View "comment-results"}}
-      <p><a href="/">&larr; Back to radar</a></p>
-      <div class="zz-comment-page">
-        <h1>{{if .Comment.Repeat}}Already posted:{{else}}Posted{{end}} {{.Comment.Posted}} of {{len .Comment.Targets}}{{with .Comment.Unknown}} ({{.}} unknown){{end}}</h1>
-        {{if .Comment.Repeat}}<p class="zz-meta">This confirmation was already used, so nothing was posted again. These are its results.</p>{{end}}
-        {{with .Comment.Error}}<p class="zz-stalled" role="alert">{{.}}</p>{{end}}
-        <pre class="zz-comment-body">{{.Comment.Body}}</pre>
-        {{if .Comment.Results}}
-        <ul class="zz-targets">
-          {{range .Comment.Results}}<li class="{{if .Posted}}zz-target-ok{{else if .Unknown}}zz-target-unknown{{else}}zz-target-fail{{end}}"><a href="{{.URL}}" target="_blank" rel="noopener noreferrer">{{.Repo}} #{{.Number}}</a> <span>{{.Title}}</span> <span class="zz-target-status">{{if .Posted}}Posted{{with .CommentURL}} &middot; <a href="{{.}}" target="_blank" rel="noopener noreferrer">view comment</a>{{end}}{{else}}{{.Error}}{{end}}</span></li>{{end}}
-        </ul>
-        {{end}}
-        {{template "skipped" .Comment.Skipped}}
-        <div class="zz-actions"><a class="btn btn-primary" href="/">Back to radar</a></div>
       </div>
 
     {{else if eq .View "thread"}}
@@ -406,15 +364,18 @@
       {{with .LabelsError}}<p class="zz-stalled" role="alert">{{.}}</p>{{end}}
       {{with .CommentNotice}}<p class="zz-stalled" role="status">{{.}}</p>{{end}}
       {{if .CommentEnabled}}{{if .CommentConnected}}
-      <details class="zz-compose" data-compose>
+      {{with .Comment}}{{if not .Retry}}{{template "commentOutcome" .}}{{end}}{{end}}
+      <details class="zz-compose" data-compose{{if and .Comment .Comment.Retry}} open{{end}}>
         <summary>Comment on selected items <span class="zz-compose-count" data-selected-count></span></summary>
         <form id="zz-bulk-comment" class="zz-compose-form" method="post" action="/items/comment">
-          <p class="zz-compose-hint">Check the items to comment on, then write one comment; gofer shows you a preview before anything is posted to GitHub as you.</p>
+          {{if and .Comment .Comment.Retry}}{{with .Comment.Error}}<p class="zz-stalled" role="alert">{{.}}</p>{{end}}{{template "skipped" .Comment.Skipped}}{{end}}
+          <p class="zz-compose-hint">Check the items to comment on, then write one comment. Post puts it on GitHub as you{{with userHandle .User}} ({{.}}){{end}}, on each checked item, one at a time; gofer cannot take it back once it is posted.</p>
+          {{/* The key makes this form post at most once (comment.go). */}}<input type="hidden" name="key" value="{{.CommentKey}}">
           <div class="zz-mention-wrap">
-            {{/* maxlength matches maxMessageBytes in webui.go, which the server enforces in bytes */}}<textarea name="content" rows="3" maxlength="16384" placeholder="e.g. /assign @someone" data-mentions aria-label="Comment"></textarea>
+            {{/* maxlength matches maxMessageBytes in webui.go, which the server enforces in bytes */}}<textarea name="content" rows="3" maxlength="16384" required placeholder="e.g. /assign @someone" data-mentions aria-label="Comment">{{if and .Comment .Comment.Retry}}{{.Comment.Body}}{{end}}</textarea>
           </div>
           <div class="zz-chat-actions">
-            <button class="btn btn-primary btn-sm" type="submit">Preview</button>
+            <button class="btn btn-primary btn-sm" type="submit" data-comment-post>Post</button>
           </div>
         </form>
         {{if .CommentToken}}<p class="zz-compose-hint">Commenting uses your personal access token, which expires {{.CommentTokenExpires.Format "January 2, 2006"}}. Connect again with a new one after that.</p>{{end}}
@@ -468,7 +429,7 @@
       {{end}}
       {{end}}{{end}}
       {{range .Items}}
-        {{template "item" (row . $.ConvEnabled $.CommentConnected)}}
+        {{template "item" (row . $.ConvEnabled $.CommentConnected $.CommentChecked)}}
       {{else}}
         <div class="zz-empty"><p>{{if .Waiting}}Nothing{{template "filterScope" .}} needs you right now.{{else if .LabelsFiltered}}No {{if .HiddenItems}}ranked {{end}}items match the selected {{if .ProjectsFiltered}}projects and {{end}}labels{{if .HiddenItems}}; only hidden ones do{{end}}.{{else if .ProjectsFiltered}}No {{if .HiddenItems}}ranked {{end}}items in the selected projects{{if .HiddenItems}}; only hidden ones{{end}}.{{else}}Nothing on your radar right now.{{end}}</p></div>
       {{end}}
@@ -477,7 +438,7 @@
         <h2 id="zz-waiting-head" class="zz-section-head">Waiting on others <span class="zz-section-count">{{len .}}</span></h2>
         <p class="zz-meta">Your last word is the latest, or a review left the next step to the author. These come back up when someone answers.</p>
         {{range .}}
-          {{template "item" (row . $.ConvEnabled $.CommentConnected)}}
+          {{template "item" (row . $.ConvEnabled $.CommentConnected $.CommentChecked)}}
         {{end}}
       </section>
       {{end}}
@@ -517,7 +478,7 @@
 {{define "item"}}{{with .Item}}
         <div class="zz-item">
           <div class="zz-item-head">
-            {{if $.CommentConnected}}<input class="zz-select" type="checkbox" name="item" value="{{.ID}}" form="zz-bulk-comment" data-comment-item data-repo="{{.GitHub.Repo}}" aria-label="Select {{.GitHub.Repo}} #{{.GitHub.Number}} for a comment">{{end}}
+            {{if $.CommentConnected}}<input class="zz-select" type="checkbox" name="item" value="{{.ID}}" form="zz-bulk-comment" data-comment-item data-repo="{{.GitHub.Repo}}"{{if $.Checked}} checked{{end}} aria-label="Select {{.GitHub.Repo}} #{{.GitHub.Number}} for a comment">{{end}}
             <div class="zz-title">{{stateIcon .}}<a href="{{.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.GitHub.Title}}</a></div>
             <div class="zz-item-actions">
               {{if $.ConvEnabled}}
@@ -559,6 +520,26 @@
             {{with .More}}<li class="zz-ci-fail">{{.}}</li>{{end}}
             {{if .Partial}}<li class="zz-ci-note">Some CI results could not be read.</li>{{end}}
           </ul>{{end}}{{end}}
+{{/* A bulk comment's outcome, on the radar it returned to. */}}
+{{define "commentOutcome"}}
+      <section class="zz-comment-outcome" role="status" aria-label="Comment results">
+        {{if .Running}}
+        <p>gofer is still posting your comment. Reload in a moment to see the results.</p>
+        {{else}}
+        {{if .Targets}}<h2>{{if .Repeat}}Already posted:{{else}}Posted{{end}} {{.Posted}} of {{len .Targets}}{{with .Unknown}} ({{.}} unknown){{end}}</h2>{{end}}
+        {{if .Repeat}}<p class="zz-meta">This form was already used, so nothing was posted again. These are its results.</p>{{end}}
+        {{with .Error}}<p class="zz-stalled" role="alert">{{.}}</p>{{end}}
+        {{with .Body}}<pre class="zz-comment-body">{{.}}</pre>{{end}}
+        {{if .Results}}
+        <ul class="zz-targets">
+          {{range .Results}}<li class="{{if .Posted}}zz-target-ok{{else if .Unknown}}zz-target-unknown{{else}}zz-target-fail{{end}}"><a href="{{.URL}}" target="_blank" rel="noopener noreferrer">{{.Repo}} #{{.Number}}</a> <span>{{.Title}}</span> <span class="zz-target-status">{{if .Posted}}Posted{{with .CommentURL}} &middot; <a href="{{.}}" target="_blank" rel="noopener noreferrer">view comment</a>{{end}}{{else}}{{.Error}}{{end}}</span></li>{{end}}
+        </ul>
+        {{end}}
+        {{template "skipped" .Skipped}}
+        {{end}}
+        <p class="zz-comment-dismiss"><a href="/">Dismiss</a></p>
+      </section>
+{{end}}
 {{define "skipped"}}{{with .}}<h2>Skipped</h2>
         <ul class="zz-targets zz-skipped">
           {{range .}}<li><span>{{.Label}}</span> <span class="zz-target-status">{{.Reason}}</span></li>{{end}}

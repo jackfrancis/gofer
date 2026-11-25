@@ -603,13 +603,18 @@ Wired on the web-tier side; they define what a runtime must respect:
   logout. Storing a write grant is strict, and every failed connection revokes the
   token it was issued, that token only (`discardToken`), never the authorization. The web tier posts with it
   (`internal/comment` over `internal/ghcomment`, which checks `"private": false`
-  first and follows no redirect). The preview registers the comment and the destinations
-  it showed as eligible (item, repository and number) under a one-time nonce;
-  confirming drops one whose item left the radar or now names another destination,
-  and never adds or redirects one. A same-origin confirm consumes it, and a nonce
-  gofer does not hold is refused, so nothing posts twice from one preview, across a
-  restart included. A confirmed batch's results are its owner's to read without a
-  live grant; only starting one needs it.
+  first and follows no redirect). Post posts in one step, no preview
+  (`webui.Comment`): same-origin only, then a redirect to the radar, which shows the
+  results (`/?comment=<key>`) or, when nothing was posted, reopens the box with the
+  same comment and selection. Each radar render mints a one-time form key (the
+  process's epoch, its issue time, random bytes; `newCommentKey`); the first
+  submission claims it for its owner, a resubmit shows that batch and posts nothing,
+  and a key gofer cannot vouch for (another epoch, i.e. before a restart, or older
+  than `commentKeyTTL`) posts nothing, so nothing posts twice from one form, across a
+  restart included. A used key is held until it expires; only a batch that posted
+  nothing is dropped early, and past `maxRecords` gofer refuses to post rather than
+  forget one. A batch's results are its owner's to read without a live grant; only
+  starting one needs it.
   Same-origin trusts `Sec-Fetch-Site: same-origin`, since `Referrer-Policy:
   no-referrer` makes a form's `Origin` "null". Posts are serial, a second apart; a
   rate limit stops the batch, the grant is re-read before each post (a disconnect,

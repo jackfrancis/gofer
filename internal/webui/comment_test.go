@@ -93,24 +93,54 @@ func postComment(h *Handler, form url.Values, header ...string) *httptest.Respon
 	return rec
 }
 
-func commentForm(body string, ids ...string) url.Values {
-	return url.Values{"content": {body}, "item": ids}
+// commentForm is the radar's comment form, with a key the radar would mint now.
+func commentForm(h *Handler, body string, ids ...string) url.Values {
+	return url.Values{"key": {h.newCommentKey(h.now())}, "content": {body}, "item": ids}
 }
 
-// previewNonce extracts the nonce the preview rendered.
-func previewNonce(t *testing.T, page string) string {
+// sameSite is the fetch metadata a browser sends with the radar's own form.
+var sameSite = []string{"Sec-Fetch-Site", "same-origin"}
+
+func post(h *Handler, form url.Values) *httptest.ResponseRecorder {
+	return postComment(h, form, sameSite...)
+}
+
+// radar renders the radar at target (the redirect a post answers with).
+func radar(t *testing.T, h *Handler, target string) string {
 	t.Helper()
-	const marker = `name="nonce" value="`
+	rec := httptest.NewRecorder()
+	h.Index(rec, httptest.NewRequest(http.MethodGet, target, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("radar %s = %d", target, rec.Code)
+	}
+	return rec.Body.String()
+}
+
+// posted posts form and returns the radar it is sent back to.
+func posted(t *testing.T, h *Handler, form url.Values) string {
+	t.Helper()
+	rec := post(h, form)
+	loc := rec.Header().Get("Location")
+	if rec.Code != http.StatusSeeOther || !strings.HasPrefix(loc, "/?comment=") {
+		t.Fatalf("post = %d %q\n%s", rec.Code, loc, rec.Body)
+	}
+	return radar(t, h, loc)
+}
+
+// formKey extracts the key the radar's comment form carries.
+func formKey(t *testing.T, page string) string {
+	t.Helper()
+	const marker = `name="key" value="`
 	i := strings.Index(page, marker)
 	if i < 0 {
-		t.Fatalf("no nonce in the preview:\n%s", page)
+		t.Fatalf("no comment key on the radar:\n%s", page)
 	}
 	rest := page[i+len(marker):]
 	return rest[:strings.Index(rest, `"`)]
 }
 
 // The radar offers the bulk comment only to a user who connected the write grant,
-// and a connect link to one who has not.
+// and a connect link to one who has not. Its form posts in one step.
 func TestRadarCommentControls(t *testing.T) {
 	page := func(c *fakeCommenter) string {
 		rec := httptest.NewRecorder()
@@ -119,15 +149,18 @@ func TestRadarCommentControls(t *testing.T) {
 	}
 	connected := page(&fakeCommenter{enabled: true, connected: true})
 	for _, want := range []string{
-		`id="zz-bulk-comment"`, `action="/items/comment"`, `form="zz-bulk-comment"`,
-		`data-repo="a/one"`, `/static/comment.js`, `action="/auth/github-write/disconnect"`,
+		`id="zz-bulk-comment"`, `action="/items/comment"`, `form="zz-bulk-comment"`, `name="key"`,
+		`data-repo="a/one"`, `/static/comment.js`, `action="/auth/github-write/disconnect"`, `>Post</button>`,
 	} {
 		if !strings.Contains(connected, want) {
 			t.Errorf("connected radar lacks %s", want)
 		}
 	}
+	if strings.Contains(connected, "Preview") {
+		t.Error("the radar still offers a preview step")
+	}
 	notConnected := page(&fakeCommenter{enabled: true})
-	if !strings.Contains(notConnected, `href="/auth/github-write/login"`) || strings.Contains(notConnected, `data-comment-item`) {
+	if !strings.Contains(notConnected, `href="/auth/github-write/login"`) || strings.Contains(notConnected, `data-comment-item`) || strings.Contains(notConnected, `name="key"`) {
 		t.Error("an unconnected user should get the connect link and no checkboxes")
 	}
 	for name, out := range map[string]string{"disabled": page(&fakeCommenter{}), "no commenter": page(nil)} {
@@ -137,146 +170,163 @@ func TestRadarCommentControls(t *testing.T) {
 	}
 }
 
-// The preview shows the comment and its targets, skips items off the radar, and
-// posts nothing.
-func TestCommentPreviewPostsNothing(t *testing.T) {
+// Post posts to the selected items on the radar at once, skipping the rest, and the
+// radar it returns to shows the results.
+func TestCommentPostsAndShowsResultsOnRadar(t *testing.T) {
 	c := &fakeCommenter{enabled: true, connected: true}
 	h := commentFixture(t, c)
-	rec := postComment(h, commentForm("/assign @tallaxes", "github:a/one#1", "github:b/two#2", "github:a/one#3", "github:b/two#4", "github:x/y#9"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("preview = %d", rec.Code)
+	page := posted(t, h, commentForm(h, "/assign @tallaxes", "github:a/one#1", "github:b/two#2", "github:a/one#3", "github:b/two#4", "github:x/y#9"))
+	if c.postCount() != 1 || len(c.posts[0]) != 2 || c.posts[0][0].ID != "github:a/one#1" || c.posts[0][1].ID != "github:b/two#2" {
+		t.Fatalf("posts = %+v", c.posts)
 	}
-	page := rec.Body.String()
-	for _, want := range []string{"Post this comment?", "/assign @tallaxes", "a/one #1", "b/two #2", "Post to 2 items", "hidden", "closed", "gone"} {
+	for _, want := range []string{"Posted 2 of 2", "/assign @tallaxes", "view comment", "hidden", "closed", "gone", `id="zz-bulk-comment"`, "Dismiss"} {
 		if !strings.Contains(page, want) {
-			t.Errorf("preview lacks %q", want)
+			t.Errorf("radar lacks %q", want)
 		}
 	}
-	if strings.Contains(page, `name="item" value="github:a/one#3"`) {
-		t.Error("the confirm form carries a hidden item")
-	}
-	if c.postCount() != 0 {
-		t.Error("the preview posted")
+	if strings.Contains(page, " checked aria-label") {
+		t.Error("a posted comment's items are checked again")
 	}
 }
 
-// preview posts a preview and returns its nonce.
-func preview(t *testing.T, h *Handler, body string, ids ...string) string {
-	t.Helper()
-	rec := postComment(h, commentForm(body, ids...))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("preview = %d\n%s", rec.Code, rec.Body)
-	}
-	return previewNonce(t, rec.Body.String())
-}
-
-func confirmForm(nonce string) url.Values {
-	return url.Values{"confirm": {"1"}, "nonce": {nonce}}
-}
-
-// Confirm posts exactly what the preview showed, once; resubmitting the same
-// confirmation shows its results again and posts nothing more.
-func TestCommentConfirmPostsOnce(t *testing.T) {
+// A resubmitted form shows its results again and posts nothing more, even with
+// another comment or items in it.
+func TestCommentFormPostsOnce(t *testing.T) {
 	c := &fakeCommenter{enabled: true, connected: true}
 	h := commentFixture(t, c)
-	nonce := preview(t, h, "/lgtm", "github:a/one#1", "github:b/two#2")
-
-	// Only the nonce goes back: the comment and items are the preview's, whatever
-	// else the form says.
-	form := confirmForm(nonce)
+	form := commentForm(h, "/lgtm", "github:a/one#1", "github:b/two#2")
+	posted(t, h, form)
 	form.Set("content", "/close")
 	form.Add("item", "github:a/one#3")
-	rec := postComment(h, form, "Sec-Fetch-Site", "same-origin", "Origin", "http://example.com")
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Posted 2 of 2") {
-		t.Fatalf("confirm = %d\n%s", rec.Code, rec.Body)
+	rec := post(h, form)
+	if loc := rec.Header().Get("Location"); rec.Code != http.StatusSeeOther || !strings.HasSuffix(loc, "&again=1") {
+		t.Fatalf("resubmit = %d %q", rec.Code, loc)
 	}
-	if c.postCount() != 1 || len(c.posts[0]) != 2 || c.bodies[0] != "/lgtm" {
-		t.Fatalf("posts = %+v bodies = %v", c.posts, c.bodies)
-	}
-	again := postComment(h, form, "Sec-Fetch-Site", "same-origin")
-	if !strings.Contains(again.Body.String(), "Already posted") {
-		t.Errorf("resubmit page:\n%s", again.Body)
+	page := radar(t, h, rec.Header().Get("Location"))
+	if !strings.Contains(page, "Already posted: 2 of 2") || !strings.Contains(page, "/lgtm") {
+		t.Errorf("resubmit radar:\n%s", page)
 	}
 	if c.postCount() != 1 {
 		t.Errorf("a resubmit posted again: %d posts", c.postCount())
 	}
+	// Each radar render mints a fresh key, so the next comment posts.
+	if k1, k2 := formKey(t, radar(t, h, "/")), formKey(t, radar(t, h, "/")); k1 == k2 || !validKey(h, k1) {
+		t.Errorf("radar keys %q %q", k1, k2)
+	}
 }
 
-// Review P1: a confirmation gofer does not hold (never issued, expired, or from
-// before a restart) posts nothing.
-func TestCommentUnknownConfirmationPostsNothing(t *testing.T) {
+func validKey(h *Handler, key string) bool {
+	_, ok := h.commentKeyIssued(key, h.now())
+	return ok
+}
+
+// Concurrent submissions of one form (a double click) post once.
+func TestCommentDoubleSubmitPostsOnce(t *testing.T) {
 	c := &fakeCommenter{enabled: true, connected: true}
 	h := commentFixture(t, c)
-	nonce := preview(t, h, "/lgtm", "github:a/one#1")
+	form := commentForm(h, "/lgtm", "github:a/one#1")
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); post(h, form) }()
+	}
+	wg.Wait()
+	if c.postCount() != 1 {
+		t.Errorf("posts = %d", c.postCount())
+	}
+}
 
-	// A restart: a new handler holds no previews.
-	restarted := commentFixture(t, c)
-	if rec := postComment(restarted, confirmForm(nonce), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "expired") {
-		t.Errorf("confirm after a restart = %d\n%s", rec.Code, rec.Body)
-	}
-	// Never issued.
-	if rec := postComment(h, confirmForm(newNonce()), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusConflict {
-		t.Errorf("confirm of an unissued nonce = %d", rec.Code)
-	}
-	// Expired.
-	now := time.Now()
-	h.now = func() time.Time { return now.Add(previewTTL + time.Minute) }
-	if rec := postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusConflict {
-		t.Errorf("confirm of an expired preview = %d", rec.Code)
+// A key gofer refuses (from before a restart, expired, forged, or missing, as from
+// an old preview page's confirm form) posts nothing, says gofer cannot tell what an
+// earlier submission did, and offers the comment again.
+func TestCommentStaleFormPostsNothing(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	form := commentForm(h, "/lgtm", "github:a/one#1")
+
+	restarted := commentFixture(t, c) // a new process: another epoch
+	expired := commentFixture(t, c)
+	expired.epoch = h.epoch
+	expired.now = func() time.Time { return time.Now().Add(commentKeyTTL + time.Minute) }
+	future := url.Values{"key": {h.newCommentKey(time.Now().Add(time.Hour))}, "content": {"/lgtm"}, "item": {"github:a/one#1"}}
+	old := url.Values{"confirm": {"1"}, "nonce": {strings.Repeat("ab", 16)}}
+	for name, tc := range map[string]struct {
+		h    *Handler
+		form url.Values
+	}{
+		"restart": {restarted, form}, "expired": {expired, form}, "future": {h, future}, "old confirm": {h, old},
+		"malformed": {h, url.Values{"key": {"nope"}, "content": {"/lgtm"}, "item": {"github:a/one#1"}}},
+	} {
+		page := posted(t, tc.h, tc.form)
+		if !strings.Contains(page, "cannot tell whether an earlier submission") || !strings.Contains(page, "check the items on GitHub") {
+			t.Errorf("%s: radar:\n%s", name, page)
+		}
 	}
 	if c.postCount() != 0 {
 		t.Errorf("posted %d times", c.postCount())
 	}
+	page := posted(t, restarted, form)
+	if !strings.Contains(page, "<details class=\"zz-compose\" data-compose open>") || !strings.Contains(page, ">/lgtm</textarea>") ||
+		!strings.Contains(page, `value="github:a/one#1" form="zz-bulk-comment" data-comment-item data-repo="a/one" checked`) {
+		t.Errorf("the refused comment is not offered again:\n%s", page)
+	}
 }
 
-// A preview belongs to its owner.
-func TestCommentConfirmationIsTheOwners(t *testing.T) {
+// A batch's results are its owner's.
+func TestCommentResultsAreTheOwners(t *testing.T) {
 	c := &fakeCommenter{enabled: true, connected: true}
 	h := commentFixture(t, c)
-	nonce := preview(t, h, "/lgtm", "github:a/one#1")
+	form := commentForm(h, "/lgtm", "github:a/one#1")
+	rec := post(h, form)
 	h.sessions = fakeSessions{&session.User{ID: "github:7", Provider: "github"}}
-	if rec := postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusConflict {
-		t.Errorf("another user's confirm = %d", rec.Code)
+	if page := radar(t, h, rec.Header().Get("Location")); strings.Contains(page, "/lgtm") || strings.Contains(page, "Posted 1") {
+		t.Error("another user saw the results")
 	}
-	if c.postCount() != 0 {
-		t.Error("posted another user's preview")
+	// The same key from another user is that user's own, unused form: its batch is
+	// their own (none of their items match), never the first user's results.
+	if rec := post(h, form); strings.HasSuffix(rec.Header().Get("Location"), "&again=1") {
+		t.Error("another user's submission was taken for a resubmit")
 	}
-}
-
-// The comment's line breaks survive from the preview to the post.
-func TestCommentKeepsLineBreaks(t *testing.T) {
-	c := &fakeCommenter{enabled: true, connected: true}
-	h := commentFixture(t, c)
-	nonce := preview(t, h, "\n/assign @a\r\n/cc @b", "github:a/one#1")
-	postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin")
-	if c.postCount() != 1 || c.bodies[0] != "\n/assign @a\n/cc @b" {
-		t.Errorf("posted %q", c.bodies)
-	}
-}
-
-// Review P1: the Post button works under gofer's referrer policy, which makes a
-// form POST send "Origin: null"; the preview also relaxes that policy for itself.
-func TestCommentConfirmUnderNoReferrer(t *testing.T) {
-	c := &fakeCommenter{enabled: true, connected: true}
-	h := commentFixture(t, c)
-	rec := postComment(h, commentForm("/lgtm", "github:a/one#1"))
-	if got := rec.Header().Get("Referrer-Policy"); got != "same-origin" {
-		t.Errorf("preview Referrer-Policy = %q, want same-origin", got)
-	}
-	nonce := previewNonce(t, rec.Body.String())
-	if rec := postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin", "Origin", "null"); rec.Code != http.StatusOK {
-		t.Fatalf("same-origin confirm with Origin: null = %d", rec.Code)
+	if bt := h.batches.lookup("github:7", form.Get("key"), h.now()); bt == nil || !strings.Contains(bt.view.Error, "None of the selected items") {
+		t.Errorf("another user's batch = %+v", bt)
 	}
 	if c.postCount() != 1 {
 		t.Errorf("posts = %d", c.postCount())
 	}
 }
 
-// A cross-site confirm is refused before anything is posted.
-func TestCommentConfirmRefusesCrossSite(t *testing.T) {
+// The comment's line breaks survive to the post.
+func TestCommentKeepsLineBreaks(t *testing.T) {
 	c := &fakeCommenter{enabled: true, connected: true}
 	h := commentFixture(t, c)
-	nonce := preview(t, h, "/lgtm", "github:a/one#1")
+	post(h, commentForm(h, "\n/assign @a\r\n/cc @b", "github:a/one#1"))
+	if c.postCount() != 1 || c.bodies[0] != "\n/assign @a\n/cc @b" {
+		t.Errorf("posted %q", c.bodies)
+	}
+}
+
+// Review P1: Post works under gofer's referrer policy, which makes a form POST send
+// "Origin: null"; the radar relaxes that policy for itself when it carries the form.
+func TestCommentPostUnderNoReferrer(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	rec := httptest.NewRecorder()
+	h.Index(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if got := rec.Header().Get("Referrer-Policy"); got != "same-origin" {
+		t.Errorf("radar Referrer-Policy = %q, want same-origin", got)
+	}
+	if rec := postComment(h, commentForm(h, "/lgtm", "github:a/one#1"), "Sec-Fetch-Site", "same-origin", "Origin", "null"); rec.Code != http.StatusSeeOther {
+		t.Fatalf("same-origin post with Origin: null = %d", rec.Code)
+	}
+	if c.postCount() != 1 {
+		t.Errorf("posts = %d", c.postCount())
+	}
+}
+
+// A cross-site post is refused before anything is posted.
+func TestCommentRefusesCrossSite(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
 	for _, hdr := range [][]string{
 		{"Sec-Fetch-Site", "cross-site"},
 		{"Sec-Fetch-Site", "same-site"},
@@ -284,16 +334,17 @@ func TestCommentConfirmRefusesCrossSite(t *testing.T) {
 		{"Origin", "https://evil.example"},
 		{"Origin", "null"}, // without fetch metadata, an opaque origin proves nothing
 	} {
-		if rec := postComment(h, confirmForm(nonce), hdr...); rec.Code != http.StatusForbidden {
+		if rec := postComment(h, commentForm(h, "/lgtm", "github:a/one#1"), hdr...); rec.Code != http.StatusForbidden {
 			t.Errorf("%v: status %d, want 403", hdr, rec.Code)
 		}
 	}
 	if c.postCount() != 0 {
-		t.Error("a cross-site confirm posted")
+		t.Error("a cross-site post posted")
 	}
 }
 
-// A form gofer cannot accept previews and posts nothing.
+// A form gofer cannot accept posts nothing; the radar says why and offers the
+// comment and selection again.
 func TestCommentRefusesBadForms(t *testing.T) {
 	c := &fakeCommenter{enabled: true, connected: true}
 	h := commentFixture(t, c)
@@ -301,17 +352,25 @@ func TestCommentRefusesBadForms(t *testing.T) {
 	for i := range many {
 		many[i] = fmt.Sprintf("github:a/one#%d", i+100)
 	}
-	cases := map[string]url.Values{
-		"empty comment": commentForm("  \n ", "github:a/one#1"),
-		"no items":      commentForm("/lgtm"),
-		"too many":      commentForm("/lgtm", many...),
-		"too long":      commentForm(strings.Repeat("x", maxMessageBytes+1), "github:a/one#1"),
-		"bad nonce":     confirmForm("nope"),
+	cases := map[string]struct {
+		form url.Values
+		want string
+	}{
+		"empty comment": {commentForm(h, "  \n ", "github:a/one#1"), "Write a comment first."},
+		"no items":      {commentForm(h, "/lgtm"), "Select at least one item"},
+		"too many":      {commentForm(h, "/lgtm", many...), "at most 50 items"},
+		"too long":      {commentForm(h, strings.Repeat("x", maxMessageBytes+1), "github:a/one#1"), "too long"},
+		"none eligible": {commentForm(h, "/lgtm", "github:a/one#3"), "None of the selected items"},
 	}
-	for name, form := range cases {
-		if rec := postComment(h, form, "Sec-Fetch-Site", "same-origin"); rec.Code < 400 {
-			t.Errorf("%s: status %d", name, rec.Code)
+	for name, tc := range cases {
+		page := posted(t, h, tc.form)
+		if !strings.Contains(page, tc.want) {
+			t.Errorf("%s: radar lacks %q", name, tc.want)
 		}
+	}
+	page := posted(t, h, commentForm(h, "/lgtm", "github:a/one#3", "github:a/one#1x"))
+	if !strings.Contains(page, ">/lgtm</textarea>") || !strings.Contains(page, "data-compose open") {
+		t.Errorf("the refused comment is not offered again:\n%s", page)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/items/comment", strings.NewReader("--x--"))
 	req.Header.Set("Content-Type", "multipart/form-data; boundary=x")
@@ -325,48 +384,59 @@ func TestCommentRefusesBadForms(t *testing.T) {
 	}
 }
 
-// Unconfirmed previews are bounded per owner; the oldest goes first.
-func TestCommentPreviewsAreBounded(t *testing.T) {
-	c := &fakeCommenter{enabled: true, connected: true}
+// A refused attempt keeps the selection checked on the radar it returns to.
+func TestCommentRefusalKeepsSelection(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true, postErr: comment.ErrNotConnected}
 	h := commentFixture(t, c)
-	first := preview(t, h, "/lgtm", "github:a/one#1")
-	for i := 0; i < maxPreviewsPerOwner; i++ {
-		preview(t, h, "/lgtm", "github:a/one#1")
+	page := posted(t, h, commentForm(h, "/lgtm", "github:a/one#1"))
+	if !strings.Contains(page, "Connect commenting") {
+		t.Errorf("radar:\n%s", page)
 	}
-	if rec := postComment(h, confirmForm(first), "Sec-Fetch-Site", "same-origin"); rec.Code != http.StatusConflict {
-		t.Errorf("the oldest preview past the bound = %d, want refused", rec.Code)
+	if !strings.Contains(page, `data-repo="a/one" checked`) || strings.Contains(page, `data-repo="b/two" checked`) {
+		t.Error("the selection is not kept as it was")
+	}
+}
+
+// Held batches are bounded: one that posted nothing is dropped first, and gofer
+// refuses to post rather than forget a used key.
+func TestCommentBatchesAreBounded(t *testing.T) {
+	var b batches
+	now := time.Now()
+	until := now.Add(time.Hour)
+	failed, mine, _ := b.claim("u", "failed", until, now)
+	failed.view = commentView{Error: "x"}
+	close(failed.done)
+	if !mine {
+		t.Fatal("first claim not mine")
+	}
+	for i := 1; i < maxRecords; i++ {
+		bt, _, ok := b.claim("u", fmt.Sprint("k", i), until, now.Add(time.Duration(i)))
+		if !ok {
+			t.Fatalf("claim %d refused", i)
+		}
+		bt.view.Posted = 1
+		close(bt.done)
+	}
+	if _, _, ok := b.claim("u", "next", until, now.Add(time.Hour/2)); !ok {
+		t.Fatal("the batch that posted nothing was not dropped for a new one")
+	}
+	if b.lookup("u", "failed", now) != nil || b.lookup("u", "k1", now) == nil {
+		t.Error("dropped the wrong batch")
+	}
+	if _, _, ok := b.claim("u", "more", until, now.Add(time.Hour/2)); ok {
+		t.Error("a used key was forgotten to make room")
+	}
+	if _, _, ok := b.claim("u", "later", until, until.Add(time.Second)); !ok {
+		t.Error("expired batches were not dropped")
 	}
 }
 
 // A user who has not connected the write grant is sent to connect it.
 func TestCommentNeedsConnection(t *testing.T) {
 	h := commentFixture(t, &fakeCommenter{enabled: true})
-	rec := postComment(h, commentForm("/lgtm", "github:a/one#1"))
+	rec := post(h, commentForm(h, "/lgtm", "github:a/one#1"))
 	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/?commenting=connect" {
 		t.Fatalf("status %d location %q", rec.Code, rec.Header().Get("Location"))
-	}
-}
-
-// A batch that attempted nothing (no grant) reopens its preview, so the same
-// confirmation works once the user reconnects, and posts once.
-func TestCommentNotConnectedReopensPreview(t *testing.T) {
-	c := &fakeCommenter{enabled: true, connected: true, postErr: comment.ErrNotConnected}
-	h := commentFixture(t, c)
-	nonce := preview(t, h, "/lgtm", "github:a/one#1")
-	rec := postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin")
-	if !strings.Contains(rec.Body.String(), "Connect commenting") {
-		t.Errorf("page:\n%s", rec.Body)
-	}
-	c.mu.Lock()
-	c.postErr = nil
-	c.mu.Unlock()
-	rec = postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin")
-	if c.postCount() != 1 || strings.Contains(rec.Body.String(), "Already posted") {
-		t.Errorf("retry after reconnecting: %d posts\n%s", c.postCount(), rec.Body)
-	}
-	postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin")
-	if c.postCount() != 1 {
-		t.Errorf("posted %d times", c.postCount())
 	}
 }
 
@@ -408,7 +478,7 @@ func TestReloadKeepsSelection(t *testing.T) {
 // A result whose answer was lost is shown as unknown, not as failed or posted.
 func TestCommentResultsShowUnknown(t *testing.T) {
 	tgt := comment.Target{Repo: "a/one", Number: 1, Title: "t", URL: "https://github.com/a/one/pull/1"}
-	out := renderPage(t, pageData{View: "comment-results", Comment: &commentView{
+	out := renderPage(t, pageData{View: "worklist", CommentEnabled: true, CommentConnected: true, Comment: &commentView{
 		Body: "/lgtm", Targets: []comment.Target{tgt, tgt}, Posted: 1, Unknown: 1,
 		Results: []comment.Result{
 			{Target: tgt, Posted: true},
@@ -416,114 +486,46 @@ func TestCommentResultsShowUnknown(t *testing.T) {
 		},
 	}})
 	if !strings.Contains(out, "Posted 1 of 2 (1 unknown)") || !strings.Contains(out, "zz-target-unknown") {
-		t.Errorf("results page:\n%s", out)
+		t.Errorf("results:\n%s", out)
 	}
 }
 
-// Review P1 (second round): confirming never adds an item the preview listed as
-// skipped, even if it is back on the radar by then; it may only drop one.
-func TestCommentConfirmNeverAddsTargets(t *testing.T) {
-	c := &fakeCommenter{enabled: true, connected: true}
-	h := commentFixture(t, c)
-	rec := postComment(h, commentForm("/lgtm", "github:a/one#1", "github:a/one#3", "github:b/two#2"))
-	page := rec.Body.String()
-	if !strings.Contains(page, "Post to 2 items") || !strings.Contains(page, "hidden") {
-		t.Fatalf("preview:\n%s", page)
-	}
-	nonce := previewNonce(t, page)
-
-	// Between preview and confirm: the hidden item is unhidden, and b/two#2 is hidden.
-	err := h.store.Update(context.Background(), "github:42", func(items []worklist.WorkItem) ([]worklist.WorkItem, error) {
-		var out []worklist.WorkItem
-		for _, it := range items {
-			switch it.ID {
-			case "github:a/one#3":
-				it.Meta.HiddenAt = time.Time{}
-				out = append(out, it)
-			case "github:b/two#2":
-				it.Meta.HiddenAt = time.Now()
-				out = append(out, it)
-			}
-		}
-		return out, nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin")
-	if c.postCount() != 1 || len(c.posts[0]) != 1 || c.posts[0][0].ID != "github:a/one#1" {
-		t.Fatalf("posted to %+v; want only a/one#1 (previewed, still on the radar)", c.posts)
-	}
-}
-
-// Review P2 (second round): an unknown confirmation does not claim nothing was ever
-// posted from it.
-func TestCommentUnknownConfirmationIsHonest(t *testing.T) {
+// A batch still posting when the radar is reached says so.
+func TestCommentResultsWhileRunning(t *testing.T) {
 	h := commentFixture(t, &fakeCommenter{enabled: true, connected: true})
-	rec := postComment(h, confirmForm(newNonce()), "Sec-Fetch-Site", "same-origin")
-	body := rec.Body.String()
-	if !strings.Contains(body, "cannot tell whether an earlier confirmation") || !strings.Contains(body, "check the items on GitHub") {
-		t.Errorf("page:\n%s", body)
+	key := h.newCommentKey(h.now())
+	if _, _, ok := h.batches.claim("github:42", key, h.now().Add(time.Hour), h.now()); !ok {
+		t.Fatal("claim refused")
+	}
+	if page := radar(t, h, "/?comment="+key); !strings.Contains(page, "still posting") {
+		t.Errorf("radar:\n%s", page)
+	}
+	if page := radar(t, h, "/?comment="+h.newCommentKey(h.now())); !strings.Contains(page, "no longer holds the results") {
+		t.Errorf("radar for unknown results:\n%s", page)
 	}
 }
 
-// Review P1 (third round): confirming posts to the repository and number the preview
-// showed. A write-back that changes an item's GitHub fields under the same ID drops
-// it from the batch instead of redirecting the comment.
-func TestCommentConfirmPinsDestination(t *testing.T) {
-	c := &fakeCommenter{enabled: true, connected: true}
-	h := commentFixture(t, c)
-	nonce := preview(t, h, "/lgtm", "github:a/one#1", "github:b/two#2")
-	err := h.store.Update(context.Background(), "github:42", func(items []worklist.WorkItem) ([]worklist.WorkItem, error) {
-		for _, it := range items {
-			if it.ID == "github:a/one#1" {
-				it.GitHub.Repo, it.GitHub.Number = "other/repo", 99
-				return []worklist.WorkItem{it}, nil
-			}
-		}
-		return nil, nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	rec := postComment(h, confirmForm(nonce), "Sec-Fetch-Site", "same-origin")
-	if c.postCount() != 1 || len(c.posts[0]) != 1 {
-		t.Fatalf("posts = %+v", c.posts)
-	}
-	if got := c.posts[0][0]; got.Repo != "b/two" || got.Number != 2 {
-		t.Errorf("posted to %s #%d", got.Repo, got.Number)
-	}
-	if !strings.Contains(rec.Body.String(), "not the destination you previewed") {
-		t.Errorf("results do not explain the dropped item:\n%s", rec.Body)
-	}
-}
-
-// Review P2 (third round): the owner reads a completed batch's results without a
-// live grant; only starting a batch needs one, and a refused start consumes nothing.
+// Review P2 (third round): the owner sees a used form's results without a live
+// grant; only starting a batch needs one, and a refused start uses nothing.
 func TestCommentReceiptNeedsNoGrant(t *testing.T) {
 	c := &fakeCommenter{enabled: true, connected: true}
 	h := commentFixture(t, c)
-	done := preview(t, h, "/lgtm", "github:a/one#1")
-	pending := preview(t, h, "/hold", "github:b/two#2")
-	postComment(h, confirmForm(done), "Sec-Fetch-Site", "same-origin")
+	done := commentForm(h, "/lgtm", "github:a/one#1")
+	pending := commentForm(h, "/hold", "github:b/two#2")
+	posted(t, h, done)
 
 	c.connected = false // the grant died, or was disconnected
-	rec := postComment(h, confirmForm(done), "Sec-Fetch-Site", "same-origin")
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Already posted: 1 of 1") {
-		t.Fatalf("receipt without a grant = %d\n%s", rec.Code, rec.Body)
+	rec := post(h, done)
+	if rec.Code != http.StatusSeeOther || !strings.HasPrefix(rec.Header().Get("Location"), "/?comment=") {
+		t.Fatalf("resubmit without a grant = %d %q", rec.Code, rec.Header().Get("Location"))
 	}
-	rec = postComment(h, confirmForm(pending), "Sec-Fetch-Site", "same-origin")
+	rec = post(h, pending)
 	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/?commenting=connect" {
 		t.Fatalf("new batch without a grant = %d %q", rec.Code, rec.Header().Get("Location"))
 	}
 	c.connected = true
-	postComment(h, confirmForm(pending), "Sec-Fetch-Site", "same-origin")
+	post(h, pending)
 	if c.postCount() != 2 {
-		t.Errorf("posts = %d; the refused start should have left its preview to confirm", c.postCount())
-	}
-	// Another user cannot read the receipt.
-	h.sessions = fakeSessions{&session.User{ID: "github:7", Provider: "github"}}
-	if rec := postComment(h, confirmForm(done), "Sec-Fetch-Site", "same-origin"); rec.Code == http.StatusOK {
-		t.Error("another user read the receipt")
+		t.Errorf("posts = %d; the refused start should have left its form to post", c.postCount())
 	}
 }

@@ -110,7 +110,8 @@ type Handler struct {
 	options     []ModelOption // model picker options, default first (options[0]); nil when AI is disabled
 	reconnect   Reconnector   // nil: never prompt to sign in again
 	commenter   Commenter     // nil: no bulk comment (comment.go)
-	batches     batches       // confirmed bulk comments, by nonce
+	batches     batches       // bulk comment batches, by owner and form key (comment.go)
+	epoch       [8]byte       // this process's part of every comment form key
 	now         func() time.Time
 }
 
@@ -130,6 +131,7 @@ func New(sessions Sessions, store worklist.Store, pipeline Pipeline, providers P
 		providers:   providers,
 		convEnabled: convEnabled,
 		options:     options,
+		epoch:       newEpoch(),
 		now:         time.Now,
 	}
 	if rc, ok := providers.(Reconnector); ok {
@@ -321,7 +323,9 @@ type pageData struct {
 	CommentTokenDisabled     bool                // worklist: a token is stored while tokens are not allowed; offer Disconnect
 	CommentOtherClient       bool                // worklist: a grant from another commenting app is stored; offer Disconnect
 	CommentCleanupPending    bool                // worklist: a disconnect has not finished deleting gofer's copy; offer a retry
-	Comment                  *commentView        // comment-preview / comment-results views
+	Comment                  *commentView        // worklist: the outcome of the bulk comment the radar was sent back from
+	CommentKey               string              // worklist: the comment form's one-time key
+	CommentChecked           map[string]bool     // worklist: items to show checked again (a comment that posted nothing)
 	Draft                    *draftThread        // thread: the draft review's button and newest draft (draftreview.go); nil shows neither
 	DraftResult              *draftResult        // draft-review-result view
 }
@@ -331,9 +335,9 @@ type pageData struct {
 // ranked worklist.
 func (h *Handler) Index(w http.ResponseWriter, r *http.Request) {
 	data, status := h.view(r)
-	if data.CommentTokensAllowed && !data.CommentConnected {
-		// The token form posts same-origin only; this lets it send its real Origin on
-		// a browser without fetch metadata (see Comment).
+	if data.CommentConnected || data.CommentTokensAllowed {
+		// The comment and token forms post same-origin only; this lets them send their
+		// real Origin on a browser without fetch metadata (see sameOrigin).
 		w.Header().Set("Referrer-Policy", "same-origin")
 	}
 	h.render(w, status, data)
@@ -416,7 +420,7 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 				data.Draft = h.draftThreadView(r.Context(), user, it, now)
 				if data.Draft != nil && data.Draft.Index >= 0 {
 					// The draft's Create button posts same-origin only; this lets it send
-					// its real Origin on a browser without fetch metadata (see Comment).
+					// its real Origin on a browser without fetch metadata (see sameOrigin).
 					w.Header().Set("Referrer-Policy", "same-origin")
 				}
 			}
@@ -1243,6 +1247,16 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		data.CommentEnabled, data.CommentConnected = h.commentState(r.Context(), user)
 		if data.CommentEnabled {
 			data.CommentNotice = commentNotices[r.URL.Query().Get("commenting")]
+			if data.CommentConnected {
+				data.CommentKey = h.newCommentKey(h.now())
+			}
+			if data.Comment = h.commentOutcome(r, user); data.Comment.Retry() {
+				// Nothing went to GitHub: offer the same comment and selection again.
+				data.CommentChecked = make(map[string]bool, len(data.Comment.Selected))
+				for _, id := range data.Comment.Selected {
+					data.CommentChecked[id] = true
+				}
+			}
 			if d, ok := h.commenter.(commentDetailer); ok {
 				det := d.Details(r.Context(), user.ID)
 				data.CommentTokensAllowed, data.CommentToken, data.CommentTokenExpires = det.TokensAllowed, det.Token, det.Expires
@@ -1519,10 +1533,11 @@ type itemRow struct {
 	Item             worklist.WorkItem
 	ConvEnabled      bool
 	CommentConnected bool
+	Checked          bool // selected for a bulk comment (one that posted nothing, offered again)
 }
 
-func newItemRow(it worklist.WorkItem, convEnabled, commentConnected bool) itemRow {
-	return itemRow{Item: it, ConvEnabled: convEnabled, CommentConnected: commentConnected}
+func newItemRow(it worklist.WorkItem, convEnabled, commentConnected bool, checked map[string]bool) itemRow {
+	return itemRow{Item: it, ConvEnabled: convEnabled, CommentConnected: commentConnected, Checked: checked[it.ID]}
 }
 
 // waitingBadge labels an item waiting on someone else: who, and for how long ("" for
