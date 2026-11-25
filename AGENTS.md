@@ -693,9 +693,14 @@ Wired on the web-tier side; they define what a runtime must respect:
   checked against its own condition in the store update); while a review request has
   no answer it offers "Retry the earlier review" instead (`review=retry` naming the
   turn: same turn, new attempt, so the gate shares a run in flight and the store keeps
-  one answer), never for a hidden request (unhide it first) and a 2nd opinion only
-  blind; a definite dispatch refusal shows on the thread (`review_refused`) and leaves
-  the turn retryable at once (a disabled draft button says why in text: Safari
+  one answer), for the newest one it can retry (`retryCandidate`: visible, a 2nd
+  opinion only blind), and a request that may still answer but cannot be retried
+  (hidden, or a 2nd opinion no model may run) blocks a new one until a notice ends it
+  (`reviewBlocker`, `WorkItem.Ended`); "Review the current revision" likewise retries
+  a re-review already asked for (`WorkItem.ReviewOutdatedAt`); a definite dispatch
+  refusal shows on the thread (`review_refused`, describing that attempt, hidden
+  while a later one runs) and leaves the turn retryable at once (a disabled draft
+  button says why in text: Safari
   shows no tooltip on a disabled button, and `.btn:disabled` must look disabled); model-written draft text is LF-normalized and has
   every bot-command line made inert, `worklist.NeutralizeCommands` in `BoundDraft`,
   a suggestion block holding one (found by goldmark, lists included) turned into

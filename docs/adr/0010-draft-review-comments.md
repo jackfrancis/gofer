@@ -37,9 +37,14 @@ review's text is written by a model, so this feature needs that rule amended.
    which retries that very turn (it runs as it was asked, without later messages)
    rather than adding another: the dispatcher's gate shares a run still in flight and
    the store keeps one answer per turn, so a first review is never answered twice, and
-   there is nothing to wait out first. A hidden request is not retried until the user
-   unhides it, and a 2nd opinion is retried only blind, by a model it may use. A
-   dispatch the backend certainly refused is said so on the thread and leaves the turn
+   there is nothing to wait out first. It offers the newest request it can retry: a
+   hidden request is not retried until the user unhides it, and a 2nd opinion only
+   blind, by a model it may use, so an older ordinary request is offered past a 2nd
+   opinion no model can run. A request that may still answer but cannot be retried
+   blocks a new one; once a notice ended its run it no longer can, and a new ordinary
+   review may be asked for. "Review the current revision" retries a re-review already
+   asked for in the same way. A dispatch the backend certainly refused is said so on
+   the thread (about that attempt, and not while a later one runs) and leaves the turn
    retryable at once; an uncertain one stays pending.
    It is not shown while drafting again would only repeat the offered draft
    (`WorkItem.RedraftRedundant`), because the drafter would read the conversation it

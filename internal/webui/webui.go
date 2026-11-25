@@ -422,7 +422,9 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 			if !it.IsHidden() {
 				data.Draft = h.draftThreadView(r.Context(), user, it, now)
 				if data.Draft != nil {
-					data.Draft.ReviewRefused = r.URL.Query().Get("review_refused") == "1"
+					// The flag describes the attempt the redirect came from: once a later one
+					// is running (a retry in another tab, say), it is not shown.
+					data.Draft.ReviewRefused = r.URL.Query().Get("review_refused") == "1" && !it.ReplyPending(now, reviewStaleAfter)
 				}
 				if data.Draft != nil && data.Draft.Index >= 0 {
 					// The draft's Create button posts same-origin only; this lets it send

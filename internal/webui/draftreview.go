@@ -68,17 +68,22 @@ type draftThread struct {
 	Outdated bool
 	// ReviewOutdated marks a newest draft that read a revision other than the one
 	// the latest review read (WorkItem.ReviewOutdated): the thread offers a review
-	// of the current revision, enabled while no reply is in flight (ReviewReady).
+	// of the current revision, enabled while no reply is in flight and nothing blocks
+	// it (ReviewReady, else AgainWhy). AgainKey names a review of the current revision
+	// already asked for and unanswered (one the backend refused, say), which the
+	// button then retries instead of asking again.
 	ReviewOutdated bool
 	ReviewReady    bool
+	AgainKey       string
+	AgainWhy       string
 	// NeedsReview marks a pull request with no completed review, no reply in flight
 	// (firstReviewable) and no review request at all: the draft button is disabled
 	// for want of a review, so the thread offers one right there ("Review this pull
 	// request", webui.ReviewAgain).
 	NeedsReview bool
 	// RetryKey names, in that state but with a review request that has no answer,
-	// the request "Retry the earlier review" retries (retriableReview): never a
-	// second request, which the first's run could also answer.
+	// the request "Retry the earlier review" retries (retryCandidate): never a second
+	// request, which the first's run could also answer.
 	RetryKey string
 	// ReviewRefused reports that the backend certainly refused the last review this
 	// thread's buttons dispatched, so nothing is running (query review_refused).
@@ -94,41 +99,66 @@ const (
 	reviewAgain = "again" // "Review the current revision": the latest review is outdated
 )
 
-// unansweredReview returns the position of the newest review request with no answer
-// (a system notice is not one), hidden or not, or -1. While there is one, no new
-// review request is added: its run may still answer. It is retried instead (same
-// turn, a new attempt), so the dispatcher's gate shares a run still in flight and the
-// store keeps one answer per turn, whatever the timing.
-func unansweredReview(it worklist.WorkItem) int {
-	for i := len(it.Thread) - 1; i >= 0; i-- {
-		if m := it.Thread[i]; m.Role == worklist.RoleUser && m.Kind == worklist.KindReviewRequest && !it.Answered(it.TurnKey(i)) {
+// While a review request has no answer, no other one is added: its run may still
+// answer. It is retried instead (same turn, a new attempt), so the dispatcher's gate
+// shares a run still in flight and the store keeps one answer per turn, whatever the
+// timing. Only requests after position `after` count: -1 for a first review, the
+// outdated draft's reply (WorkItem.ReviewOutdatedAt) for a review of the current
+// revision.
+
+// retryCandidate returns the newest review request after `after` with no answer
+// that the thread can retry: visible (a hidden one waits for the user to unhide it,
+// never reversed for them), and by a model it may use (retryChoices: a 2nd opinion
+// only blind, never as an ordinary review that would still count as independent).
+// It is -1 when there is none. An older ordinary request is a candidate even when a
+// newer 2nd opinion cannot be retried.
+func (h *Handler) retryCandidate(it worklist.WorkItem, after int) int {
+	for i := len(it.Thread) - 1; i > after; i-- {
+		m := it.Thread[i]
+		if m.Role != worklist.RoleUser || m.Kind != worklist.KindReviewRequest || m.Hidden || it.Answered(it.TurnKey(i)) {
+			continue
+		}
+		if _, _, ok := h.retryChoices(it, i); ok {
 			return i
 		}
 	}
 	return -1
 }
 
-// retriableReview says whether the thread can retry its unanswered review request j
-// (unansweredReview) from here, with the models it may use, or why not: a hidden
-// request waits for the user to unhide it (never reversed for them), and a 2nd
-// opinion is retried only blind, by a model it may use (retryChoices), never as an
-// ordinary review that would still count as independent.
-func (h *Handler) retriableReview(it worklist.WorkItem, j int) (choices []ModelOption, independent bool, why string) {
-	if it.Thread[j].Hidden {
-		return nil, false, "The review asked for in this conversation is hidden and has no answer. Unhide it to retry it."
+// reviewBlocker says why no review may be asked for after `after`, or "": a review
+// request there has no answer and may still get one (no notice ended its run), yet
+// the thread cannot retry it (hidden, or a 2nd opinion no model may run). A request a
+// notice ended can no longer answer, so it blocks nothing.
+func (h *Handler) reviewBlocker(it worklist.WorkItem, after int) string {
+	for i := len(it.Thread) - 1; i > after; i-- {
+		m := it.Thread[i]
+		key := it.TurnKey(i)
+		if m.Role != worklist.RoleUser || m.Kind != worklist.KindReviewRequest || it.Answered(key) || it.Ended(key) {
+			continue
+		}
+		if m.Hidden {
+			return "A review asked for in this conversation is hidden and has no answer yet. Unhide it to retry it."
+		}
+		if _, _, ok := h.retryChoices(it, i); !ok {
+			return "A 2nd opinion asked for in this conversation has no answer yet, and no model it may use is configured to retry it."
+		}
 	}
-	choices, independent, ok := h.retryChoices(it, j)
-	if !ok {
-		return nil, false, "The 2nd opinion asked for in this conversation has no answer, and no model it may use is configured, so it cannot run again."
-	}
-	return choices, independent, ""
+	return ""
 }
 
-// firstReviewable reports whether "Review this pull request" may act on it now: a
-// pull request on the radar with no completed review and no reply plausibly in
-// flight (the page polls while one is).
+// firstReviewable reports whether the thread may act on a first review now: a pull
+// request on the radar with no completed review and no reply plausibly in flight
+// (the page polls while one is).
 func firstReviewable(it worklist.WorkItem, now time.Time) bool {
 	return it.Type == worklist.TypePullRequest && it.OnRadar() && !it.HasReview() && !it.ReplyPending(now, reviewStaleAfter)
+}
+
+// againReviewable reports whether the thread may act on a review of the current
+// revision now: the latest review is outdated (returning the draft reply that makes
+// it so) and no reply is plausibly in flight.
+func againReviewable(it worklist.WorkItem, now time.Time) (int, bool) {
+	d := it.ReviewOutdatedAt()
+	return d, it.Type == worklist.TypePullRequest && it.OnRadar() && d >= 0 && !it.ReplyPending(now, reviewStaleAfter)
 }
 
 // reviewCreator returns the commenter's pending-review side, if it has one.
@@ -155,23 +185,30 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 		// missing review.
 		v.Why = "Wait for the reply in progress, so the draft includes it."
 	case !it.HasReview():
-		j := unansweredReview(it)
-		if j < 0 {
+		if j := h.retryCandidate(it, -1); j >= 0 {
+			v.Why = "The review asked for earlier has no answer, so there are no review comments to draft yet. Retry it: it runs as it was asked, without the messages that came after it."
+			v.RetryKey = it.TurnKey(j)
+		} else if why := h.reviewBlocker(it, -1); why != "" {
+			v.Why = why
+		} else {
 			v.Why = "Review this pull request first: there are no review comments to draft yet. A review asked for in a Discuss message does not count; use Review this pull request."
 			v.NeedsReview = true
-			break
 		}
-		if _, _, why := h.retriableReview(it, j); why != "" {
-			v.Why = why
-			break
-		}
-		v.Why = "The review asked for earlier has no answer, so there are no review comments to draft yet. Retry it: it runs as it was asked, without the messages that came after it."
-		v.RetryKey = it.TurnKey(j)
 	default:
 		v.Ready = true
 	}
-	v.ReviewOutdated = it.ReviewOutdated()
-	v.ReviewReady = v.ReviewOutdated && it.HasReview() && !it.ReplyPending(now, reviewStaleAfter)
+	if d := it.ReviewOutdatedAt(); d >= 0 {
+		v.ReviewOutdated = true
+		switch {
+		case it.ReplyPending(now, reviewStaleAfter):
+			v.AgainWhy = "Wait for the reply in progress."
+		case h.retryCandidate(it, d) >= 0:
+			v.AgainKey = it.TurnKey(h.retryCandidate(it, d))
+		default:
+			v.AgainWhy = h.reviewBlocker(it, d)
+		}
+		v.ReviewReady = v.AgainWhy == ""
+	}
 	// Only a draft pinned to the item's pull request as it stands is offered: a
 	// write-back that changed the item's destination retires it. A draft stored under
 	// older rules is not offered either, though its receipt, if it was confirmed,
@@ -308,28 +345,29 @@ func (h *Handler) ReviewAgain(w http.ResponseWriter, r *http.Request) {
 			if it.ID != id {
 				continue
 			}
+			d, again := againReviewable(it, now)
+			first := firstReviewable(it, now)
 			switch action {
 			case reviewFirst:
-				if !firstReviewable(it, now) || unansweredReview(it) >= 0 {
+				if !first || h.retryCandidate(it, -1) >= 0 || h.reviewBlocker(it, -1) != "" {
 					return nil, nil // reviewed since, a reply in flight, a request to retry instead, or off the radar
 				}
 			case reviewRetry:
-				j := unansweredReview(it)
-				if !firstReviewable(it, now) || j < 0 || it.TurnKey(j) != turn {
-					return nil, nil // reviewed since, answered, a reply in flight, or the page is out of date
+				// The turn must be the one the thread offers to retry, as a first review
+				// or as a review of the current revision; otherwise the page is out of date.
+				j, ok := it.TurnIndex(turn)
+				if !ok || !((first && h.retryCandidate(it, -1) == j) || (again && h.retryCandidate(it, d) == j)) {
+					return nil, nil
 				}
-				choices, ind, why := h.retriableReview(it, j)
-				if why != "" {
-					return nil, nil // hidden, or a 2nd opinion no model may run
-				}
+				choices, ind, _ := h.retryChoices(it, j)
 				opt, independent = pickOption(choices, ""), ind
 				s := current[i].Restamp(j, now)
 				retry = &s
 				ref = worklist.TurnRef{Item: id, Turn: s.Key, Attempt: s.Attempt}
 				return current[i : i+1], nil
 			case reviewAgain:
-				if it.Type != worklist.TypePullRequest || !it.OnRadar() || !it.ReviewOutdated() || it.ReplyPending(now, reviewStaleAfter) {
-					return nil, nil // the review is current (or the conversation was reset), a reply in flight, or off the radar
+				if !again || h.retryCandidate(it, d) >= 0 || h.reviewBlocker(it, d) != "" {
+					return nil, nil // the review is current (or the conversation was reset), a request to retry instead, a reply in flight, or off the radar
 				}
 			}
 			current[i].Thread = append(current[i].Thread, msg)

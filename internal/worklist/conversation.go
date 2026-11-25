@@ -339,6 +339,12 @@ func (w WorkItem) Answered(key string) bool {
 	return ok
 }
 
+// Ended reports whether a system notice ended the current attempt at the user turn
+// with key (noticed): its run is done, so it can no longer answer that attempt.
+func (w WorkItem) Ended(key string) bool {
+	return w.noticed()[key]
+}
+
 // TurnIndex returns the position of the turn with key.
 func (w WorkItem) TurnIndex(key string) (int, bool) {
 	for i := range w.Thread {
@@ -433,22 +439,27 @@ func (w WorkItem) Reviewed(rev Revision) bool {
 // is stale, and drafting again (never counted redundant once a turn follows it) is
 // the way forward, not another review. A draft reply without a revision, a hidden
 // one, or a notice says nothing.
-func (w WorkItem) ReviewOutdated() bool {
+func (w WorkItem) ReviewOutdated() bool { return w.ReviewOutdatedAt() >= 0 }
+
+// ReviewOutdatedAt returns the position of the draft reply that makes the latest
+// review outdated (ReviewOutdated), or -1. Review requests after it are the ones
+// asked for the current revision.
+func (w WorkItem) ReviewOutdatedAt() int {
 	for i := len(w.Thread) - 1; i >= 0; i-- {
 		if !w.IsDraftReviewRequest(i) {
 			continue
 		}
 		j, ok := w.replies()[w.TurnKey(i)]
 		if w.Thread[i].Hidden || !ok || w.Thread[j].Hidden || w.Thread[j].Head == "" {
-			return false
+			return -1
 		}
 		latest := w.latestReview()
-		if j < latest {
-			return false
+		if j < latest || (latest >= 0 && w.Thread[latest].revision() == w.Thread[j].revision()) {
+			return -1
 		}
-		return latest < 0 || w.Thread[latest].revision() != w.Thread[j].revision()
+		return j
 	}
-	return false
+	return -1
 }
 
 // FirstReviewModel returns the chat model that produced the item's first visible

@@ -1040,3 +1040,86 @@ func TestDisabledButtonsLookDisabled(t *testing.T) {
 		t.Fatalf("app.css (%d) has no disabled button style", rec.Code)
 	}
 }
+
+// An unusable 2nd opinion never blocks an ordinary review: past a newer one no model
+// may run, an older unanswered ordinary request is offered for retry; and once a
+// notice ended the 2nd opinion's run (it can no longer answer), a new ordinary review
+// may be asked for, as an ordinary review, not a blind one. While it may still
+// answer, it blocks, and the thread says why.
+func TestUnusableSecondOpinionDoesNotBlock(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	ago := func(d time.Duration) time.Time { return time.Now().Add(-d) }
+	ordinary := worklist.Message{ID: "q1", Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, At: ago(2 * time.Hour)}
+	panel := worklist.Message{ID: "q2", Role: worklist.RoleUser, Content: worklist.IndependentReviewPrompt, Kind: worklist.KindReviewRequest, At: ago(time.Hour)}
+	ended := worklist.Message{ID: "n", ReplyTo: "q2", Role: worklist.RoleAgent, Content: worklist.ReconnectNotice, Notice: worklist.NoticeReconnect, At: ago(time.Hour)}
+
+	h, p, _ := draftFixture(t, c, []worklist.Message{ordinary, panel, ended})
+	h.options = nil // only the run's default model: no 2nd opinion can run
+	if page, _ := threadPage(t, h); !strings.Contains(page, `name="turn" value="q1"`) {
+		t.Errorf("the older ordinary request is not offered:\n%s", page)
+	}
+	postReview(h, "retry", "q1")
+	if len(p.converses) != 1 || len(p.secondOpinions) != 0 || p.turns[0].Turn != "q1" {
+		t.Errorf("retry of the ordinary request: converses %v, second opinions %v, turns %+v", p.converses, p.secondOpinions, p.turns)
+	}
+
+	h, p, store := draftFixture(t, c, []worklist.Message{panel, ended})
+	h.options = nil
+	if page, _ := threadPage(t, h); !strings.Contains(page, ">Review this pull request</button>") {
+		t.Errorf("an ended, unusable 2nd opinion blocks a first review:\n%s", page)
+	}
+	postReview(h, "first")
+	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+	last := it.Thread[len(it.Thread)-1]
+	if len(it.Thread) != 3 || last.Content != reviewPrompt || last.IsPanelReview() || len(p.converses) != 1 || len(p.secondOpinions) != 0 {
+		t.Errorf("first review beside an ended 2nd opinion: %+v, converses %v, second opinions %v", it.Thread, p.converses, p.secondOpinions)
+	}
+
+	h, p, _ = draftFixture(t, c, []worklist.Message{panel})
+	h.options = nil
+	if page, _ := threadPage(t, h); !strings.Contains(page, "no model it may use is configured") || strings.Contains(page, ">Review this pull request</button>") {
+		t.Errorf("a 2nd opinion that may still answer does not block:\n%s", page)
+	}
+	postReview(h, "first")
+	if len(p.turns) != 0 {
+		t.Error("a review was added beside a 2nd opinion that may still answer")
+	}
+}
+
+// After the backend refuses "Review the current revision", the button retries that
+// request (naming it) instead of asking again, so an outage never piles up requests
+// for the same revision; the old form adds nothing.
+func TestRefusedReReviewIsRetried(t *testing.T) {
+	const pushed = "fedcba9876543210fedcba9876543210fedcba98"
+	th := draftedThread(time.Now().Add(-time.Hour))
+	th[1].Head, th[1].Base = draftCommit, "main"
+	th[3].Head, th[3].Base = pushed, "main"
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	h, p, store := draftFixture(t, c, th)
+	p.err = ingest.ErrNotAccepted
+	rec := postReview(h, "again")
+	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+	asked := it.Thread[len(it.Thread)-1]
+	if len(it.Thread) != 5 || asked.Kind != worklist.KindReviewRequest {
+		t.Fatalf("thread after the refused re-review: %+v", it.Thread)
+	}
+	page := pageAt(t, h, rec.Header().Get("Location"))
+	if !strings.Contains(page, ">Retry the review of the current revision</button>") || !strings.Contains(page, `name="turn" value="`+asked.ID+`"`) || !strings.Contains(page, "That review attempt did not start") {
+		t.Errorf("the refused re-review is not offered for retry:\n%s", page)
+	}
+	postReview(h, "again") // the old form, clicked again during the outage
+	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); len(it.Thread) != 5 {
+		t.Errorf("a second re-review request was added: %d turns", len(it.Thread))
+	}
+	p.err = nil
+	postReview(h, "retry", asked.ID)
+	it, _, _ = store.Get(context.Background(), "github:42", draftItemID)
+	if len(it.Thread) != 5 || p.turns[len(p.turns)-1].Turn != asked.ID || it.Thread[4].Attempt == "" {
+		t.Errorf("the refused re-review was not retried as itself: %+v", p.turns)
+	}
+	// The refusal URL now describes an attempt that was superseded: with the retry
+	// running, it shows no refusal.
+	if page := pageAt(t, h, rec.Header().Get("Location")); strings.Contains(page, "That review attempt did not start") {
+		t.Error("a superseded refusal is still shown while the retry runs")
+	}
+}
