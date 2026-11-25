@@ -104,10 +104,10 @@ func TestAppendReplyDraftOnlyForDraftRequests(t *testing.T) {
 		t.Error("a reply to a review request kept a draft")
 	}
 	receipt := &DraftReceipt{State: DraftCreated, URL: "https://github.com/x"}
-	if _, err := AppendReply(&item, "d", Message{ID: "a2", Content: "drafted", Draft: draft, DraftReceipt: receipt, HiddenRev: 99, ReadRev: 99}); err != nil {
+	if _, err := AppendReply(&item, "d", Message{ID: "a2", Content: "drafted", Draft: draft, DraftReceipt: receipt, HiddenRev: 99, ReadRev: 99, ReadRevKnown: true}); err != nil {
 		t.Fatal(err)
 	}
-	if got := item.Thread[5]; got.Draft == nil || len(got.Draft.Comments) != 1 || got.DraftReceipt != nil || got.HiddenRev != 0 || got.ReadRev != 0 {
+	if got := item.Thread[5]; got.Draft == nil || len(got.Draft.Comments) != 1 || got.DraftReceipt != nil || got.HiddenRev != 0 || got.ReadRev != 0 || got.ReadRevKnown {
 		t.Fatalf("draft reply = %+v", got)
 	}
 	if _, err := AppendReply(&item, "d2", Message{ID: "a3", Content: "sign in", Notice: NoticeReconnect, Draft: draft}); err != nil {
@@ -166,10 +166,17 @@ func TestLatestDraft(t *testing.T) {
 func TestRedraftRedundant(t *testing.T) {
 	asked := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
 	q0 := Message{ID: "q0", Role: RoleUser, Content: "leave out the rename"}
-	d1 := Message{ID: "d1", Role: RoleUser, Kind: KindDraftReviewRequest, Content: "draft", At: asked}
+	d1 := Message{ID: "d1", Role: RoleUser, Kind: KindDraftReviewRequest, Content: "draft", At: asked, ReadRevKnown: true}
 	a1 := Message{ID: "a1", ReplyTo: "d1", Role: RoleAgent, Content: "drafted", Draft: pinned("x")}
 	if !draftPR(q0, d1, a1).RedraftRedundant() {
 		t.Error("a thread ending with its draft is not redundant to redraft")
+	}
+	// A request saved before revisions were recorded says nothing about toggles of
+	// its time: its draft never counts as redundant.
+	unrecorded := d1
+	unrecorded.ReadRevKnown = false
+	if draftPR(q0, unrecorded, a1).RedraftRedundant() {
+		t.Error("a draft whose request recorded no revision counts as redundant")
 	}
 	q := Message{ID: "q", Role: RoleUser, Content: "what about y?"}
 	if draftPR(d1, a1, q).RedraftRedundant() {

@@ -43,7 +43,7 @@ func draftedThread(at time.Time) []worklist.Message {
 	return []worklist.Message{
 		{ID: "q", Role: worklist.RoleUser, Content: "Can you review this PR?", Kind: worklist.KindReviewRequest, At: at},
 		{ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "Rename x.", Model: "m1", At: at},
-		{ID: "d", Role: worklist.RoleUser, Content: draftReviewPrompt, Kind: worklist.KindDraftReviewRequest, At: at},
+		{ID: "d", Role: worklist.RoleUser, Content: draftReviewPrompt, Kind: worklist.KindDraftReviewRequest, At: at, ReadRevKnown: true},
 		{ID: "a", ReplyTo: "d", Role: worklist.RoleAgent, Content: "Drafted 2.", At: at, Draft: &worklist.DraftReview{
 			Repo: "o/r", Number: 1, Commit: draftCommit, BaseRef: "main", Body: "- Add a test.",
 			Patches: map[string]string{"a.go": worklist.PatchDigest("pa"), "b.go": worklist.PatchDigest("pb")},
@@ -150,6 +150,15 @@ func TestThreadHidesRedundantDraftButton(t *testing.T) {
 		t.Error("a confirmed draft (which says to draft again to start over) left no button")
 	}
 
+	// A draft requested before gofer recorded revisions keeps the button, as it did
+	// then: toggles of that time left no trace to judge it by.
+	legacy := draftedThread(old)
+	legacy[2].ReadRevKnown = false
+	h, _, _ = draftFixture(t, connected, legacy)
+	if page, _ := threadPage(t, h); !strings.Contains(page, `action="/items/draft-review"`) {
+		t.Error("a draft whose request recorded no revision hid the button")
+	}
+
 	h, _, _ = draftFixture(t, &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true}}, draftedThread(old))
 	if page, _ := threadPage(t, h); !strings.Contains(page, "Connect GitHub to comment") {
 		t.Error("an unconnected user lost the connect link")
@@ -198,7 +207,7 @@ func TestDraftReviewRefusesRedundantRedraft(t *testing.T) {
 	// discussion since made it not so.
 	newerDraft := func(extra ...worklist.Message) []worklist.Message {
 		th := append(draftedThread(time.Now().Add(-time.Hour)),
-			worklist.Message{ID: "d2", Role: worklist.RoleUser, Content: draftReviewPrompt, Kind: worklist.KindDraftReviewRequest, At: time.Now().Add(-time.Hour)},
+			worklist.Message{ID: "d2", Role: worklist.RoleUser, Content: draftReviewPrompt, Kind: worklist.KindDraftReviewRequest, At: time.Now().Add(-time.Hour), ReadRevKnown: true},
 			worklist.Message{ID: "a2", ReplyTo: "d2", Role: worklist.RoleAgent, Content: "Drafted 1.", At: time.Now().Add(-time.Hour), Draft: &worklist.DraftReview{
 				Repo: "o/r", Number: 1, Commit: strings.Repeat("b", 40), BaseRef: "main",
 				Patches:  map[string]string{"a.go": worklist.PatchDigest("pa2")},
@@ -302,7 +311,7 @@ func TestDraftReviewDispatches(t *testing.T) {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		h.DraftReview(httptest.NewRecorder(), req)
 		it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
-		if got := it.Thread[len(it.Thread)-1]; got.Kind != worklist.KindDraftReviewRequest || got.ReadRev != 7 {
+		if got := it.Thread[len(it.Thread)-1]; got.Kind != worklist.KindDraftReviewRequest || got.ReadRev != 7 || !got.ReadRevKnown {
 			t.Errorf("the request did not record the thread's revision: %+v", got)
 		}
 	}
@@ -323,8 +332,8 @@ func TestDraftReviewDispatches(t *testing.T) {
 	if last.Kind != worklist.KindDraftReviewRequest || len(p.turns) != 1 || p.turns[0].Turn != last.ID || p.converseModels[0] != "m0" {
 		t.Fatalf("appended %+v, dispatched %+v models %v", last, p.turns, p.converseModels)
 	}
-	if last.ReadRev != 0 {
-		t.Errorf("ReadRev = %d on a thread nothing was ever hidden in", last.ReadRev)
+	if last.ReadRev != 0 || !last.ReadRevKnown {
+		t.Errorf("ReadRev = %d (known %v) on a thread nothing was ever hidden in", last.ReadRev, last.ReadRevKnown)
 	}
 	// The request is now pending: a second click does nothing.
 	post(h)

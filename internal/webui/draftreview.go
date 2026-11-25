@@ -154,7 +154,7 @@ func (h *Handler) DraftReview(w http.ResponseWriter, r *http.Request) {
 				return nil, nil // a stale page: no review yet, a reply in flight, a draft already last, or off the radar
 			}
 			req := msg
-			req.ReadRev = current[i].VisibilityRev() // inside the update, ordered with every hide
+			req.ReadRev, req.ReadRevKnown = current[i].VisibilityRev(), true // inside the update, ordered with every hide
 			current[i].Thread = append(current[i].Thread, req)
 			appended = true
 			return current[i : i+1], nil

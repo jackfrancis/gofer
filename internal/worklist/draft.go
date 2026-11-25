@@ -239,7 +239,10 @@ func (w WorkItem) latestDraft() (req, reply int) {
 // above the request's ReadRev), so hiding or unhiding an earlier instruction opens
 // drafting again. Revisions, not times, order the two: each is assigned inside the
 // store update that saved it, and a retry of the request keeps its ReadRev, so a
-// slow first run's draft is still judged by what it could have read. A toggle after
+// slow first run's draft is still judged by what it could have read. A request
+// saved before revisions were recorded (no ReadRevKnown) cannot be judged so, and
+// its draft never counts as redundant: the thread keeps the button, as it did then.
+// A toggle after
 // the request but before its run read the thread counts too, which errs toward
 // offering the button. A confirmed draft (any receipt) is used up: the thread says to
 // draft again to start over. A retired draft (an empty redraft, a hidden request or
@@ -255,6 +258,9 @@ func (w WorkItem) RedraftRedundant() bool {
 		return false
 	}
 	if !w.Thread[i].Draft.For(w) || w.Thread[i].DraftReceipt != nil {
+		return false
+	}
+	if !w.Thread[req].ReadRevKnown {
 		return false
 	}
 	read := w.Thread[req].ReadRev

@@ -39,8 +39,11 @@ review's text is written by a model, so this feature needs that rule amended.
    takes the thread's next visibility revision (`Message.HiddenRev`, assigned by
    `WorkItem.SetHidden` inside the store update that saves it), and the request records
    the revision current when it was saved (`Message.ReadRev`, read inside its own
-   update and kept by a retry, which restamps only the time). Runs never set either:
-   `AppendReply` clears both on a reply. The request handler refuses a
+   update and kept by a retry, which restamps only the time), marking it recorded
+   (`Message.ReadRevKnown`). A request saved before revisions were recorded has no
+   such mark, and toggles of its time left no revision, so its draft never counts as
+   redundant: such a thread keeps the button, as it did before. Runs never set any of
+   these: `AppendReply` clears them on a reply. The request handler refuses a
    redundant one from a stale page. The draft's head is not compared with the item's,
    since gofer has no observation of the head it can order against the drafter's own
    read: a confirmation GitHub refuses as out of date (a new head, or a moved base)
