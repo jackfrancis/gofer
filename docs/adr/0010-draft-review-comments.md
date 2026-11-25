@@ -29,6 +29,10 @@ review's text is written by a model, so this feature needs that rule amended.
    the default model, as any Discuss turn. It is offered only when commenting is
    configured, on a pull request on the radar with a completed review and no reply in
    flight; without a connected write grant the thread links to connecting it instead.
+   While it is disabled the thread says why in visible text (Safari shows no tooltip
+   on a disabled button), and with no review yet it offers "Review this pull request"
+   right there (`webui.ReviewAgain`), since a review asked for in a Discuss message is
+   not a review request.
    It is not shown while drafting again would only repeat the offered draft
    (`WorkItem.RedraftRedundant`), because the drafter would read the conversation it
    read: the draft is unconfirmed and pinned to the item's pull request, no turn after

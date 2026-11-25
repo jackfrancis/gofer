@@ -70,6 +70,10 @@ type draftThread struct {
 	// of the current revision, enabled while no reply is in flight (ReviewReady).
 	ReviewOutdated bool
 	ReviewReady    bool
+	// NeedsReview marks a pull request with no completed review and no reply in
+	// flight: the draft button is disabled for want of one, so the thread offers a
+	// review right there ("Review this pull request", webui.ReviewAgain).
+	NeedsReview bool
 }
 
 // reviewCreator returns the commenter's pending-review side, if it has one.
@@ -91,10 +95,13 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 	switch {
 	case connected && it.RedraftRedundant():
 		v.Redundant = true
-	case !it.HasReview():
-		v.Why = "Review this pull request first: there are no review comments to draft yet."
 	case it.ReplyPending(now, reviewStaleAfter):
+		// Before the review check: a first review still running is a wait, not a
+		// missing review.
 		v.Why = "Wait for the reply in progress, so the draft includes it."
+	case !it.HasReview():
+		v.Why = "Review this pull request first: there are no review comments to draft yet. A review asked for in a Discuss message does not count; use Review this pull request."
+		v.NeedsReview = true
 	default:
 		v.Ready = true
 	}
@@ -193,12 +200,14 @@ func (h *Handler) DraftReview(w http.ResponseWriter, r *http.Request) {
 }
 
 // ReviewAgain handles POST /items/review-again, the thread's "Review the current
-// revision": offered when the newest draft read a pull request revision other than
-// the one the latest review read (WorkItem.ReviewOutdated), so no approval could be
-// drafted from it. It appends a review request, keeping the conversation, and
-// dispatches it to the default model; its answer records the revision it read, so a
-// draft afterwards can approve it. A stale page (the review already current, a reply
-// in flight, the item off the radar) appends nothing.
+// revision" and "Review this pull request": offered when the newest draft read a
+// pull request revision other than the one the latest review read
+// (WorkItem.ReviewOutdated), so no approval could be drafted from it, or when the
+// pull request has no completed review yet, so nothing can be drafted at all. It
+// appends a review request, keeping the conversation, and dispatches it to the
+// default model; its answer records the revision it read, so a draft afterwards can
+// use it. A stale page (the review already current, a reply in flight, the item off
+// the radar) appends nothing.
 func (h *Handler) ReviewAgain(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
 	if user == nil || !h.convEnabled {
@@ -212,7 +221,7 @@ func (h *Handler) ReviewAgain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := h.now().UTC()
-	msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Content: reviewAgainPrompt, Kind: worklist.KindReviewRequest, At: now}
+	msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Kind: worklist.KindReviewRequest, At: now}
 	appended := false
 	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		appended = false
@@ -221,10 +230,20 @@ func (h *Handler) ReviewAgain(w http.ResponseWriter, r *http.Request) {
 			if it.ID != id {
 				continue
 			}
-			if it.Type != worklist.TypePullRequest || !it.OnRadar() || !it.ReviewOutdated() || it.ReplyPending(now, reviewStaleAfter) {
+			if it.Type != worklist.TypePullRequest || !it.OnRadar() || it.ReplyPending(now, reviewStaleAfter) {
 				return nil, nil
 			}
-			current[i].Thread = append(current[i].Thread, msg)
+			req := msg
+			switch {
+			case !it.HasReview():
+				req.Content = reviewPrompt
+			case it.ReviewOutdated():
+				req.Content = reviewAgainPrompt
+			default:
+				return nil, nil
+			}
+			msg = req
+			current[i].Thread = append(current[i].Thread, req)
 			appended = true
 			return current[i : i+1], nil
 		}

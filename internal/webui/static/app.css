@@ -46,6 +46,11 @@ body {
   text-decoration: none; font-size: 14px; font-weight: 500; cursor: pointer;
 }
 .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+/* A disabled button must look disabled: .btn's own colors override the browser's
+   disabled look, and Safari shows no tooltip on a disabled element, so without this
+   a disabled button looks clickable and does nothing. Its reason is shown as text
+   beside it (zz-why). */
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
 /* Destructive action (Reset Conversations): outlined, not filled — it sits beside the
    batch actions and should read as a deliberate choice, not a primary one. */
 .btn-danger { color: var(--danger); border-color: var(--danger); background: #fff; }

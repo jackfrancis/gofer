@@ -813,3 +813,54 @@ func TestClaimSavesTheBody(t *testing.T) {
 		t.Errorf("an interrupted claim shows no body:\n%s", page)
 	}
 }
+
+// A disabled Draft Review Comments button says why in visible text, since Safari
+// shows no tooltip on a disabled button and the stylesheet must mark it disabled.
+// With no review yet, the thread offers one right there: it appends a review
+// request (keeping the conversation) and dispatches it to the default model. While
+// a reply is in flight the reason is to wait, and no review is offered.
+func TestDisabledDraftButtonSaysWhy(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	asked := []worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: "can you review this?", At: time.Now().Add(-time.Hour)}, {ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "Looks fine.", At: time.Now().Add(-time.Hour)}}
+	h, p, store := draftFixture(t, c, asked)
+	page, _ := threadPage(t, h)
+	for _, want := range []string{`<p class="zz-meta zz-why">Review this pull request first`, `action="/items/review-again"`, ">Review this pull request</button>"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("thread lacks %q", want)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/items/review-again", strings.NewReader(url.Values{"id": {draftItemID}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.ReviewAgain(httptest.NewRecorder(), req)
+	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+	last := it.Thread[len(it.Thread)-1]
+	if len(it.Thread) != 3 || last.Kind != worklist.KindReviewRequest || last.Content != reviewPrompt || len(p.turns) != 1 || p.turns[0].Turn != last.ID || p.converseModels[0] != "m0" {
+		t.Fatalf("appended %+v, dispatched %+v", last, p.turns)
+	}
+	// The review is now in flight: wait, and no second review is offered.
+	page, _ = threadPage(t, h)
+	if !strings.Contains(page, `<p class="zz-meta zz-why">Wait for the reply in progress`) || strings.Contains(page, ">Review this pull request</button>") {
+		t.Errorf("pending review: reason or button wrong:\n%s", page)
+	}
+	// A reviewed pull request offers no review from here, and the button is enabled.
+	h, p, _ = draftFixture(t, c, draftedThread(time.Now().Add(-time.Hour))[:2])
+	page, _ = threadPage(t, h)
+	if strings.Contains(page, "zz-why") || strings.Contains(page, ">Review this pull request</button>") {
+		t.Errorf("a reviewed pull request shows a reason or a review button")
+	}
+	req = httptest.NewRequest(http.MethodPost, "/items/review-again", strings.NewReader(url.Values{"id": {draftItemID}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.ReviewAgain(httptest.NewRecorder(), req)
+	if len(p.turns) != 0 {
+		t.Error("a current review was reviewed again")
+	}
+}
+
+// The stylesheet marks a disabled button as such.
+func TestDisabledButtonsLookDisabled(t *testing.T) {
+	rec := httptest.NewRecorder()
+	(&Handler{}).Static().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/static/app.css", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), ".btn:disabled") {
+		t.Fatalf("app.css (%d) has no disabled button style", rec.Code)
+	}
+}

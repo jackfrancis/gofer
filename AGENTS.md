@@ -688,7 +688,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   checked by `AppendReply` whatever the run sent; the run flags a stale review
   whatever the model answered, and while the latest review is older than the draft
   the thread offers "Review the current revision", `WorkItem.ReviewOutdated`,
-  `POST /items/review-again`; model-written draft text is LF-normalized and has
+  `POST /items/review-again`, which with no review at all offers "Review this pull
+  request" (a disabled draft button says why in text: Safari shows no tooltip on a
+  disabled button, and `.btn:disabled` must look disabled); model-written draft text is LF-normalized and has
   every bot-command line made inert, `worklist.NeutralizeCommands` in `BoundDraft`,
   a suggestion block holding one (found by goldmark, lists included) turned into
   plain code rather than altered, so the checkbox is the only source of a command; a stored draft `BoundDraft` would change
