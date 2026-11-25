@@ -28,6 +28,13 @@ data:
   # bulk comment: a SEPARATE classic OAuth app (callback BASE_URL +
   # /auth/github-write/callback) that each user connects to let gofer post their
   # own comments (public_repo). It must not be the sign-in app (ADR 0009).
+  # GITHUB_WRITE_TOKENS=true (with the write client above) also lets each user
+  # connect commenting with a classic personal access token (public_repo only, an
+  # expiry of 90 days or less) for organizations that block unapproved OAuth apps.
+  # gofer cannot revoke such a token; the user deletes it on GitHub (ADR 0011). It
+  # needs an https BASE_URL (startup fails otherwise, except on loopback).
+  # Deliberately absent here, so a deploy never turns it on or off: set it on the
+  # live ConfigMap, then restart gofer-0.
   # REFRESH_INTERVAL (a Go duration, at least 1m, e.g. "15m") refreshes every
   # populated worklist from GitHub on that schedule; each refresh is a full ingest
   # run (GitHub walk, enrich, rank). With a chat model configured, each tick also

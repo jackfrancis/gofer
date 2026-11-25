@@ -159,6 +159,13 @@ Wired on the web-tier side; they define what a runtime must respect:
   independently. It posts only what the user confirmed: their own comment, with no
   model involved, or the comments they kept from a draft review, created as a
   PENDING review that only they see until they submit it on GitHub (ADR 0010).
+  Where the deployment allows it (`GITHUB_WRITE_TOKENS`, ADR 0011), the user may
+  connect with a classic personal access token instead, in the same vault slot:
+  exactly `public_repo` (checked at connection and again before every write), an
+  expiry within 90 days, the signed-in account, an https `BASE_URL`, stored only when
+  no usable grant is connected. gofer cannot revoke a token, so disconnect and logout
+  delete its copy and send the user to GitHub's token settings; a token is never sent
+  to an OAuth app endpoint.
 
 ## Conventions & gotchas
 
@@ -641,6 +648,47 @@ Wired on the web-tier side; they define what a runtime must respect:
   branch), and, checked last, the pull request is open with the draft's head and base
   branch; the POST has no `event`, so GitHub keeps it pending. Any 5xx on a ghcomment
   POST is an unknown outcome, never "not posted". gofer never submits a review.
+- Commenting with a personal access token (ADR 0011, `internal/auth/token.go`) is
+  opt-in (`GITHUB_WRITE_TOKENS=true`, which config refuses without the write
+  client or without an https `BASE_URL`, loopback excepted; a bad value is never
+  echoed). The token is stored as the write grant (provider `github-write`,
+  `ClientID` = `auth.PersonalTokenClient`), so the lock, versioning, logout ledger and
+  the broker's refusal all apply unchanged. `ConnectWriteToken` checks it with
+  `GET /user` (classic: `X-OAuth-Scopes` present; scopes exactly `public_repo`; an
+  expiry header within `maxTokenLifetime`; the session's account; the allow-list) and
+  stores it only when nothing usable is connected or pending (`storeWriteToken`; an
+  expired token is replaced, a pending disconnect nobody here is running is finished
+  first through `claimLogout`/`runLogout`, and the OAuth callback refuses to replace
+  a live token, revoking its new OAuth token). Read
+  through `fromConfiguredClient` (a token counts only while tokens are allowed) and
+  `tokenExpired` (an expired token is not connected and not handed out). Every
+  stranded state keeps a way out on the radar (`CommentingState`): an expired or
+  disabled token (stored while tokens were allowed) or a grant from a previous
+  commenting app (`OtherClient`) gets Disconnect, and a pending cleanup gets Retry
+  disconnect. The OAuth callback enforces it too (the thread page has its own
+  connect link): it refuses to replace a live token or another app's grant. A token
+  connection that ran a pending disconnect first reports what that left
+  (`tokenConnectedNotice`, `priorWarning` on failure): an OAuth grant GitHub did not
+  confirm revoked sends the user to revoke it, since gofer no longer holds it; a
+  credential of unknown kind names both settings pages; the copy is called deleted
+  only once the vault confirmed it; and the token just connected is never one to
+  delete. A rejection
+  is confirmed with `GET /user` (`tokenAlive`), never check-token, and logout's
+  `revokeLocked` skips revocation for a token (`tokensSettings`). Report a deletion
+  only from `logoutResult.tokenDeleted`/`cleanupPending`, never from which settings
+  page is listed, and report `cleanupPending` even when revocation was `confirmed`
+  (for a non-GitHub provider "confirmed" only means nothing to revoke: claim no
+  revocation), and nothing about cleanup from a logout that did not own it
+  (`cleanupUnknown`). A revocation GitHub confirmed is remembered for that
+  credential version (`credLocks.revoked`, in memory), so a retry only deletes.
+  Every ghcomment write checks the token's `X-OAuth-Scopes` on the
+  request before it (`writeRepo`): more than `public_repo` writes nothing
+  (`ErrTokenScopes`), and the service drops a widened token (`WriteScopesChanged`,
+  which reports whether the vault confirmed the deletion; only then do the words say
+  so); a missing header writes nothing either (`ErrScopesUnknown`) and keeps the
+  credential. `ghcomment` reads an
+  organization's OAuth App access restriction as `AppRestrictedError`, which the
+  comment service words for the user.
 - Schema changes are a new numbered file in `internal/storage/migrations/`; never
   edit an applied one.
 - To ship a workload-only change (`internal/agent`, `internal/llm`,

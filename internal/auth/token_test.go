@@ -1,0 +1,868 @@
+package auth
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jackfrancis/gofer/internal/session"
+	"github.com/jackfrancis/gofer/internal/vault"
+)
+
+// patToken is a classic token for the tests (ghp_ + 36 characters).
+const (
+	patToken   = "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+	patToken2  = "ghp_" + "ZYXWVUTSRQPONMLKJIHGFEDCBA9876543210"
+	tokenClock = "2026-11-24 12:00:00 UTC"
+)
+
+// patInfo is what the fake GitHub says about one token.
+type patInfo struct {
+	id     int64
+	login  string
+	scopes *string // the X-OAuth-Scopes header; nil = none sent (a fine-grained token)
+	expiry string  // the expiration header; "" = none (never expires)
+}
+
+// patGitHub answers GET /user per token, with the headers GitHub sends, and passes
+// the OAuth apps' /applications calls through to the main fake GitHub. It records
+// whether any of those carried a personal access token: gofer must never send one to
+// an OAuth app's revoke or check endpoint.
+type patGitHub struct {
+	srv *httptest.Server
+
+	mu      sync.Mutex
+	tokens  map[string]patInfo
+	patToOA bool // a personal access token reached /applications
+}
+
+func newPATGitHub(t *testing.T, gh *fakeGitHub) *patGitHub {
+	t.Helper()
+	f := &patGitHub{tokens: map[string]patInfo{}}
+	target, _ := url.Parse(gh.srv.URL)
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/applications/") {
+			body, _ := io.ReadAll(r.Body)
+			if strings.Contains(string(body), "ghp_") {
+				f.mu.Lock()
+				f.patToOA = true
+				f.mu.Unlock()
+			}
+			r.Body = io.NopCloser(strings.NewReader(string(body)))
+			proxy.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path != "/user" {
+			http.NotFound(w, r)
+			return
+		}
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		f.mu.Lock()
+		info, ok := f.tokens[tok]
+		f.mu.Unlock()
+		if !ok {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"Bad credentials"}`))
+			return
+		}
+		if info.scopes != nil {
+			w.Header().Set("X-OAuth-Scopes", *info.scopes)
+		}
+		if info.expiry != "" {
+			w.Header().Set("GitHub-Authentication-Token-Expiration", info.expiry)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": info.id, "login": info.login})
+	}))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *patGitHub) set(token string, info patInfo) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tokens[token] = info
+}
+
+func (f *patGitHub) kill(token string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.tokens, token)
+}
+
+func scopes(s string) *string { return &s }
+
+// goodPAT is a classic, public_repo-only token for octocat (id 42) expiring 30 days
+// after tokenClock.
+func goodPAT() patInfo {
+	return patInfo{id: 42, login: "octocat", scopes: scopes("public_repo"), expiry: "2026-12-24 12:00:00 UTC"}
+}
+
+// newTokenHandler is a write-grant handler that allows tokens, signed in as octocat,
+// with GitHub's /user answered per token from then on.
+func newTokenHandler(t *testing.T) (*Handler, *http.Request, *patGitHub, *fakeGitHub, vault.Vault) {
+	t.Helper()
+	gh := newFakeGitHub(t)
+	h, _, cfg, vlt := newWriteHandler(t, gh)
+	cfg.Providers.GitHubWriteTokens = true
+	h.providers[WriteProvider].tokens = true
+	now, _ := time.Parse("2006-01-02 15:04:05 MST", tokenClock)
+	h.now = func() time.Time { return now }
+	_, signedIn := signIn(t, h)
+	pat := newPATGitHub(t, gh)
+	h.githubAPIBase = pat.srv.URL
+	return h, signedIn, pat, gh, vlt
+}
+
+func postToken(h *Handler, signedIn *http.Request, token string, header ...string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, writePath+"/token", strings.NewReader(url.Values{"token": {token}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	for i := 0; i+1 < len(header); i += 2 {
+		req.Header.Set(header[i], header[i+1])
+	}
+	for _, c := range signedIn.Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.ConnectWriteToken(rec, req)
+	return rec
+}
+
+// A classic, public_repo-only token from the signed-in account, expiring within 90
+// days, is stored as the write grant: the web tier posts with it, and the broker
+// still never vends it to a run.
+func TestConnectWriteTokenStoresAClassicToken(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	rec := postToken(h, signedIn, patToken)
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/?commenting=token" {
+		t.Fatalf("connect: %d %q %s", rec.Code, rec.Header().Get("Location"), rec.Body)
+	}
+	c, ok := writeStored(t, vlt)
+	if !ok || c.ClientID != PersonalTokenClient || c.AccessToken != patToken || c.Login != "octocat" || c.Version == "" || c.RefreshToken != "" {
+		t.Fatalf("stored = %+v (ok=%v)", c, ok)
+	}
+	if want, _ := time.Parse("2006-01-02 15:04:05 MST", "2026-12-24 12:00:00 UTC"); !c.Expiry.Equal(want) {
+		t.Errorf("expiry = %v, want %v", c.Expiry, want)
+	}
+	st := h.CommentingState(bg, user)
+	if !st.Connected || !st.Token || !st.TokensAllowed || st.Expires.IsZero() {
+		t.Errorf("state = %+v", st)
+	}
+	if got, err := h.WriteCredential(bg, user); err != nil || got.AccessToken != patToken {
+		t.Errorf("WriteCredential = %v", err)
+	}
+	if _, err := h.Credential(bg, user, WriteProvider, VendRequest{}); !errors.Is(err, vault.ErrNotFound) {
+		t.Errorf("the broker vended the token: %v", err)
+	}
+}
+
+// Every token gofer should not hold is refused, nothing is stored, and the token is
+// never echoed back.
+func TestConnectWriteTokenRefusals(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	for name, tc := range map[string]struct {
+		token  string
+		info   *patInfo
+		header []string
+		status int
+		why    string
+	}{
+		"fine-grained prefix": {token: "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz", status: 400, why: "fine-grained"},
+		"not a token":         {token: "hunter2", status: 400, why: "does not look like"},
+		"rejected":            {token: patToken, status: 400, why: "GitHub rejected"},
+		"no scopes header":    {token: patToken, info: &patInfo{id: 42, login: "octocat", expiry: "2026-12-24 12:00:00 UTC"}, status: 400, why: "not a classic token"},
+		"broader scopes":      {token: patToken, info: &patInfo{id: 42, login: "octocat", scopes: scopes("public_repo, repo"), expiry: "2026-12-24 12:00:00 UTC"}, status: 400, why: "exactly one scope"},
+		"no scopes":           {token: patToken, info: &patInfo{id: 42, login: "octocat", scopes: scopes(""), expiry: "2026-12-24 12:00:00 UTC"}, status: 400, why: "it has none"},
+		"never expires":       {token: patToken, info: &patInfo{id: 42, login: "octocat", scopes: scopes("public_repo")}, status: 400, why: "never expires"},
+		"expires too late":    {token: patToken, info: &patInfo{id: 42, login: "octocat", scopes: scopes("public_repo"), expiry: "2027-06-24 12:00:00 UTC"}, status: 400, why: "more than 90 days"},
+		"other account":       {token: patToken, info: &patInfo{id: 7, login: "mallory", scopes: scopes("public_repo"), expiry: "2026-12-24 12:00:00 UTC"}, status: 403, why: "different GitHub account"},
+		"cross-site":          {token: patToken, info: func() *patInfo { p := goodPAT(); return &p }(), header: []string{"Sec-Fetch-Site", "cross-site"}, status: 403},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pat.kill(patToken)
+			if tc.info != nil {
+				pat.set(patToken, *tc.info)
+			}
+			rec := postToken(h, signedIn, tc.token, tc.header...)
+			if rec.Code != tc.status || !strings.Contains(rec.Body.String(), tc.why) {
+				t.Errorf("%d %s", rec.Code, rec.Body)
+			}
+			if strings.Contains(rec.Body.String(), tc.token) {
+				t.Error("the token was echoed back")
+			}
+			if _, ok := writeStored(t, vlt); ok {
+				t.Error("a token was stored")
+			}
+		})
+	}
+}
+
+// A token is refused while commenting is already connected (so an OAuth grant is never
+// orphaned unrevoked), and when the deployment does not allow tokens.
+func TestConnectWriteTokenNeedsRoomAndPermission(t *testing.T) {
+	h, signedIn, pat, gh, vlt := newTokenHandler(t)
+	h.githubAPIBase = gh.srv.URL // the OAuth connect re-checks with the main fake
+	connectWrite(t, h, signedIn)
+	h.githubAPIBase = pat.srv.URL
+	oauth, _ := writeStored(t, vlt)
+	pat.set(patToken, goodPAT())
+	if rec := postToken(h, signedIn, patToken); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "already connected") {
+		t.Errorf("connected: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); c.AccessToken != oauth.AccessToken {
+		t.Error("the OAuth grant was replaced")
+	}
+	h.providers[WriteProvider].tokens = false
+	if rec := postToken(h, signedIn, patToken); rec.Code != http.StatusNotFound {
+		t.Errorf("tokens off: %d", rec.Code)
+	}
+}
+
+// An expired token, or one stored while tokens were allowed and no longer are, is
+// not used: the user connects again.
+func TestStoredTokenStopsWorking(t *testing.T) {
+	h, signedIn, pat, _, _ := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	later, _ := time.Parse("2006-01-02 15:04:05 MST", "2026-12-24 12:00:01 UTC")
+	h.now = func() time.Time { return later }
+	if st := h.CommentingState(bg, user); st.Connected {
+		t.Errorf("an expired token reads as connected: %+v", st)
+	}
+	if _, err := h.WriteCredential(bg, user); !errors.Is(err, vault.ErrSignInRequired) {
+		t.Errorf("an expired token was handed out: %v", err)
+	}
+	h.now = func() time.Time { t0, _ := time.Parse("2006-01-02 15:04:05 MST", tokenClock); return t0 }
+	h.providers[WriteProvider].tokens = false
+	if _, err := h.WriteCredential(bg, user); !errors.Is(err, vault.ErrSignInRequired) {
+		t.Errorf("a token was handed out with tokens turned off: %v", err)
+	}
+}
+
+// Disconnecting deletes gofer's copy without asking an OAuth app to revoke it (it
+// cannot), and tells the user to delete the token on GitHub.
+func TestDisconnectTokenDeletesWithoutRevoking(t *testing.T) {
+	h, signedIn, pat, gh, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	req := httptest.NewRequest(http.MethodPost, writePath+"/disconnect", nil)
+	for _, c := range signedIn.Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.DisconnectWrite(rec, req)
+	if rec.Header().Get("Location") != "/?commenting=token-deleted" {
+		t.Fatalf("disconnect: %d %q", rec.Code, rec.Header().Get("Location"))
+	}
+	if _, ok := writeStored(t, vlt); ok {
+		t.Error("the token is still stored")
+	}
+	if pat.patToOA || gh.tokensRevoked.Load() != 0 || gh.revokedOther.Load() != 0 {
+		t.Errorf("gofer tried to revoke the token through an OAuth app (sent=%v)", pat.patToOA)
+	}
+	if st := h.CommentingState(bg, user); st.Connected {
+		t.Errorf("still connected: %+v", st)
+	}
+}
+
+// Signing out deletes the token too, and says only the user can revoke it.
+func TestLogoutWithTokenSaysDeleteIt(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	for _, c := range signedIn.Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.Logout(rec, req)
+	var body struct {
+		Message  string   `json:"message"`
+		Settings []string `json:"settings_urls"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &body)
+	if rec.Code != http.StatusOK || !strings.Contains(body.Message, "commenting token") || len(body.Settings) != 1 || body.Settings[0] != tokensSettings {
+		t.Fatalf("logout: %d %s", rec.Code, rec.Body)
+	}
+	if _, ok := writeStored(t, vlt); ok {
+		t.Error("the token is still stored after logout")
+	}
+	if pat.patToOA {
+		t.Error("gofer sent the token to an OAuth app endpoint")
+	}
+}
+
+// A 401 on a token is confirmed with GitHub (GET /user) before the token is dropped;
+// a token GitHub still accepts is kept.
+func TestWriteRejectedToken(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	c, _ := writeStored(t, vlt)
+	h.WriteRejected(bg, user, c.Version)
+	if _, ok := writeStored(t, vlt); !ok {
+		t.Fatal("a token GitHub still accepts was dropped")
+	}
+	pat.kill(patToken)
+	h.WriteRejected(bg, user, c.Version)
+	if _, ok := writeStored(t, vlt); ok {
+		t.Error("a token GitHub rejects was kept")
+	}
+	if pat.patToOA {
+		t.Error("gofer checked the token with an OAuth app endpoint")
+	}
+}
+
+// GitHub's expiration header parses in both forms it is known to use.
+func TestInspectTokenExpiryFormats(t *testing.T) {
+	h, _, pat, _, _ := newTokenHandler(t)
+	for _, exp := range []string{"2026-12-24 12:00:00 UTC", "2026-12-24 12:00:00 +0000"} {
+		info := goodPAT()
+		info.expiry = exp
+		pat.set(patToken2, info)
+		got, err := h.inspectToken(bg, patToken2)
+		if err != nil || got.expiry.Format(time.RFC3339) != "2026-12-24T12:00:00Z" || !got.classic || strconv.Itoa(len(got.scopes)) != "1" {
+			t.Errorf("%s: %+v %v", exp, got, err)
+		}
+	}
+}
+
+// faultyVault fails Delete (or Get of the write grant) on demand, as a database
+// could; everything else reaches the real vault.
+type faultyVault struct {
+	vault.Vault
+	failDelete, failGet bool
+	// unreadable fails Get of the write grant until a Delete of it succeeds: a
+	// corrupted row gofer can remove but not read.
+	unreadable bool
+}
+
+func (f *faultyVault) Delete(ctx context.Context, userID, provider string) error {
+	if f.failDelete && provider == WriteProvider {
+		return errors.New("disk on fire")
+	}
+	err := f.Vault.Delete(ctx, userID, provider)
+	if err == nil && provider == WriteProvider {
+		f.unreadable = false
+	}
+	return err
+}
+
+func (f *faultyVault) Get(ctx context.Context, userID, provider string) (vault.Credential, error) {
+	if (f.failGet || f.unreadable) && provider == WriteProvider {
+		return vault.Credential{}, errors.New("disk on fire")
+	}
+	return f.Vault.Get(ctx, userID, provider)
+}
+
+func disconnect(h *Handler, signedIn *http.Request) string {
+	req := httptest.NewRequest(http.MethodPost, writePath+"/disconnect", nil)
+	for _, c := range signedIn.Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.DisconnectWrite(rec, req)
+	return rec.Header().Get("Location")
+}
+
+// An expired token reads as expired, and a new one replaces it from the radar without
+// disconnecting first; while it is live it still blocks a replacement.
+func TestExpiredTokenCanBeRenewed(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	later, _ := time.Parse("2006-01-02 15:04:05 MST", "2026-12-24 12:00:01 UTC")
+	h.now = func() time.Time { return later }
+	st := h.CommentingState(bg, user)
+	if st.Connected || !st.TokenExpired || st.Expires.IsZero() {
+		t.Fatalf("state = %+v", st)
+	}
+	renewed := goodPAT()
+	renewed.expiry = "2027-01-24 12:00:00 UTC"
+	pat.set(patToken2, renewed)
+	if rec := postToken(h, signedIn, patToken2); rec.Code != http.StatusSeeOther {
+		t.Fatalf("renew: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); c.AccessToken != patToken2 {
+		t.Error("the expired token was not replaced")
+	}
+	if st := h.CommentingState(bg, user); !st.Connected || !st.Token || st.TokenExpired {
+		t.Errorf("after renewal: %+v", st)
+	}
+}
+
+// An OAuth connection that finishes after a token was connected in another tab does
+// not replace the live token: its new OAuth token is discarded. An expired token it
+// may replace.
+func TestLateOAuthCallbackKeepsALiveToken(t *testing.T) {
+	h, signedIn, pat, gh, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	rec, _, _ := connectWrite(t, h, signedIn)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "personal access token") {
+		t.Fatalf("callback: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); c.AccessToken != patToken {
+		t.Error("the live token was replaced by the OAuth grant")
+	}
+	if gh.tokensRevoked.Load() != 1 {
+		t.Errorf("the refused OAuth token was not discarded: %d revoked", gh.tokensRevoked.Load())
+	}
+	later, _ := time.Parse("2006-01-02 15:04:05 MST", "2026-12-24 12:00:01 UTC")
+	h.now = func() time.Time { return later }
+	if rec, _, _ := connectWrite(t, h, signedIn); rec.Code != http.StatusFound {
+		t.Fatalf("callback over an expired token: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); isPersonalToken(c) {
+		t.Error("the expired token was not replaced by the OAuth grant")
+	}
+}
+
+// Deletion is reported only once the vault confirms it: a failed delete says cleanup
+// is pending (the logout stays recorded, so the token is not used), never "deleted".
+// A credential gofer could not read gets both GitHub settings pages.
+func TestDisconnectReportsDeletionHonestly(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	fv := &faultyVault{Vault: vlt, failDelete: true}
+	h.vault = fv
+	if loc := disconnect(h, signedIn); loc != "/?commenting=disconnect-pending" {
+		t.Fatalf("failed delete: %q", loc)
+	}
+	if _, ok := writeStored(t, vlt); !ok {
+		t.Fatal("test setup: the row should still be there")
+	}
+	if st := h.CommentingState(bg, user); st.Connected {
+		t.Errorf("a token whose disconnect is pending reads as connected: %+v", st)
+	}
+	if _, err := h.WriteCredential(bg, user); err == nil {
+		t.Error("a token whose disconnect is pending was handed out")
+	}
+	fv.failDelete = false
+	if _, err := h.WriteCredential(bg, user); err == nil {
+		t.Error("the next access handed out the token instead of finishing the logout")
+	}
+	if _, ok := writeStored(t, vlt); ok {
+		t.Error("the next credential access did not finish the deletion")
+	}
+
+	// Unreadable: gofer cannot tell which kind it held.
+	h2, signedIn2, pat2, _, vlt2 := newTokenHandler(t)
+	pat2.set(patToken, goodPAT())
+	postToken(h2, signedIn2, patToken)
+	h2.vault = &faultyVault{Vault: vlt2, failGet: true}
+	if loc := disconnect(h2, signedIn2); loc != "/?commenting=unconfirmed-any" {
+		t.Errorf("unreadable: %q", loc)
+	}
+}
+
+// Signing out with a delete that fails says cleanup is pending, not that the token is
+// gone.
+func TestLogoutReportsPendingCleanup(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	h.vault = &faultyVault{Vault: vlt, failDelete: true}
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	for _, c := range signedIn.Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.Logout(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "could not finish deleting") || strings.Contains(rec.Body.String(), "deleted its copy") {
+		t.Fatalf("logout: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// A token whose scopes were widened after it was connected is dropped at the version
+// GitHub reported; an OAuth grant is left alone (gofer only ever asked it for
+// public_repo), and a stale version changes nothing.
+func TestWriteScopesChanged(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	c, _ := writeStored(t, vlt)
+	if h.WriteScopesChanged(bg, user, "stale-version") {
+		t.Error("a stale version reported a deletion")
+	}
+	if _, ok := writeStored(t, vlt); !ok {
+		t.Fatal("a stale version dropped the token")
+	}
+	fv := &faultyVault{Vault: vlt, failDelete: true}
+	h.vault = fv
+	if h.WriteScopesChanged(bg, user, c.Version) {
+		t.Error("a failed delete reported a deletion")
+	}
+	fv.failDelete = false
+	if !h.WriteScopesChanged(bg, user, c.Version) {
+		t.Error("a confirmed delete was not reported")
+	}
+	if _, ok := writeStored(t, vlt); ok {
+		t.Error("a widened token was kept")
+	}
+
+	h2, signedIn2, pat2, gh2, vlt2 := newTokenHandler(t)
+	h2.githubAPIBase = gh2.srv.URL
+	connectWrite(t, h2, signedIn2)
+	h2.githubAPIBase = pat2.srv.URL
+	oauth, _ := writeStored(t, vlt2)
+	if h2.WriteScopesChanged(bg, user, oauth.Version) {
+		t.Error("an OAuth grant reported a deletion")
+	}
+	if _, ok := writeStored(t, vlt2); !ok {
+		t.Error("an OAuth grant was deleted without being revoked")
+	}
+}
+
+// Review (round 3): a token stored while tokens were allowed, once they are not, is
+// unused but still in the OAuth grant's way. The radar offers Disconnect for it; the
+// callback keeps refusing until then, and connects once it is gone.
+func TestDisabledTokenCanBeDisconnected(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	postToken(h, signedIn, patToken)
+	h.providers[WriteProvider].tokens = false
+	h.cfg.Providers.GitHubWriteTokens = false
+	if st := h.CommentingState(bg, user); st.Connected || !st.TokenDisabled || st.TokensAllowed || st.Expires.IsZero() {
+		t.Fatalf("state = %+v", st)
+	}
+	if rec, _, _ := connectWrite(t, h, signedIn); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "disconnect commenting") {
+		t.Fatalf("callback over a disabled token: %d %s", rec.Code, rec.Body)
+	}
+	if loc := disconnect(h, signedIn); loc != "/?commenting=token-deleted" {
+		t.Fatalf("disconnect: %q", loc)
+	}
+	if st := h.CommentingState(bg, user); st.TokenDisabled || st.CleanupPending {
+		t.Errorf("after disconnect: %+v", st)
+	}
+	if rec, _, _ := connectWrite(t, h, signedIn); rec.Code != http.StatusFound {
+		t.Fatalf("callback after disconnect: %d %s", rec.Code, rec.Body)
+	}
+	if c, ok := writeStored(t, vlt); !ok || isPersonalToken(c) {
+		t.Error("the OAuth grant was not stored")
+	}
+}
+
+// Review (round 3): a disconnect whose delete failed leaves the radar a retry, and
+// connecting a token resumes the abandoned deletion instead of refusing for good:
+// while the vault still fails nothing is stored, and once it recovers the old copy
+// is deleted and the new token stored.
+func TestPendingCleanupCanBeRetried(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	pat.set(patToken2, goodPAT())
+	postToken(h, signedIn, patToken)
+	fv := &faultyVault{Vault: vlt, failDelete: true}
+	h.vault = fv
+	if loc := disconnect(h, signedIn); loc != "/?commenting=disconnect-pending" {
+		t.Fatalf("failed delete: %q", loc)
+	}
+	if st := h.CommentingState(bg, user); !st.CleanupPending || st.Connected {
+		t.Fatalf("state = %+v", st)
+	}
+	if rec := postToken(h, signedIn, patToken2); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("connect while the vault still fails: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); c.AccessToken != patToken {
+		t.Fatal("a token was stored over a copy gofer could not delete")
+	}
+	fv.failDelete = false
+	if rec := postToken(h, signedIn, patToken2); rec.Code != http.StatusSeeOther {
+		t.Fatalf("connect once the vault recovered: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); c.AccessToken != patToken2 {
+		t.Error("the new token was not stored")
+	}
+	if st := h.CommentingState(bg, user); !st.Connected || st.CleanupPending {
+		t.Errorf("after reconnecting: %+v", st)
+	}
+
+	// Retry disconnect from the radar finishes it too.
+	h2, signedIn2, pat2, _, vlt2 := newTokenHandler(t)
+	pat2.set(patToken, goodPAT())
+	postToken(h2, signedIn2, patToken)
+	fv2 := &faultyVault{Vault: vlt2, failDelete: true}
+	h2.vault = fv2
+	disconnect(h2, signedIn2)
+	fv2.failDelete = false
+	if loc := disconnect(h2, signedIn2); loc != "/?commenting=token-deleted" {
+		t.Errorf("retry: %q", loc)
+	}
+	if _, ok := writeStored(t, vlt2); ok {
+		t.Error("the retry did not delete the copy")
+	}
+	if st := h2.CommentingState(bg, user); st.CleanupPending {
+		t.Errorf("after the retry: %+v", st)
+	}
+}
+
+// Review (round 3): GitHub can confirm an OAuth grant's revocation while the vault
+// fails to delete gofer's copy. Disconnect and logout report both outcomes.
+func TestRevokedButCleanupPending(t *testing.T) {
+	for _, via := range []string{"disconnect", "logout"} {
+		gh := newFakeGitHub(t)
+		h, _, _, vlt := newWriteHandler(t, gh)
+		_, signedIn := signIn(t, h)
+		connectWrite(t, h, signedIn)
+		h.vault = &faultyVault{Vault: vlt, failDelete: true}
+		if via == "disconnect" {
+			if loc := disconnect(h, signedIn); loc != "/?commenting=revoked-pending" {
+				t.Errorf("disconnect: %q", loc)
+			}
+		} else {
+			req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+			for _, c := range signedIn.Cookies() {
+				req.AddCookie(c)
+			}
+			rec := httptest.NewRecorder()
+			h.Logout(rec, req)
+			var out struct{ Revocation, Cleanup, Message string }
+			if err := json.NewDecoder(rec.Body).Decode(&out); err != nil || rec.Code != http.StatusOK ||
+				out.Revocation != "confirmed" || out.Cleanup != "pending" || !strings.Contains(out.Message, "could not finish deleting") {
+				t.Errorf("logout: %d %+v %v", rec.Code, out, err)
+			}
+		}
+		if gh.revokedOther.Load() != 1 {
+			t.Errorf("%s: the write grant was not revoked: %d", via, gh.revokedOther.Load())
+		}
+		if _, ok := writeStored(t, vlt); !ok {
+			t.Fatalf("%s: test setup: the row should still be there", via)
+		}
+	}
+}
+
+// Review (round 4): connecting a token first finishes a pending disconnect, and the
+// connection reports what that disconnect left: an OAuth grant GitHub did not
+// confirm revoked (gofer no longer holds it to revoke later), or a previous token
+// gofer deleted. A confirmed revocation is not asked again (round 4, P3).
+func TestTokenConnectReportsWhatTheOldGrantLeft(t *testing.T) {
+	for name, tc := range map[string]struct {
+		oauth, revokeFails bool
+		want               string
+	}{
+		"oauth unrevoked": {oauth: true, revokeFails: true, want: "/?commenting=token-unrevoked"},
+		"oauth revoked":   {oauth: true, want: "/?commenting=token"},
+		"previous token":  {want: "/?commenting=token-replaced"},
+	} {
+		h, signedIn, pat, gh, vlt := newTokenHandler(t)
+		pat.set(patToken, goodPAT())
+		pat.set(patToken2, goodPAT())
+		if tc.oauth {
+			connectWrite(t, h, signedIn)
+		} else {
+			postToken(h, signedIn, patToken)
+		}
+		gh.mu.Lock()
+		gh.revokeErr = tc.revokeFails
+		gh.mu.Unlock()
+		fv := &faultyVault{Vault: vlt, failDelete: true}
+		h.vault = fv
+		disconnect(h, signedIn)
+		fv.failDelete = false
+		revocations := gh.revokedOther.Load()
+		rec := postToken(h, signedIn, patToken2)
+		if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != tc.want {
+			t.Errorf("%s: %d %q", name, rec.Code, rec.Header().Get("Location"))
+		}
+		if c, _ := writeStored(t, vlt); c.AccessToken != patToken2 {
+			t.Errorf("%s: the token was not stored", name)
+		}
+		if name == "oauth revoked" && gh.revokedOther.Load() != revocations {
+			t.Errorf("%s: a revocation GitHub already confirmed was asked again", name)
+		}
+	}
+}
+
+// Review (round 4, P3): after GitHub confirmed revocation and only the delete failed,
+// Retry disconnect deletes without asking GitHub again (which answers an
+// already-revoked token with 404), and keeps reporting the revocation confirmed.
+func TestRetryKeepsConfirmedRevocation(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newWriteHandler(t, gh)
+	_, signedIn := signIn(t, h)
+	connectWrite(t, h, signedIn)
+	fv := &faultyVault{Vault: vlt, failDelete: true}
+	h.vault = fv
+	if loc := disconnect(h, signedIn); loc != "/?commenting=revoked-pending" {
+		t.Fatalf("first: %q", loc)
+	}
+	fv.failDelete = false
+	gh.mu.Lock()
+	gh.revokeErr = true // what GitHub answers an already-revoked grant, as far as gofer can tell
+	gh.mu.Unlock()
+	if loc := disconnect(h, signedIn); loc != "/" {
+		t.Errorf("retry: %q, want the confirmed outcome kept", loc)
+	}
+	if gh.revokedOther.Load() != 1 {
+		t.Errorf("revocations = %d, want 1", gh.revokedOther.Load())
+	}
+	if _, ok := writeStored(t, vlt); ok {
+		t.Error("the retry did not delete the copy")
+	}
+}
+
+// Review (round 4): an OAuth grant from a previous commenting app (the write client
+// ID changed) is unused but in a token's way: the radar state offers Disconnect, the
+// token connect refuses until then, and succeeds after.
+func TestOtherClientGrantCanBeDisconnected(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	connectWrite(t, h, signedIn)
+	h.providers[WriteProvider].oauth.ClientID = "a-new-commenting-app"
+	if st := h.CommentingState(bg, user); st.Connected || !st.OtherClient || st.TokenDisabled {
+		t.Fatalf("state = %+v", st)
+	}
+	if rec := postToken(h, signedIn, patToken); rec.Code != http.StatusConflict {
+		t.Fatalf("token over another app's grant: %d", rec.Code)
+	}
+	if loc := disconnect(h, signedIn); loc != "/?commenting=unconfirmed" {
+		t.Fatalf("disconnect: %q", loc)
+	}
+	if st := h.CommentingState(bg, user); st.OtherClient {
+		t.Errorf("after disconnect: %+v", st)
+	}
+	if rec := postToken(h, signedIn, patToken); rec.Code != http.StatusSeeOther {
+		t.Fatalf("token after disconnect: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); c.AccessToken != patToken {
+		t.Error("the token was not stored")
+	}
+}
+
+// deleteFailVault fails Delete for one provider.
+type deleteFailVault struct {
+	vault.Vault
+	provider string
+}
+
+func (d deleteFailVault) Delete(ctx context.Context, userID, provider string) error {
+	if provider == d.provider {
+		return errors.New("disk on fire")
+	}
+	return d.Vault.Delete(ctx, userID, provider)
+}
+
+// Review (round 4): for a provider gofer revokes nothing at, a logout whose delete
+// fails reports the pending deletion and claims nothing about GitHub.
+func TestNonGitHubLogoutClaimsNoRevocation(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, sessions, _, vlt := newWriteHandler(t, gh)
+	const gUser = "google:1"
+	if err := vlt.Put(bg, gUser, vault.Credential{Provider: "google", AccessToken: "ya29", Version: "g1"}); err != nil {
+		t.Fatal(err)
+	}
+	h.vault = deleteFailVault{Vault: vlt, provider: "google"}
+	start := httptest.NewRecorder()
+	if err := sessions.Authenticate(start, httptest.NewRequest(http.MethodGet, "/", nil), &session.User{ID: gUser, Provider: "google", Email: "a@example.test"}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	for _, c := range start.Result().Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.Logout(rec, req)
+	var out struct{ Revocation, Cleanup, Message string }
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil || rec.Code != http.StatusOK {
+		t.Fatalf("logout: %d %v", rec.Code, err)
+	}
+	if out.Revocation != "none" || out.Cleanup != "pending" || strings.Contains(out.Message, "GitHub") {
+		t.Errorf("answer = %+v", out)
+	}
+}
+
+// Review (round 5): the OAuth callback, which the PR thread's connect link also
+// reaches, refuses to replace a grant from a previous commenting app (it would be
+// left live at GitHub): the new OAuth token is discarded and the old row kept until
+// the user disconnects it.
+func TestOAuthCallbackRefusesAPreviousAppsGrant(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newWriteHandler(t, gh)
+	_, signedIn := signIn(t, h)
+	connectWrite(t, h, signedIn)
+	old, _ := writeStored(t, vlt)
+	// The deployment moved to a new commenting app: the stored grant is the old one's.
+	old.ClientID = "a-previous-commenting-app"
+	if err := vlt.Put(bg, user, old); err != nil {
+		t.Fatal(err)
+	}
+	discarded := gh.tokensRevoked.Load()
+	rec, _, _ := connectWrite(t, h, signedIn)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "previous commenting app") {
+		t.Fatalf("callback: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); c.Version != old.Version {
+		t.Error("the previous app's grant was replaced")
+	}
+	if gh.tokensRevoked.Load() != discarded+1 {
+		t.Error("the refused OAuth token was not discarded")
+	}
+	disconnect(h, signedIn)
+	if rec, _, _ := connectWrite(t, h, signedIn); rec.Code != http.StatusFound {
+		t.Fatalf("callback after disconnect: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// Review (round 5): what a token connection says about the pending disconnect it
+// finished (or failed to finish) first.
+func TestTokenConnectPriorNotices(t *testing.T) {
+	// Revocation unconfirmed and the delete still failing: the 503 keeps the
+	// revocation warning but never says the copy is gone.
+	h, signedIn, pat, gh, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	connectWrite(t, h, signedIn)
+	gh.mu.Lock()
+	gh.revokeErr = true
+	gh.mu.Unlock()
+	h.vault = &faultyVault{Vault: vlt, failDelete: true}
+	disconnect(h, signedIn)
+	rec := postToken(h, signedIn, patToken)
+	body := rec.Body.String()
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(body, "did not confirm your earlier commenting grant was revoked") ||
+		!strings.Contains(body, "not finished deleting its copy") || strings.Contains(body, "deleted its copy") {
+		t.Errorf("still failing: %d %s", rec.Code, body)
+	}
+
+	// An old credential the delete could remove but nobody could read: either kind,
+	// so the notice names both settings pages.
+	h2, signedIn2, pat2, _, vlt2 := newTokenHandler(t)
+	pat2.set(patToken, goodPAT())
+	pat2.set(patToken2, goodPAT())
+	postToken(h2, signedIn2, patToken)
+	fv := &faultyVault{Vault: vlt2, failDelete: true}
+	h2.vault = fv
+	disconnect(h2, signedIn2)
+	fv.failDelete, fv.unreadable = false, true
+	rec = postToken(h2, signedIn2, patToken2)
+	if loc := rec.Header().Get("Location"); rec.Code != http.StatusSeeOther || loc != "/?commenting=token-unknown" {
+		t.Errorf("unreadable old credential: %d %q %s", rec.Code, loc, rec.Body)
+	}
+
+	// Reconnecting with the very token whose disconnect failed: nothing to tell the
+	// user to delete.
+	h3, signedIn3, pat3, _, vlt3 := newTokenHandler(t)
+	pat3.set(patToken, goodPAT())
+	postToken(h3, signedIn3, patToken)
+	fv3 := &faultyVault{Vault: vlt3, failDelete: true}
+	h3.vault = fv3
+	disconnect(h3, signedIn3)
+	fv3.failDelete = false
+	rec = postToken(h3, signedIn3, patToken)
+	if loc := rec.Header().Get("Location"); loc != "/?commenting=token" {
+		t.Errorf("same token: %d %q", rec.Code, loc)
+	}
+}

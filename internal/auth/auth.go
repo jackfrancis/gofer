@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,6 +46,9 @@ type provider struct {
 	// signed-in user connects (the write grant, ADR 0009). It is never offered on the
 	// sign-in page, never served by Login/Callback, and never vended by Credential.
 	grant bool
+	// tokens lets the write grant be a classic personal access token the user pastes
+	// (GITHUB_WRITE_TOKENS, ADR 0011), as well as this client's OAuth grant.
+	tokens bool
 }
 
 // github reports whether p is one of gofer's GitHub clients (sign-in or the write
@@ -160,6 +164,7 @@ func NewHandler(cfg *config.Config, sessions *session.Manager, vlt vault.Vault) 
 				userURL:   "https://api.github.com/user",
 				userAgent: "gofer",
 				mapUser:   mapGitHubUser,
+				tokens:    cfg.Providers.GitHubWriteTokens,
 			}
 		}
 	}
@@ -413,6 +418,9 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 		h.sessions.Destroy(w, r.WithContext(dctx))
 		dcancel()
 		res = h.unconfirmed(u.Provider, h.providers[u.Provider], nil)
+		// This request neither performed nor observed the deletion: it cannot say
+		// whether gofer's copy is gone.
+		res.cleanupUnknown = true
 	case err != nil:
 		slog.ErrorContext(r.Context(), "logout could not be recorded; the session stands", "user", u.ID, "err", err)
 		writeLogoutError(w)
@@ -426,18 +434,70 @@ func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 			res = mergeLogout(res, h.revokeAndDelete(r.Context(), u.ID, WriteProvider, writeLo))
 		}
 	}
-	if res.confirmed {
+	switch {
+	case res.confirmed && !res.cleanupPending:
 		w.WriteHeader(http.StatusNoContent)
 		return
+	case res.confirmed:
+		// Nothing is left to revoke, but a stored copy was not deleted yet: report
+		// both, rather than let the revocation stand for the cleanup. For a provider
+		// gofer revokes nothing at (Google, Microsoft), "confirmed" only means that:
+		// no provider was contacted, so nothing is claimed about one.
+		answer := map[string]any{
+			"revocation": "confirmed",
+			"cleanup":    "pending",
+			"message":    "You are signed out of gofer, and GitHub confirmed gofer's access is revoked, but gofer could not finish deleting its stored copy yet. It no longer uses it, and it will retry.",
+		}
+		if !isGitHub(u.Provider) {
+			answer["revocation"] = "none"
+			answer["message"] = "You are signed out of gofer, but gofer could not finish deleting its stored copy of your sign-in yet. It no longer uses it, and it will retry."
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(answer)
+		return
+	}
+	msg := "You are signed out of gofer, but GitHub did not confirm that gofer's access was revoked. Revoke gofer in GitHub's settings to be sure."
+	switch {
+	case res.cleanupPending:
+		// Not deleted yet: the pending logout keeps it unused, and the next credential
+		// access or a restart finishes it. Say so, rather than claim it is gone.
+		msg = "You are signed out of gofer and it no longer uses your GitHub access, but it could not finish deleting its stored copy yet; it will retry. Revoke gofer in GitHub's settings to be sure, and if you connected commenting with a personal access token, delete that token there too."
+	case res.tokenDeleted:
+		// The write grant was a personal access token (ADR 0011): gofer deleted its
+		// copy, and only the user can revoke the token itself.
+		msg = "You are signed out of gofer, and gofer deleted its copy of your commenting token. gofer cannot revoke a personal access token: delete it in GitHub's settings if you no longer use it."
+		if len(res.settings) > 1 {
+			msg += " GitHub also did not confirm that gofer's other access was revoked; revoke it there too."
+		}
+	case slices.Contains(res.settings, tokensSettings):
+		msg = "You are signed out of gofer, but gofer could not confirm what GitHub still holds for it. Check both your authorized apps and your personal access tokens in GitHub's settings."
+	}
+	answer := map[string]any{
+		"revocation":    "unconfirmed",
+		"message":       msg,
+		"settings_url":  res.settings[0],
+		"settings_urls": res.settings,
+	}
+	if c := cleanupState(res); c != "" {
+		answer["cleanup"] = c
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"revocation":    "unconfirmed",
-		"message":       "You are signed out of gofer, but GitHub did not confirm that gofer's access was revoked. Revoke gofer in GitHub's settings to be sure.",
-		"settings_url":  res.settings[0],
-		"settings_urls": res.settings,
-	})
+	_ = json.NewEncoder(w).Encode(answer)
+}
+
+// cleanupState says whether gofer's stored copy is gone ("done") or its deletion is
+// still pending ("pending"), as the logout's answer reports it, or "" when this
+// request cannot know (another request owns the logout).
+func cleanupState(res logoutResult) string {
+	switch {
+	case res.cleanupPending:
+		return "pending"
+	case res.cleanupUnknown:
+		return ""
+	}
+	return "done"
 }
 
 // writeLogoutError answers a logout that changed nothing.

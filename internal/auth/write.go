@@ -2,11 +2,13 @@ package auth
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -29,10 +31,28 @@ const writePath = "/auth/github-write"
 
 // CommentingState says whether the user can post comments through gofer: Enabled when
 // the deployment configures the write client, Connected when the user has a usable
-// write grant stored (from the configured client, no logout pending).
+// write grant stored (from the configured client or, where allowed, an unexpired
+// personal access token; no logout pending). TokensAllowed says the deployment lets
+// users connect with a token (ADR 0011); Token and Expires describe a connected one.
+// TokenExpired says a token is stored but has expired (Expires is when): not
+// connected, but gofer still holds a copy the user can replace or disconnect.
+// TokenDisabled says an unexpired token is stored while the deployment no longer
+// allows tokens: unused, and in the way of the OAuth grant until the user disconnects
+// it. OtherClient says an OAuth grant from another commenting app (before
+// GITHUB_WRITE_CLIENT_ID changed) is stored: unused, and in the way of a token, so
+// the user disconnects it first. CleanupPending says a disconnect or logout of the
+// write grant has not finished deleting gofer's copy (unused meanwhile): Disconnect
+// retries it.
 type CommentingState struct {
-	Enabled   bool
-	Connected bool
+	Enabled        bool
+	Connected      bool
+	TokensAllowed  bool
+	Token          bool
+	TokenExpired   bool
+	TokenDisabled  bool
+	OtherClient    bool
+	CleanupPending bool
+	Expires        time.Time
 }
 
 // CommentingState reports the user's write-grant state. It reads only; a dead grant
@@ -42,12 +62,28 @@ func (h *Handler) CommentingState(ctx context.Context, userID string) Commenting
 	if !ok || h.vault == nil {
 		return CommentingState{}
 	}
-	st := CommentingState{Enabled: true}
-	if pending, err := h.logoutPending(ctx, userID, WriteProvider); err != nil || pending {
+	st := CommentingState{Enabled: true, TokensAllowed: p.tokens}
+	switch pending, err := h.logoutPending(ctx, userID, WriteProvider); {
+	case err != nil:
+		return st
+	case pending:
+		st.CleanupPending = true
 		return st
 	}
 	cred, err := h.vault.Get(ctx, userID, WriteProvider)
-	st.Connected = err == nil && fromConfiguredClient(p, cred)
+	st.Connected = err == nil && fromConfiguredClient(p, cred) && !tokenExpired(cred, h.now())
+	switch {
+	case st.Connected && isPersonalToken(cred):
+		st.Token, st.Expires = true, cred.Expiry
+	case err == nil && tokenExpired(cred, h.now()):
+		st.TokenExpired, st.Expires = true, cred.Expiry
+	case err == nil && isPersonalToken(cred):
+		// Stored while tokens were allowed, and they no longer are.
+		st.TokenDisabled, st.Expires = true, cred.Expiry
+	case err == nil && !st.Connected:
+		// Any other stored grant gofer cannot use: one from another commenting app.
+		st.OtherClient = true
+	}
 	return st
 }
 
@@ -66,13 +102,19 @@ func (h *Handler) WriteCredential(ctx context.Context, userID string) (vault.Cre
 	if h.cfg != nil && !h.cfg.SignInAllowed("github", cred.Login) {
 		return vault.Credential{}, vault.ErrSignInRequired
 	}
+	if tokenExpired(cred, h.now()) {
+		// An expired personal access token: connect again with a new one. The row
+		// stays until then, so a disconnect still tells the user to delete it.
+		return vault.Credential{}, vault.ErrSignInRequired
+	}
 	return cred, nil
 }
 
-// WriteRejected handles a 401 GitHub gave the write grant at version: if GitHub's
-// check-token confirms the token is dead (the user revoked gofer in their settings),
-// the stored grant is deleted so the page asks them to connect again. A 401 that
-// check-token does not confirm changes nothing.
+// WriteRejected handles a 401 GitHub gave the write grant at version: if GitHub
+// confirms the token is dead (check-token for an OAuth grant, the user revoked gofer
+// in their settings; a 401 on GET /user for a personal access token, deleted or
+// expired), the stored grant is deleted so the page asks them to connect again. A 401
+// GitHub does not confirm changes nothing.
 func (h *Handler) WriteRejected(ctx context.Context, userID, version string) {
 	p, ok := h.providers[WriteProvider]
 	if !ok || h.vault == nil || version == "" {
@@ -87,7 +129,12 @@ func (h *Handler) WriteRejected(ctx context.Context, userID, version string) {
 	if err != nil || cred.Version != version {
 		return
 	}
-	valid, err := h.checkToken(ctx, p, cred.AccessToken)
+	var valid bool
+	if isPersonalToken(cred) {
+		valid, err = h.tokenAlive(ctx, cred.AccessToken)
+	} else {
+		valid, err = h.checkToken(ctx, p, cred.AccessToken)
+	}
 	if err != nil || valid {
 		return
 	}
@@ -203,6 +250,12 @@ func (h *Handler) ConnectWriteCallback(w http.ResponseWriter, r *http.Request) {
 	case outcome == grantSessionEnded:
 		h.failConnect(ctx, w, p, token, user.ID, http.StatusConflict, "you signed out of gofer while connecting, so the grant was not saved")
 		return
+	case outcome == grantTokenConnected:
+		h.failConnect(ctx, w, p, token, user.ID, http.StatusConflict, "gofer holds your personal access token for commenting, so the grant was not saved; disconnect commenting on the radar first to switch")
+		return
+	case outcome == grantOtherClient:
+		h.failConnect(ctx, w, p, token, user.ID, http.StatusConflict, "gofer holds a commenting grant from a previous commenting app, so the new grant was not saved; disconnect commenting on the radar first, then connect again")
+		return
 	case outcome == grantRevokedMidFlow:
 		writeGrantPage(w, http.StatusConflict, `<p>The grant was revoked while you were connecting it, so it was not saved.</p>`+
 			`<p><a href="`+writePath+`/login">Connect again</a> &middot; <a href="/">Back to radar</a></p>`)
@@ -255,6 +308,20 @@ func (h *Handler) storeWriteGrant(ctx context.Context, p *provider, userID, logi
 	}
 	if !ok {
 		return grantSessionEnded, nil
+	}
+	// A live personal access token connected meanwhile (another tab, ADR 0011) is not
+	// replaced: the user would be left holding a token they no longer know gofer
+	// stopped using. Nor is a grant from a previous commenting app (the write client
+	// ID changed): this client cannot revoke it, so replacing it would leave it live
+	// at GitHub with nothing in gofer to say so. The new OAuth token is discarded
+	// instead, and the user disconnects first.
+	switch existing, err := h.vault.Get(lctx, userID, p.name); {
+	case err == nil && isPersonalToken(existing) && !tokenExpired(existing, h.now()):
+		return grantTokenConnected, nil
+	case err == nil && !isPersonalToken(existing) && !fromConfiguredClient(p, existing):
+		return grantOtherClient, nil
+	case err != nil && !errors.Is(err, vault.ErrNotFound):
+		return 0, fmt.Errorf("read the write grant: %w", err)
 	}
 	cred := vault.Credential{
 		Provider:    p.name,
@@ -330,16 +397,32 @@ func (h *Handler) DisconnectWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lo, err := h.beginWriteDisconnect(r.Context(), user.ID)
-	switch {
-	case err != nil:
+	if err != nil {
 		slog.WarnContext(r.Context(), "write grant: recording its disconnect failed", "user", user.ID, "err", err)
 		http.Redirect(w, r, "/?commenting=error", http.StatusSeeOther)
-	case lo == nil:
+		return
+	}
+	if lo == nil {
 		http.Redirect(w, r, "/", http.StatusSeeOther) // nothing was connected
-	case !h.revokeAndDelete(r.Context(), user.ID, WriteProvider, lo).confirmed:
-		http.Redirect(w, r, "/?commenting=unconfirmed", http.StatusSeeOther)
-	default:
+		return
+	}
+	switch res := h.revokeAndDelete(r.Context(), user.ID, WriteProvider, lo); {
+	case res.confirmed && res.cleanupPending:
+		// Revoked at GitHub, but gofer's copy is not deleted yet: say both.
+		http.Redirect(w, r, "/?commenting=revoked-pending", http.StatusSeeOther)
+	case res.confirmed:
 		http.Redirect(w, r, "/", http.StatusSeeOther)
+	case res.cleanupPending:
+		// Not deleted yet: the pending logout keeps it unused and finishes later.
+		http.Redirect(w, r, "/?commenting=disconnect-pending", http.StatusSeeOther)
+	case res.tokenDeleted:
+		// A personal access token: deleted here, and only the user can revoke it.
+		http.Redirect(w, r, "/?commenting=token-deleted", http.StatusSeeOther)
+	case slices.Contains(res.settings, tokensSettings):
+		// gofer could not tell which kind it held.
+		http.Redirect(w, r, "/?commenting=unconfirmed-any", http.StatusSeeOther)
+	default:
+		http.Redirect(w, r, "/?commenting=unconfirmed", http.StatusSeeOther)
 	}
 }
 
@@ -361,7 +444,12 @@ func (h *Handler) beginWriteDisconnect(ctx context.Context, userID string) (*loc
 // mergeLogout combines two logouts' outcomes: confirmed only if both were, with
 // every settings page either names.
 func mergeLogout(a, b logoutResult) logoutResult {
-	out := logoutResult{confirmed: a.confirmed && b.confirmed}
+	out := logoutResult{
+		confirmed:      a.confirmed && b.confirmed,
+		tokenDeleted:   a.tokenDeleted || b.tokenDeleted,
+		cleanupPending: a.cleanupPending || b.cleanupPending,
+		cleanupUnknown: a.cleanupUnknown || b.cleanupUnknown,
+	}
 	if out.confirmed {
 		return out
 	}

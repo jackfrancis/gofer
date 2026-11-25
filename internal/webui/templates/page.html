@@ -417,12 +417,55 @@
             <button class="btn btn-primary btn-sm" type="submit">Preview</button>
           </div>
         </form>
+        {{if .CommentToken}}<p class="zz-compose-hint">Commenting uses your personal access token, which expires {{.CommentTokenExpires.Format "January 2, 2006"}}. Connect again with a new one after that.</p>{{end}}
         <form class="zz-compose-disconnect" method="post" action="/auth/github-write/disconnect">
-          <button class="zz-linkbtn" type="submit" title="Revoke gofer's permission to post comments for you">Disconnect commenting</button>
+          <button class="zz-linkbtn" type="submit" title="{{if .CommentToken}}Delete gofer's copy of your token (delete the token itself on GitHub){{else}}Revoke gofer's permission to post comments for you{{end}}">Disconnect commenting</button>
         </form>
       </details>
       {{else}}
-      <p class="zz-compose-connect"><a href="/auth/github-write/login">Connect GitHub for commenting</a> to post one comment (such as <code>/assign</code>) to several items at once. It is a separate permission from sign-in, and you can disconnect it at any time.</p>
+      {{if .CommentCleanupPending}}
+      <div class="zz-commenting-note" role="status">
+        <p>gofer has not finished deleting its copy of your commenting credential. It no longer uses it, and it retries on its own; you can retry now.</p>
+        <form class="zz-compose-disconnect" method="post" action="/auth/github-write/disconnect">
+          <button class="zz-linkbtn" type="submit" title="Retry deleting gofer's copy of your commenting credential">Retry disconnect</button>
+        </form>
+      </div>
+      {{end}}
+      {{if .CommentTokenDisabled}}
+      <div class="zz-commenting-note" role="status">
+        <p>gofer holds your commenting token, but this gofer no longer accepts personal access tokens, so it does not use it. Disconnect to delete gofer's copy (then delete the token on GitHub), and you can connect GitHub for commenting again.</p>
+        <form class="zz-compose-disconnect" method="post" action="/auth/github-write/disconnect">
+          <button class="zz-linkbtn" type="submit" title="Delete gofer's copy of your token (delete the token itself on GitHub)">Disconnect commenting</button>
+        </form>
+      </div>
+      {{end}}
+      {{if .CommentOtherClient}}
+      <div class="zz-commenting-note" role="status">
+        <p>gofer holds a commenting grant from a previous commenting app, which it no longer uses. Disconnect to delete gofer's copy, then connect again.</p>
+        <form class="zz-compose-disconnect" method="post" action="/auth/github-write/disconnect">
+          <button class="zz-linkbtn" type="submit" title="Delete gofer's copy of the previous app's grant">Disconnect commenting</button>
+        </form>
+      </div>
+      {{end}}
+      {{if .CommentTokenExpired}}
+      <div class="zz-commenting-note" role="status">
+        <p>Your commenting token expired on {{.CommentTokenExpires.Format "January 2, 2006"}}.{{if .CommentTokensAllowed}} Paste a new one below to keep commenting, or disconnect to delete gofer's copy.{{else}} Disconnect to delete gofer's copy.{{end}}</p>
+        <form class="zz-compose-disconnect" method="post" action="/auth/github-write/disconnect">
+          <button class="zz-linkbtn" type="submit" title="Delete gofer's copy of your expired token">Disconnect commenting</button>
+        </form>
+      </div>
+      {{end}}
+      {{if not (or .CommentTokenDisabled .CommentOtherClient)}}{{/* a stored credential gofer cannot use is in the way until it is disconnected */}}<p class="zz-compose-connect"><a href="/auth/github-write/login">Connect GitHub for commenting</a> to post one comment (such as <code>/assign</code>) to several items at once, or to create pending reviews. It is a separate permission from sign-in, and you can disconnect it at any time.</p>{{end}}
+      {{if and .CommentTokensAllowed (not .CommentOtherClient)}}
+      <details class="zz-token">
+        <summary>Or connect with a personal access token</summary>
+        <form class="zz-token-form" method="post" action="/auth/github-write/token">
+          <p class="zz-compose-hint">For organizations that block gofer's commenting app (the kubernetes organization does). Create a <a href="https://github.com/settings/tokens/new?scopes=public_repo&amp;description=gofer%20commenting" target="_blank" rel="noopener noreferrer">classic token</a> with only the <code>public_repo</code> scope and an expiry of 90 days or less, and paste it here. gofer keeps it encrypted, uses it only for the comments and reviews you confirm, and never hands it to an agent run. gofer cannot revoke a token, though: when you disconnect, delete it on GitHub.</p>
+          <input class="zz-token-input" type="password" name="token" autocomplete="off" spellcheck="false" required aria-label="Personal access token (classic)" placeholder="ghp_…">
+          <button class="btn btn-sm" type="submit">Connect with token</button>
+        </form>
+      </details>
+      {{end}}
       {{end}}{{end}}
       {{range .Items}}
         {{template "item" (row . $.ConvEnabled $.CommentConnected)}}

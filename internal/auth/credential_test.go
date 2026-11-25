@@ -1174,6 +1174,15 @@ func TestOverlappingLogoutOfConsumedSessionRecordsNothing(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (nothing recorded, revocation not this request's)", rec.Code)
 	}
+	// Review (PR #58, round 4): it neither performed nor observed a deletion, so it
+	// says nothing about one.
+	var answer map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&answer); err != nil {
+		t.Fatal(err)
+	}
+	if c, ok := answer["cleanup"]; ok {
+		t.Errorf("a duplicate logout reported cleanup %v", c)
+	}
 	if logoutIsPending(h) || gh.revoked.Load() != 0 {
 		t.Fatalf("pending = %v, revocations = %d: the stale logout acted", logoutIsPending(h), gh.revoked.Load())
 	}

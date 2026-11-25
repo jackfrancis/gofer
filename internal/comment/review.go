@@ -63,6 +63,10 @@ func (s *Service) PendingReview(ctx context.Context, userID string, rv Review) (
 	case errors.Is(err, ghcomment.ErrUnauthorized):
 		s.creds.WriteRejected(context.WithoutCancel(ctx), userID, cred.Version)
 		return ReviewResult{Error: "GitHub rejected gofer's access. Connect commenting again, then try again."}, nil
+	case errors.Is(err, ghcomment.ErrTokenScopes):
+		return ReviewResult{Error: "Not created: " + scopesChanged(s.creds.WriteScopesChanged(context.WithoutCancel(ctx), userID, cred.Version))}, nil
+	case errors.Is(err, ghcomment.ErrScopesUnknown):
+		return ReviewResult{Error: "Not created: " + scopesUnknown}, nil
 	case errors.Is(err, ghcomment.ErrPendingExists):
 		return ReviewResult{Error: "You already have a pending review on this pull request, and GitHub allows one. Submit or discard it on GitHub, then try again."}, nil
 	case errors.Is(err, ghcomment.ErrHeadMoved):
@@ -85,5 +89,5 @@ func (s *Service) PendingReview(ctx context.Context, userID string, rv Review) (
 		}
 		return ReviewResult{Error: msg + ". Nothing was created."}, nil
 	}
-	return ReviewResult{Error: describe(err)}, nil
+	return ReviewResult{Error: describeAs("Not created", err)}, nil
 }

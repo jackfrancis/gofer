@@ -32,6 +32,7 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 	f.postedTo.Store("")
 	f.postedBody.Store("")
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-OAuth-Scopes", "public_repo") // as GitHub sends for a classic token
 		if r.Header.Get("Authorization") != "Bearer "+token {
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"message":"Bad credentials"}`))
@@ -185,6 +186,7 @@ func TestAssignees(t *testing.T) {
 func postServer(t *testing.T, respond func(w http.ResponseWriter, r *http.Request)) *Client {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-OAuth-Scopes", "public_repo")
 		if r.Method == http.MethodGet {
 			_, _ = w.Write([]byte(`{"full_name":"o/r","private":false}`))
 			return
@@ -263,5 +265,84 @@ func TestPostOutcomes(t *testing.T) {
 	never := New("http://127.0.0.1:1", nil)
 	if _, err := never.Comment(context.Background(), token, "o/r", 1, "hi"); err == nil || errors.Is(err, ErrOutcomeUnknown) {
 		t.Errorf("unreachable host: %v, want a definite failure", err)
+	}
+}
+
+// An organization's OAuth App access restriction is recognized, with the organization
+// it names, so the user can be told what to do instead of a cut-off message.
+func TestAppRestricted(t *testing.T) {
+	const msg = "Although you appear to have the correct authorization credentials, the `kubernetes` organization has enabled OAuth App access restrictions, meaning that data access to third-parties is limited. For more information on these restrictions, including how to enable this app, visit https://docs.github.com/articles/restricting-access-to-your-organization-s-data/"
+	srv := postServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		b, _ := json.Marshal(map[string]string{"message": msg})
+		_, _ = w.Write(b)
+	})
+	_, err := srv.Comment(context.Background(), token, "o/r", 1, "hi")
+	var ar *AppRestrictedError
+	if !errors.As(err, &ar) || ar.Org != "kubernetes" {
+		t.Fatalf("err = %v, want AppRestrictedError for kubernetes", err)
+	}
+	if e := appRestricted(http.StatusForbidden, "Resource not accessible by personal access token"); e != nil {
+		t.Errorf("an unrelated 403 was read as an app restriction: %v", e)
+	}
+	if e := appRestricted(http.StatusForbidden, "the org has enabled OAuth App access restrictions"); e == nil || e.Org != "" {
+		t.Errorf("no organization named: %+v", e)
+	}
+}
+
+// Every write first checks the token's scopes as GitHub reports them on the request
+// before it: a token widened beyond public_repo after it was connected writes
+// nothing. A read (assignees, with the read credential) does not check, and a token
+// GitHub reports no scopes for is not refused here.
+func TestWritesRefuseWidenedScopes(t *testing.T) {
+	scopeServer := func(t *testing.T, scopes *string, posted *atomic.Int32) *Client {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if scopes != nil {
+				w.Header().Set("X-OAuth-Scopes", *scopes)
+			}
+			switch {
+			case r.Method == http.MethodPost:
+				posted.Add(1)
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"html_url":"https://github.com/o/r/issues/1#c"}`))
+			case strings.HasSuffix(r.URL.Path, "/assignees"):
+				_, _ = w.Write([]byte(`[{"login":"a"}]`))
+			default:
+				_, _ = w.Write([]byte(`{"full_name":"o/r","private":false}`))
+			}
+		}))
+		t.Cleanup(srv.Close)
+		return New(srv.URL, srv.Client().Transport)
+	}
+	str := func(s string) *string { return &s }
+	for name, tc := range map[string]struct {
+		scopes *string
+		ok     bool
+	}{
+		"exactly public_repo": {str("public_repo"), true},
+		"widened":             {str("public_repo, repo"), false},
+		"other scope":         {str("repo"), false},
+		"no header":           {nil, false},
+	} {
+		var posted atomic.Int32
+		c := scopeServer(t, tc.scopes, &posted)
+		_, err := c.Comment(context.Background(), token, "o/r", 1, "hi")
+		// No header is unknown, never a yes: refused as ErrScopesUnknown, which says
+		// nothing against the credential.
+		want := ErrTokenScopes
+		if tc.scopes == nil {
+			want = ErrScopesUnknown
+		}
+		if tc.ok != (err == nil) || (!tc.ok && (!errors.Is(err, want) || posted.Load() != 0)) {
+			t.Errorf("%s: err = %v, posted %d", name, err, posted.Load())
+		}
+		rv := Review{Commit: "0123456789abcdef0123456789abcdef01234567", BaseRef: "main", Body: "x"}
+		if _, err := c.PendingReview(context.Background(), token, "o/r", 1, rv); !tc.ok && !errors.Is(err, want) {
+			t.Errorf("%s: review err = %v", name, err)
+		}
+		if _, _, err := c.Assignees(context.Background(), token, "o/r"); err != nil {
+			t.Errorf("%s: a read checked write scopes: %v", name, err)
+		}
 	}
 }
