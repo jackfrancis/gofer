@@ -824,12 +824,12 @@ func TestDisabledDraftButtonSaysWhy(t *testing.T) {
 	asked := []worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: "can you review this?", At: time.Now().Add(-time.Hour)}, {ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "Looks fine.", At: time.Now().Add(-time.Hour)}}
 	h, p, store := draftFixture(t, c, asked)
 	page, _ := threadPage(t, h)
-	for _, want := range []string{`<p class="zz-meta zz-why">Review this pull request first`, `action="/items/review-again"`, ">Review this pull request</button>"} {
+	for _, want := range []string{`<p class="zz-meta zz-why">Review this pull request first`, `action="/items/review-again"`, `name="review" value="first"`, ">Review this pull request</button>"} {
 		if !strings.Contains(page, want) {
 			t.Errorf("thread lacks %q", want)
 		}
 	}
-	req := httptest.NewRequest(http.MethodPost, "/items/review-again", strings.NewReader(url.Values{"id": {draftItemID}}.Encode()))
+	req := httptest.NewRequest(http.MethodPost, "/items/review-again", strings.NewReader(url.Values{"id": {draftItemID}, "review": {"first"}}.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	h.ReviewAgain(httptest.NewRecorder(), req)
 	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
@@ -848,11 +848,85 @@ func TestDisabledDraftButtonSaysWhy(t *testing.T) {
 	if strings.Contains(page, "zz-why") || strings.Contains(page, ">Review this pull request</button>") {
 		t.Errorf("a reviewed pull request shows a reason or a review button")
 	}
-	req = httptest.NewRequest(http.MethodPost, "/items/review-again", strings.NewReader(url.Values{"id": {draftItemID}}.Encode()))
+	for _, action := range []string{"first", "again", ""} {
+		req = httptest.NewRequest(http.MethodPost, "/items/review-again", strings.NewReader(url.Values{"id": {draftItemID}, "review": {action}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		h.ReviewAgain(httptest.NewRecorder(), req)
+	}
+	if len(p.turns) != 0 {
+		t.Error("a reviewed pull request with a current review was reviewed again")
+	}
+}
+
+// postReview posts a ReviewAgain form naming action ("" for a form rendered before
+// forms named one).
+func postReview(h *Handler, action string) {
+	form := url.Values{"id": {draftItemID}}
+	if action != "" {
+		form.Set("review", action)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/items/review-again", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	h.ReviewAgain(httptest.NewRecorder(), req)
+}
+
+// A first review that has no answer yet is not started twice: while its run may
+// still answer (a converse run lasts up to ingest.ConverseDeadline) or while it is
+// the turn Retry would retry, the thread offers no "Review this pull request" and
+// the handler appends nothing. Once neither holds (an older unanswered review that
+// a later Discuss turn left without a Retry), a review is offered again.
+func TestFirstReviewIsNotStartedTwice(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	stalled := func(age time.Duration, later ...worklist.Message) []worklist.Message {
+		return append([]worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, At: time.Now().Add(-age)}}, later...)
+	}
+	for name, th := range map[string][]worklist.Message{
+		"stalled, run may still answer":   stalled(6 * time.Minute),
+		"past the deadline, but retryable": stalled(20 * time.Minute),
+	} {
+		h, p, store := draftFixture(t, c, th)
+		page, _ := threadPage(t, h)
+		if strings.Contains(page, ">Review this pull request</button>") || !strings.Contains(page, "has no answer yet") {
+			t.Errorf("%s: a second review offered, or no reason", name)
+		}
+		postReview(h, "first")
+		if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); len(it.Thread) != len(th) || len(p.turns) != 0 {
+			t.Errorf("%s: a duplicate review was started", name)
+		}
+	}
+	// An old unanswered review that is not the latest turn: no Retry is offered for
+	// it and its run is over, so a review is offered again.
+	old := stalled(20*time.Minute,
+		worklist.Message{ID: "d", Role: worklist.RoleUser, Content: "any thoughts?", At: time.Now().Add(-10 * time.Minute)},
+		worklist.Message{ID: "e", ReplyTo: "d", Role: worklist.RoleAgent, Content: "Some.", At: time.Now().Add(-9 * time.Minute)},
+	)
+	h, p, _ := draftFixture(t, c, old)
+	if page, _ := threadPage(t, h); !strings.Contains(page, ">Review this pull request</button>") {
+		t.Error("no review offered once the old review's run is over and it has no Retry")
+	}
+	postReview(h, "first")
+	if len(p.turns) != 1 {
+		t.Error("the offered review was not started")
+	}
+}
+
+// Each form does only its own action, checked inside the store update: an old
+// "Review the current revision" form (named, or from before forms named one) does
+// nothing once the conversation was reset, and "Review this pull request" does
+// nothing once the pull request is reviewed.
+func TestReviewFormsDoOnlyTheirOwnAction(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	h, p, _ := draftFixture(t, c, nil) // a reset conversation
+	postReview(h, "again")
+	postReview(h, "")
+	postReview(h, "bogus")
 	if len(p.turns) != 0 {
-		t.Error("a current review was reviewed again")
+		t.Errorf("a re-review form started a first review in a reset thread: %+v", p.turns)
+	}
+	h, p, _ = draftFixture(t, c, draftedThread(time.Now().Add(-time.Hour))[:2])
+	postReview(h, "first")
+	if len(p.turns) != 0 {
+		t.Error("a first-review form reviewed a reviewed pull request")
 	}
 }
 

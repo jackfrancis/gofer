@@ -231,6 +231,7 @@
         <p class="zz-meta">The latest review read an earlier revision of this pull request (it was pushed or retargeted since), so no approval can be drafted from it. Review the current revision, then draft again.</p>
         <form method="post" action="/items/review-again">
           <input type="hidden" name="id" value="{{$.Item.ID}}">
+          <input type="hidden" name="review" value="again">
           <button class="btn btn-sm" type="submit"{{if not .ReviewReady}} disabled title="Wait for the reply in progress."{{else}} title="Reviews the pull request as it stands now, keeping this conversation."{{end}}>Review the current revision</button>
         </form>
         {{if not .ReviewReady}}<p class="zz-meta zz-why">Wait for the reply in progress.</p>{{end}}
@@ -249,6 +250,7 @@
         {{if .NeedsReview}}
         <form method="post" action="/items/review-again">
           <input type="hidden" name="id" value="{{$.Item.ID}}">
+          <input type="hidden" name="review" value="first">
           <button class="btn btn-sm" type="submit" title="Reviews the pull request, keeping this conversation.">Review this pull request</button>
         </form>
         {{end}}

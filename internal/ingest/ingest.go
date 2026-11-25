@@ -123,6 +123,9 @@ const (
 	ingestDeadline   = 10 * time.Minute
 	converseDeadline = 15 * time.Minute
 	researchDeadline = 5 * time.Minute
+	// ConverseDeadline is converseDeadline for the web tier: an unanswered converse
+	// turn younger than this may still have a run in flight, which can still answer.
+	ConverseDeadline = converseDeadline
 	// reviewConcurrency bounds how many review turns a bulk action dispatches at once.
 	reviewConcurrency = 8
 	// retryAfter bounds how long a tracked backfill run is treated as in-flight before

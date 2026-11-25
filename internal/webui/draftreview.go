@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackfrancis/gofer/internal/comment"
 	"github.com/jackfrancis/gofer/internal/ghcomment"
+	"github.com/jackfrancis/gofer/internal/ingest"
 	"github.com/jackfrancis/gofer/internal/session"
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
@@ -70,10 +71,44 @@ type draftThread struct {
 	// of the current revision, enabled while no reply is in flight (ReviewReady).
 	ReviewOutdated bool
 	ReviewReady    bool
-	// NeedsReview marks a pull request with no completed review and no reply in
-	// flight: the draft button is disabled for want of one, so the thread offers a
-	// review right there ("Review this pull request", webui.ReviewAgain).
+	// NeedsReview marks a pull request with no completed review, no reply in flight
+	// and no unanswered review request a run may still answer or Retry would retry
+	// (reviewInFlight): the draft button is disabled for want of a review, so the
+	// thread offers one right there ("Review this pull request", webui.ReviewAgain).
 	NeedsReview bool
+}
+
+// Review actions a ReviewAgain form names (form "review"), each checked against its
+// own condition inside the store update, so a page rendered for one never does the
+// other once the thread changed (a conversation reset in another tab, say).
+const (
+	reviewFirst = "first" // "Review this pull request": the thread has no review
+	reviewAgain = "again" // "Review the current revision": the latest review is outdated
+)
+
+// reviewInFlight reports whether it has an unanswered, visible review request that a
+// run may still answer (younger than a converse run can last) or that Retry would
+// retry. Starting another review then would run the model twice, and both answers
+// could land: the thread offers Retry, or waiting, instead.
+func reviewInFlight(it worklist.WorkItem, now time.Time) bool {
+	retry, retryable := it.RetryableTurn(now, reviewStaleAfter)
+	for i, m := range it.Thread {
+		if m.Role != worklist.RoleUser || m.Kind != worklist.KindReviewRequest || m.Hidden || it.Answered(it.TurnKey(i)) {
+			continue
+		}
+		if now.Sub(m.At) < ingest.ConverseDeadline || (retryable && retry == i) {
+			return true
+		}
+	}
+	return false
+}
+
+// firstReviewable reports whether "Review this pull request" may add a first review
+// to it now: a pull request on the radar with no completed review, no reply in
+// flight, and no review request still in flight or retryable (reviewInFlight).
+func firstReviewable(it worklist.WorkItem, now time.Time) bool {
+	return it.Type == worklist.TypePullRequest && it.OnRadar() && !it.HasReview() &&
+		!it.ReplyPending(now, reviewStaleAfter) && !reviewInFlight(it, now)
 }
 
 // reviewCreator returns the commenter's pending-review side, if it has one.
@@ -99,6 +134,8 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 		// Before the review check: a first review still running is a wait, not a
 		// missing review.
 		v.Why = "Wait for the reply in progress, so the draft includes it."
+	case !it.HasReview() && reviewInFlight(it, now):
+		v.Why = "The review in this conversation has no answer yet and may still be running. Wait for it, or retry it when gofer offers Retry, rather than starting another."
 	case !it.HasReview():
 		v.Why = "Review this pull request first: there are no review comments to draft yet. A review asked for in a Discuss message does not count; use Review this pull request."
 		v.NeedsReview = true
@@ -216,12 +253,19 @@ func (h *Handler) ReviewAgain(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.FormValue("id")
 	back := "/items/thread?id=" + url.QueryEscape(id)
-	if id == "" {
+	action := r.FormValue("review")
+	if action == "" {
+		action = reviewAgain // a page rendered before forms named their action had only this one
+	}
+	if id == "" || (action != reviewFirst && action != reviewAgain) {
 		http.Redirect(w, r, back, http.StatusSeeOther)
 		return
 	}
 	now := h.now().UTC()
-	msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Kind: worklist.KindReviewRequest, At: now}
+	msg := worklist.Message{ID: worklist.NewMessageID(), Role: worklist.RoleUser, Kind: worklist.KindReviewRequest, Content: reviewAgainPrompt, At: now}
+	if action == reviewFirst {
+		msg.Content = reviewPrompt
+	}
 	appended := false
 	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		appended = false
@@ -230,20 +274,13 @@ func (h *Handler) ReviewAgain(w http.ResponseWriter, r *http.Request) {
 			if it.ID != id {
 				continue
 			}
-			if it.Type != worklist.TypePullRequest || !it.OnRadar() || it.ReplyPending(now, reviewStaleAfter) {
-				return nil, nil
-			}
-			req := msg
 			switch {
-			case !it.HasReview():
-				req.Content = reviewPrompt
-			case it.ReviewOutdated():
-				req.Content = reviewAgainPrompt
-			default:
-				return nil, nil
+			case action == reviewFirst && !firstReviewable(it, now):
+				return nil, nil // reviewed since, a review in flight or retryable, or off the radar
+			case action == reviewAgain && (it.Type != worklist.TypePullRequest || !it.OnRadar() || !it.ReviewOutdated() || it.ReplyPending(now, reviewStaleAfter)):
+				return nil, nil // the review is current (or the conversation was reset), a reply in flight, or off the radar
 			}
-			msg = req
-			current[i].Thread = append(current[i].Thread, req)
+			current[i].Thread = append(current[i].Thread, msg)
 			appended = true
 			return current[i : i+1], nil
 		}
