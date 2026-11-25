@@ -622,10 +622,13 @@ Wired on the web-tier side; they define what a runtime must respect:
   link without the grant) posts a `KindDraftReviewRequest` turn and dispatches a
   converse run by the default model. The button is not shown, and the handler refuses
   the request, while a redraft would only repeat the offered draft
-  (`WorkItem.RedraftRedundant`: it is the newest visible turn, unconfirmed, at the
-  known head `GitHub.CI.SHA`); a refusal as out of date (`comment.ReviewResult.Stale`)
-  offers drafting again on the result page (`redraft=1`), so "draft again" is always
-  reachable. The run (`internal/agent/draft.go`) reads the
+  (`WorkItem.RedraftRedundant`: unconfirmed, no visible turn after its request but the
+  draft itself, and no earlier turn hidden or unhidden since the request,
+  `Message.VisibilityAt`, which only `WorkItem.SetHidden` writes). The draft's head is
+  not compared with the item's (no ordered observation); a confirmation refused as out
+  of date (`comment.ReviewResult.Stale`) offers drafting again on the result page,
+  bound to that draft's turn and digest (`redraft=1`) and honored only while it is
+  still offered. The run (`internal/agent/draft.go`) reads the
   head commit and patches (`github.Client.PullDiff`), annotates the lines a comment
   may anchor to, asks `worklist.ReviewDrafter` (`llm.ReviewDrafter`) for only the
   points the visible conversation agrees on (the user's own messages decide; an

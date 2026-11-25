@@ -112,6 +112,11 @@ type Message struct {
 	// a long review thread can be pared down to its definitive turns without deleting
 	// the history. It is reversible — the user can unhide it.
 	Hidden bool `json:"hidden,omitempty"`
+	// VisibilityAt is when the user last hid or unhid the turn (WorkItem.SetHidden,
+	// stamped by the web tier); zero for a turn never toggled, or toggled before gofer
+	// recorded it. A draft requested before it may have read the conversation
+	// differently (RedraftRedundant).
+	VisibilityAt time.Time `json:"visibility_at,omitzero"`
 	// Notice marks an agent turn that is a system notice (NoticeReconnect), not an
 	// answer: it does not answer the turn it replies to. Empty on every other turn.
 	Notice string `json:"notice,omitempty"`

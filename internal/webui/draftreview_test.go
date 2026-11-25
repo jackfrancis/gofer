@@ -156,25 +156,77 @@ func TestThreadHidesRedundantDraftButton(t *testing.T) {
 	}
 }
 
-// A stale page's redundant draft request appends and dispatches nothing; the result
-// page's "Draft again" (redraft=1), offered when GitHub refused the draft as out of
-// date, goes through.
+// A stale page's redundant draft request appends and dispatches nothing. The result
+// page's "Draft again", offered when GitHub refused the draft as out of date, goes
+// through only while that very draft (turn key and digest) is still the one offered:
+// one naming another draft, or posted after a newer draft replaced it, is held to the
+// ordinary check.
 func TestDraftReviewRefusesRedundantRedraft(t *testing.T) {
 	post := func(h *Handler, form url.Values) {
 		req := httptest.NewRequest(http.MethodPost, "/items/draft-review", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		h.DraftReview(httptest.NewRecorder(), req)
 	}
+	turns := func(store worklist.Store) int {
+		it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+		return len(it.Thread)
+	}
 	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
 	th := draftedThread(time.Now().Add(-time.Hour))
+	digest := th[3].Draft.Digest()
 	h, p, store := draftFixture(t, c, th)
-	post(h, url.Values{"id": {draftItemID}})
-	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); len(it.Thread) != len(th) || len(p.turns) != 0 {
-		t.Fatalf("a redundant draft request was appended or dispatched: %d turns, %+v", len(it.Thread), p.turns)
+	for name, form := range map[string]url.Values{
+		"plain":         {"id": {draftItemID}},
+		"unbound":       {"id": {draftItemID}, "redraft": {"1"}},
+		"other turn":    {"id": {draftItemID}, "redraft": {"1"}, "msg": {"r"}, "digest": {digest}},
+		"other digest":  {"id": {draftItemID}, "redraft": {"1"}, "msg": {"a"}, "digest": {"0000"}},
+		"digest absent": {"id": {draftItemID}, "redraft": {"1"}, "msg": {"a"}},
+	} {
+		post(h, form)
+		if n := turns(store); n != len(th) || len(p.turns) != 0 {
+			t.Fatalf("%s: a redundant draft request was appended or dispatched: %d turns, %+v", name, n, p.turns)
+		}
 	}
-	post(h, url.Values{"id": {draftItemID}, "redraft": {"1"}})
-	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); len(it.Thread) != len(th)+1 || len(p.turns) != 1 {
-		t.Errorf("the out-of-date redraft was refused: %d turns, %+v", len(it.Thread), p.turns)
+	rejected := url.Values{"id": {draftItemID}, "redraft": {"1"}, "msg": {"a"}, "digest": {digest}}
+	post(h, rejected)
+	if n := turns(store); n != len(th)+1 || len(p.turns) != 1 {
+		t.Fatalf("the out-of-date redraft was refused: %d turns, %+v", n, p.turns)
+	}
+
+	// Another tab already redrafted, and the newer draft landed: the old result
+	// page's button must not retire it.
+	newer := append(draftedThread(time.Now().Add(-time.Hour)),
+		worklist.Message{ID: "d2", Role: worklist.RoleUser, Content: draftReviewPrompt, Kind: worklist.KindDraftReviewRequest, At: time.Now().Add(-time.Hour)},
+		worklist.Message{ID: "a2", ReplyTo: "d2", Role: worklist.RoleAgent, Content: "Drafted 1.", At: time.Now().Add(-time.Hour), Draft: &worklist.DraftReview{
+			Repo: "o/r", Number: 1, Commit: strings.Repeat("b", 40), BaseRef: "main",
+			Patches:  map[string]string{"a.go": worklist.PatchDigest("pa2")},
+			Comments: []worklist.DraftComment{{Path: "a.go", Line: 4, Side: "RIGHT", Body: "Rename y."}},
+		}})
+	h, p, store = draftFixture(t, c, newer)
+	post(h, rejected)
+	if n := turns(store); n != len(newer) || len(p.turns) != 0 {
+		t.Errorf("a stale result page retired the newer draft: %d turns, %+v", n, p.turns)
+	}
+}
+
+// Hiding or unhiding a turn before the draft request changes what the drafter would
+// read, so the thread offers drafting again; the toggle is stamped.
+func TestHidingAnEarlierTurnReopensDrafting(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	th := draftedThread(time.Now().Add(-time.Hour))
+	h, _, store := draftFixture(t, c, th)
+	if page, _ := threadPage(t, h); strings.Contains(page, `action="/items/draft-review"`) {
+		t.Fatal("the thread offers drafting again right under its draft")
+	}
+	req := httptest.NewRequest(http.MethodPost, "/items/thread/hide", strings.NewReader(url.Values{"id": {draftItemID}, "msg": {"r"}, "hidden": {"true"}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.HideMessage(httptest.NewRecorder(), req)
+	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+	if !it.Thread[1].Hidden || it.Thread[1].VisibilityAt.IsZero() {
+		t.Fatalf("the hide was not stamped: %+v", it.Thread[1])
+	}
+	if page, _ := threadPage(t, h); !strings.Contains(page, `action="/items/draft-review"`) {
+		t.Error("an earlier turn was hidden since the draft, but no button")
 	}
 }
 
@@ -185,7 +237,8 @@ func TestCreateDraftReviewStaleOffersRedraft(t *testing.T) {
 	th := draftedThread(time.Now().Add(-time.Hour))
 	h, _, _ := draftFixture(t, c, th)
 	rec := postCreate(h, draftConfirmForm(th), "Sec-Fetch-Site", "same-origin")
-	if body := rec.Body.String(); rec.Code != http.StatusConflict || !strings.Contains(body, `name="redraft" value="1"`) || !strings.Contains(body, `action="/items/draft-review"`) {
+	if body := rec.Body.String(); rec.Code != http.StatusConflict || !strings.Contains(body, `name="redraft" value="1"`) || !strings.Contains(body, `action="/items/draft-review"`) ||
+		!strings.Contains(body, `name="msg" value="a"`) || !strings.Contains(body, `name="digest" value="`+th[3].Draft.Digest()+`"`) {
 		t.Errorf("status %d, no redraft form:\n%s", rec.Code, body)
 	}
 	c.result = comment.ReviewResult{Error: "You already have a pending review."}

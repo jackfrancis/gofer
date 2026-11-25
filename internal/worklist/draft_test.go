@@ -159,23 +159,46 @@ func TestLatestDraft(t *testing.T) {
 	}
 }
 
-// Drafting again is redundant only while the thread ends with the unconfirmed draft
-// it offers, for the head gofer last read: any visible turn after it, a receipt, a
-// retired draft or a newer head opens drafting again; hidden turns after it do not.
+// Drafting again is redundant only while the drafter would read the conversation it
+// read: any visible turn after the draft request but its own reply, a visibility
+// change before it since the request, a receipt, or a retired draft opens drafting
+// again; hidden turns after it, and toggles before the request, do not.
 func TestRedraftRedundant(t *testing.T) {
-	d1 := Message{ID: "d1", Role: RoleUser, Kind: KindDraftReviewRequest, Content: "draft"}
+	asked := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	q0 := Message{ID: "q0", Role: RoleUser, Content: "leave out the rename"}
+	d1 := Message{ID: "d1", Role: RoleUser, Kind: KindDraftReviewRequest, Content: "draft", At: asked}
 	a1 := Message{ID: "a1", ReplyTo: "d1", Role: RoleAgent, Content: "drafted", Draft: pinned("x")}
-	if !draftPR(d1, a1).RedraftRedundant() {
+	if !draftPR(q0, d1, a1).RedraftRedundant() {
 		t.Error("a thread ending with its draft is not redundant to redraft")
 	}
 	q := Message{ID: "q", Role: RoleUser, Content: "what about y?"}
 	if draftPR(d1, a1, q).RedraftRedundant() {
 		t.Error("a turn after the draft left redrafting redundant")
 	}
+	// A correction posted while the drafter worked, answered before the draft landed:
+	// the draft is last, but it never read the correction.
+	qa := Message{ID: "qa", ReplyTo: "q", Role: RoleAgent, Content: "noted"}
+	if draftPR(d1, q, qa, a1).RedraftRedundant() {
+		t.Error("a correction posted while drafting left redrafting redundant")
+	}
 	hiddenQ := q
 	hiddenQ.Hidden = true
-	if !draftPR(d1, a1, hiddenQ).RedraftRedundant() {
-		t.Error("a hidden turn after the draft, which the drafter never reads, opened redrafting")
+	if !draftPR(d1, a1, hiddenQ).RedraftRedundant() || !draftPR(d1, hiddenQ, a1).RedraftRedundant() {
+		t.Error("a hidden turn after the request, which the drafter never reads, opened redrafting")
+	}
+	// Hiding or unhiding an earlier turn since the request changes what the drafter
+	// would read; a toggle before the request does not.
+	for name, at := range map[string]time.Time{"after": asked.Add(time.Minute), "same instant": asked} {
+		toggled := q0
+		toggled.VisibilityAt = at
+		if draftPR(toggled, d1, a1).RedraftRedundant() {
+			t.Errorf("%s: an earlier turn's visibility changed since the request, yet redrafting is redundant", name)
+		}
+	}
+	before := q0
+	before.Hidden, before.VisibilityAt = true, asked.Add(-time.Minute)
+	if !draftPR(before, d1, a1).RedraftRedundant() {
+		t.Error("a toggle the drafter already saw opened redrafting")
 	}
 	confirmed := a1
 	confirmed.DraftReceipt = &DraftReceipt{State: DraftCreated, At: time.Now()}
@@ -191,15 +214,29 @@ func TestRedraftRedundant(t *testing.T) {
 	if other.RedraftRedundant() {
 		t.Error("a draft pinned to another pull request left redrafting closed")
 	}
-	moved := draftPR(d1, a1)
-	moved.GitHub.CI = &CISummary{SHA: strings.Repeat("f", 40)}
-	if moved.RedraftRedundant() {
-		t.Error("a draft anchored to an older head left redrafting closed")
+	// A legacy reply (no ReplyTo) answers the request directly before it.
+	legacy := a1
+	legacy.ReplyTo = ""
+	if !draftPR(q0, d1, legacy).RedraftRedundant() {
+		t.Error("a legacy draft reply is not recognized as answering its request")
 	}
-	same := draftPR(d1, a1)
-	same.GitHub.CI = &CISummary{SHA: strings.ToUpper(testCommit)}
-	if !same.RedraftRedundant() {
-		t.Error("a draft at the known head is not redundant to redraft")
+}
+
+// SetHidden stamps a change of visibility, and only a change.
+func TestSetHiddenStampsChanges(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	it := draftPR(Message{ID: "q", Role: RoleUser, Content: "hi"})
+	if it.SetHidden(0, false, now) || !it.Thread[0].VisibilityAt.IsZero() {
+		t.Error("unhiding a visible turn changed it")
+	}
+	if !it.SetHidden(0, true, now) || !it.Thread[0].Hidden || !it.Thread[0].VisibilityAt.Equal(now) {
+		t.Errorf("hide: %+v", it.Thread[0])
+	}
+	if it.SetHidden(0, true, now.Add(time.Hour)) || !it.Thread[0].VisibilityAt.Equal(now) {
+		t.Error("hiding a hidden turn restamped it")
+	}
+	if it.SetHidden(1, true, now) || it.SetHidden(-1, true, now) {
+		t.Error("an out-of-range turn was changed")
 	}
 }
 

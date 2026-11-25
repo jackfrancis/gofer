@@ -742,6 +742,7 @@ func (h *Handler) HideMessage(w http.ResponseWriter, r *http.Request) {
 	// turns landed still hides the turn it showed. A turn that is gone (the thread was
 	// cleared) is a no-op, and so is any turn of a hidden item: its thread is
 	// read-only until the owner unhides it, even from a stale tab.
+	now := h.now().UTC()
 	_ = h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
 		for i := range current {
 			if current[i].ID != id {
@@ -751,10 +752,9 @@ func (h *Handler) HideMessage(w http.ResponseWriter, r *http.Request) {
 				return nil, nil
 			}
 			j, ok := current[i].TurnIndex(key)
-			if !ok {
+			if !ok || !current[i].SetHidden(j, hidden, now) {
 				return nil, nil
 			}
-			current[i].Thread[j].Hidden = hidden
 			return current[i : i+1], nil
 		}
 		return nil, nil

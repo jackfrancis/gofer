@@ -206,47 +206,78 @@ func (w WorkItem) IsDraftReviewRequest(i int) bool {
 // the draft before it, and a late reply to an older request never supersedes a newer
 // result. A hidden request or reply offers nothing.
 func (w WorkItem) LatestDraft() int {
+	_, j := w.latestDraft()
+	return j
+}
+
+// latestDraft returns the positions of the newest draft request and of the reply
+// carrying the draft the thread offers (LatestDraft), or -1, -1.
+func (w WorkItem) latestDraft() (req, reply int) {
 	for i := len(w.Thread) - 1; i >= 0; i-- {
 		if !w.IsDraftReviewRequest(i) {
 			continue
 		}
 		if w.Thread[i].Hidden {
-			return -1
+			return -1, -1
 		}
 		j, ok := w.replies()[w.TurnKey(i)]
 		if !ok || w.Thread[j].Hidden || w.Thread[j].Draft == nil {
-			return -1
+			return -1, -1
 		}
-		return j
+		return i, j
 	}
-	return -1
+	return -1, -1
 }
 
 // RedraftRedundant reports whether drafting again would only repeat the draft the
-// thread offers (LatestDraft): it is the thread's newest visible turn (hidden turns
-// are skipped, since the drafter never reads them), it is still pinned to the item's
-// pull request (DraftReview.For) at the head gofer last read there (GitHub.CI.SHA,
-// when known), and it is unconfirmed. A confirmed draft (any receipt) is used up: the
-// thread says to draft again to start over. A draft that is retired (an empty
-// redraft, a hidden reply, another pull request) or anchored to an older head leaves
-// drafting open, as does any turn after it.
+// thread offers (LatestDraft), because the conversation the drafter reads is the one
+// it read: the draft is unconfirmed and still pinned to the item's pull request
+// (DraftReview.For); no turn after its request but the draft itself is visible (the
+// drafter read only the turns before its request, so a correction posted while it
+// worked, even one answered before the draft landed, is new to it); and no turn
+// before the request changed visibility since the request was posted
+// (Message.VisibilityAt, against the request's At, both stamped by the web tier;
+// a change at the same instant counts), so hiding or unhiding an earlier instruction
+// opens drafting again. A confirmed draft (any receipt) is used up: the thread says
+// to draft again to start over. A retired draft (an empty redraft, a hidden request
+// or reply, another pull request) leaves drafting open.
+//
+// The head the draft is anchored to is not compared with the item's: gofer has no
+// observation of the head it can order against the drafter's own read. A draft that
+// GitHub finds out of date is refused when confirmed (comment.ReviewResult.Stale),
+// and that result offers drafting again.
 func (w WorkItem) RedraftRedundant() bool {
-	i := w.LatestDraft()
+	req, i := w.latestDraft()
 	if i < 0 {
 		return false
 	}
-	d := w.Thread[i].Draft
-	if !d.For(w) || w.Thread[i].DraftReceipt != nil {
+	if !w.Thread[i].Draft.For(w) || w.Thread[i].DraftReceipt != nil {
 		return false
 	}
-	if ci := w.GitHub.CI; ci != nil && ci.SHA != "" && !strings.EqualFold(ci.SHA, d.Commit) {
-		return false
-	}
-	for j := len(w.Thread) - 1; j > i; j-- {
-		if !w.Thread[j].Hidden {
+	asked := w.Thread[req].At
+	for j := range w.Thread {
+		switch {
+		case j < req:
+			if at := w.Thread[j].VisibilityAt; !at.IsZero() && !at.Before(asked) {
+				return false
+			}
+		case j > req && j != i && !w.Thread[j].Hidden:
 			return false
 		}
 	}
+	return true
+}
+
+// SetHidden hides (or unhides) turn i at now, reporting whether its visibility
+// changed. A change is stamped (Message.VisibilityAt), so a draft whose request came
+// before it no longer counts as reading the conversation as it stands
+// (RedraftRedundant).
+func (w *WorkItem) SetHidden(i int, hidden bool, now time.Time) bool {
+	if i < 0 || i >= len(w.Thread) || w.Thread[i].Hidden == hidden {
+		return false
+	}
+	w.Thread[i].Hidden = hidden
+	w.Thread[i].VisibilityAt = now
 	return true
 }
 

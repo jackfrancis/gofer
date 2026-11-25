@@ -100,6 +100,8 @@
         <form method="post" action="/items/draft-review">
           <input type="hidden" name="id" value="{{.Item.ID}}">
           <input type="hidden" name="redraft" value="1">
+          <input type="hidden" name="msg" value="{{.Key}}">
+          <input type="hidden" name="digest" value="{{.Digest}}">
           <div class="zz-actions"><button class="btn btn-primary" type="submit" title="Drafts review comments again, against the pull request as it stands now">Draft Review Comments again</button></div>
         </form>
         {{else}}
