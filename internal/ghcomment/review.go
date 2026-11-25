@@ -156,41 +156,40 @@ func (c *Client) PendingReview(ctx context.Context, token, repo string, number i
 	if pending {
 		return "", ErrPendingExists
 	}
-	read := -1 // files read for an approval's diff, checked against the final read
-	if rv.Diff != "" {
-		// An approval: the whole diff must still be the one reviewed, and that read
-		// covers the commented files' patches too.
-		if read, err = c.checkDiff(ctx, token, pull, rv.Diff, want); err != nil {
+	for attempt := 1; ; attempt++ {
+		read, baseSHA := -1, "" // for an approval: files read and the base commit they were read against
+		if rv.Diff != "" {
+			// An approval: the whole diff must still be the one reviewed, and that read
+			// covers the commented files' patches too.
+			if read, baseSHA, err = c.checkDiff(ctx, token, pull, rv.Diff, want); err != nil {
+				return "", err
+			}
+		} else if err := c.checkPatches(ctx, token, pull, want); err != nil {
 			return "", err
 		}
-	} else if err := c.checkPatches(ctx, token, pull, want); err != nil {
-		return "", err
-	}
-	// The pull request is read after the lists are paged, right before the POST, so
-	// its state, head and base are as fresh as the API lets gofer check. A push since
-	// the files were read shows here as a new head.
-	raw, err := c.do(ctx, token, http.MethodGet, pull, nil, http.StatusOK)
-	if err != nil {
-		return "", err
-	}
-	var pr struct {
-		State string `json:"state"`
-		Head  struct {
-			SHA string `json:"sha"`
-		} `json:"head"`
-		Base struct {
-			Ref string `json:"ref"`
-		} `json:"base"`
-		ChangedFiles int `json:"changed_files"`
-	}
-	if err := json.Unmarshal(raw, &pr); err != nil {
-		return "", errors.New("github: unreadable pull request")
-	}
-	if !strings.EqualFold(pr.State, "open") {
-		return "", ErrNotOpen
-	}
-	if !strings.EqualFold(pr.Head.SHA, rv.Commit) || pr.Base.Ref != rv.BaseRef || (read >= 0 && pr.ChangedFiles != read) {
-		return "", ErrHeadMoved
+		// The pull request is read after the lists are paged, right before the POST, so
+		// its state, head and base are as fresh as the API lets gofer check. A push since
+		// the files were read shows here as a new head.
+		pr, err := c.readPull(ctx, token, pull)
+		if err != nil {
+			return "", err
+		}
+		if !strings.EqualFold(pr.State, "open") {
+			return "", ErrNotOpen
+		}
+		if !strings.EqualFold(pr.Head.SHA, rv.Commit) || pr.Base.Ref != rv.BaseRef || (read >= 0 && pr.ChangedFiles != read) {
+			return "", ErrHeadMoved
+		}
+		// For an approval, the base commit must not have moved since the files were
+		// read: a stacked dependency merged in between changes a patch without moving
+		// the head, the base's name or the file count. If it moved, read the diff again
+		// against the new base: an unrelated advance leaves the digest as it was.
+		if rv.Diff == "" || strings.EqualFold(pr.Base.SHA, baseSHA) {
+			break
+		}
+		if attempt == maxDiffAttempts {
+			return "", errors.New("github: the base branch kept moving while gofer checked the approved diff; nothing was created, try again in a moment")
+		}
 	}
 	// No "event": GitHub creates the review PENDING.
 	payload, err := json.Marshal(struct {
@@ -270,6 +269,8 @@ func (c *Client) checkPatches(ctx context.Context, token, pull string, want map[
 const (
 	diffFilesPerPage = 100
 	maxDiffFilePages = 30
+	// maxDiffAttempts bounds re-reading an approved diff while the base commit moves.
+	maxDiffAttempts = 3
 )
 
 // checkDiff reads the pull request's changed-file count, then every file, and
@@ -278,29 +279,25 @@ const (
 // many files it read, which the caller checks against the pull request's count
 // again right before the write. A list longer than GitHub lists is an error, never
 // a pass.
-func (c *Client) checkDiff(ctx context.Context, token, pull, diff string, want map[string]string) (int, error) {
-	raw, err := c.do(ctx, token, http.MethodGet, pull, nil, http.StatusOK)
+func (c *Client) checkDiff(ctx context.Context, token, pull, diff string, want map[string]string) (int, string, error) {
+	pr, err := c.readPull(ctx, token, pull)
 	if err != nil {
-		return 0, err
-	}
-	var pr struct {
-		ChangedFiles int `json:"changed_files"`
-	}
-	if err := json.Unmarshal(raw, &pr); err != nil {
-		return 0, errors.New("github: unreadable pull request")
+		return 0, "", err
 	}
 	if pr.ChangedFiles > diffFilesPerPage*maxDiffFilePages {
-		return 0, errors.New("github: too many files to check the approved diff")
+		// The approved diff was read whole, so it was within the cap: this is another
+		// diff now, and the draft is out of date.
+		return 0, "", ErrHeadMoved
 	}
 	var all []File
 	for page := 1; page <= maxDiffFilePages && len(all) < pr.ChangedFiles; page++ {
 		raw, err := c.doLimit(ctx, token, http.MethodGet, pull+"/files?per_page="+strconv.Itoa(diffFilesPerPage)+"&page="+strconv.Itoa(page), nil, http.StatusOK, maxFilesPageBytes)
 		if err != nil {
-			return 0, err
+			return 0, "", err
 		}
 		var files []File
 		if err := json.Unmarshal(raw, &files); err != nil {
-			return 0, errors.New("github: unreadable file list")
+			return 0, "", errors.New("github: unreadable file list")
 		}
 		all = append(all, files...)
 		if len(files) < diffFilesPerPage {
@@ -308,7 +305,7 @@ func (c *Client) checkDiff(ctx context.Context, token, pull, diff string, want m
 		}
 	}
 	if len(all) != pr.ChangedFiles || DiffDigest(all) != diff {
-		return 0, ErrHeadMoved
+		return 0, "", ErrHeadMoved
 	}
 	found := 0
 	for _, f := range all {
@@ -317,14 +314,40 @@ func (c *Client) checkDiff(ctx context.Context, token, pull, diff string, want m
 			continue
 		}
 		if f.Patch == "" || PatchDigest(f.Patch) != d {
-			return 0, ErrHeadMoved
+			return 0, "", ErrHeadMoved
 		}
 		found++
 	}
 	if found != len(want) {
-		return 0, ErrHeadMoved // a commented file is not in the diff
+		return 0, "", ErrHeadMoved // a commented file is not in the diff
 	}
-	return len(all), nil
+	return len(all), pr.Base.SHA, nil
+}
+
+// pullState is what PendingReview checks on the pull request.
+type pullState struct {
+	State string `json:"state"`
+	Head  struct {
+		SHA string `json:"sha"`
+	} `json:"head"`
+	Base struct {
+		Ref string `json:"ref"`
+		SHA string `json:"sha"`
+	} `json:"base"`
+	ChangedFiles int `json:"changed_files"`
+}
+
+// readPull reads the pull request (its API path).
+func (c *Client) readPull(ctx context.Context, token, pull string) (pullState, error) {
+	raw, err := c.do(ctx, token, http.MethodGet, pull, nil, http.StatusOK)
+	if err != nil {
+		return pullState{}, err
+	}
+	var pr pullState
+	if err := json.Unmarshal(raw, &pr); err != nil {
+		return pullState{}, errors.New("github: unreadable pull request")
+	}
+	return pr, nil
 }
 
 // hasPendingReview reports whether the pull request (its API path) has a pending

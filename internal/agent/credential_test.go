@@ -469,3 +469,45 @@ func TestBackfillStopsWhenEnrichNeedsSignIn(t *testing.T) {
 		t.Errorf("write-backs = %d, want only the fetch's (no rank pass)", sink.ingests)
 	}
 }
+
+// A review whose only refused request is the final read of the pull request (after
+// the model answered) still ends with the reconnect notice, never a saved review:
+// the access is gone, and the turn stays retryable.
+func TestConverseReconnectAtTheFinalReviewRead(t *testing.T) {
+	plane := newFakePlane(t, planeAnswer{token: "tok", version: "v1"}, planeAnswer{status: signInRequiredStatus})
+	reads := 0
+	srv := httptest.NewServer(githubtest.PublicRepos(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/user":
+			_, _ = w.Write([]byte(`{"login":"octocat"}`))
+		case "/repos/o/r/issues/1":
+			_, _ = w.Write([]byte(`{"body":"desc"}`))
+		case "/repos/o/r/pulls/1":
+			reads++
+			if reads > 3 { // the snapshot's two reads and the discussion's; then the final read
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"state": "open", "head": map[string]any{"sha": "0123456789abcdef0123456789abcdef01234567"}, "changed_files": 1,
+				"base": map[string]any{"ref": "main", "sha": "base0", "repo": map[string]any{"full_name": "o/r"}},
+			})
+		case "/repos/o/r/pulls/1/files":
+			_, _ = w.Write([]byte(`[{"filename":"a.go","status":"modified","sha":"b","patch":"@@ -1 +1 @@\n-a\n+b"}]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	sink := converseSink()
+	sink.items[0].Thread[0].Kind = worklist.KindReviewRequest
+	fc := &fakeConverser{reply: "LGTM"}
+	if err := Run(context.Background(), Params{JobType: JobConverse, ItemID: "github:o/r#1", Turn: "q", Converser: fc, GitHubBaseURL: srv.URL}, plane.vendor(), sink); err != nil {
+		t.Fatal(err)
+	}
+	if fc.gotUser == "" || reads != 4 {
+		t.Fatalf("model called %v, pull reads %d", fc.gotUser != "", reads)
+	}
+	assertReconnectNotice(t, sink)
+}

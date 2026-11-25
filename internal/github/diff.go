@@ -16,6 +16,8 @@ const (
 	// maxDiffPages bounds the files pages read (100 files each). GitHub itself lists
 	// at most 3000 files.
 	maxDiffPages = 30
+	// maxSnapshotAttempts bounds re-reading the diff while the comparison moves.
+	maxSnapshotAttempts = 3
 )
 
 // PullDiff is a pull request's head commit, base branch, whether it is open, and its
@@ -30,7 +32,8 @@ type PullDiff struct {
 	// request reports (changed_files), which GitHub lists only up to 3000.
 	Complete bool
 	// Settled is true when the pull request read again after its files showed the
-	// same head and base, so the files are the comparison of that head with that base.
+	// same head, base branch, base commit and file count, so the files are the
+	// comparison of that head with that base as it stood.
 	Settled bool
 }
 
@@ -113,8 +116,15 @@ type pullRevision struct {
 	} `json:"head"`
 	Base struct {
 		Ref string `json:"ref"`
+		SHA string `json:"sha"`
 	} `json:"base"`
 	ChangedFiles int `json:"changed_files"`
+}
+
+// same reports whether two reads of the pull request name the same comparison:
+// head, base branch and its commit, and file count.
+func (a pullRevision) same(b pullRevision) bool {
+	return a.Head.SHA == b.Head.SHA && a.Base.Ref == b.Base.Ref && a.Base.SHA == b.Base.SHA && a.ChangedFiles == b.ChangedFiles
 }
 
 func (c *Client) readPullRevision(ctx context.Context, token, repo string, number int) (pullRevision, error) {
@@ -144,8 +154,13 @@ func (c *Client) PullRevision(ctx context.Context, token, repo string, number in
 
 // PullDiff reads repo's pull request number: its head commit, base branch, state and
 // changed-file count, then its changed files, 100 a page, until it has that many
-// (Complete), then the pull request again (Settled when its head and base are
-// unchanged). A public repository only, as every call of this client (the PR answer
+// (Complete), then the pull request again. The snapshot is Settled when the second
+// read names the same comparison (head, base branch, base commit, file count): a
+// stacked dependency merged into the base while the files were read changes a patch
+// without moving the head, the base's name or the count, but it moves the base
+// commit. If the comparison moved, the whole read is tried again, up to
+// maxSnapshotAttempts, so an unrelated advance of the base does not cost the
+// snapshot. A public repository only, as every call of this client (the PR answer
 // is checked by getPull, the file pages by get). ghcomment.PendingReview reads an
 // approved diff with the same pages and the same count.
 func (c *Client) PullDiff(ctx context.Context, token, repo string, number int) (PullDiff, error) {
@@ -157,32 +172,39 @@ func (c *Client) PullDiff(ctx context.Context, token, repo string, number int) (
 	if err != nil {
 		return PullDiff{}, err
 	}
-	d := PullDiff{HeadSHA: pr.Head.SHA, BaseRef: pr.Base.Ref, Open: strings.EqualFold(pr.State, "open")}
-	for page := 1; page <= maxDiffPages && len(d.Files) < pr.ChangedFiles; page++ {
-		body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/pulls/%d/files?per_page=100&page=%d", repo, number, page))
+	var d PullDiff
+	for attempt := 1; ; attempt++ {
+		d = PullDiff{HeadSHA: pr.Head.SHA, BaseRef: pr.Base.Ref, Open: strings.EqualFold(pr.State, "open")}
+		for page := 1; page <= maxDiffPages && len(d.Files) < pr.ChangedFiles; page++ {
+			body, err := c.get(ctx, token, fmt.Sprintf("/repos/%s/pulls/%d/files?per_page=100&page=%d", repo, number, page))
+			if err != nil {
+				return PullDiff{}, err
+			}
+			var files []struct {
+				Filename         string `json:"filename"`
+				PreviousFilename string `json:"previous_filename"`
+				Status           string `json:"status"`
+				SHA              string `json:"sha"`
+				Patch            string `json:"patch"`
+			}
+			if err := json.Unmarshal(body, &files); err != nil {
+				return PullDiff{}, err
+			}
+			for _, f := range files {
+				d.Files = append(d.Files, DiffFile{Path: f.Filename, PreviousPath: f.PreviousFilename, Status: f.Status, SHA: f.SHA, Patch: f.Patch})
+			}
+			if len(files) < 100 {
+				break
+			}
+		}
+		d.Complete = len(d.Files) == pr.ChangedFiles
+		again, err := c.readPullRevision(ctx, token, repo, number)
 		if err != nil {
-			return PullDiff{}, err
+			return d, nil // unsettled
 		}
-		var files []struct {
-			Filename         string `json:"filename"`
-			PreviousFilename string `json:"previous_filename"`
-			Status           string `json:"status"`
-			SHA              string `json:"sha"`
-			Patch            string `json:"patch"`
+		if d.Settled = again.same(pr); d.Settled || attempt == maxSnapshotAttempts {
+			return d, nil
 		}
-		if err := json.Unmarshal(body, &files); err != nil {
-			return PullDiff{}, err
-		}
-		for _, f := range files {
-			d.Files = append(d.Files, DiffFile{Path: f.Filename, PreviousPath: f.PreviousFilename, Status: f.Status, SHA: f.SHA, Patch: f.Patch})
-		}
-		if len(files) < 100 {
-			break
-		}
+		pr = again
 	}
-	d.Complete = len(d.Files) == pr.ChangedFiles
-	if again, err := c.readPullRevision(ctx, token, repo, number); err == nil {
-		d.Settled = again.Head.SHA == pr.Head.SHA && again.Base.Ref == pr.Base.Ref && again.ChangedFiles == pr.ChangedFiles
-	}
-	return d, nil
 }

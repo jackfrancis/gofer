@@ -210,6 +210,11 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 	if diffDigest != "" && (unmoved == nil || !unmoved(ctx)) {
 		diffDigest = ""
 	}
+	if holder != nil && holder.Reconnect() != nil {
+		// That last read found the access gone: the answer is discarded, as for a
+		// tool call that did, and the turn stays retryable.
+		return postReconnect(ctx, sink, item.ID, triggerKey, attempt)
+	}
 	switch {
 	case noGitHub:
 		content += storedContextOnlyNote

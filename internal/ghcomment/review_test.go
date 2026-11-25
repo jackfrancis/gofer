@@ -26,6 +26,10 @@ type reviewAPI struct {
 	created map[string]any // the last review POST body
 	answer  int            // the POST's status; 0 = 200
 	calls   []string
+	baseSHA string                    // the base commit; "" = base0
+	changed int                       // changed_files reported; 0 = the files listed
+	onPull  func(a *reviewAPI, n int) // called before the nth pull read (from 0) is answered
+	pulls   int
 }
 
 func (a *reviewAPI) server(t *testing.T) *httptest.Server {
@@ -45,11 +49,23 @@ func (a *reviewAPI) server(t *testing.T) *httptest.Server {
 			if base == "" {
 				base = "main"
 			}
+			if a.onPull != nil {
+				a.onPull(a, a.pulls)
+			}
+			a.pulls++
 			n := len(a.patches)
 			if a.patches == nil {
 				n = 1
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"state": a.state, "head": map[string]any{"sha": a.head}, "base": map[string]any{"ref": base}, "changed_files": a.filler + n})
+			changed := a.filler + n
+			if a.changed != 0 {
+				changed = a.changed
+			}
+			baseSHA := a.baseSHA
+			if baseSHA == "" {
+				baseSHA = "base0"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"state": a.state, "head": map[string]any{"sha": a.head}, "base": map[string]any{"ref": base, "sha": baseSHA}, "changed_files": changed})
 		case r.URL.Path == "/repos/Org/Public/pulls/7/files":
 			patches := a.patches
 			if patches == nil {
@@ -267,5 +283,53 @@ func TestPendingReviewChecksTheApprovedDiff(t *testing.T) {
 		if !errors.Is(err, ErrHeadMoved) || api.created != nil {
 			t.Errorf("%s: err %v, created %v", name, err, api.created)
 		}
+	}
+}
+
+// The base commit must hold still between reading an approved diff and the final
+// read of the pull request: a stacked dependency merged in between changes a patch
+// without moving the head, the base's name or the file count. When it moves, the
+// diff is read again: an unrelated advance still creates the review, a merged
+// dependency refuses it as out of date, and a base that keeps moving creates
+// nothing and asks to try again.
+func TestPendingReviewRechecksWhenTheBaseMoves(t *testing.T) {
+	approval := Review{Commit: reviewHead, BaseRef: "main", Body: "/lgtm\n/approve", Diff: DiffDigest([]File{{Filename: "a.go", Patch: reviewPatch}})}
+	run := func(onPull func(a *reviewAPI, n int)) (*reviewAPI, error) {
+		api := &reviewAPI{state: "open", head: reviewHead, onPull: onPull}
+		_, err := New(api.server(t).URL, nil).PendingReview(context.Background(), token, "org/public", 7, approval)
+		return api, err
+	}
+	// Reads: 0 = checkDiff's, 1 = the final read, 2 = the retry's checkDiff, 3 = its final read.
+	api, err := run(func(a *reviewAPI, n int) {
+		if n == 1 {
+			a.baseSHA = "base1" // unrelated: the files stay as they are
+		}
+	})
+	if err != nil || api.created == nil || api.pulls != 4 {
+		t.Errorf("unrelated advance: err %v, created %v, pull reads %d", err, api.created, api.pulls)
+	}
+	api, err = run(func(a *reviewAPI, n int) {
+		if n == 1 { // the dependency merged after the files were read
+			a.baseSHA = "base1"
+			a.patches = map[string]string{"a.go": "@@ -1,2 +1,2 @@\n a\n-b2\n+B"}
+		}
+	})
+	if !errors.Is(err, ErrHeadMoved) || api.created != nil {
+		t.Errorf("merged dependency: err %v, created %v", err, api.created)
+	}
+	api, err = run(func(a *reviewAPI, n int) { a.baseSHA = "base" + strconv.Itoa(n) })
+	if err == nil || errors.Is(err, ErrHeadMoved) || api.created != nil {
+		t.Errorf("a base that keeps moving: err %v, created %v", err, api.created)
+	}
+}
+
+// An approved diff was read whole, so a pull request now past the 3000-file cap is
+// another diff: the draft is out of date (ErrHeadMoved), so the owner is offered a
+// redraft rather than a retry that cannot succeed.
+func TestPendingReviewPastTheCapIsOutOfDate(t *testing.T) {
+	api := &reviewAPI{state: "open", head: reviewHead, changed: 3001}
+	approval := Review{Commit: reviewHead, BaseRef: "main", Body: "/lgtm\n/approve", Diff: DiffDigest([]File{{Filename: "a.go", Patch: reviewPatch}})}
+	if _, err := New(api.server(t).URL, nil).PendingReview(context.Background(), token, "org/public", 7, approval); !errors.Is(err, ErrHeadMoved) || api.created != nil {
+		t.Errorf("err %v, created %v", err, api.created)
 	}
 }

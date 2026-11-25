@@ -157,11 +157,15 @@ converse reply on a pull request records the head and base it read (`Message.Hea
 and `Base`, kept only as a valid pair), and a review also records the digest of the
 whole diff (`Message.Diff`). A review reads one settled snapshot first
 (`github.PullDiff`: the pull request, every file, then the pull request again, settled
-only when its head and base are unchanged) and shows the model that snapshot's head
+only when the second read names the same comparison: head, base branch, base commit
+and file count; a stacked dependency merged in between moves the base commit while
+leaving the rest alone, so the whole read is tried again, up to three times, and an
+unrelated advance of the base still settles) and shows the model that snapshot's head
 and file list, so what the model is told it reviews and what gofer records are the
 same read. The model's tools read GitHub live, so after it answers the run reads the
 pull request once more: if the head or base moved while it worked, the review vouches
-for no diff. A diff gofer cannot identify has no digest either
+for no diff, and if that read finds the access gone, the turn gets the reconnect
+notice, never a saved review. A diff gofer cannot identify has no digest either
 (`PullDiff.Unverifiable`): a list not read whole, a snapshot that did not settle, or a
 file other than a new one that GitHub shows no patch for (a binary change), since its
 entry names only the head blob and a merge base that moved under it would leave the
@@ -180,7 +184,11 @@ it with the review (`ghcomment.Review.Diff`), and `PendingReview` reads every fi
 pull request lists and refuses (out of date, "draft again") unless they hash to that
 digest (`ghcomment.DiffDigest`, the same formula; a test holds the two equal), every
 commented path is among them, and the final read of the pull request reports as many
-files as were read. Both sides read files the same way, 100 a page up to GitHub's 3000,
+files as were read and the same base commit the files were read against (if the base
+moved, the diff is read again, up to three times, so an unrelated advance still
+creates the review and a merged dependency refuses it). A pull request now past the
+3000-file cap is another diff than the one approved, so it is refused as out of date,
+which offers drafting again. Both sides read files the same way, 100 a page up to GitHub's 3000,
 complete only when as many were read as the pull request reports (`changed_files`),
 so a comparison the workload read whole is read whole here, and one it could not is
 never offered. A withheld approval clears its digest with it, so the comments beside
