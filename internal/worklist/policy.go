@@ -51,10 +51,14 @@ func (p RunPolicy) IsBot(login string) bool {
 //     that Resolve leaves unrescored.
 //   - Signals.ReviewRequestedByBot is re-derived (Classify).
 //   - The last word and turn reading are held to their bounds (BoundTurnSignals).
+//   - GitHub.AuthorAvatar is kept only as an avatar path (NormalizeAvatarPath).
+//     Projection does not bound it, so an oversized value stored verbatim would
+//     take an item read's whole budget; the page checks it again when it renders.
 func (p RunPolicy) Apply(items []WorkItem) {
 	for i := range items {
 		items[i].Meta.Origin = OriginAgent
 		BoundTurnSignals(&items[i].Signals)
+		items[i].GitHub.AuthorAvatar = NormalizeAvatarPath(items[i].GitHub.AuthorAvatar)
 	}
 	p.Classify(items)
 }

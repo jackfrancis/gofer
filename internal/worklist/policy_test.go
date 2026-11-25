@@ -2,6 +2,7 @@ package worklist
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -34,6 +35,26 @@ func TestRunPolicyApply(t *testing.T) {
 	}
 	if NewRunPolicy(nil).IsBot("") || p.IsBot("") {
 		t.Error("an empty login is never a bot")
+	}
+}
+
+// A run's author avatar is stored only as an avatar path: anything else, an
+// oversized value included, is dropped before either sink stores it, since
+// projection does not bound it and it would crowd the thread out of an item read.
+func TestRunPolicyNormalizesAuthorAvatar(t *testing.T) {
+	items := []WorkItem{
+		{ID: "user", GitHub: GitHubRef{AuthorAvatar: "u/583231"}},
+		{ID: "bot", GitHub: GitHubRef{AuthorAvatar: "in/29110"}},
+		{ID: "url", GitHub: GitHubRef{AuthorAvatar: "https://evil.example/x.png"}},
+		{ID: "huge", GitHub: GitHubRef{AuthorAvatar: "u/" + strings.Repeat("9", MaxItemBytes)}},
+		{ID: "none"},
+	}
+	NewRunPolicy(nil).Apply(items)
+	want := map[string]string{"user": "u/583231", "bot": "in/29110"}
+	for _, it := range items {
+		if it.GitHub.AuthorAvatar != want[it.ID] {
+			t.Errorf("%s: AuthorAvatar = %.40q, want %q", it.ID, it.GitHub.AuthorAvatar, want[it.ID])
+		}
 	}
 }
 

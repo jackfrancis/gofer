@@ -11,7 +11,7 @@
   {{if and (eq .View "worklist") .CommentConnected}}<script src="/static/comment.js" defer></script>{{end}}
   {{if .WatchRefresh}}{{if .Refreshing}}<noscript><meta http-equiv="refresh" content="{{.PollSecs}}; url={{.FallbackURL}}"></noscript>{{end}}<script src="/static/reload.js" data-done="{{.RefreshDone}}" data-active="{{if .Refreshing}}1{{else}}0{{end}}" data-poll-secs="{{.PollSecs}}" data-idle-poll-secs="{{.IdlePollSecs}}" defer></script>{{end}}
   {{if eq .View "thread"}}<script src="/static/copy.js" defer></script>{{end}}
-  {{if avatarURL .User}}<script src="/static/avatar.js" defer></script>{{end}}
+  {{if or (avatarURL .User) (eq .View "worklist" "thread")}}<script src="/static/avatar.js" defer></script>{{end}}
 </head>
 <body>
   <div class="zz-container">

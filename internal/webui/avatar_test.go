@@ -144,6 +144,23 @@ func TestAuthorAvatar(t *testing.T) {
 	if !strings.Contains(out, `<span class="zz-author" title="Opened by dev-n">dev-n</span>`) {
 		t.Fatalf("an item with no avatar should show the login alone:\n%s", out)
 	}
+	// The author's avatar does not depend on the viewer's: a session from another
+	// provider still loads avatar.js on the radar and the Discuss page, though its
+	// header carries no avatar.
+	g := &session.User{ID: "google:1", Provider: "google", Name: "G"}
+	for _, data := range []pageData{
+		{View: "worklist", User: g, Items: []worklist.WorkItem{item("a", "u/7")}},
+		{View: "thread", User: g, Item: item("a", "u/7")},
+	} {
+		out := renderPage(t, data)
+		if !strings.Contains(out, user) || !strings.Contains(out, `<script src="/static/avatar.js" defer></script>`) {
+			t.Fatalf("%s: a non-GitHub viewer does not load the author's avatar:\n%s", data.View, out)
+		}
+		if strings.Contains(out, `class="zz-user" data-avatar`) {
+			t.Fatalf("%s: a non-GitHub viewer got a header avatar:\n%s", data.View, out)
+		}
+	}
+
 	none := item("x", "u/1")
 	none.GitHub.Author = ""
 	if out := renderPage(t, pageData{View: "worklist", User: gh, Items: []worklist.WorkItem{none}}); strings.Contains(out, "zz-author") {
