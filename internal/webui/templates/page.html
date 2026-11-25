@@ -527,7 +527,7 @@
         {{if .Running}}
         <p>gofer is still posting your comment. Reload in a moment to see the results.</p>
         {{else}}
-        {{if .Targets}}<h2>{{if .Repeat}}Already posted:{{else}}Posted{{end}} {{.Posted}} of {{len .Targets}}{{with .Unknown}} ({{.}} unknown){{end}}</h2>{{end}}
+        {{if .Total}}<h2>{{if .Repeat}}Already posted:{{else}}Posted{{end}} {{.Posted}} of {{.Total}}{{with .Unknown}} ({{.}} unknown){{end}}</h2>{{end}}
         {{if .Repeat}}<p class="zz-meta">This form was already used, so nothing was posted again. These are its results.</p>{{end}}
         {{with .Error}}<p class="zz-stalled" role="alert">{{.}}</p>{{end}}
         {{with .Body}}<pre class="zz-comment-body">{{.}}</pre>{{end}}

@@ -133,8 +133,11 @@ The client keeps the workload's guard rules (ADR 0007, "public-only guard"):
    long-named repositories; the decoded comment and target count are checked apart,
    and what gofer keeps is bounded by them, not by the cap: a comment over 16 KiB is
    refused without a copy (in no receipt or draft), a selection with an oversized ID
-   or repository name is unreadable, and at most 500 batches and 500 drafts are held,
-   tens of MiB at worst. Batches are
+   or repository name is unreadable, a receipt keeps only bounded display text
+   (titles, repositories and reasons cut, links over 256 bytes or not http(s)
+   dropped; the outcome counts and each result's status whole), every retained
+   string is copied out of the request so none holds the request buffer alive, and
+   at most 500 batches and 500 drafts are held, tens of MiB at worst. Batches are
    bounded in all; only one that posted nothing is dropped early, and past the bound
    gofer refuses to post rather than forget a used key.
 4. The request must be same-origin, in addition to SameSite=Lax. A browser

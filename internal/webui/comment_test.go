@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/jackfrancis/gofer/internal/comment"
 	"github.com/jackfrancis/gofer/internal/session"
@@ -590,7 +591,7 @@ func TestReloadKeepsSelection(t *testing.T) {
 func TestCommentResultsShowUnknown(t *testing.T) {
 	tgt := comment.Target{Repo: "a/one", Number: 1, Title: "t", URL: "https://github.com/a/one/pull/1"}
 	out := renderPage(t, pageData{View: "worklist", CommentEnabled: true, CommentConnected: true, Comment: &commentView{
-		Body: "/lgtm", Targets: []comment.Target{tgt, tgt}, Posted: 1, Unknown: 1,
+		Body: "/lgtm", Total: 2, Posted: 1, Unknown: 1,
 		Results: []comment.Result{
 			{Target: tgt, Posted: true},
 			{Target: tgt, Unknown: true, Error: "Unknown: GitHub's answer was lost"},
@@ -997,5 +998,87 @@ func TestCommentRetainsNothingOverTheLimits(t *testing.T) {
 	}
 	if c.postCount() != 0 {
 		t.Errorf("posts = %d", c.postCount())
+	}
+}
+
+// within reports whether sub's bytes lie inside s's.
+func within(sub, s string) bool {
+	if len(sub) == 0 || len(s) == 0 {
+		return false
+	}
+	p, b := uintptr(unsafe.Pointer(unsafe.StringData(sub))), uintptr(unsafe.Pointer(unsafe.StringData(s)))
+	return p >= b && p < b+uintptr(len(s))
+}
+
+// Review P2 (PR #60, round 5): what a receipt or draft keeps from the request is
+// copied, so a short retained field never holds the whole request alive.
+func TestCommentCopiesWhatItKeeps(t *testing.T) {
+	v := selections("github:a/one#1")[0] + "&pad=" + strings.Repeat("p", 4096)
+	pins, ok := parseSelections([]string{v})
+	if !ok || len(pins) != 1 {
+		t.Fatalf("pins %v ok %v", pins, ok)
+	}
+	if within(pins[0].ID, v) || within(pins[0].Repo, v) {
+		t.Error("a selection keeps the request's buffer alive")
+	}
+	long := strings.Repeat("t", 64<<10)
+	if cut := receiptText(long, maxReceiptTitle); len(cut) > maxReceiptTitle || within(cut, long) {
+		t.Errorf("cut text: %d bytes, shares the original: %v", len(cut), within(cut, long))
+	}
+	if cut := receiptText(strings.Repeat("é", 200), 11); cut != "éééé…" {
+		t.Errorf("cut on a character boundary = %q", cut)
+	}
+}
+
+// Review P2 (PR #60, round 5): a receipt keeps bounded display fields whatever the
+// stored item holds, and the outcome whole.
+func TestCommentReceiptBoundsDisplayFields(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	huge := strings.Repeat("T", 256<<10)
+	err := h.store.Update(context.Background(), commentOwner, func(items []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		var out []worklist.WorkItem
+		for _, it := range items {
+			switch it.ID {
+			case "github:a/one#1":
+				it.GitHub.Title, it.GitHub.URL = huge, "https://github.com/a/one/pull/1?"+huge
+				out = append(out, it)
+			case "github:b/two#2":
+				it.GitHub.URL = "javascript:alert(1)"
+				out = append(out, it)
+			case "github:a/one#3": // hidden: listed as skipped, by title
+				it.GitHub.Title = huge
+				out = append(out, it)
+			}
+		}
+		return out, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := commentForm(h, "/lgtm", "github:a/one#1", "github:b/two#2", "github:a/one#3")
+	page := posted(t, h, form)
+	if !strings.Contains(page, "Posted 2 of 2") {
+		t.Errorf("radar:\n%.2000s", page)
+	}
+	bt := h.batches.lookup(commentOwner, form.Get("key"), h.now())
+	if bt == nil || len(bt.view.Results) != 2 || bt.view.Total != 2 || bt.view.Posted != 2 {
+		t.Fatalf("receipt = %+v", bt)
+	}
+	size := len(bt.view.Body) + len(bt.view.Error)
+	for _, r := range bt.view.Results {
+		size += len(r.ID) + len(r.Repo) + len(r.Title) + len(r.URL) + len(r.CommentURL) + len(r.Error)
+		if len(r.Title) > maxReceiptTitle || len(r.URL) > maxReceiptURL || len(r.CommentURL) > maxReceiptURL {
+			t.Errorf("unbounded result field: %d/%d/%d bytes", len(r.Title), len(r.URL), len(r.CommentURL))
+		}
+		if strings.HasPrefix(r.URL, "javascript:") {
+			t.Error("a non-http link is kept")
+		}
+	}
+	for _, sk := range bt.view.Skipped {
+		size += len(sk.Label) + len(sk.Reason)
+	}
+	if size > 4<<10 {
+		t.Errorf("the receipt keeps %d bytes of display text", size)
 	}
 }

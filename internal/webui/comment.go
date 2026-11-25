@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackfrancis/gofer/internal/comment"
 	"github.com/jackfrancis/gofer/internal/session"
@@ -58,10 +59,11 @@ const (
 	resultTTL = time.Hour
 	// maxRecords bounds the batches held. Only one that posted nothing is ever
 	// dropped before its key expires; past the bound with none such, posting waits.
-	// A batch retains at most a maxMessageBytes comment and MaxTargets selections
-	// and results (each bounded: maxPinIDBytes, maxPinRepoBytes, and the stored
-	// item's fields), about 100 KiB at worst, so the records stay near 50 MiB and the
-	// drafts (maxDrafts, at most a comment and selections each) near 20 MiB.
+	// A batch retains at most a maxMessageBytes comment, MaxTargets selections
+	// (maxPinIDBytes, maxPinRepoBytes) and results and skipped rows with bounded
+	// display fields (receiptView), about 100 KiB at worst, all in their own
+	// allocations (never the request's buffer), so the records stay near 50 MiB and
+	// the drafts (maxDrafts, at most a comment and selections each) near 20 MiB.
 	maxRecords = 500
 	maxDrafts  = 500
 	// maxPinIDBytes and maxPinRepoBytes bound a selection's item ID and repository
@@ -88,7 +90,7 @@ func (h *Handler) UseCommenter(c Commenter) { h.commenter = c }
 type commentView struct {
 	Body     string
 	Selected []comment.Target // the rows the form checked (item, repo, number), re-checked when nothing was posted
-	Targets  []comment.Target // what the comment went to
+	Total    int              // how many items the comment went to
 	Skipped  []skippedTarget  // selected items it did not go to, and why
 	Results  []comment.Result
 	Posted   int    // how many were posted
@@ -127,10 +129,71 @@ type batch struct {
 	view commentView // valid once done is closed
 }
 
-// finish records view as bt's outcome.
+// finish records view as bt's outcome, bounded for keeping (receiptView).
 func (bt *batch) finish(view commentView) {
-	bt.view = view
+	bt.view = receiptView(view)
 	close(bt.done)
+}
+
+const (
+	// maxReceiptTitle, maxReceiptRepo, maxReceiptText and maxReceiptURL bound the
+	// display fields a receipt keeps from the stored items and GitHub's answers,
+	// which nothing else bounds (a stored title can be any size). A longer text is
+	// cut; a longer link is dropped, as is one that is not http(s).
+	maxReceiptTitle = 200
+	maxReceiptRepo  = 160
+	maxReceiptText  = 300
+	maxReceiptURL   = 256
+)
+
+// receiptView is v as a receipt keeps it: every display field bounded, and no item
+// IDs but the selection's (already bounded). The outcome (Total, Posted, Unknown,
+// and each result's status) is kept whole.
+func receiptView(v commentView) commentView {
+	v.Error = receiptText(v.Error, maxReceiptText)
+	if v.Results != nil {
+		results := make([]comment.Result, len(v.Results))
+		for i, res := range v.Results {
+			results[i] = comment.Result{
+				Target: comment.Target{
+					Repo: receiptText(res.Repo, maxReceiptRepo), Number: res.Number,
+					Title: receiptText(res.Title, maxReceiptTitle), URL: receiptURL(res.URL),
+				},
+				Posted: res.Posted, Unknown: res.Unknown,
+				CommentURL: receiptURL(res.CommentURL), Error: receiptText(res.Error, maxReceiptText),
+			}
+		}
+		v.Results = results
+	}
+	if v.Skipped != nil {
+		skipped := make([]skippedTarget, len(v.Skipped))
+		for i, sk := range v.Skipped {
+			skipped[i] = skippedTarget{Label: receiptText(sk.Label, maxReceiptText), Reason: receiptText(sk.Reason, maxReceiptText)}
+		}
+		v.Skipped = skipped
+	}
+	return v
+}
+
+// receiptText is s cut to at most max bytes, on a character boundary, with an
+// ellipsis, in its own allocation so it does not hold the longer original alive.
+func receiptText(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max - len("…")
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return strings.Clone(s[:cut]) + "…"
+}
+
+// receiptURL is u if it is a short http(s) link, else "" (shown without a link).
+func receiptURL(u string) string {
+	if len(u) > maxReceiptURL || !(strings.HasPrefix(u, "https://") || strings.HasPrefix(u, "http://")) {
+		return ""
+	}
+	return u
 }
 
 // postedNothing reports whether bt is done and posted nothing, so dropping it early
@@ -346,7 +409,9 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	body := strings.ReplaceAll(r.PostForm.Get("content"), "\r\n", "\n")
+	// Copied: a parsed form value may share the whole request's buffer, which a
+	// kept receipt or draft would otherwise hold alive.
+	body := strings.Clone(strings.ReplaceAll(r.PostForm.Get("content"), "\r\n", "\n"))
 	pins, readable := parseSelections(r.PostForm["item"])
 	tooLong := len(body) > maxMessageBytes
 	if valid && !connected && !tooLong {
@@ -354,7 +419,7 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 		// key: the radar offers them again once commenting is connected, under that
 		// same key, so this form and the restored one post at most once between them.
 		// Only a form verified as this account's, and unused, is kept.
-		h.batches.saveDraft(user.ID, draft{body: body, pins: capPins(pins), key: key}, now)
+		h.batches.saveDraft(user.ID, draft{body: body, pins: capPins(pins), key: strings.Clone(key)}, now)
 		http.Redirect(w, r, "/?commenting=connect", http.StatusSeeOther)
 		return
 	}
@@ -483,7 +548,7 @@ func (h *Handler) runBatch(ctx context.Context, bt *batch, userID, body string, 
 		return
 	}
 	targets, skipped, err := h.pinnedTargets(ctx, userID, pins)
-	view.Targets, view.Skipped = targets, skipped
+	view.Total, view.Skipped = len(targets), skipped
 	switch {
 	case err != nil:
 		view.Error = "gofer could not read your worklist right now; nothing was posted. Try again in a moment."
@@ -555,7 +620,8 @@ func parseSelections(values []string) (pins []comment.Target, ok bool) {
 		if len(pins) > comment.MaxTargets {
 			break
 		}
-		pins = append(pins, comment.Target{ID: id, Repo: repo, Number: n})
+		// Copied, like the comment: these are kept in receipts and drafts.
+		pins = append(pins, comment.Target{ID: strings.Clone(id), Repo: strings.Clone(repo), Number: n})
 	}
 	return pins, ok
 }
