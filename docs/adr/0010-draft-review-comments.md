@@ -32,11 +32,15 @@ review's text is written by a model, so this feature needs that rule amended.
    While it is disabled the thread says why in visible text (Safari shows no tooltip
    on a disabled button), and with no review yet it offers "Review this pull request"
    right there (`webui.ReviewAgain`), since a review asked for in a Discuss message is
-   not a review request. When a review request already has no answer (stalled, ended
-   by a reconnect notice, or hidden), it retries that turn rather than adding another:
-   the dispatcher's gate shares a run still in flight and the store keeps one answer
-   per turn, so a first review is never answered twice, and there is nothing to wait
-   out first.
+   not a review request. When a review request already has no answer (stalled, or
+   ended by a reconnect notice), the thread offers "Retry the earlier review" instead,
+   which retries that very turn (it runs as it was asked, without later messages)
+   rather than adding another: the dispatcher's gate shares a run still in flight and
+   the store keeps one answer per turn, so a first review is never answered twice, and
+   there is nothing to wait out first. A hidden request is not retried until the user
+   unhides it, and a 2nd opinion is retried only blind, by a model it may use. A
+   dispatch the backend certainly refused is said so on the thread and leaves the turn
+   retryable at once; an uncertain one stays pending.
    It is not shown while drafting again would only repeat the offered draft
    (`WorkItem.RedraftRedundant`), because the drafter would read the conversation it
    read: the draft is unconfirmed and pinned to the item's pull request, no turn after

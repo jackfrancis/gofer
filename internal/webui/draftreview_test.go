@@ -2,6 +2,7 @@ package webui
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackfrancis/gofer/internal/comment"
+	"github.com/jackfrancis/gofer/internal/ingest"
 	"github.com/jackfrancis/gofer/internal/session"
 	"github.com/jackfrancis/gofer/internal/worklist"
 )
@@ -860,28 +862,40 @@ func TestDisabledDraftButtonSaysWhy(t *testing.T) {
 
 // postReview posts a ReviewAgain form naming action ("" for a form rendered before
 // forms named one).
-func postReview(h *Handler, action string) {
+func postReview(h *Handler, action string, turn ...string) *httptest.ResponseRecorder {
 	form := url.Values{"id": {draftItemID}}
 	if action != "" {
 		form.Set("review", action)
 	}
+	if len(turn) > 0 {
+		form.Set("turn", turn[0])
+	}
 	req := httptest.NewRequest(http.MethodPost, "/items/review-again", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	h.ReviewAgain(httptest.NewRecorder(), req)
+	rec := httptest.NewRecorder()
+	h.ReviewAgain(rec, req)
+	return rec
 }
 
-// "Review this pull request" never adds a second review request while one has no
-// answer: it retries that turn (same key, a new attempt), so a run still in flight is
-// shared by the dispatcher and the store keeps one answer. That holds however the
-// first ended: stalled, ended by a reconnect notice (retried at once, with nothing to
-// wait out), or hidden by the user (shown again, since they asked for the review).
-func TestFirstReviewRetriesTheUnansweredTurn(t *testing.T) {
+// pageAt renders the thread at the URL a POST redirected to.
+func pageAt(t *testing.T, h *Handler, location string) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.Thread(rec, httptest.NewRequest(http.MethodGet, location, nil))
+	return rec.Body.String()
+}
+
+// While a review request has no answer, no second one is added: the thread offers
+// "Retry the earlier review", naming that turn, which retries it (same key, a new
+// attempt), so a run still in flight is shared and the store keeps one answer. That
+// holds however the first ended: stalled, followed by a Discuss turn, or ended by a
+// reconnect notice (retried at once). "Review this pull request" is not offered then,
+// and its form adds nothing.
+func TestEarlierReviewIsRetriedNotDoubled(t *testing.T) {
 	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
 	review := func(age time.Duration) worklist.Message {
 		return worklist.Message{ID: "q", Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, At: time.Now().Add(-age)}
 	}
-	hidden := review(6 * time.Minute)
-	hidden.Hidden = true
 	for name, th := range map[string][]worklist.Message{
 		"stalled": {review(6 * time.Minute)},
 		"stalled, then a Discuss turn answered": {review(6 * time.Minute),
@@ -889,31 +903,112 @@ func TestFirstReviewRetriesTheUnansweredTurn(t *testing.T) {
 			{ID: "e", ReplyTo: "d", Role: worklist.RoleAgent, Content: "Some.", At: time.Now().Add(-5 * time.Minute)}},
 		"ended by a reconnect notice": {review(time.Minute),
 			{ID: "n", ReplyTo: "q", Role: worklist.RoleAgent, Content: worklist.ReconnectNotice, Notice: worklist.NoticeReconnect, At: time.Now()}},
-		"hidden": {hidden},
 	} {
 		h, p, store := draftFixture(t, c, th)
-		if page, _ := threadPage(t, h); !strings.Contains(page, ">Review this pull request</button>") {
-			t.Errorf("%s: no review offered", name)
+		page, _ := threadPage(t, h)
+		if !strings.Contains(page, ">Retry the earlier review</button>") || !strings.Contains(page, `name="turn" value="q"`) || strings.Contains(page, ">Review this pull request</button>") {
+			t.Errorf("%s: the earlier review is not offered for retry alone", name)
 		}
-		postReview(h, "first")
+		postReview(h, "first") // a stale page's first-review form adds nothing beside it
+		if len(p.turns) != 0 {
+			t.Errorf("%s: a second review request was dispatched", name)
+		}
+		postReview(h, "retry", "q")
 		it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
 		q := it.Thread[0]
-		if len(it.Thread) != len(th) || len(p.turns) != 1 || p.turns[0].Turn != "q" || p.turns[0].Attempt == "" || q.Attempt != p.turns[0].Attempt || q.Hidden {
+		if len(it.Thread) != len(th) || len(p.turns) != 1 || p.turns[0].Turn != "q" || p.turns[0].Attempt == "" || q.Attempt != p.turns[0].Attempt {
 			t.Errorf("%s: thread %d turns (want %d), dispatched %+v, turn %+v", name, len(it.Thread), len(th), p.turns, q)
 		}
 	}
 	// A run still in flight shares the retry: the turn keeps that run's attempt.
 	h, p, store := draftFixture(t, c, []worklist.Message{review(6 * time.Minute)})
 	p.shared = true
-	postReview(h, "first")
+	postReview(h, "retry", "q")
 	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); len(it.Thread) != 1 || it.Thread[0].Attempt != "" {
 		t.Errorf("a shared run's turn: %+v", it.Thread)
 	}
-	// With no review request at all, a new one is added.
+	// With no review request at all, "Review this pull request" adds one.
 	h, p, store = draftFixture(t, c, []worklist.Message{{ID: "d", Role: worklist.RoleUser, Content: "hi", At: time.Now().Add(-time.Hour)}, {ID: "e", ReplyTo: "d", Role: worklist.RoleAgent, Content: "hello", At: time.Now().Add(-time.Hour)}})
 	postReview(h, "first")
 	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); len(it.Thread) != 3 || it.Thread[2].Kind != worklist.KindReviewRequest || len(p.turns) != 1 || p.turns[0].Turn != it.Thread[2].ID {
 		t.Errorf("no new review request: %+v", it.Thread)
+	}
+}
+
+// A hidden unanswered review request stays hidden: the thread says to unhide it to
+// retry it, offers neither button, and no form retries or doubles it.
+func TestHiddenEarlierReviewWaitsForUnhide(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	q := worklist.Message{ID: "q", Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, Hidden: true, At: time.Now().Add(-6 * time.Minute)}
+	h, p, store := draftFixture(t, c, []worklist.Message{q})
+	page, _ := threadPage(t, h)
+	if !strings.Contains(page, "Unhide it to retry it") || strings.Contains(page, ">Retry the earlier review</button>") || strings.Contains(page, ">Review this pull request</button>") {
+		t.Errorf("hidden request: wrong offer:\n%s", page)
+	}
+	postReview(h, "retry", "q")
+	postReview(h, "first")
+	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); len(p.turns) != 0 || len(it.Thread) != 1 || !it.Thread[0].Hidden {
+		t.Errorf("a hidden request was retried, doubled or unhidden: %+v, dispatched %+v", it.Thread, p.turns)
+	}
+}
+
+// A 2nd opinion is retried only blind, by a model it may use; with none, it is not
+// retried at all, never sent as an ordinary review that would still count as
+// independent.
+func TestEarlierSecondOpinionStaysBlind(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	q := worklist.Message{ID: "q", Role: worklist.RoleUser, Content: worklist.IndependentReviewPrompt, Kind: worklist.KindReviewRequest, At: time.Now().Add(-6 * time.Minute)}
+	h, p, _ := draftFixture(t, c, []worklist.Message{q})
+	postReview(h, "retry", "q")
+	if len(p.secondOpinions) != 1 || len(p.converses) != 0 {
+		t.Errorf("a 2nd opinion was not retried blind: second opinions %v, converses %v", p.secondOpinions, p.converses)
+	}
+	h, p, _ = draftFixture(t, c, []worklist.Message{q})
+	h.options = nil // no model a 2nd opinion may use
+	page, _ := threadPage(t, h)
+	if !strings.Contains(page, "no model it may use is configured") || strings.Contains(page, ">Retry the earlier review</button>") {
+		t.Errorf("an unrunnable 2nd opinion is offered for retry:\n%s", page)
+	}
+	postReview(h, "retry", "q")
+	if len(p.turns) != 0 {
+		t.Errorf("an unrunnable 2nd opinion was dispatched: %+v", p.turns)
+	}
+}
+
+// A dispatch the backend certainly refused is said so on the thread, whichever turn
+// is the latest, and leaves nothing looking pending: a new review request is offered
+// for retry at once, and a retried one gets its time back. An uncertain failure
+// keeps the turn pending.
+func TestRefusedReviewDispatchIsShown(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	answered := []worklist.Message{{ID: "d", Role: worklist.RoleUser, Content: "hi", At: time.Now().Add(-time.Hour)}, {ID: "e", ReplyTo: "d", Role: worklist.RoleAgent, Content: "hello", At: time.Now().Add(-time.Hour)}}
+	h, p, store := draftFixture(t, c, answered)
+	p.err = ingest.ErrNotAccepted
+	rec := postReview(h, "first")
+	page := pageAt(t, h, rec.Header().Get("Location"))
+	if !strings.Contains(page, "the agent backend refused it") || !strings.Contains(page, ">Retry the earlier review</button>") {
+		t.Errorf("a refused new review: no message, or not retryable at once:\n%s", page)
+	}
+	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+	if it.ReplyPending(time.Now(), reviewStaleAfter) {
+		t.Error("a refused new review still looks pending")
+	}
+	// Retrying an older review after a later answered Discuss turn: the latest turn is
+	// not stalled, but the refusal shows all the same.
+	older := append([]worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, At: time.Now().Add(-2 * time.Hour)}}, answered...)
+	h, p, _ = draftFixture(t, c, older)
+	p.err = ingest.ErrNotAccepted
+	rec = postReview(h, "retry", "q")
+	if page := pageAt(t, h, rec.Header().Get("Location")); !strings.Contains(page, "the agent backend refused it") || !strings.Contains(page, ">Retry the earlier review</button>") {
+		t.Errorf("a refused retry of an older review shows no message:\n%s", page)
+	}
+	// An uncertain failure: a run may exist, so the turn stays pending and no refusal shows.
+	h, p, store = draftFixture(t, c, answered)
+	p.err = errors.New("lost answer")
+	rec = postReview(h, "first")
+	it, _, _ = store.Get(context.Background(), "github:42", draftItemID)
+	if !it.ReplyPending(time.Now(), reviewStaleAfter) || strings.Contains(rec.Header().Get("Location"), "review_refused") {
+		t.Error("an uncertain dispatch was treated as refused")
 	}
 }
 

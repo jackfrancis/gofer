@@ -226,6 +226,9 @@
         <p>The reviews this consensus compares are too large to read together, so it can&rsquo;t be retried. Hide some of them and get another 2nd opinion for a smaller comparison.</p>
       </div>
       {{end}}
+      {{with .Draft}}{{if .ReviewRefused}}
+      <p class="zz-stalled" role="alert">gofer could not start that review: the agent backend refused it, so nothing is running. Try again in a moment.</p>
+      {{end}}{{end}}
       {{with .Draft}}{{if .ReviewOutdated}}
       <div class="zz-draft-review">
         <p class="zz-meta">The latest review read an earlier revision of this pull request (it was pushed or retargeted since), so no approval can be drafted from it. Review the current revision, then draft again.</p>
@@ -252,6 +255,14 @@
           <input type="hidden" name="id" value="{{$.Item.ID}}">
           <input type="hidden" name="review" value="first">
           <button class="btn btn-sm" type="submit" title="Reviews the pull request, keeping this conversation.">Review this pull request</button>
+        </form>
+        {{end}}
+        {{with .RetryKey}}
+        <form method="post" action="/items/review-again">
+          <input type="hidden" name="id" value="{{$.Item.ID}}">
+          <input type="hidden" name="review" value="retry">
+          <input type="hidden" name="turn" value="{{.}}">
+          <button class="btn btn-sm" type="submit" title="Runs the review asked for earlier again, as it was asked.">Retry the earlier review</button>
         </form>
         {{end}}
         {{else}}

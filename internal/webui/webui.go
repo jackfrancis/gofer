@@ -421,6 +421,9 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 			}
 			if !it.IsHidden() {
 				data.Draft = h.draftThreadView(r.Context(), user, it, now)
+				if data.Draft != nil {
+					data.Draft.ReviewRefused = r.URL.Query().Get("review_refused") == "1"
+				}
 				if data.Draft != nil && data.Draft.Index >= 0 {
 					// The draft's Create button posts same-origin only; this lets it send
 					// its real Origin on a browser without fetch metadata (see sameOrigin).
