@@ -347,7 +347,7 @@ func TestAgentIngestAppliesRunPolicy(t *testing.T) {
 		{ID: "github:o/r#1", GitHub: worklist.GitHubRef{Number: 1, Repo: "o/r", UpdatedAt: now},
 			Signals: worklist.Signals{ReviewRequestedBy: "k8s-ci-robot", AwaitingMeSince: now.Add(-48 * time.Hour)},
 			Meta:    worklist.Metadata{Origin: worklist.OriginUser, Rank: 0.99}},
-		{ID: "github:o/r#2", GitHub: worklist.GitHubRef{Number: 2, Repo: "o/r", UpdatedAt: now},
+		{ID: "github:o/r#2", GitHub: worklist.GitHubRef{Number: 2, Repo: "o/r", UpdatedAt: now, AuthorAvatar: "https://evil.example/x.png"},
 			Signals: worklist.Signals{ReviewRequestedBy: "alice", ReviewRequestedByBot: true, AwaitingMeSince: now.Add(-48 * time.Hour)}},
 	}})
 	req := httptest.NewRequest(http.MethodPost, "/agent/worklist", bytes.NewReader(body))
@@ -371,6 +371,9 @@ func TestAgentIngestAppliesRunPolicy(t *testing.T) {
 	}
 	if human.Signals.ReviewRequestedByBot {
 		t.Error("a human's review request was stored as automated")
+	}
+	if human.GitHub.AuthorAvatar != "" {
+		t.Errorf("a run's invalid author avatar was stored: %q", human.GitHub.AuthorAvatar)
 	}
 	for _, it := range items {
 		if it.Meta.Origin != worklist.OriginAgent {

@@ -58,8 +58,8 @@ func logRequests(log *slog.Logger, next http.Handler) http.Handler {
 // allows same-origin styles and scripts (the UI ships app.css and a small
 // progressive-enhancement script from /static) but nothing else:
 // no inline styles or scripts, and no third-party origin except GitHub's avatar
-// host, for images only (the signed-in user's avatar; no-referrer keeps gofer's
-// URLs from reaching it).
+// host, for images only (the signed-in user's avatar and each work item's
+// author's; no-referrer keeps gofer's URLs from reaching it).
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()

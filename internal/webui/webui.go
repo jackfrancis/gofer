@@ -1370,8 +1370,9 @@ var funcs = template.FuncMap{
 		}
 		return s
 	},
-	"userHandle": userHandle,
-	"avatarURL":  avatarURL,
+	"userHandle":   userHandle,
+	"avatarURL":    avatarURL,
+	"authorAvatar": authorAvatarURL,
 }
 
 // AvatarOrigin serves GitHub avatars. It is the one third-party origin the page
@@ -1396,6 +1397,17 @@ func avatarURL(u *session.User) string {
 		}
 	}
 	return AvatarOrigin + "/u/" + id + "?s=48&v=4"
+}
+
+// authorAvatarURL is the GitHub avatar of the item's author, or "" when none is
+// recorded. It is built from the stored path only through AuthorAvatarPath, which
+// admits nothing but an account or app id, so only AvatarOrigin reaches the page.
+func authorAvatarURL(it worklist.WorkItem) string {
+	p := it.GitHub.AuthorAvatarPath()
+	if p == "" {
+		return ""
+	}
+	return AvatarOrigin + "/" + p + "?s=40&v=4"
 }
 
 // hasConversation reports whether the item carries conversation state that Reset
