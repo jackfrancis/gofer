@@ -216,6 +216,7 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 	reply.Kind = "" // request kinds mark user turns only
 	reply.Reviews = nil
 	reply.Hidden = false
+	reply.HiddenRev, reply.ReadRev, reply.ReadRevKnown = 0, 0, false // the web tier's revisions, never a run's
 	if !knownNotice(reply.Notice) {
 		reply.Notice = "" // only notices gofer knows
 	}

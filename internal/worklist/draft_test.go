@@ -104,10 +104,10 @@ func TestAppendReplyDraftOnlyForDraftRequests(t *testing.T) {
 		t.Error("a reply to a review request kept a draft")
 	}
 	receipt := &DraftReceipt{State: DraftCreated, URL: "https://github.com/x"}
-	if _, err := AppendReply(&item, "d", Message{ID: "a2", Content: "drafted", Draft: draft, DraftReceipt: receipt}); err != nil {
+	if _, err := AppendReply(&item, "d", Message{ID: "a2", Content: "drafted", Draft: draft, DraftReceipt: receipt, HiddenRev: 99, ReadRev: 99, ReadRevKnown: true}); err != nil {
 		t.Fatal(err)
 	}
-	if got := item.Thread[5]; got.Draft == nil || len(got.Draft.Comments) != 1 || got.DraftReceipt != nil {
+	if got := item.Thread[5]; got.Draft == nil || len(got.Draft.Comments) != 1 || got.DraftReceipt != nil || got.HiddenRev != 0 || got.ReadRev != 0 || got.ReadRevKnown {
 		t.Fatalf("draft reply = %+v", got)
 	}
 	if _, err := AppendReply(&item, "d2", Message{ID: "a3", Content: "sign in", Notice: NoticeReconnect, Draft: draft}); err != nil {
@@ -156,6 +156,105 @@ func TestLatestDraft(t *testing.T) {
 	hiddenReq.Hidden = true
 	if got := draftPR(hiddenReq, a1).LatestDraft(); got != -1 {
 		t.Errorf("a hidden request's draft is offered: %d", got)
+	}
+}
+
+// Drafting again is redundant only while the drafter would read the conversation it
+// read: any visible turn after the draft request but its own reply, a visibility
+// change before it since the request, a receipt, or a retired draft opens drafting
+// again; hidden turns after it, and toggles before the request, do not.
+func TestRedraftRedundant(t *testing.T) {
+	asked := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	q0 := Message{ID: "q0", Role: RoleUser, Content: "leave out the rename"}
+	d1 := Message{ID: "d1", Role: RoleUser, Kind: KindDraftReviewRequest, Content: "draft", At: asked, ReadRevKnown: true}
+	a1 := Message{ID: "a1", ReplyTo: "d1", Role: RoleAgent, Content: "drafted", Draft: pinned("x")}
+	if !draftPR(q0, d1, a1).RedraftRedundant() {
+		t.Error("a thread ending with its draft is not redundant to redraft")
+	}
+	// A request saved before revisions were recorded says nothing about toggles of
+	// its time: its draft never counts as redundant.
+	unrecorded := d1
+	unrecorded.ReadRevKnown = false
+	if draftPR(q0, unrecorded, a1).RedraftRedundant() {
+		t.Error("a draft whose request recorded no revision counts as redundant")
+	}
+	q := Message{ID: "q", Role: RoleUser, Content: "what about y?"}
+	if draftPR(d1, a1, q).RedraftRedundant() {
+		t.Error("a turn after the draft left redrafting redundant")
+	}
+	// A correction posted while the drafter worked, answered before the draft landed:
+	// the draft is last, but it never read the correction.
+	qa := Message{ID: "qa", ReplyTo: "q", Role: RoleAgent, Content: "noted"}
+	if draftPR(d1, q, qa, a1).RedraftRedundant() {
+		t.Error("a correction posted while drafting left redrafting redundant")
+	}
+	hiddenQ := q
+	hiddenQ.Hidden = true
+	if !draftPR(d1, a1, hiddenQ).RedraftRedundant() || !draftPR(d1, hiddenQ, a1).RedraftRedundant() {
+		t.Error("a hidden turn after the request, which the drafter never reads, opened redrafting")
+	}
+	// Hiding or unhiding an earlier turn since the request was saved (a revision
+	// above the request's) changes what the drafter would read; a toggle saved
+	// before the request does not.
+	toggled := q0
+	toggled.HiddenRev = 3
+	read := d1
+	read.ReadRev = 2
+	if draftPR(toggled, read, a1).RedraftRedundant() {
+		t.Error("an earlier turn's visibility changed since the request, yet redrafting is redundant")
+	}
+	read.ReadRev = 3
+	if !draftPR(toggled, read, a1).RedraftRedundant() {
+		t.Error("a toggle saved before the request opened redrafting")
+	}
+	// A retry restamps the request's time but keeps its revision: the slow first
+	// run's draft, landing last, is still judged by what it could have read.
+	retried := draftPR(q0, d1, a1)
+	retried.SetHidden(0, true)
+	retried.Restamp(1, asked.Add(time.Hour))
+	if retried.RedraftRedundant() {
+		t.Error("a retry made a hide the first run never saw look older than the request")
+	}
+	confirmed := a1
+	confirmed.DraftReceipt = &DraftReceipt{State: DraftCreated, At: time.Now()}
+	if draftPR(d1, confirmed).RedraftRedundant() {
+		t.Error("a confirmed draft left redrafting closed")
+	}
+	empty := Message{ID: "a1", ReplyTo: "d1", Role: RoleAgent, Content: "Nothing to draft."}
+	if draftPR(d1, empty).RedraftRedundant() || draftPR(d1).RedraftRedundant() || draftPR().RedraftRedundant() {
+		t.Error("no offered draft, yet redrafting is redundant")
+	}
+	other := draftPR(d1, a1)
+	other.GitHub.Number = 2
+	if other.RedraftRedundant() {
+		t.Error("a draft pinned to another pull request left redrafting closed")
+	}
+	// A legacy reply (no ReplyTo) answers the request directly before it.
+	legacy := a1
+	legacy.ReplyTo = ""
+	if !draftPR(q0, d1, legacy).RedraftRedundant() {
+		t.Error("a legacy draft reply is not recognized as answering its request")
+	}
+}
+
+// SetHidden gives each change of visibility, and only a change, the thread's next
+// revision, whichever turn it changes.
+func TestSetHiddenRevisions(t *testing.T) {
+	it := draftPR(Message{ID: "q", Role: RoleUser, Content: "hi"}, Message{ID: "r", Role: RoleAgent, Content: "hello"})
+	if it.SetHidden(0, false) || it.VisibilityRev() != 0 {
+		t.Error("unhiding a visible turn changed it")
+	}
+	if !it.SetHidden(0, true) || !it.Thread[0].Hidden || it.Thread[0].HiddenRev != 1 {
+		t.Errorf("hide: %+v", it.Thread[0])
+	}
+	if it.SetHidden(0, true) || it.Thread[0].HiddenRev != 1 {
+		t.Error("hiding a hidden turn took a revision")
+	}
+	if !it.SetHidden(1, true) || it.Thread[1].HiddenRev != 2 || !it.SetHidden(0, false) || it.Thread[0].HiddenRev != 3 || it.VisibilityRev() != 3 {
+		t.Errorf("revisions do not follow the order of changes: %+v", it.Thread)
+	}
+	if it.SetHidden(2, true) || it.SetHidden(-1, true) {
+		t.Error("an out-of-range turn was changed")
 	}
 }
 

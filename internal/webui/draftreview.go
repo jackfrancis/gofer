@@ -46,6 +46,7 @@ type ReviewCreator interface {
 // item is not a pull request on the radar, or commenting or the assistant is off.
 type draftThread struct {
 	Connected bool   // the write grant is connected; otherwise the thread links to connecting it
+	Redundant bool   // connected, and a redraft would repeat the draft the thread offers (RedraftRedundant): no button
 	Ready     bool   // the button is enabled: a completed review, and no reply in flight
 	Why       string // why the button is disabled
 	Index     int    // the position of the draft the thread offers; -1 for none
@@ -74,6 +75,8 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 	}
 	v := &draftThread{Connected: connected, Index: -1}
 	switch {
+	case connected && it.RedraftRedundant():
+		v.Redundant = true
 	case !it.HasReview():
 		v.Why = "Review this pull request first: there are no review comments to draft yet."
 	case it.ReplyPending(now, reviewStaleAfter):
@@ -93,11 +96,30 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 }
 
 // draftable reports whether a draft-review request may be added to it now: a pull
-// request on the radar (so not hidden or closed) with a completed review and no reply
-// in flight. It is the button's condition, checked again inside the store update.
-func draftable(it worklist.WorkItem, now time.Time) bool {
-	return it.Type == worklist.TypePullRequest && it.OnRadar() && it.HasReview() && !it.ReplyPending(now, reviewStaleAfter)
+// request on the radar (so not hidden or closed) with a completed review, no reply
+// in flight, and no draft a new one would only repeat (RedraftRedundant). It is the
+// button's condition, checked again inside the store update.
+//
+// redraft, when set, is the out-of-date result page's "Draft Review Comments again",
+// naming the draft (turn key and digest) GitHub refused: the item may have moved in
+// ways gofer cannot see (a new head or base), so that request is judged by the draft
+// it names alone. It is admitted only while that very draft is still the one
+// offered, whatever its redundancy, and refused otherwise, never falling back to the
+// ordinary check: once anything replaced the draft (a redraft from another tab, say,
+// and a discussion since), a stale result page must not retire the newer one.
+func draftable(it worklist.WorkItem, now time.Time, redraft *draftRef) bool {
+	if it.Type != worklist.TypePullRequest || !it.OnRadar() || !it.HasReview() || it.ReplyPending(now, reviewStaleAfter) {
+		return false
+	}
+	if redraft != nil {
+		_, ok := it.OfferedDraft(redraft.Key, redraft.Digest)
+		return ok
+	}
+	return !it.RedraftRedundant()
 }
+
+// draftRef names one draft: the key of the turn carrying it and its Digest.
+type draftRef struct{ Key, Digest string }
 
 // DraftReview handles POST /items/draft-review, the thread's "Draft Review
 // Comments". It appends the draft-review request to the item's thread and
@@ -112,6 +134,10 @@ func (h *Handler) DraftReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.FormValue("id")
+	var redraft *draftRef // set only by the out-of-date result page's form
+	if r.FormValue("redraft") == "1" {
+		redraft = &draftRef{Key: r.FormValue("msg"), Digest: r.FormValue("digest")}
+	}
 	back := "/items/thread?id=" + url.QueryEscape(id)
 	if id == "" || !connected {
 		http.Redirect(w, r, back, http.StatusSeeOther)
@@ -126,10 +152,12 @@ func (h *Handler) DraftReview(w http.ResponseWriter, r *http.Request) {
 			if current[i].ID != id {
 				continue
 			}
-			if !draftable(current[i], now) {
-				return nil, nil // a stale page: no review yet, a reply in flight, or off the radar
+			if !draftable(current[i], now, redraft) {
+				return nil, nil // a stale page: no review yet, a reply in flight, a draft already last, or off the radar
 			}
-			current[i].Thread = append(current[i].Thread, msg)
+			req := msg
+			req.ReadRev, req.ReadRevKnown = current[i].VisibilityRev(), true // inside the update, ordered with every hide
+			current[i].Thread = append(current[i].Thread, req)
 			appended = true
 			return current[i : i+1], nil
 		}
@@ -152,6 +180,9 @@ type draftResult struct {
 	Comments int    // inline comments sent
 	Summary  bool   // the summary was sent
 	Approve  bool   // the approval commands were sent
+	Redraft  bool   // GitHub refused the draft as out of date: the page offers drafting again
+	Key      string // the refused draft's turn key and Digest, binding that offer to it
+	Digest   string
 	// Body is the review body sent (the summary and approval kept), shown to copy:
 	// GitHub's dialog for submitting a pending review can open with an empty summary
 	// that replaces it.
@@ -292,7 +323,7 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 		settle(nil) // GitHub certainly created nothing: the owner may try again
 	}
 	slog.InfoContext(ctx, "pending review", "user", user.ID, "created", res.Created, "unknown", res.Unknown, "comments", len(rv.Comments), "approve", approve)
-	view := draftResult{Item: it, Created: res.Created, Unknown: res.Unknown, URL: res.URL, Comments: len(rv.Comments), Summary: summary != "", Approve: approve, Body: rv.Body, Error: res.Error}
+	view := draftResult{Item: it, Created: res.Created, Unknown: res.Unknown, URL: res.URL, Comments: len(rv.Comments), Summary: summary != "", Approve: approve, Body: rv.Body, Redraft: res.Stale, Key: key, Digest: digest, Error: res.Error}
 	status := http.StatusOK
 	if !res.Created && !res.Unknown {
 		status = http.StatusConflict
