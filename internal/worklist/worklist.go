@@ -84,6 +84,13 @@ type GitHubRef struct {
 	// none until the next refresh.
 	Author string `json:"author,omitempty"`
 
+	// AuthorAvatar is where GitHub serves the author's avatar, as a path on its
+	// avatar host: "u/<account id>" for a user, "in/<app id>" for an app's bot. It
+	// is display-only, and it reaches the page, so read it only through
+	// AuthorAvatarPath, which refuses anything but those two forms. An item stored
+	// before it was recorded has none until the next refresh.
+	AuthorAvatar string `json:"author_avatar,omitempty"`
+
 	// LabelColors maps each of the item's labels (Signals.Labels) to its GitHub
 	// color, six hex digits without '#', for display only. Read a color through
 	// LabelColor, which refuses anything but six hex digits.
@@ -189,6 +196,34 @@ func (c *CISummary) Equal(o *CISummary) bool {
 // The value reaches a stylesheet, so nothing else may pass.
 func (g GitHubRef) LabelColor(name string) string {
 	return NormalizeLabelColor(g.LabelColors[name])
+}
+
+// AuthorAvatarPath returns the author's avatar path (AuthorAvatar), or "" if none
+// is stored or the stored value is not one NormalizeAvatarPath admits.
+func (g GitHubRef) AuthorAvatarPath() string {
+	return NormalizeAvatarPath(g.AuthorAvatar)
+}
+
+// maxAvatarIDDigits bounds the id in an avatar path: GitHub ids are int64s.
+const maxAvatarIDDigits = 19
+
+// NormalizeAvatarPath returns p if it is an avatar path on GitHub's avatar host,
+// "u/" or "in/" followed by a decimal id, or "" otherwise. Nothing else can pass, so
+// a run cannot point the page at another path or host through the stored value.
+func NormalizeAvatarPath(p string) string {
+	id, ok := strings.CutPrefix(p, "u/")
+	if !ok {
+		id, ok = strings.CutPrefix(p, "in/")
+	}
+	if !ok || id == "" || len(id) > maxAvatarIDDigits {
+		return ""
+	}
+	for i := 0; i < len(id); i++ {
+		if id[i] < '0' || id[i] > '9' {
+			return ""
+		}
+	}
+	return p
 }
 
 // NormalizeLabelColor returns c as six lowercase hex digits (a leading '#' is

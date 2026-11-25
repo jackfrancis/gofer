@@ -34,8 +34,8 @@ var md = goldmark.New(
 // as the link's text, instead of an <img>. A reply's image would otherwise be
 // fetched as soon as the thread opens, sending a model-chosen URL (path and query)
 // to its host with no click; and the page's CSP admits one third-party image host
-// (GitHub's avatars, for the header), so a URL there would load. With no <img> in
-// any reply, that exception serves the header alone. Goldmark's image renderer is
+// (GitHub's avatars, for the header and each item's author), so a URL there would
+// load. With no <img> in any reply, that exception serves those avatars alone. Goldmark's image renderer is
 // the only source of <img> here (raw HTML is escaped), so replacing it suffices.
 type imagesAsLinks struct{}
 

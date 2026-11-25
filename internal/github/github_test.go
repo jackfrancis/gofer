@@ -30,7 +30,7 @@ func TestFetchWorklistMapsAndDedups(t *testing.T) {
 		// The same PR surfaces under the involves and review-requested queries, so the
 		// two reasons must merge onto one deduped item.
 		if strings.Contains(q, "involves:@me") || strings.Contains(q, "review-requested:@me") {
-			_, _ = w.Write([]byte(`{"items":[{"number":42,"title":"Fix bug","html_url":"https://github.com/o/r/pull/42","state":"open","comments":3,"repository_url":"https://api.github.com/repos/o/r","user":{"login":"me"},"pull_request":{"url":"x"},"labels":[{"name":"kind/bug","color":"D73A4A"},{"name":"odd","color":"red}*{x"}]}]}`))
+			_, _ = w.Write([]byte(`{"items":[{"number":42,"title":"Fix bug","html_url":"https://github.com/o/r/pull/42","state":"open","comments":3,"repository_url":"https://api.github.com/repos/o/r","user":{"login":"me","avatar_url":"https://avatars.githubusercontent.com/u/583231?v=4"},"pull_request":{"url":"x"},"labels":[{"name":"kind/bug","color":"D73A4A"},{"name":"odd","color":"red}*{x"}]}]}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"items":[]}`))
@@ -57,6 +57,9 @@ func TestFetchWorklistMapsAndDedups(t *testing.T) {
 	}
 	if it.Signals.Comments != 3 {
 		t.Fatalf("want 3 comments, got %d", it.Signals.Comments)
+	}
+	if it.GitHub.Author != "me" || it.GitHub.AuthorAvatar != "u/583231" {
+		t.Fatalf("author %q avatar %q", it.GitHub.Author, it.GitHub.AuthorAvatar)
 	}
 	// Every label is kept; only a well-formed color, normalized, comes with it.
 	if !slices.Equal(it.Signals.Labels, []string{"kind/bug", "odd"}) {
@@ -491,5 +494,27 @@ func TestFetchWorklistGatesDraftObservations(t *testing.T) {
 				t.Errorf("complete = %v, want %v", f.Complete, tc.complete)
 			}
 		})
+	}
+}
+
+// An author's avatar_url is kept only as a path on GitHub's avatar host, a user's or
+// an app bot's, without its query; anything else records no avatar.
+func TestAvatarPath(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://avatars.githubusercontent.com/u/583231?v=4": "u/583231",
+		"https://avatars.githubusercontent.com/u/583231":     "u/583231",
+		"https://avatars.githubusercontent.com/in/29110?v=4": "in/29110",
+		"":                         "",
+		"https://evil.example/u/1": "",
+		"https://avatars.githubusercontent.com.evil.example/u/1":       "",
+		"http://avatars.githubusercontent.com/u/1":                     "",
+		"https://avatars.githubusercontent.com/u/1/../x":               "",
+		"https://avatars.githubusercontent.com/octocat":                "",
+		"https://avatars.githubusercontent.com/u/":                     "",
+		"https://avatars.githubusercontent.com/u/12345678901234567890": "",
+	} {
+		if got := avatarPath(in); got != want {
+			t.Errorf("avatarPath(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

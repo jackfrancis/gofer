@@ -123,6 +123,7 @@
         <div class="zz-title">{{stateIcon .Item}}<a href="{{.Item.GitHub.URL}}" target="_blank" rel="noopener noreferrer">{{.Item.GitHub.Title}}</a></div>
         <div class="zz-meta">
           <span>{{.Item.GitHub.Repo}}{{if .Item.GitHub.Number}} #{{.Item.GitHub.Number}}{{end}}</span>
+          {{template "author" .Item}}
           {{if .Item.Meta.HiddenAt.IsZero}}
           <form method="post" action="/items/hide">
             <input type="hidden" name="id" value="{{.Item.ID}}">
@@ -499,6 +500,7 @@
           </div>
           <div class="zz-meta">
             <span>{{.GitHub.Repo}} #{{.GitHub.Number}}</span>
+            {{template "author" .}}
             {{with ghLabels .}}<span class="zz-labels">{{range .}}<span class="Label zz-ghlabel">{{.Name}}</span>{{end}}</span>{{end}}
           </div>
           {{template "ci" ciSummary .}}
@@ -531,6 +533,7 @@
           </div>
           <div class="zz-meta">
             <span>{{.GitHub.Repo}} #{{.GitHub.Number}}</span>
+            {{template "author" .}}
             <span class="Label zz-priority {{priorityClass .Meta.Priority}}">{{with .Meta.Priority}}{{.}}{{else}}unranked{{end}}</span>{{with waitingBadge .}}
             <span class="Label zz-waiting-badge" title="{{waitingTitle $.Item}}">{{.}}</span>{{end}}
             {{with ghLabels .}}<span class="zz-labels">{{range .}}<span class="Label zz-ghlabel{{with .Class}} {{.}}{{end}}">{{.Name}}</span>{{end}}</span>{{end}}
@@ -550,6 +553,8 @@
           {{end}}
         </div>
 {{end}}{{end}}
+{{/* Who opened the item, with their avatar's URL for avatar.js (no <img> in the markup), or nothing when the author is unknown. */}}
+{{define "author"}}{{with .GitHub.Author}}<span class="zz-author" title="Opened by {{.}}"{{with authorAvatar $}} data-avatar="{{.}}"{{end}}>{{.}}</span>{{end}}{{end}}
 {{/* A pull request's CI summary (ciView), or nothing for nil. */}}
 {{define "ci"}}{{with .}}<ul class="zz-ci" aria-label="CI results">
             {{if .Historical}}<li class="zz-ci-note">Last known CI results; no longer updated since this item left your radar.</li>{{else if .Stale}}<li class="zz-ci-note">Last known CI results, from before you hid this item; the next refresh checks them again.</li>{{end}}

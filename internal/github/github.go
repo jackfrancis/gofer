@@ -309,7 +309,8 @@ type searchItem struct {
 	// User and Assignees let gofer prove the specific relationship a union membership
 	// query cannot report.
 	User *struct {
-		Login string `json:"login"`
+		Login     string `json:"login"`
+		AvatarURL string `json:"avatar_url"`
 	} `json:"user"`
 	Assignees []struct {
 		Login string `json:"login"`
@@ -378,9 +379,10 @@ func (it searchItem) workItem(reasons []worklist.Reason, now time.Time) worklist
 		merged = it.PullRequest.MergedAt != nil
 	}
 	repo := it.repo()
-	var author string
+	var author, avatar string
 	if it.User != nil {
 		author = it.User.Login
+		avatar = avatarPath(it.User.AvatarURL)
 	}
 
 	sig := worklist.Signals{
@@ -424,10 +426,27 @@ func (it searchItem) workItem(reasons []worklist.Reason, now time.Time) worklist
 			Merged:      merged,
 			StateReason: it.StateReason,
 			Author:      author,
+
+			AuthorAvatar: avatar,
 		},
 		Signals: sig,
 		Meta:    worklist.Metadata{Origin: worklist.OriginAgent},
 	}
+}
+
+// avatarHost serves GitHub avatars; a user's avatar_url points there.
+const avatarHost = "https://avatars.githubusercontent.com/"
+
+// avatarPath reduces a user's avatar_url to its path on GitHub's avatar host
+// ("u/<id>" for a user, "in/<id>" for an app's bot), dropping the query, or ""
+// for a URL on any other host or of any other form (worklist.NormalizeAvatarPath).
+func avatarPath(avatarURL string) string {
+	rest, ok := strings.CutPrefix(avatarURL, avatarHost)
+	if !ok {
+		return ""
+	}
+	path, _, _ := strings.Cut(rest, "?")
+	return worklist.NormalizeAvatarPath(path)
 }
 
 // searchIssues walks a search query page by page. whole reports that the walk saw
