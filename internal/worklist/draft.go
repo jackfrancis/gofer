@@ -235,12 +235,15 @@ func (w WorkItem) latestDraft() (req, reply int) {
 // (DraftReview.For); no turn after its request but the draft itself is visible (the
 // drafter read only the turns before its request, so a correction posted while it
 // worked, even one answered before the draft landed, is new to it); and no turn
-// before the request changed visibility since the request was posted
-// (Message.VisibilityAt, against the request's At, both stamped by the web tier;
-// a change at the same instant counts), so hiding or unhiding an earlier instruction
-// opens drafting again. A confirmed draft (any receipt) is used up: the thread says
-// to draft again to start over. A retired draft (an empty redraft, a hidden request
-// or reply, another pull request) leaves drafting open.
+// before the request was hidden or unhidden since the request was saved (a HiddenRev
+// above the request's ReadRev), so hiding or unhiding an earlier instruction opens
+// drafting again. Revisions, not times, order the two: each is assigned inside the
+// store update that saved it, and a retry of the request keeps its ReadRev, so a
+// slow first run's draft is still judged by what it could have read. A toggle after
+// the request but before its run read the thread counts too, which errs toward
+// offering the button. A confirmed draft (any receipt) is used up: the thread says to
+// draft again to start over. A retired draft (an empty redraft, a hidden request or
+// reply, another pull request) leaves drafting open.
 //
 // The head the draft is anchored to is not compared with the item's: gofer has no
 // observation of the head it can order against the drafter's own read. A draft that
@@ -254,11 +257,11 @@ func (w WorkItem) RedraftRedundant() bool {
 	if !w.Thread[i].Draft.For(w) || w.Thread[i].DraftReceipt != nil {
 		return false
 	}
-	asked := w.Thread[req].At
+	read := w.Thread[req].ReadRev
 	for j := range w.Thread {
 		switch {
 		case j < req:
-			if at := w.Thread[j].VisibilityAt; !at.IsZero() && !at.Before(asked) {
+			if w.Thread[j].HiddenRev > read {
 				return false
 			}
 		case j > req && j != i && !w.Thread[j].Hidden:
@@ -268,16 +271,29 @@ func (w WorkItem) RedraftRedundant() bool {
 	return true
 }
 
-// SetHidden hides (or unhides) turn i at now, reporting whether its visibility
-// changed. A change is stamped (Message.VisibilityAt), so a draft whose request came
-// before it no longer counts as reading the conversation as it stands
-// (RedraftRedundant).
-func (w *WorkItem) SetHidden(i int, hidden bool, now time.Time) bool {
+// VisibilityRev is the thread's visibility revision: the highest HiddenRev in it, or
+// 0. Turns are only appended (clearing removes them all), so it only grows while the
+// thread stands. Read it inside the store update whose result depends on it.
+func (w WorkItem) VisibilityRev() int {
+	rev := 0
+	for _, m := range w.Thread {
+		rev = max(rev, m.HiddenRev)
+	}
+	return rev
+}
+
+// SetHidden hides (or unhides) turn i, reporting whether its visibility changed. A
+// change takes the thread's next visibility revision (HiddenRev), so a draft whose
+// request was saved before it no longer counts as reading the conversation as it
+// stands (RedraftRedundant). Call it inside the store update that saves the change,
+// so the revision follows the order of the saved writes.
+func (w *WorkItem) SetHidden(i int, hidden bool) bool {
 	if i < 0 || i >= len(w.Thread) || w.Thread[i].Hidden == hidden {
 		return false
 	}
+	rev := w.VisibilityRev() + 1
 	w.Thread[i].Hidden = hidden
-	w.Thread[i].VisibilityAt = now
+	w.Thread[i].HiddenRev = rev
 	return true
 }
 

@@ -98,20 +98,20 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 // in flight, and no draft a new one would only repeat (RedraftRedundant). It is the
 // button's condition, checked again inside the store update.
 //
-// redraft names the draft (turn key and digest) GitHub refused as out of date, from
-// that result page's "Draft Review Comments again": the item may have moved in ways
-// gofer cannot see (a new head or base), so while that very draft is still the one
-// offered, its redundancy does not stand in the way. Once anything replaced it (a
-// redraft from another tab, say), the ordinary check applies, so a stale result page
-// cannot retire a newer draft.
-func draftable(it worklist.WorkItem, now time.Time, redraft draftRef) bool {
+// redraft, when set, is the out-of-date result page's "Draft Review Comments again",
+// naming the draft (turn key and digest) GitHub refused: the item may have moved in
+// ways gofer cannot see (a new head or base), so that request is judged by the draft
+// it names alone. It is admitted only while that very draft is still the one
+// offered, whatever its redundancy, and refused otherwise, never falling back to the
+// ordinary check: once anything replaced the draft (a redraft from another tab, say,
+// and a discussion since), a stale result page must not retire the newer one.
+func draftable(it worklist.WorkItem, now time.Time, redraft *draftRef) bool {
 	if it.Type != worklist.TypePullRequest || !it.OnRadar() || !it.HasReview() || it.ReplyPending(now, reviewStaleAfter) {
 		return false
 	}
-	if redraft.Key != "" {
-		if _, ok := it.OfferedDraft(redraft.Key, redraft.Digest); ok {
-			return true
-		}
+	if redraft != nil {
+		_, ok := it.OfferedDraft(redraft.Key, redraft.Digest)
+		return ok
 	}
 	return !it.RedraftRedundant()
 }
@@ -132,9 +132,9 @@ func (h *Handler) DraftReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.FormValue("id")
-	var redraft draftRef // set only by the out-of-date result page's form
+	var redraft *draftRef // set only by the out-of-date result page's form
 	if r.FormValue("redraft") == "1" {
-		redraft = draftRef{Key: r.FormValue("msg"), Digest: r.FormValue("digest")}
+		redraft = &draftRef{Key: r.FormValue("msg"), Digest: r.FormValue("digest")}
 	}
 	back := "/items/thread?id=" + url.QueryEscape(id)
 	if id == "" || !connected {
@@ -153,7 +153,9 @@ func (h *Handler) DraftReview(w http.ResponseWriter, r *http.Request) {
 			if !draftable(current[i], now, redraft) {
 				return nil, nil // a stale page: no review yet, a reply in flight, a draft already last, or off the radar
 			}
-			current[i].Thread = append(current[i].Thread, msg)
+			req := msg
+			req.ReadRev = current[i].VisibilityRev() // inside the update, ordered with every hide
+			current[i].Thread = append(current[i].Thread, req)
 			appended = true
 			return current[i : i+1], nil
 		}

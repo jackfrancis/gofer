@@ -35,15 +35,21 @@ review's text is written by a model, so this feature needs that rule amended.
    its request but the draft itself is visible (the drafter read only the turns before
    its request, so a correction posted while it worked counts even if answered before
    the draft landed), and no turn before the request was hidden or unhidden since the
-   request was posted (`Message.VisibilityAt`, stamped by `WorkItem.SetHidden` on the
-   web tier's clock, as the request's time is). The request handler refuses a
+   request was saved. Stored revisions order the two, never times: each hide or unhide
+   takes the thread's next visibility revision (`Message.HiddenRev`, assigned by
+   `WorkItem.SetHidden` inside the store update that saves it), and the request records
+   the revision current when it was saved (`Message.ReadRev`, read inside its own
+   update and kept by a retry, which restamps only the time). Runs never set either:
+   `AppendReply` clears both on a reply. The request handler refuses a
    redundant one from a stale page. The draft's head is not compared with the item's,
    since gofer has no observation of the head it can order against the drafter's own
    read: a confirmation GitHub refuses as out of date (a new head, or a moved base)
    offers "Draft Review Comments again" on its result page, bound to that draft (its
-   turn key and digest, `redraft=1`). It skips the redundancy check only while that
-   draft is still the one offered, so a stale result page cannot retire a newer draft,
-   and the "draft again" it asks for is always reachable.
+   turn key and digest, `redraft=1`). That request is judged by the draft it names
+   alone: admitted while that draft is still the one offered, whatever its redundancy,
+   and refused otherwise, never falling back to the thread button's check, so a stale
+   result page cannot retire a newer draft, and the "draft again" it asks for is always
+   reachable.
 2. **Draft (the run, read-only).** The workload (`internal/agent/draft.go`) reads the
    pull request's head commit, base branch and changed files with their patches
    (`github.Client.PullDiff`, public-only like every workload call). It annotates each

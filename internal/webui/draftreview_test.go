@@ -194,18 +194,36 @@ func TestDraftReviewRefusesRedundantRedraft(t *testing.T) {
 	}
 
 	// Another tab already redrafted, and the newer draft landed: the old result
-	// page's button must not retire it.
-	newer := append(draftedThread(time.Now().Add(-time.Hour)),
-		worklist.Message{ID: "d2", Role: worklist.RoleUser, Content: draftReviewPrompt, Kind: worklist.KindDraftReviewRequest, At: time.Now().Add(-time.Hour)},
-		worklist.Message{ID: "a2", ReplyTo: "d2", Role: worklist.RoleAgent, Content: "Drafted 1.", At: time.Now().Add(-time.Hour), Draft: &worklist.DraftReview{
-			Repo: "o/r", Number: 1, Commit: strings.Repeat("b", 40), BaseRef: "main",
-			Patches:  map[string]string{"a.go": worklist.PatchDigest("pa2")},
-			Comments: []worklist.DraftComment{{Path: "a.go", Line: 4, Side: "RIGHT", Body: "Rename y."}},
-		}})
-	h, p, store = draftFixture(t, c, newer)
-	post(h, rejected)
-	if n := turns(store); n != len(newer) || len(p.turns) != 0 {
-		t.Errorf("a stale result page retired the newer draft: %d turns, %+v", n, p.turns)
+	// page's button must not retire it, neither while it is redundant nor after a
+	// discussion since made it not so.
+	newerDraft := func(extra ...worklist.Message) []worklist.Message {
+		th := append(draftedThread(time.Now().Add(-time.Hour)),
+			worklist.Message{ID: "d2", Role: worklist.RoleUser, Content: draftReviewPrompt, Kind: worklist.KindDraftReviewRequest, At: time.Now().Add(-time.Hour)},
+			worklist.Message{ID: "a2", ReplyTo: "d2", Role: worklist.RoleAgent, Content: "Drafted 1.", At: time.Now().Add(-time.Hour), Draft: &worklist.DraftReview{
+				Repo: "o/r", Number: 1, Commit: strings.Repeat("b", 40), BaseRef: "main",
+				Patches:  map[string]string{"a.go": worklist.PatchDigest("pa2")},
+				Comments: []worklist.DraftComment{{Path: "a.go", Line: 4, Side: "RIGHT", Body: "Rename y."}},
+			}})
+		return append(th, extra...)
+	}
+	for name, th := range map[string][]worklist.Message{
+		"redundant": newerDraft(),
+		"discussed since": newerDraft(
+			worklist.Message{ID: "m", Role: worklist.RoleUser, Content: "Also y?", At: time.Now().Add(-time.Hour)},
+			worklist.Message{ID: "n", ReplyTo: "m", Role: worklist.RoleAgent, Content: "Yes.", At: time.Now().Add(-time.Hour)}),
+	} {
+		h, p, store = draftFixture(t, c, th)
+		post(h, rejected)
+		if n := turns(store); n != len(th) || len(p.turns) != 0 {
+			t.Errorf("%s: a stale result page retired the newer draft: %d turns, %+v", name, n, p.turns)
+		}
+		// The thread's own button still drafts when the conversation moved on.
+		if name == "discussed since" {
+			post(h, url.Values{"id": {draftItemID}})
+			if n := turns(store); n != len(th)+1 {
+				t.Errorf("the thread's button no longer drafts after a discussion: %d turns", n)
+			}
+		}
 	}
 }
 
@@ -222,8 +240,8 @@ func TestHidingAnEarlierTurnReopensDrafting(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	h.HideMessage(httptest.NewRecorder(), req)
 	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
-	if !it.Thread[1].Hidden || it.Thread[1].VisibilityAt.IsZero() {
-		t.Fatalf("the hide was not stamped: %+v", it.Thread[1])
+	if !it.Thread[1].Hidden || it.Thread[1].HiddenRev != 1 {
+		t.Fatalf("the hide took no revision: %+v", it.Thread[1])
 	}
 	if page, _ := threadPage(t, h); !strings.Contains(page, `action="/items/draft-review"`) {
 		t.Error("an earlier turn was hidden since the draft, but no button")
@@ -274,6 +292,20 @@ func TestThreadShowsDraftSelection(t *testing.T) {
 // The button appends the draft request and dispatches it to the default model; a
 // stale page (nothing reviewed yet) appends and dispatches nothing.
 func TestDraftReviewDispatches(t *testing.T) {
+	// The request records the thread's visibility revision when it is saved.
+	{
+		c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+		th := draftedThread(time.Now().Add(-time.Hour))[:2]
+		th[0].HiddenRev, th[1].HiddenRev = 4, 7
+		h, _, store := draftFixture(t, c, th)
+		req := httptest.NewRequest(http.MethodPost, "/items/draft-review", strings.NewReader(url.Values{"id": {draftItemID}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		h.DraftReview(httptest.NewRecorder(), req)
+		it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+		if got := it.Thread[len(it.Thread)-1]; got.Kind != worklist.KindDraftReviewRequest || got.ReadRev != 7 {
+			t.Errorf("the request did not record the thread's revision: %+v", got)
+		}
+	}
 	post := func(h *Handler) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "/items/draft-review", strings.NewReader(url.Values{"id": {draftItemID}}.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -290,6 +322,9 @@ func TestDraftReviewDispatches(t *testing.T) {
 	last := it.Thread[len(it.Thread)-1]
 	if last.Kind != worklist.KindDraftReviewRequest || len(p.turns) != 1 || p.turns[0].Turn != last.ID || p.converseModels[0] != "m0" {
 		t.Fatalf("appended %+v, dispatched %+v models %v", last, p.turns, p.converseModels)
+	}
+	if last.ReadRev != 0 {
+		t.Errorf("ReadRev = %d on a thread nothing was ever hidden in", last.ReadRev)
 	}
 	// The request is now pending: a second click does nothing.
 	post(h)
