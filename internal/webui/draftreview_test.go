@@ -1190,3 +1190,69 @@ func TestRefusedSecondOpinionDoesNotBlock(t *testing.T) {
 		t.Error("a refusal of an earlier attempt unblocked a later one")
 	}
 }
+
+// When a 2nd opinion's submission and then its retry are both refused, rolling the
+// retry back restores the original attempt with its refusal record: the turn still
+// cannot answer, so once no model is left to retry it, it blocks nothing.
+func TestRefusedRetryKeepsTheOriginalRefusal(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	panel := worklist.Message{ID: "q", Role: worklist.RoleUser, Content: worklist.IndependentReviewPrompt, Kind: worklist.KindReviewRequest, Refused: true, At: time.Now().Add(-time.Hour)}
+	h, p, store := draftFixture(t, c, []worklist.Message{panel})
+	p.err = ingest.ErrNotAccepted
+	postReview(h, "retry", "q")
+	if len(p.secondOpinions) != 1 {
+		t.Fatalf("the retry was not dispatched blind: %v", p.secondOpinions)
+	}
+	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+	if q := it.Thread[0]; q.Attempt != "" || !q.Refused || q.RefusedAttempt != "" || !it.Ended("q") {
+		t.Fatalf("after the refused retry: %+v (ended %v)", q, it.Ended("q"))
+	}
+	h, _, _ = draftFixture(t, c, it.Thread)
+	h.options = nil
+	if page, _ := threadPage(t, h); !strings.Contains(page, ">Review this pull request</button>") {
+		t.Errorf("the twice-refused 2nd opinion blocks a first review:\n%s", page)
+	}
+}
+
+// A review request the latest review superseded (asked before it landed) does not
+// block a review of the current revision, even hidden and unanswered: only requests
+// asked since the latest review count.
+func TestSupersededHiddenRequestDoesNotBlockReReview(t *testing.T) {
+	const pushed = "fedcba9876543210fedcba9876543210fedcba98"
+	old := worklist.Message{ID: "h0", Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, Hidden: true, At: time.Now().Add(-3 * time.Hour)}
+	th := append([]worklist.Message{old}, draftedThread(time.Now().Add(-time.Hour))...)
+	th[2].Head, th[2].Base = draftCommit, "main" // the review's answer
+	th[4].Head, th[4].Base = pushed, "main"      // the draft's reply: the PR moved
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	h, p, store := draftFixture(t, c, th)
+	page, _ := threadPage(t, h)
+	if !strings.Contains(page, `name="review" value="again"`) || strings.Contains(page, "Unhide it to retry it") {
+		t.Errorf("a superseded hidden request blocks the re-review:\n%s", page)
+	}
+	postReview(h, "again")
+	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); len(it.Thread) != len(th)+1 || len(p.turns) != 1 || !it.Thread[0].Hidden {
+		t.Errorf("re-review: %d turns, dispatched %+v", len(it.Thread), p.turns)
+	}
+}
+
+// A 2nd opinion the backend certainly refused is not shown as working: with no run
+// started it is not pending, and it is retryable at once.
+func TestRefusedSecondOpinionIsNotPending(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	h, p, store := draftFixture(t, c, draftedThread(time.Now().Add(-time.Hour))[:2])
+	p.err = ingest.ErrNotAccepted
+	req := httptest.NewRequest(http.MethodPost, "/items/second-opinion", strings.NewReader(url.Values{"id": {draftItemID}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.SecondOpinion(httptest.NewRecorder(), req)
+	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+	now := time.Now()
+	if it.ReplyPending(now, reviewStaleAfter) {
+		t.Error("a refused 2nd opinion is pending")
+	}
+	if i, ok := it.RetryableTurn(now, reviewStaleAfter); !ok || it.TurnKey(i) != it.Thread[len(it.Thread)-1].ID {
+		t.Error("a refused 2nd opinion is not retryable at once")
+	}
+	if page, _ := threadPage(t, h); strings.Contains(page, "zz-pending") {
+		t.Error("a refused 2nd opinion shows the working cue")
+	}
+}

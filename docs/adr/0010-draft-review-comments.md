@@ -43,10 +43,12 @@ review's text is written by a model, so this feature needs that rule amended.
    opinion no model can run. A request that may still answer but cannot be retried
    blocks a new one; once its current attempt can no longer answer (a notice ended its
    run, or the backend certainly refused its dispatch, which the turn records,
-   `Message.Refused`), a new ordinary review may be asked for. "Review the current
-   revision" retries any unanswered review request in the same way, wherever it sits:
-   a request records no revision, so a later draft of the same revision does not make
-   an outstanding re-review a stranger. A dispatch the backend certainly refused is said so on
+   `Message.Refused`; a refused attempt is also neither pending nor waiting to stall,
+   and a retry rolled back after a refusal keeps the earlier attempt's record), a new
+   ordinary review may be asked for. "Review the current revision" retries, in the
+   same way, an unanswered review request asked since the latest review landed:
+   requests before it are superseded by it, and a redraft of the same revision moves
+   no review, so an outstanding re-review stays the one to retry. A dispatch the backend certainly refused is said so on
    the thread (about that attempt, and not while a later one runs) and leaves the turn
    retryable at once; an uncertain one stays pending.
    It is not shown while drafting again would only repeat the offered draft

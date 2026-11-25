@@ -102,19 +102,21 @@ const (
 // While a review request has no answer, no other one is added: its run may still
 // answer. It is retried instead (same turn, a new attempt), so the dispatcher's gate
 // shares a run still in flight and the store keeps one answer per turn, whatever the
-// timing. Every unanswered request counts, wherever it sits in the thread: a request
-// records no revision, only its answer does, and a
-// retry reviews the pull request as it stands, so an outstanding re-review stays the
-// one to retry even after a later draft read the same revision.
+// timing. The requests that count are those after `after`: the whole thread (-1) for
+// a first review, and for a review of the current revision those asked since the
+// latest review landed (WorkItem.LatestReviewAt), since that review superseded any
+// asked before it. Requests record no revision, only answers do, so a redraft of the
+// same revision, which moves no review, leaves an outstanding re-review the one to
+// retry.
 
-// retryCandidate returns the newest review request with no answer
+// retryCandidate returns the newest review request after `after` with no answer
 // that the thread can retry: visible (a hidden one waits for the user to unhide it,
 // never reversed for them), and by a model it may use (retryChoices: a 2nd opinion
 // only blind, never as an ordinary review that would still count as independent).
 // It is -1 when there is none. An older ordinary request is a candidate even when a
 // newer 2nd opinion cannot be retried.
-func (h *Handler) retryCandidate(it worklist.WorkItem) int {
-	for i := len(it.Thread) - 1; i >= 0; i-- {
+func (h *Handler) retryCandidate(it worklist.WorkItem, after int) int {
+	for i := len(it.Thread) - 1; i > after; i-- {
 		m := it.Thread[i]
 		if m.Role != worklist.RoleUser || m.Kind != worklist.KindReviewRequest || m.Hidden || it.Answered(it.TurnKey(i)) {
 			continue
@@ -126,13 +128,13 @@ func (h *Handler) retryCandidate(it worklist.WorkItem) int {
 	return -1
 }
 
-// reviewBlocker says why no review may be asked for, or "": a review request has no
-// answer and may still get one, yet the thread cannot retry it (hidden, or a 2nd
-// opinion no model may run). A request whose current attempt can no longer answer
+// reviewBlocker says why no review may be asked for, or "": a review request after
+// `after` has no answer and may still get one, yet the thread cannot retry it
+// (hidden, or a 2nd opinion no model may run). A request whose current attempt can no longer answer
 // (WorkItem.Ended: a notice ended its run, or the backend certainly refused it)
 // blocks nothing.
-func (h *Handler) reviewBlocker(it worklist.WorkItem) string {
-	for i := len(it.Thread) - 1; i >= 0; i-- {
+func (h *Handler) reviewBlocker(it worklist.WorkItem, after int) string {
+	for i := len(it.Thread) - 1; i > after; i-- {
 		m := it.Thread[i]
 		key := it.TurnKey(i)
 		if m.Role != worklist.RoleUser || m.Kind != worklist.KindReviewRequest || it.Answered(key) || it.Ended(key) {
@@ -185,10 +187,10 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 		// missing review.
 		v.Why = "Wait for the reply in progress, so the draft includes it."
 	case !it.HasReview():
-		if j := h.retryCandidate(it); j >= 0 {
+		if j := h.retryCandidate(it, -1); j >= 0 {
 			v.Why = "The review asked for earlier has no answer, so there are no review comments to draft yet. Retry it: it runs as it was asked, without the messages that came after it."
 			v.RetryKey = it.TurnKey(j)
-		} else if why := h.reviewBlocker(it); why != "" {
+		} else if why := h.reviewBlocker(it, -1); why != "" {
 			v.Why = why
 		} else {
 			v.Why = "Review this pull request first: there are no review comments to draft yet. A review asked for in a Discuss message does not count; use Review this pull request."
@@ -202,10 +204,10 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 		switch {
 		case it.ReplyPending(now, reviewStaleAfter):
 			v.AgainWhy = "Wait for the reply in progress."
-		case h.retryCandidate(it) >= 0:
-			v.AgainKey = it.TurnKey(h.retryCandidate(it))
+		case h.retryCandidate(it, it.LatestReviewAt()) >= 0:
+			v.AgainKey = it.TurnKey(h.retryCandidate(it, it.LatestReviewAt()))
 		default:
-			v.AgainWhy = h.reviewBlocker(it)
+			v.AgainWhy = h.reviewBlocker(it, it.LatestReviewAt())
 		}
 		v.ReviewReady = v.AgainWhy == ""
 	}
@@ -349,14 +351,14 @@ func (h *Handler) ReviewAgain(w http.ResponseWriter, r *http.Request) {
 			first := firstReviewable(it, now)
 			switch action {
 			case reviewFirst:
-				if !first || h.retryCandidate(it) >= 0 || h.reviewBlocker(it) != "" {
+				if !first || h.retryCandidate(it, -1) >= 0 || h.reviewBlocker(it, -1) != "" {
 					return nil, nil // reviewed since, a reply in flight, a request to retry instead, or off the radar
 				}
 			case reviewRetry:
 				// The turn must be the one the thread offers to retry, as a first review
 				// or as a review of the current revision; otherwise the page is out of date.
 				j, ok := it.TurnIndex(turn)
-				if !ok || !(first || again) || h.retryCandidate(it) != j {
+				if !ok || !((first && h.retryCandidate(it, -1) == j) || (again && h.retryCandidate(it, it.LatestReviewAt()) == j)) {
 					return nil, nil
 				}
 				choices, ind, _ := h.retryChoices(it, j)
@@ -366,7 +368,7 @@ func (h *Handler) ReviewAgain(w http.ResponseWriter, r *http.Request) {
 				ref = worklist.TurnRef{Item: id, Turn: s.Key, Attempt: s.Attempt}
 				return current[i : i+1], nil
 			case reviewAgain:
-				if !again || h.retryCandidate(it) >= 0 || h.reviewBlocker(it) != "" {
+				if !again || h.retryCandidate(it, it.LatestReviewAt()) >= 0 || h.reviewBlocker(it, it.LatestReviewAt()) != "" {
 					return nil, nil // the review is current (or the conversation was reset), a request to retry instead, a reply in flight, or off the radar
 				}
 			}
@@ -392,21 +394,18 @@ func (h *Handler) ReviewAgain(w http.ResponseWriter, r *http.Request) {
 		h.revertShared(r.Context(), user.ID, err, []worklist.RetryStamp{*retry})
 	}
 	if errors.Is(err, ingest.ErrNotAccepted) {
-		// The backend certainly started nothing: make the turn retryable at once, and
-		// say so on the thread, whichever turn is the latest. A retried turn gets its
-		// time back; a new one is set back past the pending window, so the thread
-		// offers to retry it now instead of showing it pending. Any other error leaves
-		// the turn pending, since a run may exist.
-		// The refused attempt is recorded too: for a new turn it stays the turn's
-		// attempt, so the turn is known to be unable to answer (WorkItem.Ended); a
-		// retried turn goes back to its earlier attempt, whose outcome the record
-		// leaves as it was.
-		h.markRefused(r.Context(), user.ID, []worklist.TurnRef{ref})
-		undo := worklist.RetryStamp{Item: id, Key: ref.Turn, At: now, PrevAt: now.Add(-reviewStaleAfter)}
+		// The backend certainly started nothing: say so on the thread, whichever turn
+		// is the latest, and leave the turn retryable at once. A new turn records the
+		// refusal of its only attempt, so it is neither pending nor able to answer
+		// (WorkItem.MarkRefused). A retried turn goes back to its earlier attempt, and
+		// with it whatever was known of that attempt: recording the retry's refusal
+		// would only replace the earlier attempt's record. Any other error leaves the
+		// turn pending, since a run may exist.
 		if retry != nil {
-			undo = *retry
+			h.undoRefusedRetry(r.Context(), user.ID, *retry)
+		} else {
+			h.markRefused(r.Context(), user.ID, []worklist.TurnRef{ref})
 		}
-		h.undoRefusedRetry(r.Context(), user.ID, undo)
 		back += "&review_refused=1"
 	}
 	http.Redirect(w, r, back, http.StatusSeeOther)

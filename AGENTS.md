@@ -698,9 +698,12 @@ Wired on the web-tier side; they define what a runtime must respect:
   (hidden, or a 2nd opinion no model may run) blocks a new one until its attempt can
   no longer answer (`reviewBlocker`, `WorkItem.Ended`: a notice ended it, or the
   backend certainly refused it, recorded by `WorkItem.MarkRefused` from every review
-  dispatch site, batches through `ingest.RefusedRuns`); "Review the current revision"
-  likewise retries any unanswered review request, wherever it sits (requests record
-  no revision), instead of asking again; a definite dispatch
+  dispatch site, batches through `ingest.RefusedRuns`, but never for a retry that is
+  rolled back, which restores the earlier attempt's record; a refused attempt is
+  neither pending nor waiting to stall); "Review the current revision" likewise
+  retries an unanswered review request asked since the latest review landed
+  (`WorkItem.LatestReviewAt`: earlier ones are superseded, and a redraft moves no
+  review), instead of asking again; a definite dispatch
   refusal shows on the thread (`review_refused`, describing that attempt, hidden
   while a later one runs) and leaves the turn retryable at once (a disabled draft
   button says why in text: Safari

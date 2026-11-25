@@ -354,8 +354,20 @@ func (w WorkItem) Ended(key string) bool {
 		return true
 	}
 	i, ok := w.TurnIndex(key)
-	return ok && w.Thread[i].Refused && w.Thread[i].RefusedAttempt == w.Thread[i].Attempt
+	return ok && w.refused(i)
 }
+
+// refused reports whether the backend certainly refused the current attempt at turn
+// i (MarkRefused): no run exists for it, so it is neither pending nor waiting out
+// staleAfter before a retry.
+func (w WorkItem) refused(i int) bool {
+	return w.Thread[i].Refused && w.Thread[i].RefusedAttempt == w.Thread[i].Attempt
+}
+
+// LatestReviewAt returns the position of the latest review (the visible answer to a
+// visible review request that landed last), or -1. Review requests before it are
+// superseded by it: a review cycle starts there.
+func (w WorkItem) LatestReviewAt() int { return w.latestReview() }
 
 // MarkRefused records that the backend certainly refused the dispatch of attempt at
 // the user turn with key, so no run exists for it (Ended). It applies only while that
@@ -665,11 +677,12 @@ func (w WorkItem) hasSynthesisRequest() bool {
 // plausibly in flight (younger than staleAfter). Past that window the run has almost
 // certainly finished or failed, so the turn is eligible for a retry.
 //
-// A turn a system notice replied to is not pending: its run is done.
+// A turn a system notice replied to is not pending: its run is done. Nor is one whose
+// current attempt the backend certainly refused (MarkRefused): no run started.
 func (w WorkItem) ReplyPending(now time.Time, staleAfter time.Duration) bool {
 	answered, noticed := w.replies(), w.noticed()
 	for i, m := range w.Thread {
-		if m.Role != RoleUser || now.Sub(m.At) >= staleAfter {
+		if m.Role != RoleUser || now.Sub(m.At) >= staleAfter || w.refused(i) {
 			continue
 		}
 		key := w.TurnKey(i)
@@ -681,15 +694,16 @@ func (w WorkItem) ReplyPending(now time.Time, staleAfter time.Duration) bool {
 }
 
 // ReplyStalled reports whether the most recent user turn has no reply and is past
-// staleAfter, so its run has almost certainly failed and the turn can be retried. A
-// turn a system notice replied to has not stalled: the notice says what to do.
+// staleAfter, so its run has almost certainly failed and the turn can be retried, or
+// its current attempt was certainly refused (no run started), so it can be retried at
+// once. A turn a system notice replied to has not stalled: the notice says what to do.
 func (w WorkItem) ReplyStalled(now time.Time, staleAfter time.Duration) bool {
 	i, ok := w.LastUserTurn()
 	if !ok {
 		return false
 	}
 	key := w.TurnKey(i)
-	return now.Sub(w.Thread[i].At) >= staleAfter && !w.Answered(key) && !w.noticed()[key]
+	return (now.Sub(w.Thread[i].At) >= staleAfter || w.refused(i)) && !w.Answered(key) && !w.noticed()[key]
 }
 
 // RetryableTurn returns the position of the turn RetryStalled would retry: the
