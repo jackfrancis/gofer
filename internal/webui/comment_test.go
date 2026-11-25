@@ -3,12 +3,16 @@ package webui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"html/template"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +24,7 @@ import (
 type fakeCommenter struct {
 	enabled, connected bool
 	postErr            error
+	refuseAll          string // every target refused with this reason, and no batch error
 
 	mu       sync.Mutex
 	posts    [][]comment.Target
@@ -35,9 +40,15 @@ func (f *fakeCommenter) Post(_ context.Context, _ string, targets []comment.Targ
 	if f.postErr != nil {
 		return nil, f.postErr
 	}
+	out := make([]comment.Result, len(targets))
+	if f.refuseAll != "" {
+		for i, t := range targets {
+			out[i] = comment.Result{Target: t, Error: f.refuseAll}
+		}
+		return out, nil
+	}
 	f.posts = append(f.posts, targets)
 	f.bodies = append(f.bodies, body)
-	out := make([]comment.Result, len(targets))
 	for i, t := range targets {
 		out[i] = comment.Result{Target: t, Posted: true, CommentURL: t.URL + "#c"}
 	}
@@ -93,9 +104,25 @@ func postComment(h *Handler, form url.Values, header ...string) *httptest.Respon
 	return rec
 }
 
-// commentForm is the radar's comment form, with a key the radar would mint now.
+// commentOwner is the fixture's signed-in account.
+const commentOwner = "github:42"
+
+// commentForm is the radar's comment form for commentOwner, with a key the radar would mint
+// now, checking the rows of ids (github:<repo>#<number>) as the radar renders them.
 func commentForm(h *Handler, body string, ids ...string) url.Values {
-	return url.Values{"key": {h.newCommentKey(h.now())}, "content": {body}, "item": ids}
+	return url.Values{"key": {h.newCommentKey(commentOwner, h.now())}, "content": {body}, "item": selections(ids...)}
+}
+
+// selections are the checkbox values of the rows ids name, as the radar renders them.
+func selections(ids ...string) []string {
+	out := make([]string, len(ids))
+	for i, id := range ids {
+		ref := strings.TrimPrefix(id, "github:")
+		j := strings.LastIndex(ref, "#")
+		n, _ := strconv.Atoi(ref[j+1:])
+		out[i] = selectionValue(worklist.WorkItem{ID: id, GitHub: worklist.GitHubRef{Repo: ref[:j], Number: n}})
+	}
+	return out
 }
 
 // sameSite is the fetch metadata a browser sends with the radar's own form.
@@ -216,8 +243,8 @@ func TestCommentFormPostsOnce(t *testing.T) {
 }
 
 func validKey(h *Handler, key string) bool {
-	_, ok := h.commentKeyIssued(key, h.now())
-	return ok
+	_, check := h.commentKeyIssued(key, commentOwner, h.now())
+	return check == keyOK
 }
 
 // Concurrent submissions of one form (a double click) post once.
@@ -246,16 +273,16 @@ func TestCommentStaleFormPostsNothing(t *testing.T) {
 
 	restarted := commentFixture(t, c) // a new process: another epoch
 	expired := commentFixture(t, c)
-	expired.epoch = h.epoch
+	expired.epoch, expired.keySecret = h.epoch, h.keySecret
 	expired.now = func() time.Time { return time.Now().Add(commentKeyTTL + time.Minute) }
-	future := url.Values{"key": {h.newCommentKey(time.Now().Add(time.Hour))}, "content": {"/lgtm"}, "item": {"github:a/one#1"}}
+	future := url.Values{"key": {h.newCommentKey(commentOwner, time.Now().Add(time.Hour))}, "content": {"/lgtm"}, "item": selections("github:a/one#1")}
 	old := url.Values{"confirm": {"1"}, "nonce": {strings.Repeat("ab", 16)}}
 	for name, tc := range map[string]struct {
 		h    *Handler
 		form url.Values
 	}{
 		"restart": {restarted, form}, "expired": {expired, form}, "future": {h, future}, "old confirm": {h, old},
-		"malformed": {h, url.Values{"key": {"nope"}, "content": {"/lgtm"}, "item": {"github:a/one#1"}}},
+		"malformed": {h, url.Values{"key": {"nope"}, "content": {"/lgtm"}, "item": selections("github:a/one#1")}},
 	} {
 		page := posted(t, tc.h, tc.form)
 		if !strings.Contains(page, "cannot tell whether an earlier submission") || !strings.Contains(page, "check the items on GitHub") {
@@ -267,7 +294,7 @@ func TestCommentStaleFormPostsNothing(t *testing.T) {
 	}
 	page := posted(t, restarted, form)
 	if !strings.Contains(page, "<details class=\"zz-compose\" data-compose open>") || !strings.Contains(page, ">/lgtm</textarea>") ||
-		!strings.Contains(page, `value="github:a/one#1" form="zz-bulk-comment" data-comment-item data-repo="a/one" checked`) {
+		!strings.Contains(page, `data-repo="a/one" checked`) || strings.Contains(page, `data-repo="b/two" checked`) {
 		t.Errorf("the refused comment is not offered again:\n%s", page)
 	}
 }
@@ -282,16 +309,71 @@ func TestCommentResultsAreTheOwners(t *testing.T) {
 	if page := radar(t, h, rec.Header().Get("Location")); strings.Contains(page, "/lgtm") || strings.Contains(page, "Posted 1") {
 		t.Error("another user saw the results")
 	}
-	// The same key from another user is that user's own, unused form: its batch is
-	// their own (none of their items match), never the first user's results.
-	if rec := post(h, form); strings.HasSuffix(rec.Header().Get("Location"), "&again=1") {
-		t.Error("another user's submission was taken for a resubmit")
-	}
-	if bt := h.batches.lookup("github:7", form.Get("key"), h.now()); bt == nil || !strings.Contains(bt.view.Error, "None of the selected items") {
-		t.Errorf("another user's batch = %+v", bt)
-	}
 	if c.postCount() != 1 {
 		t.Errorf("posts = %d", c.postCount())
+	}
+}
+
+// Review P1 (PR #60): a form rendered for one account never posts as another, even
+// when the browser signed in as an account that has the same item on its radar and
+// a write grant. The comment is offered again, to post with an explicit Post.
+func TestCommentKeyIsBoundToItsAccount(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	h.store.(*worklist.MemoryStore).Seed("github:7", worklist.WorkItem{
+		ID: "github:a/one#1", Source: "github", Type: worklist.TypePullRequest,
+		GitHub: worklist.GitHubRef{Repo: "a/one", Number: 1, Title: "title-1", URL: "https://github.com/a/one/pull/1", State: "open"},
+		Meta:   worklist.Metadata{Origin: worklist.OriginUser, Rank: 0.5},
+	})
+	form := commentForm(h, "/lgtm", "github:a/one#1") // rendered for github:42
+	if _, check := h.commentKeyIssued(form.Get("key"), "github:7", h.now()); check != keyOtherAccount {
+		t.Errorf("check for another account = %v", check)
+	}
+	h.sessions = fakeSessions{&session.User{ID: "github:7", Provider: "github", Login: "other"}}
+	page := posted(t, h, form)
+	if c.postCount() != 0 {
+		t.Fatalf("posted as another account: %+v", c.posts)
+	}
+	if !strings.Contains(page, "signed in to gofer as another GitHub account") || !strings.Contains(page, ">/lgtm</textarea>") {
+		t.Errorf("radar:\n%s", page)
+	}
+	// Posting again from the radar the second account now sees is a fresh, explicit act.
+	posted(t, h, url.Values{"key": {formKey(t, page)}, "content": {"/lgtm"}, "item": selections("github:a/one#1")})
+	if c.postCount() != 1 {
+		t.Errorf("posts = %d", c.postCount())
+	}
+}
+
+// Review P1 (PR #60): a checked row posts only to the repository and number it
+// showed. A write-back that changed the item's GitHub fields under the same ID skips
+// it instead of redirecting the comment.
+func TestCommentPinsCheckedDestination(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	page := radar(t, h, "/")
+	want := `value="` + template.HTMLEscapeString(selections("github:a/one#1")[0]) + `"`
+	if !strings.Contains(page, want) {
+		t.Fatalf("radar row lacks %s", want)
+	}
+	form := commentForm(h, "/lgtm", "github:a/one#1", "github:b/two#2")
+	err := h.store.Update(context.Background(), commentOwner, func(items []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		for _, it := range items {
+			if it.ID == "github:a/one#1" {
+				it.GitHub.Repo, it.GitHub.Number = "other/repo", 99
+				return []worklist.WorkItem{it}, nil
+			}
+		}
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page = posted(t, h, form)
+	if c.postCount() != 1 || len(c.posts[0]) != 1 || c.posts[0][0].Repo != "b/two" || c.posts[0][0].Number != 2 {
+		t.Fatalf("posts = %+v", c.posts)
+	}
+	if !strings.Contains(page, "not the item you checked") {
+		t.Errorf("results do not explain the skipped row:\n%s", page)
 	}
 }
 
@@ -361,6 +443,8 @@ func TestCommentRefusesBadForms(t *testing.T) {
 		"too many":      {commentForm(h, "/lgtm", many...), "at most 50 items"},
 		"too long":      {commentForm(h, strings.Repeat("x", maxMessageBytes+1), "github:a/one#1"), "too long"},
 		"none eligible": {commentForm(h, "/lgtm", "github:a/one#3"), "None of the selected items"},
+		"unreadable selection": {url.Values{"key": {h.newCommentKey(commentOwner, h.now())}, "content": {"/lgtm"}, "item": {"github:a/one#1"}},
+			"could not read the selected items"},
 	}
 	for name, tc := range cases {
 		page := posted(t, h, tc.form)
@@ -368,7 +452,7 @@ func TestCommentRefusesBadForms(t *testing.T) {
 			t.Errorf("%s: radar lacks %q", name, tc.want)
 		}
 	}
-	page := posted(t, h, commentForm(h, "/lgtm", "github:a/one#3", "github:a/one#1x"))
+	page := posted(t, h, commentForm(h, "/lgtm", "github:a/one#3"))
 	if !strings.Contains(page, ">/lgtm</textarea>") || !strings.Contains(page, "data-compose open") {
 		t.Errorf("the refused comment is not offered again:\n%s", page)
 	}
@@ -493,14 +577,14 @@ func TestCommentResultsShowUnknown(t *testing.T) {
 // A batch still posting when the radar is reached says so.
 func TestCommentResultsWhileRunning(t *testing.T) {
 	h := commentFixture(t, &fakeCommenter{enabled: true, connected: true})
-	key := h.newCommentKey(h.now())
-	if _, _, ok := h.batches.claim("github:42", key, h.now().Add(time.Hour), h.now()); !ok {
+	key := h.newCommentKey(commentOwner, h.now())
+	if _, _, ok := h.batches.claim(commentOwner, key, h.now().Add(time.Hour), h.now()); !ok {
 		t.Fatal("claim refused")
 	}
 	if page := radar(t, h, "/?comment="+key); !strings.Contains(page, "still posting") {
 		t.Errorf("radar:\n%s", page)
 	}
-	if page := radar(t, h, "/?comment="+h.newCommentKey(h.now())); !strings.Contains(page, "no longer holds the results") {
+	if page := radar(t, h, "/?comment="+h.newCommentKey(commentOwner, h.now())); !strings.Contains(page, "no longer holds the results") {
 		t.Errorf("radar for unknown results:\n%s", page)
 	}
 }
@@ -519,13 +603,116 @@ func TestCommentReceiptNeedsNoGrant(t *testing.T) {
 	if rec.Code != http.StatusSeeOther || !strings.HasPrefix(rec.Header().Get("Location"), "/?comment=") {
 		t.Fatalf("resubmit without a grant = %d %q", rec.Code, rec.Header().Get("Location"))
 	}
+	// Review P2 (PR #60): the radar shows the receipt, not only the connect prompt.
+	if page := radar(t, h, rec.Header().Get("Location")); !strings.Contains(page, "Already posted: 1 of 1") || !strings.Contains(page, "view comment") {
+		t.Errorf("radar without a grant:\n%s", page)
+	}
 	rec = post(h, pending)
 	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/?commenting=connect" {
 		t.Fatalf("new batch without a grant = %d %q", rec.Code, rec.Header().Get("Location"))
 	}
 	c.connected = true
+	radar(t, h, "/") // the kept draft comes back once; posting is still the user's act
 	post(h, pending)
 	if c.postCount() != 2 {
 		t.Errorf("posts = %d; the refused start should have left its form to post", c.postCount())
+	}
+}
+
+// Review P2 (PR #60): when GitHub refuses every target, the retry form says nothing
+// was posted and shows each target's reason (a rate limit says when to try again).
+func TestCommentAllRefusedShowsReasons(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true, refuseAll: "Not posted: GitHub's rate limit; try again after 12:30."}
+	h := commentFixture(t, c)
+	page := posted(t, h, commentForm(h, "/lgtm", "github:a/one#1", "github:b/two#2"))
+	for _, want := range []string{"Nothing was posted.", "try again after 12:30", "zz-target-fail", ">/lgtm</textarea>", "data-compose open"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("radar lacks %q", want)
+		}
+	}
+}
+
+// Review P2 (PR #60): an unsent comment survives reconnecting commenting, and comes
+// back to post with an explicit Post, once.
+func TestCommentDraftSurvivesReconnect(t *testing.T) {
+	c := &fakeCommenter{enabled: true}
+	h := commentFixture(t, c)
+	rec := post(h, commentForm(h, "/assign @a", "github:b/two#2"))
+	if rec.Header().Get("Location") != "/?commenting=connect" {
+		t.Fatalf("location %q", rec.Header().Get("Location"))
+	}
+	if page := radar(t, h, "/?commenting=connect"); strings.Contains(page, "/assign @a") {
+		t.Error("the draft shows before commenting is connected")
+	}
+	c.connected = true
+	page := radar(t, h, "/")
+	for _, want := range []string{"Your comment is back", ">/assign @a</textarea>", `data-repo="b/two" checked`, "data-compose open"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("radar after reconnecting lacks %q", want)
+		}
+	}
+	if strings.Contains(radar(t, h, "/"), "/assign @a") {
+		t.Error("the draft came back twice")
+	}
+	if c.postCount() != 0 {
+		t.Error("the draft posted without Post")
+	}
+}
+
+// A grant lost when the batch starts keeps the comment too: the radar shows the
+// connect prompt and the reason, and the comment comes back after reconnecting.
+func TestCommentGrantLostKeepsDraft(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true, postErr: comment.ErrNotConnected}
+	h := commentFixture(t, c)
+	rec := post(h, commentForm(h, "/lgtm", "github:a/one#1"))
+	c.connected, c.postErr = false, nil
+	page := radar(t, h, rec.Header().Get("Location"))
+	if !strings.Contains(page, "Connect commenting") || !strings.Contains(page, "/lgtm") {
+		t.Errorf("radar without a grant:\n%s", page)
+	}
+	c.connected = true
+	if page := radar(t, h, "/"); !strings.Contains(page, ">/lgtm</textarea>") {
+		t.Errorf("the comment did not come back:\n%s", page)
+	}
+}
+
+// flakyStore fails every read while fail is set.
+type flakyStore struct {
+	worklist.Store
+	fail *atomic.Bool
+}
+
+func (s flakyStore) List(ctx context.Context, owner string) ([]worklist.WorkItem, error) {
+	if s.fail.Load() {
+		return nil, errors.New("down")
+	}
+	return s.Store.List(ctx, owner)
+}
+
+func (s flakyStore) Briefs(ctx context.Context, owner string, q worklist.BriefQuery) ([]worklist.WorkItem, error) {
+	if s.fail.Load() {
+		return nil, errors.New("down")
+	}
+	return s.Store.Briefs(ctx, owner, q)
+}
+
+// Review P2 (PR #60): when the worklist cannot be read on the way back, Try again
+// keeps the outcome's URL, so the comment and selection return once it reads.
+func TestCommentOutcomeSurvivesWorklistError(t *testing.T) {
+	c := &fakeCommenter{enabled: true, connected: true}
+	h := commentFixture(t, c)
+	var fail atomic.Bool
+	h.store = flakyStore{Store: h.store, fail: &fail}
+	fail.Store(true)
+	rec := post(h, commentForm(h, "/lgtm", "github:a/one#1"))
+	loc := rec.Header().Get("Location")
+	got := httptest.NewRecorder()
+	h.Index(got, httptest.NewRequest(http.MethodGet, loc, nil))
+	if got.Code != http.StatusBadGateway || !strings.Contains(got.Body.String(), `href="`+template.HTMLEscapeString(loc)+`"`) {
+		t.Fatalf("error page %d does not retry %s:\n%s", got.Code, loc, got.Body)
+	}
+	fail.Store(false)
+	if page := radar(t, h, loc); !strings.Contains(page, ">/lgtm</textarea>") || !strings.Contains(page, "could not read your worklist") {
+		t.Errorf("radar after recovery:\n%s", page)
 	}
 }

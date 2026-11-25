@@ -100,21 +100,28 @@ The client keeps the workload's guard rules (ADR 0007, "public-only guard"):
 1. Each item on the radar gets a checkbox. The compose box takes the comment
    (at most 16 KiB) for up to 50 selected items.
 2. **Post** posts at once; there is no preview step. The radar names the account it
-   posts as and says a posted comment cannot be taken back. The comment and selection
+   posts as and says a posted comment cannot be taken back. Each checkbox carries
+   its item and the repository and number its row showed. The comment and selection
    are checked, then resolved against the owner's stored items at that moment: only
    items on the radar take the comment; any that are gone, hidden or closed since
    the page rendered are skipped and listed (bulk actions never act on items off the
-   radar). Posts go in order, one at a time, at least a second apart: GitHub asks
+   radar), and so is one whose item now names another repository or number (a
+   write-back can change an item's GitHub fields under the same ID): the user checked
+   a destination, so the comment is never redirected. Posts go in order, one at a time, at least a second apart: GitHub asks
    for serial content creation, spaced out.
 3. Each radar render mints a **one-time form key**: this process's epoch (random at
-   startup), the time it was issued, and random bytes. The first submission of a key
+   startup), the time it was issued, random bytes, and a MAC (under a per-process
+   secret) binding them to the account the radar was rendered for. A form rendered
+   for one account never posts as another (the browser signed in as someone else in
+   another tab): it posts nothing, says so, and offers the comment again. The first submission of a key
    claims it for its owner, atomically, and runs the batch; any later submission of
    the same key (a double click, a back-button resubmit) shows that batch's results
    and posts nothing, to its owner, with or without a live grant: only starting a
    batch needs one, so a user whose grant died mid-batch can still see which
    comments landed. A used key is remembered (in memory) until it expires, 12 hours
    after it was issued, and results at least an hour; a key gofer cannot vouch for
-   (from another epoch, i.e. before a web-pod restart; expired; malformed; missing)
+   (from another epoch, i.e. before a web-pod restart; expired; malformed; missing;
+   another account's)
    posts nothing, and the radar says gofer cannot tell what an earlier submission of
    that form did, and to check the items on GitHub before posting again. Batches are
    bounded in all; only one that posted nothing is dropped early, and past the bound
@@ -132,7 +139,14 @@ The client keeps the workload's guard rules (ADR 0007, "public-only guard"):
    was written, or that got a server error (any 5xx, amended by ADR 0010: a 500 does not say the write was rolled back either), is **unknown**: it may
    have been posted, and the radar says to check before posting again. A batch that
    posted nothing (a refused form, no grant, the worklist unreadable, nothing
-   eligible) reopens the comment box with the same comment and selection and the reason. A 401 confirmed
+   eligible, every target refused) reopens the comment box with the same comment and
+   selection, the reason, and each target's own reason (a rate limit says when to try
+   again). The results show whether or not commenting is still connected: a grant lost
+   mid-batch leaves the connect prompt and the receipt of what landed. A comment that
+   could not start for want of a grant (or lost it before the first post) is kept, in
+   memory, for two hours, and comes back in the box once commenting is connected, to
+   post with an explicit Post. If the worklist cannot be read on the way back, the
+   error page's Try again keeps the results URL. A 401 confirmed
    by GitHub's check-token deletes the stored grant. A rate limit (429, or 403 with
    GitHub's rate-limit signals) stops the batch, says when to try again, and leaves
    the rest unattempted. The grant is read again before every post after the first,

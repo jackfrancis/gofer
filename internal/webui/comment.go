@@ -3,7 +3,9 @@ package webui
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -111,6 +113,12 @@ type batch struct {
 	view commentView // valid once done is closed
 }
 
+// finish records view as bt's outcome.
+func (bt *batch) finish(view commentView) {
+	bt.view = view
+	close(bt.done)
+}
+
 // postedNothing reports whether bt is done and posted nothing, so dropping it early
 // cannot let anything post twice.
 func (bt *batch) postedNothing() bool {
@@ -123,8 +131,9 @@ func (bt *batch) postedNothing() bool {
 }
 
 type batches struct {
-	mu sync.Mutex
-	m  map[string]*commentRecord // by owner + "\x00" + key
+	mu     sync.Mutex
+	m      map[string]*commentRecord // by owner + "\x00" + key
+	drafts map[string]draft          // by owner: an unsent comment kept through reconnecting
 }
 
 func recordKey(owner, key string) string { return owner + "\x00" + key }
@@ -184,45 +193,76 @@ func (b *batches) lookup(owner, key string, now time.Time) *batch {
 }
 
 // A comment key is the process's epoch (8 bytes, random at startup), the time it
-// was issued (8 bytes, Unix seconds), and 16 random bytes, in hex. The epoch makes a
-// form from before a restart, whose earlier use gofer has forgotten, unusable; the
-// issue time bounds how long a used key must be remembered.
-const commentKeyLen = 64
+// was issued (8 bytes, Unix seconds), 16 random bytes, and a MAC (16 bytes) binding
+// those to the account the radar was rendered for, in hex. The epoch makes a form
+// from before a restart, whose earlier use gofer has forgotten, unusable; the issue
+// time bounds how long a used key must be remembered; the MAC keeps a form loaded as
+// one account from posting as another (the browser signed in again in another tab).
+const commentKeyLen = 96
 
-func newEpoch() [8]byte {
-	var e [8]byte
-	if _, err := rand.Read(e[:]); err != nil {
+// keyCheck is what commentKeyIssued found.
+type keyCheck int
+
+const (
+	keyOK           keyCheck = iota
+	keyStale                 // malformed, missing, expired, or from another process
+	keyOtherAccount          // issued to another account than the session's
+)
+
+func randomBytes(n int) []byte {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
 		panic("webui: failed to read random bytes: " + err.Error())
 	}
+	return buf
+}
+
+func newEpoch() (e [8]byte) {
+	copy(e[:], randomBytes(len(e)))
 	return e
 }
 
-// newCommentKey mints a radar comment form's one-time key.
-func (h *Handler) newCommentKey(now time.Time) string {
-	buf := make([]byte, commentKeyLen/2)
+func newKeySecret() (k [32]byte) {
+	copy(k[:], randomBytes(len(k)))
+	return k
+}
+
+// commentKeyMAC binds a key's first 32 bytes to owner.
+func (h *Handler) commentKeyMAC(head []byte, owner string) []byte {
+	m := hmac.New(sha256.New, h.keySecret[:])
+	m.Write(head)
+	m.Write([]byte(owner))
+	return m.Sum(nil)[:16]
+}
+
+// newCommentKey mints a radar comment form's one-time key for owner.
+func (h *Handler) newCommentKey(owner string, now time.Time) string {
+	buf := make([]byte, 32, commentKeyLen/2)
 	copy(buf, h.epoch[:])
 	binary.BigEndian.PutUint64(buf[8:16], uint64(now.Unix()))
-	if _, err := rand.Read(buf[16:]); err != nil {
-		panic("webui: failed to read random bytes: " + err.Error())
-	}
+	copy(buf[16:], randomBytes(16))
+	buf = append(buf, h.commentKeyMAC(buf, owner)...)
 	return hex.EncodeToString(buf)
 }
 
-// commentKeyIssued returns when key was issued, if this process issued a key of
-// that shape and it has not expired at now.
-func (h *Handler) commentKeyIssued(key string, now time.Time) (time.Time, bool) {
+// commentKeyIssued returns when key was issued, if this process issued it to owner
+// and it has not expired at now.
+func (h *Handler) commentKeyIssued(key, owner string, now time.Time) (time.Time, keyCheck) {
 	if len(key) != commentKeyLen {
-		return time.Time{}, false
+		return time.Time{}, keyStale
 	}
 	buf, err := hex.DecodeString(key)
 	if err != nil || !bytes.Equal(buf[:8], h.epoch[:]) {
-		return time.Time{}, false
+		return time.Time{}, keyStale
+	}
+	if !hmac.Equal(buf[32:], h.commentKeyMAC(buf[:32], owner)) {
+		return time.Time{}, keyOtherAccount
 	}
 	issued := time.Unix(int64(binary.BigEndian.Uint64(buf[8:16])), 0)
 	if issued.After(now.Add(commentKeySkew)) || now.Sub(issued) > commentKeyTTL {
-		return time.Time{}, false
+		return time.Time{}, keyStale
 	}
-	return issued, true
+	return issued, keyOK
 }
 
 // commentState is the radar's commenting state for user.
@@ -237,12 +277,23 @@ func (h *Handler) commentState(ctx context.Context, user *session.User) (enabled
 // posted nothing for this request, not what an earlier use of the same form did.
 const staleCommentForm = "Nothing was posted: this page was loaded too long ago, or gofer restarted since. gofer cannot tell whether an earlier submission of this form posted, so check the items on GitHub before you post again."
 
+// otherAccountForm answers a form rendered for another account than the session's.
+const otherAccountForm = "Nothing was posted: this page was loaded while you were signed in to gofer as another GitHub account. Check which account you are signed in as, the comment, and the items, then post again."
+
+// draftRestored introduces a comment kept while commenting was reconnected.
+const draftRestored = "Your comment is back from before you connected commenting. Nothing was posted: check it and the items, then press Post."
+
+// badSelection answers a form whose selections gofer cannot read.
+const badSelection = "Nothing was posted: gofer could not read the selected items. Reload the radar and select them again."
+
 // Comment handles POST /items/comment, the radar's Post button (same-origin only).
 // It posts the comment to each selected item still on the radar, in order, then
 // redirects to the radar, which shows the results (/?comment=<key>). The form's
 // one-time key (minted with the radar page) makes it post at most once: a resubmit
 // of a used form shows that batch's results and posts nothing, and a key gofer does
-// not hold (expired, or from before a restart) is refused.
+// not hold (expired, from before a restart, or rendered for another account) is
+// refused. Each checked row names the destination it showed, and a row whose item
+// now names another is skipped.
 func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 	user := h.sessions.CurrentUser(r)
 	enabled, connected := h.commentState(r.Context(), user)
@@ -261,7 +312,8 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 	}
 	now := h.now()
 	key := r.PostForm.Get("key")
-	issued, valid := h.commentKeyIssued(key, now)
+	issued, check := h.commentKeyIssued(key, user.ID, now)
+	valid := check == keyOK
 	if valid {
 		// A used form's results are the owner's to see again without a live grant;
 		// only starting a batch needs one.
@@ -270,17 +322,20 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	body := strings.ReplaceAll(r.PostForm.Get("content"), "\r\n", "\n")
+	pins, readable := parseSelections(r.PostForm["item"])
 	if !connected {
+		// Keep the comment and selection through the connect flow: the radar offers
+		// them again once commenting is connected, to post with an explicit Post.
+		h.batches.saveDraft(user.ID, body, pinIDs(pins), now)
 		http.Redirect(w, r, "/?commenting=connect", http.StatusSeeOther)
 		return
 	}
-	body := strings.ReplaceAll(r.PostForm.Get("content"), "\r\n", "\n")
-	ids := dedupeIDs(r.PostForm["item"])
 	until := issued.Add(commentKeyTTL)
 	if !valid {
 		// Posts nothing, but keeps the comment and selection for the radar to offer
 		// again, under a key of gofer's own.
-		key = h.newCommentKey(now)
+		key = h.newCommentKey(user.ID, now)
 		until = now
 	}
 	if min := now.Add(resultTTL); until.Before(min) {
@@ -292,11 +347,15 @@ func (h *Handler) Comment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if mine {
-		if !valid {
-			bt.view = commentView{Body: body, Selected: capIDs(ids), Error: staleCommentForm}
-			close(bt.done)
-		} else {
-			go h.runBatch(context.WithoutCancel(r.Context()), bt, user.ID, body, ids)
+		switch {
+		case check == keyOtherAccount:
+			bt.finish(commentView{Body: body, Selected: pinIDs(pins), Error: otherAccountForm})
+		case !valid:
+			bt.finish(commentView{Body: body, Selected: pinIDs(pins), Error: staleCommentForm})
+		case !readable:
+			bt.finish(commentView{Body: body, Selected: pinIDs(pins), Error: badSelection})
+		default:
+			go h.runBatch(context.WithoutCancel(r.Context()), bt, user.ID, body, pins)
 		}
 	}
 	h.awaitBatch(w, r, bt, key, !mine)
@@ -340,16 +399,29 @@ func (h *Handler) commentOutcome(r *http.Request, user *session.User) *commentVi
 	return &view
 }
 
+// commentReturnURL is the radar URL that shows the bulk comment outcome r names, or
+// "" (the plain radar).
+func commentReturnURL(r *http.Request) string {
+	q := r.URL.Query()
+	key := q.Get("comment")
+	if key == "" {
+		return ""
+	}
+	out := url.Values{"comment": {key}}
+	if q.Get("again") == "1" {
+		out.Set("again", "1")
+	}
+	return "/?" + out.Encode()
+}
+
 // runBatch checks the form, resolves its items against the owner's radar now, posts,
 // and records the outcome on bt.
-func (h *Handler) runBatch(ctx context.Context, bt *batch, userID, body string, ids []string) {
+func (h *Handler) runBatch(ctx context.Context, bt *batch, userID, body string, pins []comment.Target) {
 	ctx, cancel := context.WithTimeout(ctx, postTimeout)
 	defer cancel()
-	view := commentView{Body: body, Selected: capIDs(ids)}
-	defer func() {
-		bt.view = view
-		close(bt.done)
-	}()
+	ids := pinIDs(pins)
+	view := commentView{Body: body, Selected: ids}
+	defer func() { bt.finish(view) }()
 	switch {
 	case strings.TrimSpace(body) == "":
 		view.Error = "Write a comment first."
@@ -357,14 +429,14 @@ func (h *Handler) runBatch(ctx context.Context, bt *batch, userID, body string, 
 	case len(body) > maxMessageBytes:
 		view.Error = messageTooLong
 		return
-	case len(ids) == 0:
+	case len(pins) == 0:
 		view.Error = "Select at least one item to comment on."
 		return
-	case len(ids) > comment.MaxTargets:
+	case len(pins) > comment.MaxTargets:
 		view.Error = "Select at most 50 items for one comment."
 		return
 	}
-	targets, skipped, err := h.commentTargets(ctx, userID, ids)
+	targets, skipped, err := h.pinnedTargets(ctx, userID, pins)
 	view.Targets, view.Skipped = targets, skipped
 	switch {
 	case err != nil:
@@ -378,6 +450,9 @@ func (h *Handler) runBatch(ctx context.Context, bt *batch, userID, body string, 
 	switch {
 	case errors.Is(err, comment.ErrNotConnected):
 		view.Error = "gofer has no GitHub access to post with. Connect commenting, then try again; nothing was posted."
+		// The radar shows the connect prompt, not the comment box: keep the comment
+		// for after reconnecting.
+		h.batches.saveDraft(userID, body, ids, h.now())
 	case err != nil:
 		slog.WarnContext(ctx, "bulk comment failed", "user", userID, "err", err)
 		view.Error = "gofer could not post right now; nothing was posted. Try again in a moment."
@@ -394,12 +469,128 @@ func (h *Handler) runBatch(ctx context.Context, bt *batch, userID, body string, 
 	slog.InfoContext(ctx, "bulk comment", "user", userID, "targets", len(targets), "posted", view.Posted, "unknown", view.Unknown)
 }
 
-// capIDs bounds the ids kept to re-check on the radar.
-func capIDs(ids []string) []string {
-	if len(ids) > comment.MaxTargets {
-		return ids[:comment.MaxTargets]
+// selectionValue is a radar checkbox's value: the item and the destination the row
+// showed, so a write-back that changes the item's repository or number under the
+// same ID is caught, never followed (pinnedTargets).
+func selectionValue(it worklist.WorkItem) string {
+	return url.Values{"id": {it.ID}, "repo": {it.GitHub.Repo}, "n": {strconv.Itoa(it.GitHub.Number)}}.Encode()
+}
+
+// parseSelections reads the checked rows, first per item. ok is false if any could
+// not be read (a page from before rows carried their destination); the readable ones
+// are still returned, to check again on the radar. At most MaxTargets+1 are kept:
+// one more is enough to refuse the form.
+func parseSelections(values []string) (pins []comment.Target, ok bool) {
+	ok = true
+	seen := map[string]bool{}
+	for _, v := range values {
+		q, err := url.ParseQuery(v)
+		n, nerr := strconv.Atoi(q.Get("n"))
+		id := q.Get("id")
+		if err != nil || nerr != nil || id == "" {
+			ok = false
+			continue
+		}
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if len(pins) > comment.MaxTargets {
+			break
+		}
+		pins = append(pins, comment.Target{ID: id, Repo: q.Get("repo"), Number: n})
+	}
+	return pins, ok
+}
+
+// pinIDs is the item ids of pins, at most MaxTargets, to re-check on the radar.
+func pinIDs(pins []comment.Target) []string {
+	ids := make([]string, 0, len(pins))
+	for i, p := range pins {
+		if i == comment.MaxTargets {
+			break
+		}
+		ids = append(ids, p.ID)
 	}
 	return ids
+}
+
+// pinnedTargets resolves the checked rows against the owner's stored items now. A
+// row is kept only if its item is still on the radar AND still names the repository
+// and number the row showed: a write-back may have changed an item's GitHub fields
+// under the same ID, and the user checked the destination, not the ID.
+func (h *Handler) pinnedTargets(ctx context.Context, ownerID string, pins []comment.Target) ([]comment.Target, []skippedTarget, error) {
+	current, skipped, err := h.commentTargets(ctx, ownerID, pinIDs(pins))
+	if err != nil {
+		return nil, nil, err
+	}
+	now := make(map[string]comment.Target, len(current))
+	for _, t := range current {
+		now[t.ID] = t
+	}
+	var targets []comment.Target
+	for _, p := range pins {
+		t, ok := now[p.ID]
+		switch {
+		case !ok:
+			// skipped by commentTargets already (gone, hidden, closed)
+		case !strings.EqualFold(t.Repo, p.Repo) || t.Number != p.Number:
+			skipped = append(skipped, skippedTarget{
+				Label:  p.Repo + " #" + itoa(p.Number),
+				Reason: "now points at " + t.Repo + " #" + itoa(t.Number) + "; not the item you checked",
+			})
+		default:
+			targets = append(targets, t)
+		}
+	}
+	return targets, skipped, nil
+}
+
+// draft is an unsent comment kept through reconnecting commenting.
+type draft struct {
+	body     string
+	selected []string
+	saved    time.Time
+}
+
+// draftTTL is how long an unsent comment is kept for the owner to reconnect.
+const draftTTL = 2 * time.Hour
+
+// saveDraft keeps the owner's unsent comment (the newest only), if it has any text
+// or selection.
+func (b *batches) saveDraft(owner, body string, selected []string, now time.Time) {
+	if strings.TrimSpace(body) == "" && len(selected) == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.drafts == nil {
+		b.drafts = map[string]draft{}
+	}
+	for k, d := range b.drafts {
+		if now.Sub(d.saved) > draftTTL {
+			delete(b.drafts, k)
+		}
+	}
+	for len(b.drafts) >= maxRecords {
+		var oldest string
+		for k, d := range b.drafts {
+			if oldest == "" || d.saved.Before(b.drafts[oldest].saved) {
+				oldest = k
+			}
+		}
+		delete(b.drafts, oldest)
+	}
+	b.drafts[owner] = draft{body: body, selected: selected, saved: now}
+}
+
+// takeDraft removes and returns the owner's unsent comment, if one is kept.
+func (b *batches) takeDraft(owner string, now time.Time) (draft, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	d, ok := b.drafts[owner]
+	delete(b.drafts, owner)
+	return d, ok && now.Sub(d.saved) <= draftTTL
 }
 
 // commentTargets resolves the selected ids against the owner's stored items. Only
@@ -508,19 +699,6 @@ func sameOrigin(r *http.Request) bool {
 	}
 	u, err := url.Parse(o)
 	return o != "null" && err == nil && u.Host != "" && u.Host == r.Host
-}
-
-func dedupeIDs(in []string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(in))
-	for _, id := range in {
-		if id == "" || seen[id] {
-			continue
-		}
-		seen[id] = true
-		out = append(out, id)
-	}
-	return out
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }

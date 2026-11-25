@@ -606,12 +606,17 @@ Wired on the web-tier side; they define what a runtime must respect:
   first and follows no redirect). Post posts in one step, no preview
   (`webui.Comment`): same-origin only, then a redirect to the radar, which shows the
   results (`/?comment=<key>`) or, when nothing was posted, reopens the box with the
-  same comment and selection. Each radar render mints a one-time form key (the
-  process's epoch, its issue time, random bytes; `newCommentKey`); the first
-  submission claims it for its owner, a resubmit shows that batch and posts nothing,
-  and a key gofer cannot vouch for (another epoch, i.e. before a restart, or older
-  than `commentKeyTTL`) posts nothing, so nothing posts twice from one form, across a
-  restart included. A used key is held until it expires; only a batch that posted
+  same comment and selection and each target's reason. Each radar render mints a
+  one-time form key (the process's epoch, its issue time, random bytes, and a MAC
+  binding them to the rendering account; `newCommentKey`); the first submission
+  claims it for its owner, a resubmit shows that batch and posts nothing, and a key
+  gofer cannot vouch for (another epoch, i.e. before a restart; older than
+  `commentKeyTTL`; another account's) posts nothing, so nothing posts twice from one
+  form, across a restart included, and never as another account. Each checkbox
+  carries its row's repository and number (`selectionValue`), and a row whose item
+  now names another is skipped, never redirected (`pinnedTargets`). An unsent
+  comment refused for want of a grant is kept per owner (`saveDraft`) and comes back
+  in the box once connected, never posted without Post. A used key is held until it expires; only a batch that posted
   nothing is dropped early, and past `maxRecords` gofer refuses to post rather than
   forget one. A batch's results are its owner's to read without a live grant; only
   starting one needs it.

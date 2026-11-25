@@ -112,6 +112,7 @@ type Handler struct {
 	commenter   Commenter     // nil: no bulk comment (comment.go)
 	batches     batches       // bulk comment batches, by owner and form key (comment.go)
 	epoch       [8]byte       // this process's part of every comment form key
+	keySecret   [32]byte      // binds a comment form key to its account (comment.go)
 	now         func() time.Time
 }
 
@@ -132,6 +133,7 @@ func New(sessions Sessions, store worklist.Store, pipeline Pipeline, providers P
 		convEnabled: convEnabled,
 		options:     options,
 		epoch:       newEpoch(),
+		keySecret:   newKeySecret(),
 		now:         time.Now,
 	}
 	if rc, ok := providers.(Reconnector); ok {
@@ -1167,7 +1169,9 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 	}
 	res, err := worklist.Resolve(r.Context(), h.store, h.pipeline, h.now(), user.ID, worklist.DefaultSort, true)
 	if err != nil {
-		return pageData{View: "error", User: user}, http.StatusBadGateway
+		// Try again keeps a bulk comment's results, and its comment and selection to
+		// offer again, which the radar shows once the worklist reads.
+		return pageData{View: "error", User: user, RetryURL: commentReturnURL(r)}, http.StatusBadGateway
 	}
 	switch res.Status {
 	case worklist.StatusProcessing:
@@ -1248,9 +1252,18 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 		if data.CommentEnabled {
 			data.CommentNotice = commentNotices[r.URL.Query().Get("commenting")]
 			if data.CommentConnected {
-				data.CommentKey = h.newCommentKey(h.now())
+				data.CommentKey = h.newCommentKey(user.ID, h.now())
 			}
-			if data.Comment = h.commentOutcome(r, user); data.Comment.Retry() {
+			data.Comment = h.commentOutcome(r, user)
+			if data.CommentConnected {
+				// An unsent comment kept through reconnecting comes back once, to post
+				// with an explicit Post; an outcome that offers its comment again
+				// supersedes it.
+				if d, ok := h.batches.takeDraft(user.ID, h.now()); ok && data.Comment == nil {
+					data.Comment = &commentView{Body: d.body, Selected: d.selected, Error: draftRestored}
+				}
+			}
+			if data.Comment.Retry() {
 				// Nothing went to GitHub: offer the same comment and selection again.
 				data.CommentChecked = make(map[string]bool, len(data.Comment.Selected))
 				for _, id := range data.Comment.Selected {
@@ -1373,6 +1386,7 @@ var funcs = template.FuncMap{
 	"discussBadge":           discussBadge,
 	"discussTitle":           discussTitle,
 	"row":                    newItemRow,
+	"selection":              selectionValue,
 	"waitingBadge":           waitingBadge,
 	"waitingTitle":           waitingTitle,
 	"isSecondOpinionRequest": isSecondOpinionRequest,
