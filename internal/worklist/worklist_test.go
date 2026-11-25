@@ -186,3 +186,24 @@ func TestResolveReturnsOffRadarItems(t *testing.T) {
 		}
 	}
 }
+
+// Only an account or app id path on the avatar host reads back as an author avatar,
+// since it reaches the page.
+func TestAuthorAvatarPath(t *testing.T) {
+	for in, want := range map[string]string{
+		"u/583231": "u/583231",
+		"in/29110": "in/29110",
+		"":         "",
+		"u/":       "",
+		"u/1/../x": "",
+		"u/1?x=y":  "",
+		"/u/1":     "",
+		"x/1":      "",
+		"https://avatars.githubusercontent.com/u/1": "",
+		"u/12345678901234567890":                    "",
+	} {
+		if got := (GitHubRef{AuthorAvatar: in}).AuthorAvatarPath(); got != want {
+			t.Errorf("AuthorAvatarPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

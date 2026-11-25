@@ -32,6 +32,9 @@ body {
   width: 24px; height: 24px; border-radius: 50%; flex: none;
   background: var(--bg-subtle); box-shadow: 0 0 0 1px var(--border);
 }
+/* An item's author, with their avatar (avatar.js) before the login. */
+.zz-author { display: inline-flex; align-items: center; gap: 4px; }
+.zz-author .zz-avatar { width: 16px; height: 16px; }
 
 .zz-signin h1, .zz-empty h1 { font-size: 28px; margin: 24px 0 8px; }
 .zz-signin p, .zz-empty p { color: var(--muted); }

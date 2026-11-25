@@ -557,11 +557,18 @@ Wired on the web-tier side; they define what a runtime must respect:
   render asks AEI (within 5s) instead of reading local state, so it stops once the
   run has ended.
 - The page's CSP admits one third-party origin, GitHub's avatar host, for images
-  only, for the header's avatar (`webui.AvatarOrigin`). Rendered Markdown never
-  emits an `<img>` (`internal/markdown` renders images as links), so no reply can
-  reach that host or make the browser fetch anything. The avatar is added by
-  `static/avatar.js` after the load event, never as an `<img>` in the markup, which
-  would delay a meta refresh until it loaded.
+  only, for the header's avatar and each item's author's (`webui.AvatarOrigin`).
+  Rendered Markdown never emits an `<img>` (`internal/markdown` renders images as
+  links), so no reply can reach that host or make the browser fetch anything. The
+  avatars are added by `static/avatar.js` after the load event, never as an `<img>`
+  in the markup, which would delay a meta refresh until it loaded. An author's
+  avatar is stored as a path on that host (`GitHubRef.AuthorAvatar`, set at ingest
+  from the search hit's `avatar_url`: `u/<id>` for a user, `in/<id>` for an app's
+  bot); read it only through `GitHubRef.AuthorAvatarPath`, which admits nothing
+  else, since it reaches the page. `RunPolicy.Apply` drops any other value a run
+  writes back (projection does not bound the field). The worklist and Discuss pages
+  load `avatar.js` whatever the viewer's provider; other views only for a header
+  avatar.
 - GitHub labels render in their own colors on the radar. The CSP allows no inline
   style, so a label carries a `ghl-<hex>` class and the page links `/labels.css?c=…`
   (`internal/webui/labels.go`), a stylesheet generated from the query alone. Colors
