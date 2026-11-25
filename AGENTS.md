@@ -690,9 +690,10 @@ Wired on the web-tier side; they define what a runtime must respect:
   the thread offers "Review the current revision", `WorkItem.ReviewOutdated`,
   `POST /items/review-again`, which with no review at all offers "Review this pull
   request" (form `review=first`; the re-review form says `again`, and each action is
-  checked against its own condition in the store update), never while an unanswered
-  review request may still be answered (younger than `ingest.ConverseDeadline`) or
-  is the turn Retry would retry (a disabled draft button says why in text: Safari
+  checked against its own condition in the store update), which retries the newest
+  unanswered review request (same turn, new attempt, unhidden) rather than add a
+  second, so the gate shares a run in flight and the store keeps one answer (a
+  disabled draft button says why in text: Safari
   shows no tooltip on a disabled button, and `.btn:disabled` must look disabled); model-written draft text is LF-normalized and has
   every bot-command line made inert, `worklist.NeutralizeCommands` in `BoundDraft`,
   a suggestion block holding one (found by goldmark, lists included) turned into

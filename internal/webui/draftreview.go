@@ -71,10 +71,10 @@ type draftThread struct {
 	// of the current revision, enabled while no reply is in flight (ReviewReady).
 	ReviewOutdated bool
 	ReviewReady    bool
-	// NeedsReview marks a pull request with no completed review, no reply in flight
-	// and no unanswered review request a run may still answer or Retry would retry
-	// (reviewInFlight): the draft button is disabled for want of a review, so the
-	// thread offers one right there ("Review this pull request", webui.ReviewAgain).
+	// NeedsReview marks a pull request with no completed review and no reply in
+	// flight (firstReviewable): the draft button is disabled for want of a review, so
+	// the thread offers one right there ("Review this pull request",
+	// webui.ReviewAgain), which retries an unanswered review request if there is one.
 	NeedsReview bool
 }
 
@@ -86,29 +86,26 @@ const (
 	reviewAgain = "again" // "Review the current revision": the latest review is outdated
 )
 
-// reviewInFlight reports whether it has an unanswered, visible review request that a
-// run may still answer (younger than a converse run can last) or that Retry would
-// retry. Starting another review then would run the model twice, and both answers
-// could land: the thread offers Retry, or waiting, instead.
-func reviewInFlight(it worklist.WorkItem, now time.Time) bool {
-	retry, retryable := it.RetryableTurn(now, reviewStaleAfter)
-	for i, m := range it.Thread {
-		if m.Role != worklist.RoleUser || m.Kind != worklist.KindReviewRequest || m.Hidden || it.Answered(it.TurnKey(i)) {
-			continue
-		}
-		if now.Sub(m.At) < ingest.ConverseDeadline || (retryable && retry == i) {
-			return true
+// unansweredReview returns the position of the newest review request with no answer
+// (a system notice is not one), hidden or not, or -1. "Review this pull request"
+// retries it rather than adding another: a run for it may still be in flight (the
+// dispatcher's gate then shares that run), and the store keeps one answer per turn,
+// so the model never answers a first review twice, whatever the timing, a reconnect
+// notice or the user's hiding of the turn.
+func unansweredReview(it worklist.WorkItem) int {
+	for i := len(it.Thread) - 1; i >= 0; i-- {
+		if m := it.Thread[i]; m.Role == worklist.RoleUser && m.Kind == worklist.KindReviewRequest && !it.Answered(it.TurnKey(i)) {
+			return i
 		}
 	}
-	return false
+	return -1
 }
 
-// firstReviewable reports whether "Review this pull request" may add a first review
-// to it now: a pull request on the radar with no completed review, no reply in
-// flight, and no review request still in flight or retryable (reviewInFlight).
+// firstReviewable reports whether "Review this pull request" may act on it now: a
+// pull request on the radar with no completed review and no reply plausibly in
+// flight (the page polls while one is).
 func firstReviewable(it worklist.WorkItem, now time.Time) bool {
-	return it.Type == worklist.TypePullRequest && it.OnRadar() && !it.HasReview() &&
-		!it.ReplyPending(now, reviewStaleAfter) && !reviewInFlight(it, now)
+	return it.Type == worklist.TypePullRequest && it.OnRadar() && !it.HasReview() && !it.ReplyPending(now, reviewStaleAfter)
 }
 
 // reviewCreator returns the commenter's pending-review side, if it has one.
@@ -134,8 +131,6 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 		// Before the review check: a first review still running is a wait, not a
 		// missing review.
 		v.Why = "Wait for the reply in progress, so the draft includes it."
-	case !it.HasReview() && reviewInFlight(it, now):
-		v.Why = "The review in this conversation has no answer yet and may still be running. Wait for it, or retry it when gofer offers Retry, rather than starting another."
 	case !it.HasReview():
 		v.Why = "Review this pull request first: there are no review comments to draft yet. A review asked for in a Discuss message does not count; use Review this pull request."
 		v.NeedsReview = true
@@ -266,9 +261,14 @@ func (h *Handler) ReviewAgain(w http.ResponseWriter, r *http.Request) {
 	if action == reviewFirst {
 		msg.Content = reviewPrompt
 	}
-	appended := false
+	var (
+		ref         worklist.TurnRef     // the turn to dispatch; empty when nothing changed
+		retry       *worklist.RetryStamp // set when an unanswered review request is retried
+		independent bool
+		opt         ModelOption
+	)
 	err := h.store.Update(r.Context(), user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
-		appended = false
+		ref, retry, independent = worklist.TurnRef{}, nil, false
 		for i := range current {
 			it := current[i]
 			if it.ID != id {
@@ -276,19 +276,49 @@ func (h *Handler) ReviewAgain(w http.ResponseWriter, r *http.Request) {
 			}
 			switch {
 			case action == reviewFirst && !firstReviewable(it, now):
-				return nil, nil // reviewed since, a review in flight or retryable, or off the radar
+				return nil, nil // reviewed since, a reply in flight, or off the radar
 			case action == reviewAgain && (it.Type != worklist.TypePullRequest || !it.OnRadar() || !it.ReviewOutdated() || it.ReplyPending(now, reviewStaleAfter)):
 				return nil, nil // the review is current (or the conversation was reset), a reply in flight, or off the radar
 			}
+			if j := unansweredReview(it); action == reviewFirst && j >= 0 {
+				// Retry the review already asked for, never add a second: a run for it may
+				// still answer. The user asked for the review now, so a hidden request is
+				// shown again.
+				current[i].SetHidden(j, false)
+				choices, ind, ok := h.retryChoices(current[i], j)
+				if ok {
+					opt, independent = pickOption(choices, ""), ind
+				} else {
+					opt, _ = h.defaultOption() // no model a blind review may use: review it plainly, still as this one turn
+				}
+				s := current[i].Restamp(j, now)
+				retry = &s
+				ref = worklist.TurnRef{Item: id, Turn: s.Key, Attempt: s.Attempt}
+				return current[i : i+1], nil
+			}
 			current[i].Thread = append(current[i].Thread, msg)
-			appended = true
+			opt, _ = h.defaultOption()
+			ref = worklist.TurnRef{Item: id, Turn: msg.ID}
 			return current[i : i+1], nil
 		}
 		return nil, nil
 	})
-	if err == nil && appended {
-		opt, _ := h.defaultOption()
-		_ = h.pipeline.Converse(r.Context(), user.ID, worklist.TurnRef{Item: id, Turn: msg.ID}, opt.Endpoint, opt.Model)
+	if err != nil || ref.Turn == "" {
+		http.Redirect(w, r, back, http.StatusSeeOther)
+		return
+	}
+	if independent {
+		err = h.pipeline.SecondOpinion(r.Context(), user.ID, ref, opt.Endpoint, opt.Model)
+	} else {
+		err = h.pipeline.Converse(r.Context(), user.ID, ref, opt.Endpoint, opt.Model)
+	}
+	if retry != nil {
+		// A run for the turn was still in flight, and the retry shares it: the turn
+		// keeps that run's attempt. A refusal puts the turn's time back.
+		h.revertShared(r.Context(), user.ID, err, []worklist.RetryStamp{*retry})
+		if errors.Is(err, ingest.ErrNotAccepted) && h.undoRefusedRetry(r.Context(), user.ID, *retry) {
+			back += "&retry=refused"
+		}
 	}
 	http.Redirect(w, r, back, http.StatusSeeOther)
 }

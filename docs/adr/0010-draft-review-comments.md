@@ -32,9 +32,11 @@ review's text is written by a model, so this feature needs that rule amended.
    While it is disabled the thread says why in visible text (Safari shows no tooltip
    on a disabled button), and with no review yet it offers "Review this pull request"
    right there (`webui.ReviewAgain`), since a review asked for in a Discuss message is
-   not a review request. It is not offered while a review request has no answer and
-   its run may still give one, or while Retry would retry it, so the model never runs
-   a first review twice.
+   not a review request. When a review request already has no answer (stalled, ended
+   by a reconnect notice, or hidden), it retries that turn rather than adding another:
+   the dispatcher's gate shares a run still in flight and the store keeps one answer
+   per turn, so a first review is never answered twice, and there is nothing to wait
+   out first.
    It is not shown while drafting again would only repeat the offered draft
    (`WorkItem.RedraftRedundant`), because the drafter would read the conversation it
    read: the draft is unconfirmed and pinned to the item's pull request, no turn after

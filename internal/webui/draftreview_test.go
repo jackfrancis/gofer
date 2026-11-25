@@ -870,43 +870,50 @@ func postReview(h *Handler, action string) {
 	h.ReviewAgain(httptest.NewRecorder(), req)
 }
 
-// A first review that has no answer yet is not started twice: while its run may
-// still answer (a converse run lasts up to ingest.ConverseDeadline) or while it is
-// the turn Retry would retry, the thread offers no "Review this pull request" and
-// the handler appends nothing. Once neither holds (an older unanswered review that
-// a later Discuss turn left without a Retry), a review is offered again.
-func TestFirstReviewIsNotStartedTwice(t *testing.T) {
+// "Review this pull request" never adds a second review request while one has no
+// answer: it retries that turn (same key, a new attempt), so a run still in flight is
+// shared by the dispatcher and the store keeps one answer. That holds however the
+// first ended: stalled, ended by a reconnect notice (retried at once, with nothing to
+// wait out), or hidden by the user (shown again, since they asked for the review).
+func TestFirstReviewRetriesTheUnansweredTurn(t *testing.T) {
 	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
-	stalled := func(age time.Duration, later ...worklist.Message) []worklist.Message {
-		return append([]worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, At: time.Now().Add(-age)}}, later...)
+	review := func(age time.Duration) worklist.Message {
+		return worklist.Message{ID: "q", Role: worklist.RoleUser, Content: reviewPrompt, Kind: worklist.KindReviewRequest, At: time.Now().Add(-age)}
 	}
+	hidden := review(6 * time.Minute)
+	hidden.Hidden = true
 	for name, th := range map[string][]worklist.Message{
-		"stalled, run may still answer":   stalled(6 * time.Minute),
-		"past the deadline, but retryable": stalled(20 * time.Minute),
+		"stalled": {review(6 * time.Minute)},
+		"stalled, then a Discuss turn answered": {review(6 * time.Minute),
+			{ID: "d", Role: worklist.RoleUser, Content: "any thoughts?", At: time.Now().Add(-5*time.Minute - time.Second)},
+			{ID: "e", ReplyTo: "d", Role: worklist.RoleAgent, Content: "Some.", At: time.Now().Add(-5 * time.Minute)}},
+		"ended by a reconnect notice": {review(time.Minute),
+			{ID: "n", ReplyTo: "q", Role: worklist.RoleAgent, Content: worklist.ReconnectNotice, Notice: worklist.NoticeReconnect, At: time.Now()}},
+		"hidden": {hidden},
 	} {
 		h, p, store := draftFixture(t, c, th)
-		page, _ := threadPage(t, h)
-		if strings.Contains(page, ">Review this pull request</button>") || !strings.Contains(page, "has no answer yet") {
-			t.Errorf("%s: a second review offered, or no reason", name)
+		if page, _ := threadPage(t, h); !strings.Contains(page, ">Review this pull request</button>") {
+			t.Errorf("%s: no review offered", name)
 		}
 		postReview(h, "first")
-		if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); len(it.Thread) != len(th) || len(p.turns) != 0 {
-			t.Errorf("%s: a duplicate review was started", name)
+		it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+		q := it.Thread[0]
+		if len(it.Thread) != len(th) || len(p.turns) != 1 || p.turns[0].Turn != "q" || p.turns[0].Attempt == "" || q.Attempt != p.turns[0].Attempt || q.Hidden {
+			t.Errorf("%s: thread %d turns (want %d), dispatched %+v, turn %+v", name, len(it.Thread), len(th), p.turns, q)
 		}
 	}
-	// An old unanswered review that is not the latest turn: no Retry is offered for
-	// it and its run is over, so a review is offered again.
-	old := stalled(20*time.Minute,
-		worklist.Message{ID: "d", Role: worklist.RoleUser, Content: "any thoughts?", At: time.Now().Add(-10 * time.Minute)},
-		worklist.Message{ID: "e", ReplyTo: "d", Role: worklist.RoleAgent, Content: "Some.", At: time.Now().Add(-9 * time.Minute)},
-	)
-	h, p, _ := draftFixture(t, c, old)
-	if page, _ := threadPage(t, h); !strings.Contains(page, ">Review this pull request</button>") {
-		t.Error("no review offered once the old review's run is over and it has no Retry")
-	}
+	// A run still in flight shares the retry: the turn keeps that run's attempt.
+	h, p, store := draftFixture(t, c, []worklist.Message{review(6 * time.Minute)})
+	p.shared = true
 	postReview(h, "first")
-	if len(p.turns) != 1 {
-		t.Error("the offered review was not started")
+	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); len(it.Thread) != 1 || it.Thread[0].Attempt != "" {
+		t.Errorf("a shared run's turn: %+v", it.Thread)
+	}
+	// With no review request at all, a new one is added.
+	h, p, store = draftFixture(t, c, []worklist.Message{{ID: "d", Role: worklist.RoleUser, Content: "hi", At: time.Now().Add(-time.Hour)}, {ID: "e", ReplyTo: "d", Role: worklist.RoleAgent, Content: "hello", At: time.Now().Add(-time.Hour)}})
+	postReview(h, "first")
+	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); len(it.Thread) != 3 || it.Thread[2].Kind != worklist.KindReviewRequest || len(p.turns) != 1 || p.turns[0].Turn != it.Thread[2].ID {
+		t.Errorf("no new review request: %+v", it.Thread)
 	}
 }
 

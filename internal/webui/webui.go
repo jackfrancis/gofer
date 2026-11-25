@@ -612,28 +612,37 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 		// The refusal can be the request's own cancellation (the browser went away
 		// before the dispatch was sent), so the rollback must not use the request's
 		// context: it runs detached from it, under its own bound.
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), undoRetryTimeout)
-		undone := false
-		err := h.store.Update(ctx, user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
-			undone = false
-			for _, it := range current {
-				if it.ID == id && it.UndoRetry(stamp) {
-					undone = true
-					return []worklist.WorkItem{it}, nil
-				}
-			}
-			return nil, nil
-		})
-		cancel()
-		switch {
-		case err != nil:
-			// The turn stays pending until reviewStaleAfter, then offers Retry again.
-			slog.WarnContext(ctx, "retry refused, and restoring the turn failed", "user", user.ID, "item", id, "turn", turn, "err", err)
-		case undone:
+		if h.undoRefusedRetry(r.Context(), user.ID, stamp) {
 			back += "&retry=refused"
 		}
 	}
 	http.Redirect(w, r, back, http.StatusSeeOther)
+}
+
+// undoRefusedRetry puts back the turn a retry re-stamped (stamp) after the backend
+// refused its dispatch (ingest.ErrNotAccepted), so the page offers it again at once,
+// reporting whether it did. It runs detached from the request, under
+// undoRetryTimeout; a failure only logs, and the turn then waits out
+// reviewStaleAfter. A later attempt or an answer that landed meanwhile is left alone.
+func (h *Handler) undoRefusedRetry(ctx context.Context, ownerID string, stamp worklist.RetryStamp) bool {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoRetryTimeout)
+	defer cancel()
+	undone := false
+	err := h.store.Update(ctx, ownerID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		undone = false
+		for _, it := range current {
+			if it.ID == stamp.Item && it.UndoRetry(stamp) {
+				undone = true
+				return []worklist.WorkItem{it}, nil
+			}
+		}
+		return nil, nil
+	})
+	if err != nil {
+		slog.WarnContext(ctx, "retry refused, and restoring the turn failed", "user", ownerID, "item", stamp.Item, "turn", stamp.Key, "err", err)
+		return false
+	}
+	return undone
 }
 
 // retryChoices returns the models a retry of item turn i may use, which the
