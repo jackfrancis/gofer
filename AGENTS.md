@@ -650,14 +650,17 @@ Wired on the web-tier side; they define what a runtime must respect:
   `worklist.ApprovalCommands`, `/lgtm` and `/approve` on lines of their own, a flag
   apart from the summary so its bound never cuts them, offered as its own checkbox
   and joined by `worklist.ReviewBody`; an approval stands only on a draft pinned to
-  the head and base the latest visible review read, `WorkItem.Reviewed` over the
-  `Message.Head`/`Base` every converse reply on a pull request records, checked by
-  `AppendReply` whatever the run sent; the run flags a stale review whatever the
-  model answered, and the thread then offers "Review the current revision",
-  `WorkItem.ReviewOutdated`, `POST /items/review-again`; model-written draft text has
+  the revision the latest visible review read, head, base and whole-diff digest,
+  `WorkItem.Reviewed` over the `Message.Head`/`Base`/`Diff` a review records
+  (`github.DiffDigest`, matched by `ghcomment.DiffDigest`, which `PendingReview`
+  checks against every file before creating an approval, `ghcomment.Review.Diff`),
+  checked by `AppendReply` whatever the run sent; the run flags a stale review
+  whatever the model answered, and while the latest review is older than the draft
+  the thread offers "Review the current revision", `WorkItem.ReviewOutdated`,
+  `POST /items/review-again`; model-written draft text is LF-normalized and has
   every bot-command line made inert, `worklist.NeutralizeCommands` in `BoundDraft`,
-  a suggestion block holding one turned into plain code rather than altered, so the
-  checkbox is the only source of a command; a stored draft `BoundDraft` would change
+  a suggestion block holding one (found by goldmark, lists included) turned into
+  plain code rather than altered, so the checkbox is the only source of a command; a stored draft `BoundDraft` would change
   today is neither offered nor confirmable, `DraftReview.Current`; GitHub's submit
   dialog can replace the body, so the body is saved on the receipt in the claim,
   before GitHub is contacted, `DraftReceipt.Body`, and shown to copy), pinned to the repository, number, head

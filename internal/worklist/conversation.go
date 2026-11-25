@@ -144,8 +144,14 @@ type Message struct {
 	// the revision its latest review read (ReviewedRevision), since a push or a
 	// retarget changes what would merge. Empty on user turns, on non-pull-request
 	// items, and on replies stored before they were recorded.
-	Head string    `json:"head,omitempty"`
-	Base string    `json:"base,omitempty"`
+	Head string `json:"head,omitempty"`
+	Base string `json:"base,omitempty"`
+	// Diff is the digest of the whole diff the run read with Head and Base
+	// (github.DiffDigest): recorded by a review, and by a draft, so a stacked pull
+	// request whose dependency merged into its base (a new diff, same head and base
+	// name) no longer counts as reviewed. Empty when the run did not read the diff
+	// whole.
+	Diff string    `json:"diff,omitempty"`
 	At   time.Time `json:"at"`
 }
 
@@ -372,12 +378,19 @@ func (w WorkItem) hasCompletedRequest(kind string) bool {
 // request answered by the assistant).
 func (w WorkItem) HasReview() bool { return w.hasCompletedRequest(KindReviewRequest) }
 
-// ReviewedRevision returns the pull request revision the latest review read: the
-// Head and Base of the visible answer to a visible review request that landed last
-// in the thread. Both are "" when there is no such review, or when that answer
-// recorded none. An approval drafted from the conversation approves that head
-// against that base, and nothing else.
-func (w WorkItem) ReviewedRevision() (head, base string) {
+// Revision is the pull request revision a run read: its head commit, base branch,
+// and the digest of the whole diff GitHub showed (github.DiffDigest; "" when the
+// run did not read it whole).
+type Revision struct {
+	Head, Base, Diff string
+}
+
+// revision is m's recorded revision.
+func (m Message) revision() Revision { return Revision{m.Head, m.Base, m.Diff} }
+
+// latestReview returns the position of the visible answer to a visible review
+// request that landed last in the thread, or -1.
+func (w WorkItem) latestReview() int {
 	latest := -1
 	for key, j := range w.replies() {
 		i, ok := w.TurnIndex(key)
@@ -386,25 +399,40 @@ func (w WorkItem) ReviewedRevision() (head, base string) {
 		}
 		latest = max(latest, j)
 	}
-	if latest < 0 {
-		return "", ""
+	return latest
+}
+
+// ReviewedRevision returns the pull request revision the latest review read
+// (latestReview): the zero Revision when there is no such review, or when that
+// answer recorded none. An approval drafted from the conversation approves that
+// revision, and nothing else.
+func (w WorkItem) ReviewedRevision() Revision {
+	if j := w.latestReview(); j >= 0 {
+		return w.Thread[j].revision()
 	}
-	return w.Thread[latest].Head, w.Thread[latest].Base
+	return Revision{}
 }
 
-// Reviewed reports whether the latest review read exactly head against base
-// (ReviewedRevision), so an approval of that revision stands.
-func (w WorkItem) Reviewed(head, base string) bool {
-	h, b := w.ReviewedRevision()
-	return h != "" && h == strings.ToLower(head) && b == base
+// Reviewed reports whether the latest review read exactly rev (ReviewedRevision):
+// the same head, against the same base, with the same diff, which it must have read
+// whole. Only then does an approval of rev stand. A push changes the head, a
+// retarget the base, and a related change merged into the base (a stacked pull
+// request's dependency) the diff while leaving both alone; an unrelated advance of
+// the base changes none of them.
+func (w WorkItem) Reviewed(rev Revision) bool {
+	r := w.ReviewedRevision()
+	return r.Head != "" && r.Diff != "" && r.Head == strings.ToLower(rev.Head) && r.Base == rev.Base && r.Diff == rev.Diff
 }
 
-// ReviewOutdated reports whether the newest draft request was answered by a run
-// that read a pull request revision other than the one the latest review read: the
-// head was pushed or the base retargeted since that review, so no approval can be
-// drafted from it until the pull request is reviewed again. The draft reply
-// records the revision it read (Message.Head and Base); a reply without one, a
-// hidden one, or a notice says nothing.
+// ReviewOutdated reports whether the latest review is older than the newest draft
+// and read another pull request revision: the draft's reply (which records the
+// revision its run read) landed after the latest review, and the revisions differ,
+// so the head was pushed, the base retargeted, or the diff moved since that review,
+// and no approval can be drafted from it until the pull request is reviewed again.
+// A review that landed after the draft is the newer reading: then the draft is what
+// is stale, and drafting again (never counted redundant once a turn follows it) is
+// the way forward, not another review. A draft reply without a revision, a hidden
+// one, or a notice says nothing.
 func (w WorkItem) ReviewOutdated() bool {
 	for i := len(w.Thread) - 1; i >= 0; i-- {
 		if !w.IsDraftReviewRequest(i) {
@@ -414,7 +442,11 @@ func (w WorkItem) ReviewOutdated() bool {
 		if w.Thread[i].Hidden || !ok || w.Thread[j].Hidden || w.Thread[j].Head == "" {
 			return false
 		}
-		return !w.Reviewed(w.Thread[j].Head, w.Thread[j].Base)
+		latest := w.latestReview()
+		if j < latest {
+			return false
+		}
+		return latest < 0 || w.Thread[latest].revision() != w.Thread[j].revision()
 	}
 	return false
 }

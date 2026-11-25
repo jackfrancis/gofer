@@ -16,6 +16,9 @@ import (
 
 const draftCommit = "0123456789abcdef0123456789abcdef01234567"
 
+// draftDiff is the digest of the whole diff an approving draft approves.
+var draftDiff = worklist.PatchDigest("the whole diff")
+
 type fakeReviewCommenter struct {
 	fakeCommenter
 	result  comment.ReviewResult
@@ -585,7 +588,7 @@ func (s ctxStore) Update(ctx context.Context, ownerID string, fn func([]worklist
 func TestCreateDraftReviewApproval(t *testing.T) {
 	approving := func() []worklist.Message {
 		th := draftedThread(time.Now().Add(-time.Hour))
-		th[3].Draft.Approve = true
+		th[3].Draft.Approve, th[3].Draft.Diff = true, draftDiff
 		return th
 	}
 	create := func(t *testing.T, th []worklist.Message, form url.Values) (comment.Review, string) {
@@ -619,14 +622,17 @@ func TestCreateDraftReviewApproval(t *testing.T) {
 	if rv.Body != "- Add a test.\n\n/lgtm\n/approve" || len(rv.Comments) != 0 {
 		t.Errorf("summary and approval: body %q, %d comments", rv.Body, len(rv.Comments))
 	}
+	if rv.Diff != draftDiff {
+		t.Errorf("approval sent without its diff to check: %q", rv.Diff)
+	}
 	if !strings.Contains(body, "a summary and the approval commands") {
 		t.Errorf("result page:\n%s", body)
 	}
 	if rv, _ := create(t, approving(), url.Values{"approve": {"1"}}); rv.Body != worklist.ApprovalCommands {
 		t.Errorf("approval only: body %q", rv.Body)
 	}
-	if rv, _ := create(t, approving(), url.Values{"summary": {"1"}}); rv.Body != "- Add a test." {
-		t.Errorf("approval left out: body %q", rv.Body)
+	if rv, _ := create(t, approving(), url.Values{"summary": {"1"}}); rv.Body != "- Add a test." || rv.Diff != "" {
+		t.Errorf("approval left out: body %q, diff %q", rv.Body, rv.Diff)
 	}
 	if rv, _ := create(t, draftedThread(time.Now().Add(-time.Hour)), url.Values{"summary": {"1"}, "approve": {"1"}}); rv.Body != "- Add a test." {
 		t.Errorf("a draft that does not approve sent: %q", rv.Body)
@@ -637,7 +643,7 @@ func TestCreateDraftReviewApproval(t *testing.T) {
 // review whose body is the approval commands.
 func TestCreateDraftReviewApprovalOnly(t *testing.T) {
 	th := draftedThread(time.Now().Add(-time.Hour))
-	th[3].Draft = &worklist.DraftReview{Repo: "o/r", Number: 1, Commit: draftCommit, BaseRef: "main", Approve: true}
+	th[3].Draft = &worklist.DraftReview{Repo: "o/r", Number: 1, Commit: draftCommit, BaseRef: "main", Approve: true, Diff: draftDiff}
 	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true}}
 	h, _, _ := draftFixture(t, c, th)
 	page, _ := threadPage(t, h)
@@ -660,7 +666,7 @@ func TestCreateDraftReviewApprovalOnly(t *testing.T) {
 func TestCreateDraftReviewShowsTheBodyToPaste(t *testing.T) {
 	const want = "- Add a test.\n\n/lgtm\n/approve"
 	th := draftedThread(time.Now().Add(-time.Hour))
-	th[3].Draft.Approve = true
+	th[3].Draft.Approve, th[3].Draft.Diff = true, draftDiff
 	form := url.Values{"id": {draftItemID}, "msg": {"a"}, "digest": {th[3].Draft.Digest()}, "summary": {"1"}, "approve": {"1"}}
 	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true, URL: "https://github.com/o/r/pull/1#pullrequestreview-9"}}
 	h, _, store := draftFixture(t, c, th)
@@ -788,7 +794,7 @@ func TestOutdatedDraftIsRefused(t *testing.T) {
 // off after GitHub created the review still shows the text to paste.
 func TestClaimSavesTheBody(t *testing.T) {
 	th := draftedThread(time.Now().Add(-time.Hour))
-	th[3].Draft.Approve = true
+	th[3].Draft.Approve, th[3].Draft.Diff = true, draftDiff
 	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}, result: comment.ReviewResult{Created: true}}
 	h, _, store := draftFixture(t, c, th)
 	var during *worklist.DraftReceipt

@@ -18,6 +18,12 @@ const draftHead = "0123456789abcdef0123456789abcdef01234567"
 // draftPatch adds lines 11-12 and removes old line 11 in a.go.
 const draftPatch = "@@ -10,3 +10,4 @@ func f() {\n ctx\n-old\n+new1\n+new2\n tail"
 
+// draftDiff is the digest of the whole diff draftGitHub serves.
+var draftDiff = github.DiffDigest([]github.DiffFile{
+	{Path: "a.go", Status: "modified", SHA: "blob-a", Patch: draftPatch},
+	{Path: "logo.png", Status: "added", SHA: "blob-logo"},
+})
+
 type fakeDrafter struct {
 	prop worklist.DraftProposal
 	got  worklist.DraftInput
@@ -45,8 +51,8 @@ func draftGitHub(t *testing.T, state string) string {
 			_, _ = w.Write([]byte(`{"body":"desc"}`))
 		case "/repos/o/r/pulls/1/files":
 			_ = json.NewEncoder(w).Encode([]map[string]any{
-				{"filename": "a.go", "status": "modified", "patch": draftPatch},
-				{"filename": "logo.png", "status": "added"},
+				{"filename": "a.go", "status": "modified", "sha": "blob-a", "patch": draftPatch},
+				{"filename": "logo.png", "status": "added", "sha": "blob-logo"},
 			})
 		default:
 			http.NotFound(w, r)
@@ -62,7 +68,7 @@ func draftItem() worklist.WorkItem {
 		GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, Title: "t"},
 		Thread: []worklist.Message{
 			{ID: "q", Role: worklist.RoleUser, Content: "review?", Kind: worklist.KindReviewRequest},
-			{ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "rename new1", Model: "m1", Head: draftHead, Base: "main"},
+			{ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "rename new1", Model: "m1", Head: draftHead, Base: "main", Diff: draftDiff},
 			{ID: "h", Role: worklist.RoleUser, Content: "secret aside", Hidden: true},
 			{ID: "d", Role: worklist.RoleUser, Content: "draft", Kind: worklist.KindDraftReviewRequest},
 		},
@@ -227,7 +233,11 @@ func TestRunConverseWithholdsStaleApproval(t *testing.T) {
 			if m.Draft != nil {
 				t.Fatalf("stale approval drafted: %+v", m.Draft)
 			}
-			for _, want := range []string{"No approval drafted", "is now commit `0123456789ab` against `main`", "Review the current revision"} {
+			why := "is now commit `0123456789ab` against `main`"
+			if head == "" {
+				why = "did not record the revision it read"
+			}
+			for _, want := range []string{"No approval drafted", why, "Review the current revision"} {
 				if !strings.Contains(m.Content, want) {
 					t.Errorf("reply lacks %q:\n%s", want, m.Content)
 				}
@@ -303,11 +313,38 @@ func TestRunConverseRecordsReviewedHead(t *testing.T) {
 		t.Fatal(err)
 	}
 	th := sink.items[0].Thread
-	if m := th[len(th)-1]; m.ReplyTo != "q" || m.Head != draftHead || m.Base != "main" {
+	if m := th[len(th)-1]; m.ReplyTo != "q" || m.Head != draftHead || m.Base != "main" || m.Diff != draftDiff {
 		t.Fatalf("reply = %+v", m)
 	}
-	if !sink.items[0].Reviewed(draftHead, "main") {
+	if !sink.items[0].Reviewed(worklist.Revision{Head: draftHead, Base: "main", Diff: draftDiff}) {
 		t.Errorf("Reviewed(head, base) = false: %+v", th[len(th)-1])
+	}
+}
+
+// A stacked pull request whose dependency merged into its base shows a new diff
+// with the same head and base name: the review of the old diff approves nothing, the
+// reply says why, and an approval is pinned to the diff only when it matches.
+func TestRunConverseApprovalNeedsTheReviewedDiff(t *testing.T) {
+	item := draftItem()
+	item.Thread[1].Diff = worklist.PatchDigest("the diff before the dependency merged")
+	sink := &memSink{items: []worklist.WorkItem{item}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: item.ID, Turn: "d", Converser: &fakeConverser{}, Drafter: &fakeDrafter{prop: worklist.DraftProposal{Approve: true}}},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	th := sink.items[0].Thread
+	m := th[len(th)-1]
+	if m.Draft != nil || !strings.Contains(m.Content, "its changes are no longer the ones that review read") || m.Diff != draftDiff {
+		t.Fatalf("reply = %+v", m)
+	}
+	sink = &memSink{items: []worklist.WorkItem{draftItem()}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: "github:o/r#1", Turn: "d", Converser: &fakeConverser{}, Drafter: &fakeDrafter{prop: worklist.DraftProposal{Approve: true}}},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	th = sink.items[0].Thread
+	if d := th[len(th)-1].Draft; d == nil || !d.Approve || d.Diff != draftDiff {
+		t.Errorf("approval of the reviewed diff = %+v", d)
 	}
 }
 

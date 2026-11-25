@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -70,6 +71,34 @@ type Review struct {
 	Body     string
 	Comments []ReviewComment
 	Patches  map[string]string // path -> PatchDigest
+	// Diff, when set, is the DiffDigest of the whole diff the review approves (ADR
+	// 0010): PendingReview reads every file and refuses (ErrHeadMoved) unless the
+	// pull request still shows exactly that diff.
+	Diff string
+}
+
+// File is one changed file as the pull request's files list names it.
+type File struct {
+	Filename         string `json:"filename"`
+	PreviousFilename string `json:"previous_filename"`
+	Status           string `json:"status"`
+	SHA              string `json:"sha"`
+	Patch            string `json:"patch"`
+}
+
+// DiffDigest identifies a pull request's diff as GitHub lists its files: hex SHA-256
+// over the files sorted by path, one JSON line each of [path, previous path, status,
+// blob SHA, SHA-256 of the patch]. The workload records it when a review reads the
+// diff (github.DiffDigest computes the same), and PendingReview compares it.
+func DiffDigest(files []File) string {
+	sorted := append([]File(nil), files...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Filename < sorted[j].Filename })
+	h := sha256.New()
+	for _, f := range sorted {
+		line, _ := json.Marshal([]string{f.Filename, f.PreviousFilename, f.Status, f.SHA, PatchDigest(f.Patch)})
+		h.Write(append(line, '\n'))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // PatchDigest identifies one file's patch as GitHub lists it on the pull request's
@@ -127,7 +156,13 @@ func (c *Client) PendingReview(ctx context.Context, token, repo string, number i
 	if pending {
 		return "", ErrPendingExists
 	}
-	if err := c.checkPatches(ctx, token, pull, want); err != nil {
+	if rv.Diff != "" {
+		// An approval: the whole diff must still be the one reviewed, and that read
+		// covers the commented files' patches too.
+		if err := c.checkDiff(ctx, token, pull, rv.Diff, want); err != nil {
+			return "", err
+		}
+	} else if err := c.checkPatches(ctx, token, pull, want); err != nil {
 		return "", err
 	}
 	// The pull request is read after the lists are paged, right before the POST, so
@@ -223,6 +258,36 @@ func (c *Client) checkPatches(ctx context.Context, token, pull string, want map[
 		}
 	}
 	return errors.New("github: too many files to check the commented ones")
+}
+
+// checkDiff reads every file of the pull request and refuses (ErrHeadMoved) unless
+// their DiffDigest is diff and every path in want has a patch with that
+// PatchDigest. A list too long to read whole is an error, never a pass.
+func (c *Client) checkDiff(ctx context.Context, token, pull, diff string, want map[string]string) error {
+	var all []File
+	for page := 1; page <= maxFilePages; page++ {
+		raw, err := c.doLimit(ctx, token, http.MethodGet, pull+"/files?per_page="+strconv.Itoa(filesPerPage)+"&page="+strconv.Itoa(page), nil, http.StatusOK, maxFilesPageBytes)
+		if err != nil {
+			return err
+		}
+		var files []File
+		if err := json.Unmarshal(raw, &files); err != nil {
+			return errors.New("github: unreadable file list")
+		}
+		all = append(all, files...)
+		if len(files) < filesPerPage {
+			if DiffDigest(all) != diff {
+				return ErrHeadMoved
+			}
+			for _, f := range all {
+				if d, ok := want[f.Filename]; ok && (f.Patch == "" || PatchDigest(f.Patch) != d) {
+					return ErrHeadMoved
+				}
+			}
+			return nil // the digest covers every file, so a commented file left out would have changed it
+		}
+	}
+	return errors.New("github: too many files to check the approved diff")
 }
 
 // hasPendingReview reports whether the pull request (its API path) has a pending

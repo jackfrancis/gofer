@@ -7,9 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	"github.com/yuin/goldmark/text"
 )
 
 // This file is the draft review (ADR 0010): a converse run, asked by a
@@ -64,6 +70,12 @@ type DraftReview struct {
 	// body, after the summary; ReviewBody), which the owner may leave out like any
 	// other part. It is kept apart from Body so the summary's bound never cuts it.
 	Approve bool `json:"approve,omitempty"`
+	// Diff is, on an approving draft, the digest of the whole diff it approves
+	// (github.DiffDigest), the one the latest review read: the web tier creates the
+	// review only while the pull request still shows exactly that diff. Empty on a
+	// draft that does not approve; an approving draft without a valid one approves
+	// nothing (BoundDraft).
+	Diff string `json:"diff,omitempty"`
 	// Patches maps every commented file to the PatchDigest of the patch its comments
 	// were anchored to. The web tier re-reads those patches before it creates the
 	// review and refuses if one changed: a related change merged into the base can
@@ -160,7 +172,10 @@ func BoundDraft(d *DraftReview) *DraftReview {
 	out := &DraftReview{
 		Repo: d.Repo, Number: d.Number, Commit: strings.ToLower(d.Commit), BaseRef: d.BaseRef,
 		Body:    cutText(NeutralizeCommands(strings.TrimSpace(d.Body)), MaxDraftBodyBytes),
-		Approve: d.Approve,
+		Approve: d.Approve && validDigest(d.Diff),
+	}
+	if out.Approve {
+		out.Diff = strings.ToLower(d.Diff)
 	}
 	for _, c := range d.Comments {
 		if len(out.Comments) == MaxDraftComments {
@@ -172,7 +187,7 @@ func BoundDraft(d *DraftReview) *DraftReview {
 		}
 		body := strings.TrimSpace(c.Body)
 		digest := d.Patches[c.Path]
-		if body == "" || c.Line < 1 || (side != SideRight && side != SideLeft) || !ValidDraftPath(c.Path) || len(digest) != 64 || !isHex(digest) {
+		if body == "" || c.Line < 1 || (side != SideRight && side != SideLeft) || !ValidDraftPath(c.Path) || !validDigest(digest) {
 			continue
 		}
 		out.Comments = append(out.Comments, DraftComment{Path: c.Path, Line: c.Line, Side: side, Body: cutText(NeutralizeCommands(body), MaxDraftCommentBytes)})
@@ -185,6 +200,11 @@ func BoundDraft(d *DraftReview) *DraftReview {
 		return nil
 	}
 	return out
+}
+
+// validDigest reports whether s is a hex SHA-256.
+func validDigest(s string) bool {
+	return len(s) == 64 && isHex(s)
 }
 
 // validRef reports whether s can be a stored branch name: non-empty, bounded, UTF-8.
@@ -207,75 +227,102 @@ func (d *DraftReview) Current() bool {
 // another slash.
 var commandLine = regexp.MustCompile(`^([ \t]*)(/[A-Za-z][A-Za-z0-9_-]*)([ \t\r].*)?$`)
 
-// fenceOpen matches a fenced code block's opening line: up to three spaces, three or
-// more backticks or tildes, and an info string whose first word is the language.
-var fenceOpen = regexp.MustCompile("^( {0,3})(`{3,}|~{3,})[ \t]*([^ \t`\r]*)")
-
 // SuggestionNote follows a suggestion block NeutralizeCommands turned into a plain
 // code block.
 const SuggestionNote = "_(gofer did not offer this as a suggested change: a line in it would act as a bot command on GitHub, so it is shown as plain code.)_"
 
-// NeutralizeCommands returns model-written review text with every command line
-// (commandLine: /lgtm, /approve, /hold, ...) made inert by wrapping its command in
-// backticks, so it reads the same but no longer starts with a slash. A drafted
-// review acts on a pull request only through what the owner selects: its approval
-// commands come from DraftReview.Approve alone, never from the text.
+// NeutralizeCommands returns model-written review text with its line endings
+// normalized to LF and every command line (commandLine: /lgtm, /approve, /hold, ...)
+// made inert by wrapping its command in backticks, so it reads the same but no
+// longer starts with a slash. A drafted review acts on a pull request only through
+// what the owner selects: its approval commands come from DraftReview.Approve alone,
+// never from the text.
+//
+// Line endings come first: a bot splits lines at LF, and a browser turns a bare CR
+// into LF before the page's copy button reads the text, so a CR could otherwise hide
+// a command from this check and reveal it in the pasted text. The text stored, shown
+// and copied is this one.
 //
 // A GitHub suggestion block is applied verbatim, so it is never altered and left a
-// suggestion: one holding a command line (a .gitignore's /dist, say) becomes a
-// plain code block, with SuggestionNote after it, so the author cannot apply the
-// altered text. Every other block keeps its lines unless they are command lines. The
-// result is a fixed point: neutralizing it again changes nothing.
+// suggestion: one holding a command line (a .gitignore's /dist, say) becomes a plain
+// code block, with SuggestionNote after it, so the author cannot apply the altered
+// text. Blocks are found as Markdown parses them (goldmark), so a suggestion nested
+// in a list, with its fence indented past three spaces, is one too. Lines outside
+// any suggestion are judged as a bot reads them, raw. The result is a fixed point.
 func NeutralizeCommands(s string) string {
+	s = strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n")
 	lines := strings.Split(s, "\n")
-	out := make([]string, 0, len(lines))
-	for i := 0; i < len(lines); i++ {
-		m := fenceOpen.FindStringSubmatch(lines[i])
-		if m == nil {
-			out = append(out, neutralizeLine(lines[i]))
-			continue
+	hit := make([]bool, len(lines))
+	found := false
+	for i, l := range lines {
+		hit[i] = commandLine.MatchString(l)
+		found = found || hit[i]
+	}
+	if !found {
+		return s
+	}
+	starts := make([]int, len(lines)) // each line's byte offset in s
+	for i, off := 1, 0; i < len(lines); i++ {
+		off += len(lines[i-1]) + 1
+		starts[i] = off
+	}
+	lineOf := func(off int) int { return sort.Search(len(starts), func(i int) bool { return starts[i] > off }) - 1 }
+
+	// Suggestion blocks holding a command line: the language to replace on the
+	// opening line, and where the note goes.
+	type demotion struct{ col, n int }
+	opener := map[int]demotion{}  // opening line -> the language's column and length
+	noteAfter := map[int]string{} // line -> the note, indented to the block's fence
+	src := []byte(s)
+	doc := goldmark.New().Parser().Parse(text.NewReader(src))
+	_ = ast.Walk(doc, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		fc, ok := n.(*ast.FencedCodeBlock)
+		if !entering || !ok || fc.Info == nil || fc.Lines().Len() == 0 {
+			return ast.WalkContinue, nil
 		}
-		end := i + 1 // the closing fence, or len(lines) for a block left open
-		for end < len(lines) && !closesFence(lines[end], m[2]) {
-			end++
+		lang := fc.Language(src)
+		if !strings.EqualFold(string(lang), "suggestion") {
+			return ast.WalkContinue, nil
 		}
-		body := lines[i+1 : end]
-		unsafe := false
-		for _, l := range body {
-			unsafe = unsafe || commandLine.MatchString(l)
+		first, last := lineOf(fc.Lines().At(0).Start), lineOf(fc.Lines().At(fc.Lines().Len()-1).Start)
+		if !slices.Contains(hit[first:last+1], true) {
+			return ast.WalkContinue, nil
 		}
-		suggestion := unsafe && strings.EqualFold(m[3], "suggestion")
-		if suggestion {
-			out = append(out, m[1]+m[2]+"text")
-		} else {
-			out = append(out, lines[i])
+		info := fc.Info.Segment.Start
+		open := lineOf(info)
+		opener[open] = demotion{col: info - starts[open], n: len(lang)}
+		fence := strings.IndexAny(lines[open], "`~")
+		indent := strings.Map(func(r rune) rune {
+			if r == '\t' {
+				return r
+			}
+			return ' '
+		}, lines[open][:max(fence, 0)])
+		end := len(lines) - 1 // the closing fence, or the last line of a block left open
+		for k := last + 1; k < len(lines); k++ {
+			if t := strings.TrimSpace(lines[k]); len(t) >= 3 && (strings.Trim(t, "`") == "" || strings.Trim(t, "~") == "") {
+				end = k
+				break
+			}
 		}
-		for _, l := range body {
-			out = append(out, neutralizeLine(l))
+		noteAfter[end] = indent + SuggestionNote
+		return ast.WalkContinue, nil
+	})
+
+	out := make([]string, 0, len(lines)+len(noteAfter))
+	for i, l := range lines {
+		switch d, ok := opener[i]; {
+		case ok:
+			l = l[:d.col] + "text" + l[d.col+d.n:]
+		case hit[i]:
+			l = commandLine.ReplaceAllString(l, "$1`$2`$3")
 		}
-		if end < len(lines) {
-			out = append(out, lines[end])
+		out = append(out, l)
+		if note, ok := noteAfter[i]; ok {
+			out = append(out, note)
 		}
-		if suggestion {
-			out = append(out, SuggestionNote)
-		}
-		i = end
 	}
 	return strings.Join(out, "\n")
-}
-
-func neutralizeLine(l string) string {
-	return commandLine.ReplaceAllString(l, "$1`$2`$3")
-}
-
-// closesFence reports whether line closes a block opened by fence: the same
-// character, at least as many, and nothing after but spaces.
-func closesFence(line, fence string) bool {
-	t := strings.TrimRight(strings.TrimLeft(line, " "), " \t\r")
-	if len(line)-len(strings.TrimLeft(line, " ")) > 3 || len(t) < len(fence) {
-		return false
-	}
-	return strings.Trim(t, fence[:1]) == ""
 }
 
 // ValidDraftPath reports whether p can name a file in a diff: a relative path

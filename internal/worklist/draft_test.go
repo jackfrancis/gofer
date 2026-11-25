@@ -10,6 +10,9 @@ import (
 
 const testCommit = "0123456789abcdef0123456789abcdef01234567"
 
+// testDiff is the digest of the whole diff a review read (github.DiffDigest).
+var testDiff = PatchDigest("the whole diff")
+
 // pinned is a draft pinned to o/r#1 at testCommit against main, with a patch
 // digest for every commented file.
 func pinned(body string, comments ...DraftComment) *DraftReview {
@@ -357,13 +360,13 @@ func TestDraftDigest(t *testing.T) {
 // the commands after the summary, each on a line of its own.
 func TestApprovingDraft(t *testing.T) {
 	d := pinned("")
-	d.Approve = true
+	d.Approve, d.Diff = true, testDiff
 	got := BoundDraft(d)
 	if got == nil || !got.Approve || got.Body != "" || len(got.Comments) != 0 {
 		t.Fatalf("approval-only draft = %+v", got)
 	}
 	long := pinned(strings.Repeat("b", MaxDraftBodyBytes+10))
-	long.Approve = true
+	long.Approve, long.Diff = true, testDiff
 	if got := BoundDraft(long); !got.Approve || len(got.Body) > MaxDraftBodyBytes {
 		t.Fatalf("long approving draft: approve %v, body %d bytes", got.Approve, len(got.Body))
 	}
@@ -394,13 +397,13 @@ func TestAppendReplyApprovalNeedsTheReviewedHead(t *testing.T) {
 	const older = "fedcba9876543210fedcba9876543210fedcba98"
 	approving := func(comments ...DraftComment) *DraftReview {
 		d := pinned("", comments...)
-		d.Approve = true
+		d.Approve, d.Diff = true, testDiff
 		return d
 	}
 	thread := func(reviewHead string) WorkItem {
 		return draftPR(
 			Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
-			Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: reviewHead, Base: "main"},
+			Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: reviewHead, Base: "main", Diff: testDiff},
 			Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest},
 		)
 	}
@@ -430,14 +433,14 @@ func TestAppendReplyApprovalNeedsTheReviewedHead(t *testing.T) {
 	it = draftPR(
 		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
 		Message{ID: "q2", Role: RoleUser, Content: IndependentReviewPrompt, Kind: KindReviewRequest},
-		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main"},
-		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: older, Base: "main"},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: older, Base: "main", Diff: testDiff},
 	)
-	if got, _ := it.ReviewedRevision(); got != older {
+	if got := it.ReviewedRevision().Head; got != older {
 		t.Errorf("ReviewedRevision = %q, want the review that landed last", got)
 	}
 	it.Thread[3].Hidden = true
-	if got, _ := it.ReviewedRevision(); got != testCommit {
+	if got := it.ReviewedRevision().Head; got != testCommit {
 		t.Errorf("ReviewedRevision with the latest hidden = %q", got)
 	}
 	// Revisions are normalized or dropped, as a pair, on the way in.
@@ -474,12 +477,12 @@ func TestAppendReplyApprovalNeedsTheReviewedHead(t *testing.T) {
 func TestAppendReplyApprovalNeedsTheReviewedBase(t *testing.T) {
 	it := draftPR(
 		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
-		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main"},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
 		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest},
 	)
 	d := pinned("")
-	d.Approve, d.BaseRef = true, "release"
-	if _, err := AppendReply(&it, "d", Message{ID: "a", Content: "approve", Draft: d, Head: testCommit, Base: "release"}); err != nil {
+	d.Approve, d.BaseRef, d.Diff = true, "release", testDiff
+	if _, err := AppendReply(&it, "d", Message{ID: "a", Content: "approve", Draft: d, Head: testCommit, Base: "release", Diff: testDiff}); err != nil {
 		t.Fatal(err)
 	}
 	if it.Thread[3].Draft != nil {
@@ -492,7 +495,7 @@ func TestAppendReplyApprovalNeedsTheReviewedBase(t *testing.T) {
 	}
 	it.Thread = append(it.Thread,
 		Message{ID: "q2", Role: RoleUser, Content: "again", Kind: KindReviewRequest},
-		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "release"},
+		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "release", Diff: testDiff},
 	)
 	if it.ReviewOutdated() {
 		t.Error("ReviewOutdated = true after a review of the current revision")
@@ -541,7 +544,7 @@ func TestDraftTextCarriesNoCommands(t *testing.T) {
 		"/lgtm":                          "`/lgtm`",
 		"Looks good.\n/approve\nThanks!": "Looks good.\n`/approve`\nThanks!",
 		"  /LGTM cancel":                 "  `/LGTM` cancel",
-		"/hold\r\n/retest":               "`/hold`\r\n`/retest`",
+		"/hold\r\n/retest":               "`/hold`\n`/retest`",
 		"/usr/bin/env is fine":           "/usr/bin/env is fine",
 		"run `/lgtm` when ready":         "run `/lgtm` when ready",
 		"- /approve once tests pass":     "- /approve once tests pass",
@@ -575,5 +578,109 @@ func TestDraftTextCarriesNoCommands(t *testing.T) {
 	got := BoundDraft(d)
 	if got.Body != "Ship it.\n`/lgtm`" || got.Comments[0].Body != "nit\n`/approve`" || got.Approve {
 		t.Errorf("bounded draft = %+v", got)
+	}
+}
+
+// Line endings are normalized before commands are looked for, so a bare CR (which a
+// browser turns into LF before the copy button reads the text) can never hide a
+// command from the check and reveal it in what is pasted.
+func TestNeutralizeNormalizesLineEndings(t *testing.T) {
+	for in, want := range map[string]string{
+		"Looks good.\r/approve": "Looks good.\n`/approve`",
+		"a\r\nb\rc":             "a\nb\nc",
+		"Ship it.\r\n/lgtm\r\n": "Ship it.\n`/lgtm`\n",
+	} {
+		if got := NeutralizeCommands(in); got != want {
+			t.Errorf("NeutralizeCommands(%q) = %q, want %q", in, got, want)
+		}
+	}
+	d := pinned("Ship it.\r/lgtm")
+	if got := BoundDraft(d); got.Body != "Ship it.\n`/lgtm`" {
+		t.Errorf("stored body %q", got.Body)
+	}
+	if d.Current() {
+		t.Error("a draft stored with a bare CR is current")
+	}
+}
+
+// Suggestion blocks are found as Markdown parses them: one nested in a list, its
+// fence indented past three spaces, is demoted (not altered and left applicable),
+// with the note indented to stay in the list item.
+func TestNeutralizeFindsSuggestionsInLists(t *testing.T) {
+	in := "1. Ignore the build output:\n\n    ```suggestion\n    /dist\n    node_modules/\n    ```\n2. Next point."
+	want := "1. Ignore the build output:\n\n    ```text\n    `/dist`\n    node_modules/\n    ```\n    " + SuggestionNote + "\n2. Next point."
+	got := NeutralizeCommands(in)
+	if got != want {
+		t.Fatalf("NeutralizeCommands = %q\nwant %q", got, want)
+	}
+	if again := NeutralizeCommands(got); again != got {
+		t.Errorf("not a fixed point: %q", again)
+	}
+	// A list-nested suggestion without a command line is left exactly as written.
+	clean := "- Fix:\n\n    ```suggestion\n    return nil\n    ```"
+	if got := NeutralizeCommands(clean); got != clean {
+		t.Errorf("clean nested suggestion changed: %q", got)
+	}
+}
+
+// An approval is of the whole diff the latest review read: a stacked pull request
+// whose dependency merged into its base shows a new diff with the same head and base
+// name, and an approval of the old diff does not stand on it. An approving draft
+// with no diff to pin approves nothing.
+func TestApprovalNeedsTheReviewedDiff(t *testing.T) {
+	moved := PatchDigest("a diff with the dependency's files gone")
+	it := draftPR(
+		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest},
+	)
+	if !it.Reviewed(Revision{testCommit, "main", testDiff}) || it.Reviewed(Revision{testCommit, "main", moved}) || it.Reviewed(Revision{testCommit, "main", ""}) {
+		t.Fatal("Reviewed does not compare the diff")
+	}
+	d := pinned("")
+	d.Approve, d.Diff = true, moved
+	if _, err := AppendReply(&it, "d", Message{ID: "a", Content: "approve", Draft: d, Head: testCommit, Base: "main", Diff: moved}); err != nil {
+		t.Fatal(err)
+	}
+	if it.Thread[3].Draft != nil {
+		t.Errorf("approval of a moved diff kept: %+v", it.Thread[3].Draft)
+	}
+	if !it.ReviewOutdated() {
+		t.Error("a moved diff does not make the review outdated")
+	}
+	nodiff := pinned("")
+	nodiff.Approve = true
+	if BoundDraft(nodiff) != nil {
+		t.Error("an approving draft with no diff to pin was kept")
+	}
+	review := draftPR(Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest})
+	if _, err := AppendReply(&review, "q", Message{ID: "a", Content: "ok", Head: testCommit, Base: "main", Diff: "not-a-digest"}); err != nil {
+		t.Fatal(err)
+	}
+	if m := review.Thread[1]; m.Head != testCommit || m.Diff != "" {
+		t.Errorf("invalid diff stored: %+v", m)
+	}
+}
+
+// A review that landed after the draft is the newer reading: even if it read yet
+// another revision (pushed again since the draft), the review is current and the
+// draft is what is stale, so no further review is offered.
+func TestNewerReviewIsNotOutdated(t *testing.T) {
+	const b, c = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccccccccccccccccccccccc"
+	it := draftPR(
+		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest},
+		Message{ID: "a", ReplyTo: "d", Role: RoleAgent, Content: "out of date", Head: b, Base: "main", Diff: testDiff},
+	)
+	if !it.ReviewOutdated() {
+		t.Fatal("a review older than the draft, of another head, is not outdated")
+	}
+	it.Thread = append(it.Thread,
+		Message{ID: "q2", Role: RoleUser, Content: "again", Kind: KindReviewRequest},
+		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: c, Base: "main", Diff: testDiff},
+	)
+	if it.ReviewOutdated() {
+		t.Error("a review newer than the draft is outdated")
 	}
 }

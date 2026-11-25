@@ -149,29 +149,45 @@ approval out, or the reverse. The flag is part of the draft, so its `Digest` cov
 The review is still created pending: the commands take effect only when the owner
 submits it on GitHub.
 
-**An approval is of the revision the reviews read.** Every converse reply on a pull
-request records the revision its run read: the head commit and the base branch
-(`Message.Head` and `Base`, kept only as a valid pair). `WorkItem.ReviewedRevision` is
-the revision the latest visible review read (the visible answer to a visible review
-request that landed last). An approval stands only on a draft pinned to that head
-against that base (`WorkItem.Reviewed`): `AppendReply` clears the flag otherwise,
-whatever the run sent. A push changes what would merge, and so does a retarget, which
-leaves the head alone. The drafter is told the head and base, and the revision each
-assistant turn read. So neither a push nor a retarget between the review and the draft
-turns an approval of the old revision into one of the new; the draft's own pin (head
-and base branch checked against GitHub before creating) covers one after it.
+**An approval is of the revision the reviews read.** A revision is the head commit,
+the base branch, and the digest of the whole diff GitHub shows
+(`worklist.Revision`; `github.DiffDigest`: SHA-256 over the files sorted by path, one
+line each of path, previous path, status, blob SHA and the patch's SHA-256). Every
+converse reply on a pull request records the head and base it read (`Message.Head`
+and `Base`, kept only as a valid pair), and a review also reads the whole diff
+(`github.PullDiff`) and records its digest (`Message.Diff`; none when the list was cut
+at 3000 files). `WorkItem.ReviewedRevision` is the revision the latest visible review
+read (the visible answer to a visible review request that landed last). An approval
+stands only on a draft pinned to exactly that revision, read whole
+(`WorkItem.Reviewed`): `AppendReply` clears the flag otherwise, whatever the run sent.
+A push changes the head, a retarget the base, and a related change merged into the
+base (a stacked pull request's dependency) changes the diff while leaving both alone;
+an unrelated advance of the base changes none of them, since the merge base stays put.
+The drafter is told the head and base, and the revision each assistant turn read.
+
+An approving draft carries the diff digest it approves (`DraftReview.Diff`; without a
+valid one it approves nothing). When the owner keeps the approval, the web tier sends
+it with the review (`ghcomment.Review.Diff`), and `PendingReview` reads every file the
+pull request lists and refuses (out of date, "draft again") unless they hash to that
+digest (`ghcomment.DiffDigest`, the same formula; a test holds the two equal). So
+neither a push, a retarget nor a moved merge base, before the draft or after it,
+turns an approval of one diff into one of another. A pull request with more files
+than gofer reads gets no approval, and the reply says why.
 
 **A stale review is always flagged, and recoverable.** The run compares the latest
 review's revision with the one it read whatever the drafter answered, so a drafter
 that rightly declines to approve still leaves the owner a reason: the reply says the
-latest review is out of date ("No approval drafted" when the drafter had proposed
-one). The draft reply records the revision it read too, so the thread can tell
-(`WorkItem.ReviewOutdated`) and offers "Review the current revision"
+latest review is out of date, and which part moved ("No approval drafted" when the
+drafter had proposed one). The draft reply records the revision it read too, so the
+thread can tell (`WorkItem.ReviewOutdated`) and offers "Review the current revision"
 (`webui.ReviewAgain`, `POST /items/review-again`): a review request appended to the
 conversation, which is kept, and sent to the default model. Review all skips a
 reviewed pull request and a second opinion needs another model, so without this a
-single-model deployment had no way back short of clearing the conversation. Once that
-review lands, the button goes and drafting again can approve.
+single-model deployment had no way back short of clearing the conversation. The
+button shows only while the latest review is older than the draft: once a review
+lands after it, that review is the newer reading even if the pull request moved again
+in between, so the draft is what is stale, and drafting again (offered, since a turn
+now follows the draft) is the way forward, never another review of the same revision.
 
 **The checkbox is the only source of a command.** Model-written text is stored with
 every line a bot would read as a command (`/word` at the start of a line: `/lgtm`,
@@ -180,11 +196,19 @@ every line a bot would read as a command (`/word` at the start of a line: `/lgtm
 text). Unchecking the approval therefore leaves no approval command in what is sent.
 A path such as `/usr/bin/env` is not a command line and stays as written.
 
+Line endings are normalized to LF first: a bot splits lines at LF, and a browser turns
+a bare CR into LF before the copy button reads the text, so a CR could otherwise hide
+a command from the check and reveal it in what is pasted. The text stored, previewed
+and copied is the normalized one.
+
 A GitHub `suggestion` block is applied verbatim, so its text is never altered while it
 stays a suggestion: one holding a command-shaped line (a `.gitignore`'s `/dist`, say)
 becomes a plain `text` code block with a note after it
 (`worklist.SuggestionNote`), so the author reads the point but cannot apply edited
-code. A suggestion with no such line is kept exactly. The rewrite is a fixed point.
+code. A suggestion with no such line is kept exactly. Blocks are found as Markdown
+parses them (goldmark), so a suggestion nested in a list, its fence indented past
+three spaces, is found too, and the note is indented to stay in its list item. The
+rewrite is a fixed point.
 
 Drafts stored before a rule existed are held to it too: `DraftReview.Current` reports
 whether `BoundDraft` would store the draft unchanged today. One that is not is not

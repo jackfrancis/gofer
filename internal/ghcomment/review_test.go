@@ -207,3 +207,44 @@ func TestPendingReviewPostAnswers(t *testing.T) {
 		}
 	}
 }
+
+// An approval names the whole diff it approves: the review is created only while
+// every file the pull request lists hashes to that digest. A stacked dependency
+// merged into the base (a file added to the diff, same head and base) refuses it, as
+// a moved patch does; an approval without comments is checked all the same.
+func TestPendingReviewChecksTheApprovedDiff(t *testing.T) {
+	files := func(patches map[string]string, filler int) []File {
+		var out []File
+		for i := range filler {
+			out = append(out, File{Filename: "filler/" + strconv.Itoa(i) + ".go", Patch: "@@ -1 +1 @@\n-x\n+y"})
+		}
+		for p, patch := range patches {
+			out = append(out, File{Filename: p, Patch: patch})
+		}
+		return out
+	}
+	reviewed := DiffDigest(files(map[string]string{"a.go": reviewPatch}, 120))
+
+	api := &reviewAPI{state: "open", head: reviewHead, filler: 120}
+	c := New(api.server(t).URL, nil)
+	rv := testReview("/lgtm\n/approve")
+	rv.Diff = reviewed
+	if _, err := c.PendingReview(context.Background(), token, "org/public", 7, rv); err != nil {
+		t.Fatalf("matching diff refused: %v", err)
+	}
+	approvalOnly := Review{Commit: reviewHead, BaseRef: "main", Body: "/lgtm\n/approve", Diff: reviewed}
+	api = &reviewAPI{state: "open", head: reviewHead, filler: 120}
+	if _, err := New(api.server(t).URL, nil).PendingReview(context.Background(), token, "org/public", 7, approvalOnly); err != nil {
+		t.Fatalf("approval-only review refused: %v", err)
+	}
+	for name, patches := range map[string]map[string]string{
+		"dependency's file now in the diff": {"a.go": reviewPatch, "dep.go": "@@ -0,0 +1 @@\n+dep"},
+		"patch moved":                       {"a.go": "@@ -1,2 +1,2 @@\n a\n-b\n+C"},
+	} {
+		api := &reviewAPI{state: "open", head: reviewHead, filler: 120, patches: patches}
+		_, err := New(api.server(t).URL, nil).PendingReview(context.Background(), token, "org/public", 7, approvalOnly)
+		if !errors.Is(err, ErrHeadMoved) || api.created != nil {
+			t.Errorf("%s: err %v, created %v", name, err, api.created)
+		}
+	}
+}

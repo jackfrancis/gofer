@@ -343,6 +343,9 @@ func (h *Handler) CreateDraftReview(w http.ResponseWriter, r *http.Request) {
 	}
 	approve := draft.Approve && r.PostForm.Get("approve") == "1"
 	rv.Body = worklist.ReviewBody(summary, approve)
+	if approve {
+		rv.Diff = draft.Diff // GitHub must still show exactly the diff the approval is of
+	}
 	if len(rv.Comments) == 0 && rv.Body == "" {
 		fail(http.StatusBadRequest, "Select at least one comment, the summary or the approval to create a pending review.")
 		return

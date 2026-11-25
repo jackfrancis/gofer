@@ -90,6 +90,7 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		holder        *tokenHolder
 		noGitHub      bool
 		head, base    string // the pull request's head commit and base branch, as the discussion read showed them
+		diffDigest    string // a review's: the digest of the whole diff it read (github.PullDiff.Digest)
 	)
 	provider := p.Provider
 	if provider == "" {
@@ -125,6 +126,14 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 				head, base = disc.HeadSHA, disc.BaseRef
 			}
 		}
+		if isPR && triggerKind == worklist.KindReviewRequest {
+			// A review records the whole diff it read, with the head and base of the
+			// same read, so an approval drafted later stands only on that diff: a
+			// stacked pull request's diff can change with its head and base name.
+			if d, derr := gh.PullDiff(ctx, token, item.GitHub.Repo, item.GitHub.Number); derr == nil {
+				head, base, diffDigest = d.HeadSHA, d.BaseRef, d.Digest()
+			}
+		}
 		// The token was vended unexpired but GitHub refused it, and the broker
 		// confirmed the user's access is gone.
 		if holder.Reconnect() != nil {
@@ -134,7 +143,7 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 			// GitHub refused the token and the broker could not be asked for a new
 			// one: the same as a failed vend.
 			p.logger().Warn("converse: GitHub unavailable for this turn; answering from stored context", "err", ferr)
-			viewerLogin, sourceContext, head, base, noGitHub = "", "", "", "", true
+			viewerLogin, sourceContext, head, base, diffDigest, noGitHub = "", "", "", "", "", true
 		} else {
 			box := newGitHubToolBox(gh, token, item.GitHub.Repo)
 			// Repository checkouts live on the sandbox's scratch disk for this turn only.
@@ -195,6 +204,7 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 		Verdict: verdict,
 		Head:    head, // what a review read: an approval drafted later must be of this revision
 		Base:    base,
+		Diff:    diffDigest,
 		At:      time.Now().UTC(),
 	}
 	// Append the reply to the thread as stored now, not to the copy read above: the
