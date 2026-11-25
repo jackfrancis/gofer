@@ -38,8 +38,11 @@ const writePath = "/auth/github-write"
 // connected, but gofer still holds a copy the user can replace or disconnect.
 // TokenDisabled says an unexpired token is stored while the deployment no longer
 // allows tokens: unused, and in the way of the OAuth grant until the user disconnects
-// it. CleanupPending says a disconnect or logout of the write grant has not finished
-// deleting gofer's copy (unused meanwhile): Disconnect retries it.
+// it. OtherClient says an OAuth grant from another commenting app (before
+// GITHUB_WRITE_CLIENT_ID changed) is stored: unused, and in the way of a token, so
+// the user disconnects it first. CleanupPending says a disconnect or logout of the
+// write grant has not finished deleting gofer's copy (unused meanwhile): Disconnect
+// retries it.
 type CommentingState struct {
 	Enabled        bool
 	Connected      bool
@@ -47,6 +50,7 @@ type CommentingState struct {
 	Token          bool
 	TokenExpired   bool
 	TokenDisabled  bool
+	OtherClient    bool
 	CleanupPending bool
 	Expires        time.Time
 }
@@ -76,6 +80,9 @@ func (h *Handler) CommentingState(ctx context.Context, userID string) Commenting
 	case err == nil && isPersonalToken(cred):
 		// Stored while tokens were allowed, and they no longer are.
 		st.TokenDisabled, st.Expires = true, cred.Expiry
+	case err == nil && !st.Connected:
+		// Any other stored grant gofer cannot use: one from another commenting app.
+		st.OtherClient = true
 	}
 	return st
 }
@@ -433,6 +440,7 @@ func mergeLogout(a, b logoutResult) logoutResult {
 		confirmed:      a.confirmed && b.confirmed,
 		tokenDeleted:   a.tokenDeleted || b.tokenDeleted,
 		cleanupPending: a.cleanupPending || b.cleanupPending,
+		cleanupUnknown: a.cleanupUnknown || b.cleanupUnknown,
 	}
 	if out.confirmed {
 		return out

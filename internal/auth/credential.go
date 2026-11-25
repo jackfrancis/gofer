@@ -78,6 +78,35 @@ type credLocks struct {
 	m       map[string]*credLock
 	logouts map[string]*localLogout
 	markers map[string]*sync.Mutex
+	// revoked records, per (user, provider), the credential version GitHub confirmed
+	// revoked by a logout whose delete then failed, so a retry deletes without asking
+	// GitHub again (which answers an already-revoked token with 404, unconfirmed). In
+	// memory only: after a restart a retry asks again.
+	revoked map[string]string
+}
+
+// setRevoked records that GitHub confirmed the credential at version revoked.
+func (l *credLocks) setRevoked(userID, provider, version string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.revoked == nil {
+		l.revoked = make(map[string]string)
+	}
+	l.revoked[credKey(userID, provider)] = version
+}
+
+// wasRevoked reports whether GitHub confirmed the credential at version revoked.
+func (l *credLocks) wasRevoked(userID, provider, version string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return version != "" && l.revoked[credKey(userID, provider)] == version
+}
+
+// forgetRevoked drops the record once the credential is deleted.
+func (l *credLocks) forgetRevoked(userID, provider string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.revoked, credKey(userID, provider))
 }
 
 // markerLock serialises the transitions of one (user, provider)'s pending logout —

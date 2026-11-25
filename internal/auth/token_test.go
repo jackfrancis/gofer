@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackfrancis/gofer/internal/session"
 	"github.com/jackfrancis/gofer/internal/vault"
 )
 
@@ -634,5 +635,145 @@ func TestRevokedButCleanupPending(t *testing.T) {
 		if _, ok := writeStored(t, vlt); !ok {
 			t.Fatalf("%s: test setup: the row should still be there", via)
 		}
+	}
+}
+
+// Review (round 4): connecting a token first finishes a pending disconnect, and the
+// connection reports what that disconnect left: an OAuth grant GitHub did not
+// confirm revoked (gofer no longer holds it to revoke later), or a previous token
+// gofer deleted. A confirmed revocation is not asked again (round 4, P3).
+func TestTokenConnectReportsWhatTheOldGrantLeft(t *testing.T) {
+	for name, tc := range map[string]struct {
+		oauth, revokeFails bool
+		want               string
+	}{
+		"oauth unrevoked": {oauth: true, revokeFails: true, want: "/?commenting=token-unrevoked"},
+		"oauth revoked":   {oauth: true, want: "/?commenting=token"},
+		"previous token":  {want: "/?commenting=token-replaced"},
+	} {
+		h, signedIn, pat, gh, vlt := newTokenHandler(t)
+		pat.set(patToken, goodPAT())
+		pat.set(patToken2, goodPAT())
+		if tc.oauth {
+			connectWrite(t, h, signedIn)
+		} else {
+			postToken(h, signedIn, patToken)
+		}
+		gh.mu.Lock()
+		gh.revokeErr = tc.revokeFails
+		gh.mu.Unlock()
+		fv := &faultyVault{Vault: vlt, failDelete: true}
+		h.vault = fv
+		disconnect(h, signedIn)
+		fv.failDelete = false
+		revocations := gh.revokedOther.Load()
+		rec := postToken(h, signedIn, patToken2)
+		if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != tc.want {
+			t.Errorf("%s: %d %q", name, rec.Code, rec.Header().Get("Location"))
+		}
+		if c, _ := writeStored(t, vlt); c.AccessToken != patToken2 {
+			t.Errorf("%s: the token was not stored", name)
+		}
+		if name == "oauth revoked" && gh.revokedOther.Load() != revocations {
+			t.Errorf("%s: a revocation GitHub already confirmed was asked again", name)
+		}
+	}
+}
+
+// Review (round 4, P3): after GitHub confirmed revocation and only the delete failed,
+// Retry disconnect deletes without asking GitHub again (which answers an
+// already-revoked token with 404), and keeps reporting the revocation confirmed.
+func TestRetryKeepsConfirmedRevocation(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, _, _, vlt := newWriteHandler(t, gh)
+	_, signedIn := signIn(t, h)
+	connectWrite(t, h, signedIn)
+	fv := &faultyVault{Vault: vlt, failDelete: true}
+	h.vault = fv
+	if loc := disconnect(h, signedIn); loc != "/?commenting=revoked-pending" {
+		t.Fatalf("first: %q", loc)
+	}
+	fv.failDelete = false
+	gh.mu.Lock()
+	gh.revokeErr = true // what GitHub answers an already-revoked grant, as far as gofer can tell
+	gh.mu.Unlock()
+	if loc := disconnect(h, signedIn); loc != "/" {
+		t.Errorf("retry: %q, want the confirmed outcome kept", loc)
+	}
+	if gh.revokedOther.Load() != 1 {
+		t.Errorf("revocations = %d, want 1", gh.revokedOther.Load())
+	}
+	if _, ok := writeStored(t, vlt); ok {
+		t.Error("the retry did not delete the copy")
+	}
+}
+
+// Review (round 4): an OAuth grant from a previous commenting app (the write client
+// ID changed) is unused but in a token's way: the radar state offers Disconnect, the
+// token connect refuses until then, and succeeds after.
+func TestOtherClientGrantCanBeDisconnected(t *testing.T) {
+	h, signedIn, pat, _, vlt := newTokenHandler(t)
+	pat.set(patToken, goodPAT())
+	connectWrite(t, h, signedIn)
+	h.providers[WriteProvider].oauth.ClientID = "a-new-commenting-app"
+	if st := h.CommentingState(bg, user); st.Connected || !st.OtherClient || st.TokenDisabled {
+		t.Fatalf("state = %+v", st)
+	}
+	if rec := postToken(h, signedIn, patToken); rec.Code != http.StatusConflict {
+		t.Fatalf("token over another app's grant: %d", rec.Code)
+	}
+	if loc := disconnect(h, signedIn); loc != "/?commenting=unconfirmed" {
+		t.Fatalf("disconnect: %q", loc)
+	}
+	if st := h.CommentingState(bg, user); st.OtherClient {
+		t.Errorf("after disconnect: %+v", st)
+	}
+	if rec := postToken(h, signedIn, patToken); rec.Code != http.StatusSeeOther {
+		t.Fatalf("token after disconnect: %d %s", rec.Code, rec.Body)
+	}
+	if c, _ := writeStored(t, vlt); c.AccessToken != patToken {
+		t.Error("the token was not stored")
+	}
+}
+
+// deleteFailVault fails Delete for one provider.
+type deleteFailVault struct {
+	vault.Vault
+	provider string
+}
+
+func (d deleteFailVault) Delete(ctx context.Context, userID, provider string) error {
+	if provider == d.provider {
+		return errors.New("disk on fire")
+	}
+	return d.Vault.Delete(ctx, userID, provider)
+}
+
+// Review (round 4): for a provider gofer revokes nothing at, a logout whose delete
+// fails reports the pending deletion and claims nothing about GitHub.
+func TestNonGitHubLogoutClaimsNoRevocation(t *testing.T) {
+	gh := newFakeGitHub(t)
+	h, sessions, _, vlt := newWriteHandler(t, gh)
+	const gUser = "google:1"
+	if err := vlt.Put(bg, gUser, vault.Credential{Provider: "google", AccessToken: "ya29", Version: "g1"}); err != nil {
+		t.Fatal(err)
+	}
+	h.vault = deleteFailVault{Vault: vlt, provider: "google"}
+	start := httptest.NewRecorder()
+	if err := sessions.Authenticate(start, httptest.NewRequest(http.MethodGet, "/", nil), &session.User{ID: gUser, Provider: "google", Email: "a@example.test"}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	for _, c := range start.Result().Cookies() {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.Logout(rec, req)
+	var out struct{ Revocation, Cleanup, Message string }
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil || rec.Code != http.StatusOK {
+		t.Fatalf("logout: %d %v", rec.Code, err)
+	}
+	if out.Revocation != "none" || out.Cleanup != "pending" || strings.Contains(out.Message, "GitHub") {
+		t.Errorf("answer = %+v", out)
 	}
 }

@@ -138,6 +138,7 @@ type Details struct {
 	Token          bool
 	TokenExpired   bool // a token is stored but has expired: replace or disconnect it
 	TokenDisabled  bool // a token is stored while tokens are not allowed: disconnect it
+	OtherClient    bool // a grant from another commenting app is stored: disconnect it
 	CleanupPending bool // a disconnect has not finished deleting gofer's copy: retry it
 	Expires        time.Time
 }
@@ -150,6 +151,7 @@ func (s *Service) Details(ctx context.Context, userID string) Details {
 		Token:          st.Token,
 		TokenExpired:   st.TokenExpired,
 		TokenDisabled:  st.TokenDisabled,
+		OtherClient:    st.OtherClient,
 		CleanupPending: st.CleanupPending,
 		Expires:        st.Expires,
 	}

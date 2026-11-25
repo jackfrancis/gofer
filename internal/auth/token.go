@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -216,7 +217,16 @@ func (h *Handler) ConnectWriteToken(w http.ResponseWriter, r *http.Request) {
 		u, err := h.sessions.Lookup(r.WithContext(ctx))
 		return u != nil && u.ID == user.ID && h.sessions.SessionKey(r) == sessionKey, err
 	}
-	outcome, err := h.storeWriteToken(ctx, p, user.ID, granted.Login, token, info.expiry, sessionValid)
+	outcome, prior, err := h.storeWriteToken(ctx, p, user.ID, granted.Login, token, info.expiry, sessionValid)
+	if outcome != grantStored || err != nil {
+		// The earlier disconnect it finished may still have left an OAuth grant live.
+		if n := tokenConnectedNotice(prior); n == "token-unrevoked" {
+			unrevoked := fail
+			fail = func(status int, why string) {
+				unrevoked(status, why+` gofer did finish deleting your earlier commenting grant, but GitHub did not confirm it was revoked: revoke gofer's commenting app in <a href="`+oauthAppsSettings+`">GitHub's settings</a> (Authorized OAuth Apps).`)
+			}
+		}
+	}
 	switch {
 	case err != nil:
 		slog.WarnContext(ctx, "commenting token: not stored", "user", user.ID, "err", err)
@@ -236,7 +246,24 @@ func (h *Handler) ConnectWriteToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.InfoContext(ctx, "commenting connected with a personal access token", "user", user.ID, "expires", info.expiry)
-	http.Redirect(w, r, "/?commenting=token", http.StatusSeeOther)
+	http.Redirect(w, r, "/?commenting="+tokenConnectedNotice(prior), http.StatusSeeOther)
+}
+
+// tokenConnectedNotice is the radar notice for a token just connected, after the
+// pending disconnect it finished first (prior; nil if none). A disconnect GitHub did
+// not confirm may have left an OAuth grant live, which gofer no longer holds to
+// revoke: the user is sent to revoke it. A previous token gofer deleted is still
+// live on GitHub until the user deletes it.
+func tokenConnectedNotice(prior *logoutResult) string {
+	switch {
+	case prior == nil || prior.confirmed:
+		return "token"
+	case slices.Contains(prior.settings, oauthAppsSettings):
+		return "token-unrevoked"
+	case prior.tokenDeleted:
+		return "token-replaced"
+	}
+	return "token"
 }
 
 // scopeList names scopes for a message.
@@ -262,11 +289,12 @@ const (
 // (storing would supersede it, leaving an OAuth grant unrevoked) or while a usable
 // grant is stored (disconnect first). A pending logout nobody here is running is
 // finished first (claimLogout, runLogout), and the token is stored once it deleted
-// the old copy. An expired token is replaced.
-func (h *Handler) storeWriteToken(ctx context.Context, p *provider, userID, login, token string, expiry time.Time, sessionValid func(context.Context) (bool, error)) (grantOutcome, error) {
+// the old copy; prior is that logout's outcome, nil if none ran. An expired token is
+// replaced.
+func (h *Handler) storeWriteToken(ctx context.Context, p *provider, userID, login, token string, expiry time.Time, sessionValid func(context.Context) (bool, error)) (outcome grantOutcome, prior *logoutResult, err error) {
 	unlock, err := h.locks.lock(ctx, userID, p.name)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer unlock()
 	// A disconnect or logout of the write grant that no operation here is running (its
@@ -277,43 +305,48 @@ func (h *Handler) storeWriteToken(ctx context.Context, p *provider, userID, logi
 	pending, mine, err := h.claimLogout(ctx, userID, p.name)
 	switch {
 	case err != nil:
-		return 0, fmt.Errorf("read pending logout: %w", err)
+		return 0, prior, fmt.Errorf("read pending logout: %w", err)
 	case pending && mine == nil:
-		return grantBusy, nil
+		return grantBusy, prior, nil
 	case pending:
-		if res := h.runLogout(ctx, userID, p.name, mine); res.cleanupPending {
-			return grantCleanupFailed, nil
+		res := h.runLogout(ctx, userID, p.name, mine)
+		if res.cleanupPending {
+			return grantCleanupFailed, &res, nil
 		}
+		// Its outcome goes back to the caller: an OAuth grant GitHub did not confirm
+		// revoked is still live there, and once the token replaces the row gofer can no
+		// longer revoke it, so the user must be told.
+		prior = &res
 	}
 	defer h.locks.markerLock(userID, p.name)()
 	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stepTimeout)
 	defer cancel()
 	ok, err := sessionValid(lctx)
 	if err != nil {
-		return 0, fmt.Errorf("re-check the session: %w", err)
+		return 0, prior, fmt.Errorf("re-check the session: %w", err)
 	}
 	if !ok {
-		return grantSessionEnded, nil
+		return grantSessionEnded, prior, nil
 	}
 	// A disconnect or logout begun since (it takes only the marker lock to record).
 	if h.locks.currentLogout(userID, p.name) != nil {
-		return grantBusy, nil
+		return grantBusy, prior, nil
 	}
 	pending, err = h.ledger.LogoutPending(lctx, userID, p.name)
 	if err != nil {
-		return 0, fmt.Errorf("read pending logout: %w", err)
+		return 0, prior, fmt.Errorf("read pending logout: %w", err)
 	}
 	if pending {
-		return grantBusy, nil
+		return grantBusy, prior, nil
 	}
 	switch existing, err := h.vault.Get(lctx, userID, p.name); {
 	case err == nil && !tokenExpired(existing, h.now()):
-		return grantAlreadyConnected, nil
+		return grantAlreadyConnected, prior, nil
 	case err == nil:
 		// An expired token works nowhere any more: a new one replaces it, so the user
 		// can renew from the radar without disconnecting first.
 	case !errors.Is(err, vault.ErrNotFound):
-		return 0, fmt.Errorf("read the write grant: %w", err)
+		return 0, prior, fmt.Errorf("read the write grant: %w", err)
 	}
 	cred := vault.Credential{
 		Provider:    p.name,
@@ -325,9 +358,9 @@ func (h *Handler) storeWriteToken(ctx context.Context, p *provider, userID, logi
 		Login:       login,
 	}
 	if err := h.vault.Put(lctx, userID, cred); err != nil {
-		return 0, fmt.Errorf("store the token: %w", err)
+		return 0, prior, fmt.Errorf("store the token: %w", err)
 	}
-	return grantStored, nil
+	return grantStored, prior, nil
 }
 
 // sameOriginRequest reports whether a state-changing request came from gofer's own

@@ -319,6 +319,7 @@ type pageData struct {
 	CommentTokenExpires      time.Time           // worklist: when that token expires (or expired)
 	CommentTokenExpired      bool                // worklist: a stored token has expired; offer a new one and Disconnect
 	CommentTokenDisabled     bool                // worklist: a token is stored while tokens are not allowed; offer Disconnect
+	CommentOtherClient       bool                // worklist: a grant from another commenting app is stored; offer Disconnect
 	CommentCleanupPending    bool                // worklist: a disconnect has not finished deleting gofer's copy; offer a retry
 	Comment                  *commentView        // comment-preview / comment-results views
 	Draft                    *draftThread        // thread: the draft review's button and newest draft (draftreview.go); nil shows neither
@@ -1246,7 +1247,7 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 				det := d.Details(r.Context(), user.ID)
 				data.CommentTokensAllowed, data.CommentToken, data.CommentTokenExpires = det.TokensAllowed, det.Token, det.Expires
 				data.CommentTokenExpired, data.CommentTokenDisabled = det.TokenExpired, det.TokenDisabled
-				data.CommentCleanupPending = det.CleanupPending
+				data.CommentCleanupPending, data.CommentOtherClient = det.CleanupPending, det.OtherClient
 			}
 		}
 		if scope.projects != nil {
@@ -1285,6 +1286,8 @@ func (h *Handler) signedInView(r *http.Request, user *session.User) (pageData, i
 var commentNotices = map[string]string{
 	"connect":            "Connect GitHub for commenting first; gofer posts only with that separate grant.",
 	"token":              "Commenting is connected with your personal access token. gofer uses it only for the comments and reviews you confirm, and it stops working when the token expires.",
+	"token-unrevoked":    "Commenting is connected with your personal access token. gofer finished deleting your earlier commenting grant first, but GitHub did not confirm it was revoked, and gofer no longer holds it to revoke later: revoke gofer's commenting app in GitHub's settings (Settings, Applications, Authorized OAuth Apps).",
+	"token-replaced":     "Commenting is connected with your new personal access token, and gofer deleted its copy of the previous one. gofer cannot revoke a token: delete the old one in GitHub's settings if it still works.",
 	"token-deleted":      "Commenting is disconnected, and gofer deleted its copy of your token. gofer cannot revoke a personal access token: delete it in GitHub's settings (Settings, Developer settings, Personal access tokens) if you no longer use it.",
 	"revoked-pending":    "Commenting is disconnected, and GitHub confirmed gofer's access is revoked, but gofer could not finish deleting its stored copy yet. It no longer uses it, and it will retry.",
 	"disconnect-pending": "Commenting is disconnected and gofer no longer uses it, but gofer could not finish deleting its stored copy yet; it will retry. To be sure, revoke gofer in GitHub's settings (Authorized OAuth Apps), and delete your personal access token there if you connected with one.",

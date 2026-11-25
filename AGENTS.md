@@ -661,12 +661,19 @@ Wired on the web-tier side; they define what a runtime must respect:
   through `fromConfiguredClient` (a token counts only while tokens are allowed) and
   `tokenExpired` (an expired token is not connected and not handed out). Every
   stranded state keeps a way out on the radar (`CommentingState`): an expired or
-  disabled token (stored while tokens were allowed) gets Disconnect, and a pending
-  cleanup gets Retry disconnect. A rejection
+  disabled token (stored while tokens were allowed) or a grant from a previous
+  commenting app (`OtherClient`) gets Disconnect, and a pending cleanup gets Retry
+  disconnect. A token connection that finished a pending disconnect reports what
+  that left (`tokenConnectedNotice`): an OAuth grant GitHub did not confirm revoked
+  sends the user to revoke it, since gofer no longer holds it. A rejection
   is confirmed with `GET /user` (`tokenAlive`), never check-token, and logout's
   `revokeLocked` skips revocation for a token (`tokensSettings`). Report a deletion
   only from `logoutResult.tokenDeleted`/`cleanupPending`, never from which settings
-  page is listed, and report `cleanupPending` even when revocation was `confirmed`.
+  page is listed, and report `cleanupPending` even when revocation was `confirmed`
+  (for a non-GitHub provider "confirmed" only means nothing to revoke: claim no
+  revocation), and nothing about cleanup from a logout that did not own it
+  (`cleanupUnknown`). A revocation GitHub confirmed is remembered for that
+  credential version (`credLocks.revoked`, in memory), so a retry only deletes.
   Every ghcomment write checks the token's `X-OAuth-Scopes` on the
   request before it (`writeRepo`): more than `public_repo` writes nothing
   (`ErrTokenScopes`), and the service drops a widened token (`WriteScopesChanged`,

@@ -98,4 +98,18 @@ func TestRadarStrandedCredentials(t *testing.T) {
 	if page, _ := radarPage(t, &detailCommenter{fakeCommenter: fakeCommenter{enabled: true}}, "?commenting=revoked-pending"); !strings.Contains(page, "access is revoked, but gofer could not finish deleting") {
 		t.Error("revoked-pending notice missing")
 	}
+	// Review (round 4): a grant from a previous commenting app gets Disconnect, and
+	// neither way to connect (the token form would refuse while it is held).
+	other, _ := radarPage(t, &detailCommenter{fakeCommenter: fakeCommenter{enabled: true}, details: comment.Details{TokensAllowed: true, OtherClient: true}}, "")
+	if !strings.Contains(other, "previous commenting app") || !strings.Contains(other, `action="/auth/github-write/disconnect"`) {
+		t.Error("another app's grant is not offered Disconnect")
+	}
+	if strings.Contains(other, `href="/auth/github-write/login"`) || strings.Contains(other, `action="/auth/github-write/token"`) {
+		t.Error("a way to connect is offered while another app's grant is in its way")
+	}
+	for query, want := range map[string]string{"?commenting=token-unrevoked": "did not confirm it was revoked", "?commenting=token-replaced": "delete the old one"} {
+		if page, _ := radarPage(t, &detailCommenter{fakeCommenter: fakeCommenter{enabled: true}}, query); !strings.Contains(page, want) {
+			t.Errorf("%s: notice missing", query)
+		}
+	}
 }

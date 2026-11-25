@@ -93,7 +93,9 @@ provider, as before). Further:
 - **Turned off.** A token stored while tokens were allowed is not used once they are not
   (`fromConfiguredClient`); disconnect and logout still delete it. Until then it stands
   in the OAuth grant's way (the callback refuses while it is held), so the radar names
-  it and offers Disconnect instead of the connect link.
+  it and offers Disconnect instead of the connect link. A grant from a previous
+  commenting app (the write client ID changed) is treated the same way: named, with
+  Disconnect, and no way to connect until it is gone.
 - **Rejected.** A 401 on a token is confirmed with `GET /user` (not the OAuth app's
   check-token, which knows nothing of tokens) before gofer drops its copy.
 - **Disconnect and logout.** gofer cannot revoke a personal access token. Both delete
@@ -105,7 +107,12 @@ provider, as before). Further:
   unused until it finishes, even when GitHub confirmed an OAuth grant's revocation
   (then both are said). Nothing leaves the user stuck: the radar offers Retry
   disconnect while cleanup is pending, and connecting a token first finishes a pending
-  disconnect nobody is running, storing the token only once the old copy is gone. When the credential could not be read, the user is sent to
+  disconnect nobody is running, storing the token only once the old copy is gone. If
+  that disconnect could not get GitHub to confirm an OAuth grant revoked, the
+  connection says so and sends the user to revoke it by hand: once the token replaces
+  the row, gofer no longer holds the grant to revoke at a later logout. A revocation
+  GitHub did confirm is remembered for that credential version, so a retry deletes
+  without asking again (GitHub answers an already-revoked token with 404). When the credential could not be read, the user is sent to
   both the authorized apps and the token settings, since it may have been either kind.
 
 ### Telling the user when an organization blocks the app
