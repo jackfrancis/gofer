@@ -304,8 +304,21 @@ func TestThreadWindowKeepsTheLatestReviewForADraft(t *testing.T) {
 			Message{ID: "u" + id, Role: RoleUser, Content: strings.Repeat("chat ", 400), At: t2},
 			Message{ID: "g" + id, Role: RoleAgent, ReplyTo: "u" + id, Content: strings.Repeat("reply ", 400), At: t2})
 	}
-	th = append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, At: t2})
+	th = append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, At: t2},
+		// A review that landed after the request, before the run read it: not the one
+		// the draft reads, and it must not displace that one.
+		Message{ID: "q3", Role: RoleUser, Content: "review", Kind: KindReviewRequest, At: t2},
+		Message{ID: "a3", Role: RoleAgent, ReplyTo: "q3", Content: "newer review", Head: "cccc", Base: "main", Diff: strings.Repeat("3", 64), At: t2})
 	w := WorkItem{ID: "a", Type: TypePullRequest, Thread: th}
+	d, _ := w.TurnIndex("d")
+	before := w
+	before.Thread = th[:d]
+
+	// The whole conversation fits: nothing is marked omitted.
+	whole := ThreadWindow(w, "d", MaxItemBytes)
+	if n := len(whole.Thread); n != d+1 || whole.OmitsTurns(-1, n-1) {
+		t.Fatalf("whole: %d of %d turns, omits %v", n, d+1, whole.OmitsTurns(-1, n-1))
+	}
 
 	for name, room := range map[string]int{"fits": 40 << 10, "cut": 12 << 10} {
 		win := ThreadWindow(w, "d", encodedSize(Project(w))+room)
@@ -313,8 +326,16 @@ func TestThreadWindowKeepsTheLatestReviewForADraft(t *testing.T) {
 			t.Fatalf("%s: the window ends at the draft request and is cut, got %d of %d turns", name, len(win.Thread), len(th))
 		}
 		j := win.LatestReviewAt()
-		if j < 0 || win.Thread[j].ID != "a2" || win.ReviewedRevision() != w.ReviewedRevision() {
-			t.Fatalf("%s: the window lost the latest review (at %d)", name, j)
+		if j < 0 || win.Thread[j].ID != "a2" || win.ReviewedRevision() != before.ReviewedRevision() {
+			t.Fatalf("%s: the window lost the latest review before the request (at %d)", name, j)
+		}
+		// The discussion since the review did not all fit, and the read says so, on
+		// the turns after the gap only.
+		if !win.OmitsTurns(j, len(win.Thread)-1) {
+			t.Errorf("%s: the gap after the review is not marked", name)
+		}
+		if win.OmitsTurns(-1, j) {
+			t.Errorf("%s: turns up to the review are marked, but nothing between them was left out", name)
 		}
 		if name == "cut" && !strings.Contains(win.Thread[j].Content, "was cut from") {
 			t.Errorf("cut: the review answer should be cut with a note")

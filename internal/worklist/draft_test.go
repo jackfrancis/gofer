@@ -389,6 +389,32 @@ func TestApprovingDraft(t *testing.T) {
 	}
 }
 
+// The store judges an approval by the latest review before the draft request, the
+// one the draft's run read: a review that landed after the request neither makes
+// nor unmakes it.
+func TestAppendReplyApprovalJudgedByTheReviewBeforeTheRequest(t *testing.T) {
+	const later = "fedcba9876543210fedcba9876543210fedcba98"
+	item := draftPR(
+		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest},
+		Message{ID: "q2", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: later, Base: "main", Diff: testDiff},
+	)
+	d := pinned("")
+	d.Approve, d.Diff = true, testDiff
+	if _, err := AppendReply(&item, "d", Message{ID: "a", Content: "approve", Draft: d, Omitted: true}); err != nil {
+		t.Fatal(err)
+	}
+	m := item.Thread[len(item.Thread)-1]
+	if m.Draft == nil || !m.Draft.Approve {
+		t.Fatalf("approval of the review before the request = %+v", m.Draft)
+	}
+	if m.Omitted {
+		t.Error("a read's Omitted mark was stored")
+	}
+}
+
 // The store keeps an approval only on a draft pinned to the commit the latest
 // visible review read, whatever the run sent: a review of an earlier head, one that
 // recorded none, or one the owner hid since does not approve this commit. A reply's

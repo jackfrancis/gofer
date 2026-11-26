@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -425,6 +426,33 @@ func TestRunConverseDraftsFromADiscussion(t *testing.T) {
 	m = run(t, worklist.DraftProposal{Approve: true})
 	if m.Draft != nil || !strings.Contains(m.Content, "this conversation has no visible review") || !strings.Contains(m.Content, "Review this pull request") {
 		t.Errorf("an approval from a discussion: %+v\n%s", m.Draft, m.Content)
+	}
+}
+
+// A conversation since its latest review longer than a read leaves turns out of the
+// draft's read: a later word the drafter never saw (the owner's "do not approve yet",
+// say) may disagree, so an approval is withheld, and the reply says why.
+func TestRunConverseWithholdsAnApprovalAcrossAGap(t *testing.T) {
+	it := draftItem()
+	draft := it.Thread[len(it.Thread)-1]
+	th := it.Thread[:len(it.Thread)-1]
+	th = append(th, worklist.Message{ID: "hold", Role: worklist.RoleUser, Content: "Do not approve yet."})
+	for i := range 24 {
+		id := strconv.Itoa(i)
+		th = append(th,
+			worklist.Message{ID: "u" + id, Role: worklist.RoleUser, Content: strings.Repeat("chat ", 40000)},
+			worklist.Message{ID: "g" + id, ReplyTo: "u" + id, Role: worklist.RoleAgent, Content: "ok"})
+	}
+	it.Thread = append(th, draft)
+	sink := &memSink{items: []worklist.WorkItem{it}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: it.ID, Turn: "d", Converser: &fakeConverser{}, Drafter: &fakeDrafter{prop: worklist.DraftProposal{Approve: true}}},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := sink.items[0].Thread
+	m := got[len(got)-1]
+	if m.Draft != nil || !strings.Contains(m.Content, "No approval drafted") || !strings.Contains(m.Content, "longer than gofer reads") {
+		t.Errorf("an approval across a gap: %+v\n%s", m.Draft, m.Content)
 	}
 }
 

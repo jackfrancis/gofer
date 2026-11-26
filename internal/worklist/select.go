@@ -296,6 +296,10 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 			}
 			used := messageSize(ask)
 			keep := map[int]bool{}
+			// Each turn kept out of order (a reserved review, request or answer) can
+			// open a gap the window marks (Message.Omitted): room for the marks is
+			// reserved with it.
+			const marks = 2 * len(`,"omitted":true`)
 			// A synthesis request weighs the reviews it names (Message.Reviews): they
 			// go in first, each request with its answer, so a long discussion since
 			// cannot push them out. One that is hidden, or does not fit, is left out,
@@ -308,32 +312,34 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 					if !ok || !answered || q >= anchor || a >= anchor || th[q].Hidden || th[a].Hidden {
 						continue
 					}
-					if s := messageSize(th[q]) + messageSize(th[a]); used+s <= left {
+					if s := messageSize(th[q]) + messageSize(th[a]) + marks; used+s <= left {
 						used += s
 						keep[q], keep[a] = true, true
 					}
 				}
 			}
-			// A draft-review request approves only the revision the latest review read
-			// (WorkItem.Reviewed), and the run judges that from this window: that review
-			// goes in next, its request and answer, so a long discussion since cannot
-			// push it out and make the run say the conversation has none. An answer too
-			// long for what is left is cut, keeping the revision it recorded.
+			// A draft-review request approves only the revision the latest review
+			// before it read (WorkItem.Reviewed), and the run judges that from this
+			// window: that review goes in next, its request and answer, so a long
+			// discussion since cannot push it out and make the run say the
+			// conversation has none. An answer too long for what is left is cut,
+			// keeping the revision it recorded. The newer turns that no longer fit are
+			// marked as a gap, and the run withholds an approval across it: a later
+			// word it cannot read may disagree.
 			if th[anchor].Kind == KindDraftReviewRequest {
-				if a := keyed.latestReview(); a >= 0 && a < anchor {
-					q := -1
-					for k, j := range keyed.replies() {
-						if j == a {
-							q, _ = keyed.TurnIndex(k)
+				if a := keyed.latestReviewBefore(anchor); a >= 0 {
+					replies := keyed.replies()
+					for q := 0; q < anchor; q++ {
+						if th[q].Role != RoleUser || th[q].Kind != KindReviewRequest || replies[th[q].ID] != a || th[q].Hidden {
+							continue
 						}
-					}
-					if q >= 0 && q < anchor {
-						answer := truncateMessage(th[a], left-used-messageSize(th[q]))
-						if s := messageSize(th[q]) + messageSize(answer); used+s <= left {
+						answer := truncateMessage(th[a], left-used-messageSize(th[q])-marks)
+						if s := messageSize(th[q]) + messageSize(answer) + marks; used+s <= left {
 							used += s
 							th[a] = answer
 							keep[q], keep[a] = true, true
 						}
+						break
 					}
 				}
 			}
@@ -348,11 +354,22 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 				used += s
 				keep[i] = true
 			}
+			// A kept turn after visible turns that did not fit, since the kept turn
+			// before it, is marked: the read is not whole there (WorkItem.OmitsTurns).
+			// A hidden turn left out is no gap: it is withheld from the model anyway.
+			kept, gap := false, false
 			for i := 0; i < anchor; i++ {
-				if keep[i] {
-					window = append(window, th[i])
+				switch {
+				case keep[i]:
+					m := th[i]
+					m.Omitted = kept && gap
+					window = append(window, m)
+					kept, gap = true, false
+				case !th[i].Hidden:
+					gap = true
 				}
 			}
+			ask.Omitted = kept && gap
 			window = append(window, ask)
 		}
 	} else {

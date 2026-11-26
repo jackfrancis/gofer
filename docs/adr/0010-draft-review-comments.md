@@ -38,9 +38,13 @@ review's text is written by a model, so this feature needs that rule amended.
    even while a redraft would only repeat the offered draft: comments need no review,
    but an approval is pinned to the revision a review read, so a draft from a
    discussion alone withholds an approval and says a review is needed for it. A draft
-   run's read keeps the latest review (request and answer, the answer cut if it must
-   be) however long the discussion since, so it never mistakes a review outside its
-   window for none. When a
+   run's read keeps the latest review before the request (request and answer, the
+   answer cut if it must be) however long the discussion since, so it never mistakes
+   a review outside its window for none; the store judges an approval by that same
+   review. Visible turns since it that do not fit are marked as a gap
+   (`Message.Omitted`, `WorkItem.OmitsTurns`), and the run withholds an approval
+   across one, saying why: a later word it never read (the owner's "do not approve
+   yet") may disagree. When a
    review request already has no answer (stalled, or
    ended by a reconnect notice), the thread offers "Retry the earlier review" instead,
    which retries that very turn (it runs as it was asked, without later messages)

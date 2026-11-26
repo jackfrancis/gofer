@@ -104,6 +104,14 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 			stale = &staleReview{noReview: true, approved: true}
 		}
 		prop.Approve = false
+	case item.OmitsTurns(item.LatestReviewAt(), triggerIndex(item, triggerKey)):
+		// The read kept the latest review, but not every visible turn since it (the
+		// conversation is longer than a read): a later word the drafter never saw may
+		// disagree, so what it read is no agreement to approve.
+		if prop.Approve {
+			stale = &staleReview{gap: true, approved: true}
+		}
+		prop.Approve = false
 	case !item.Reviewed(rev):
 		stale = &staleReview{reviewed: item.ReviewedRevision(), now: rev, approved: prop.Approve}
 		prop.Approve = false
@@ -111,6 +119,15 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 	pin := worklist.DraftReview{Repo: item.GitHub.Repo, Number: item.GitHub.Number, Commit: diff.HeadSHA, BaseRef: diff.BaseRef, Patches: patches, Diff: rev.Diff}
 	draft, moved := anchorDraft(prop, anchors, pin)
 	return reply(draftContent(draft, prop.Excluded, moved, omitted, diff.Complete, stale), draft)
+}
+
+// triggerIndex is the position of the turn with key in item's thread, or the end
+// of the thread when it is not there.
+func triggerIndex(item worklist.WorkItem, key string) int {
+	if i, ok := item.TurnIndex(key); ok {
+		return i
+	}
+	return len(item.Thread)
 }
 
 // staleReview is a latest review that read another revision (reviewed; zero when
@@ -121,6 +138,7 @@ type staleReview struct {
 	reviewed, now worklist.Revision
 	unverifiable  string
 	noReview      bool // the conversation has no visible review
+	gap           bool // the read left out turns since the latest review
 	approved      bool
 }
 
@@ -308,6 +326,8 @@ func draftContent(d *worklist.DraftReview, excluded []string, moved, omitted int
 	case stale == nil:
 	case stale.noReview:
 		b.WriteString("\n**No approval drafted.** The conversation agrees on approving, but an approval is pinned to the revision a review read, and this conversation has no visible review. Use Review this pull request, then draft again.\n")
+	case stale.gap:
+		b.WriteString("\n**No approval drafted.** The conversation since its latest review is longer than gofer reads at once, so some of it was not read, and a later message could disagree. Hide the turns you no longer need since that review, then draft again.\n")
 	case stale.unverifiable != "":
 		fmt.Fprintf(&b, "\n**No approval drafted.** The conversation agrees on approving, but %s, so gofer cannot check that an approval covers exactly what was reviewed.\n", stale.unverifiable)
 	default:

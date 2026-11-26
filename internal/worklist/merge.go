@@ -217,6 +217,7 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 	reply.Reviews = nil
 	reply.Hidden = false
 	reply.HiddenRev, reply.ReadRev, reply.ReadRevKnown = 0, 0, false // the web tier's revisions, never a run's
+	reply.Omitted = false                                            // a read's mark, never stored
 	reply.Refused, reply.RefusedAttempt = false, ""                  // the web tier's record of a refusal, never a run's
 	if !knownNotice(reply.Notice) {
 		reply.Notice = "" // only notices gofer knows
@@ -260,9 +261,11 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 		if reply.Draft = BoundDraft(reply.Draft); !reply.Draft.For(*item) {
 			reply.Draft = nil
 		}
-		// An approval approves the revision the latest review read, so it stands only
-		// on a draft pinned to that head, base and diff, whatever the run decided.
-		if d := reply.Draft; d != nil && d.Approve && !item.Reviewed(Revision{d.Commit, d.BaseRef, d.Diff}) {
+		// An approval approves the revision the latest review before the request read
+		// (the one the draft's run judged by; a review landing after the request is
+		// not), so it stands only on a draft pinned to that head, base and diff,
+		// whatever the run decided.
+		if d := reply.Draft; d != nil && d.Approve && !reviewedAs(item.revisionAt(item.latestReviewBefore(i)), Revision{d.Commit, d.BaseRef, d.Diff}) {
 			d.Approve, d.Diff = false, "" // as BoundDraft stores a draft that does not approve, so it stays Current
 			if d.Empty() {
 				reply.Draft = nil
