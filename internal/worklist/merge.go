@@ -263,9 +263,12 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 		}
 		// An approval approves the revision the latest review before the request read
 		// (the one the draft's run judged by; a review landing after the request is
-		// not), so it stands only on a draft pinned to that head, base and diff,
-		// whatever the run decided.
-		if d := reply.Draft; d != nil && d.Approve && !reviewedAs(item.revisionAt(item.latestReviewBefore(i)), Revision{d.Commit, d.BaseRef, d.Diff}) {
+		// not), so it stands only on a draft pinned to that head, base and diff, and
+		// only if the run's read held that review and every visible turn since its
+		// request (DraftBasis.Read, judged on the read the store serves now), whatever
+		// the run decided: a run from before that check, or one that ignored it, never
+		// approves past an owner's later word it did not read.
+		if d := reply.Draft; d != nil && d.Approve && !(reviewedAs(item.revisionAt(item.latestReviewBefore(i)), Revision{d.Commit, d.BaseRef, d.Diff}) && item.readsReviewWhole(i)) {
 			d.Approve, d.Diff = false, "" // as BoundDraft stores a draft that does not approve, so it stays Current
 			if d.Empty() {
 				reply.Draft = nil

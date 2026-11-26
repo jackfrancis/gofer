@@ -240,9 +240,9 @@ func ReadItem(ctx context.Context, store Store, ownerID, id, turn string) (WorkI
 // as many of the visible turns as fit, newest first; turns after it are left out
 // (none of them answers it, and the model sees only what precedes it). For a
 // synthesis request, the reviews it weighs (Message.Reviews) are kept before any
-// other turn, and for a draft-review request the latest review (its request and
-// answer, the answer cut if it must be), whose recorded revision decides whether
-// the draft may approve.
+// other turn. A draft-review request names the latest review before it and carries
+// the revision that review recorded (WorkItem.DraftBasis), whether or not the
+// review fits.
 //
 // LatestUserTurn names the stored thread's newest user turn (a Discuss run
 // dispatched without a turn answers it), resolved here against the whole thread,
@@ -290,16 +290,31 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 				// instead of leaving a smaller comparison it cannot tell from the whole.
 				th[anchor].Reviews = keyed.synthesisReviews(anchor, keyed.replies())
 			}
+			if th[anchor].Kind == KindDraftReviewRequest {
+				// A draft approves only the revision the latest review before it read,
+				// and only on the whole conversation since that review's request: the
+				// request carries both into the read (DraftBasis), so the run can tell a
+				// review that did not fit from none, and a stale revision from a read
+				// cut short. The turns themselves are the ordinary newest-first window:
+				// keeping the review out of order would push out a later word that
+				// disagrees with it.
+				th[anchor].Reviews, th[anchor].Head, th[anchor].Base, th[anchor].Diff = nil, "", "", ""
+				if j := keyed.latestReviewBefore(anchor); j >= 0 {
+					r := th[j].revision()
+					th[anchor].Reviews = []string{th[keyed.requestOf(j)].ID}
+					th[anchor].Head, th[anchor].Base, th[anchor].Diff = r.Head, r.Base, r.Diff
+				}
+			}
+			// A turn kept after visible turns left out is marked (Message.Omitted):
+			// room for one mark, and two more for each turn kept out of order (a
+			// synthesis's reviews), is reserved with it.
+			const mark = len(`,"omitted":true`)
 			ask := th[anchor]
-			if messageSize(ask) > left {
+			if messageSize(ask)+mark > left {
 				ask = truncateMessage(ask, left/2)
 			}
-			used := messageSize(ask)
+			used := messageSize(ask) + mark
 			keep := map[int]bool{}
-			// Each turn kept out of order (a reserved review, request or answer) can
-			// open a gap the window marks (Message.Omitted): room for the marks is
-			// reserved with it.
-			const marks = 2 * len(`,"omitted":true`)
 			// A synthesis request weighs the reviews it names (Message.Reviews): they
 			// go in first, each request with its answer, so a long discussion since
 			// cannot push them out. One that is hidden, or does not fit, is left out,
@@ -312,34 +327,9 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 					if !ok || !answered || q >= anchor || a >= anchor || th[q].Hidden || th[a].Hidden {
 						continue
 					}
-					if s := messageSize(th[q]) + messageSize(th[a]) + marks; used+s <= left {
+					if s := messageSize(th[q]) + messageSize(th[a]) + 4*mark; used+s <= left {
 						used += s
 						keep[q], keep[a] = true, true
-					}
-				}
-			}
-			// A draft-review request approves only the revision the latest review
-			// before it read (WorkItem.Reviewed), and the run judges that from this
-			// window: that review goes in next, its request and answer, so a long
-			// discussion since cannot push it out and make the run say the
-			// conversation has none. An answer too long for what is left is cut,
-			// keeping the revision it recorded. The newer turns that no longer fit are
-			// marked as a gap, and the run withholds an approval across it: a later
-			// word it cannot read may disagree.
-			if th[anchor].Kind == KindDraftReviewRequest {
-				if a := keyed.latestReviewBefore(anchor); a >= 0 {
-					replies := keyed.replies()
-					for q := 0; q < anchor; q++ {
-						if th[q].Role != RoleUser || th[q].Kind != KindReviewRequest || replies[th[q].ID] != a || th[q].Hidden {
-							continue
-						}
-						answer := truncateMessage(th[a], left-used-messageSize(th[q])-marks)
-						if s := messageSize(th[q]) + messageSize(answer) + marks; used+s <= left {
-							used += s
-							th[a] = answer
-							keep[q], keep[a] = true, true
-						}
-						break
 					}
 				}
 			}
@@ -354,22 +344,23 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 				used += s
 				keep[i] = true
 			}
-			// A kept turn after visible turns that did not fit, since the kept turn
-			// before it, is marked: the read is not whole there (WorkItem.OmitsTurns).
-			// A hidden turn left out is no gap: it is withheld from the model anyway.
-			kept, gap := false, false
+			// A kept turn after visible turns that did not fit (since the kept turn
+			// before it, or the start of the thread) is marked: the read is not whole
+			// there (WorkItem.OmitsTurns). A hidden turn left out is no gap: it is
+			// withheld from the model anyway.
+			gap := false
 			for i := 0; i < anchor; i++ {
 				switch {
 				case keep[i]:
 					m := th[i]
-					m.Omitted = kept && gap
+					m.Omitted = gap
 					window = append(window, m)
-					kept, gap = true, false
+					gap = false
 				case !th[i].Hidden:
 					gap = true
 				}
 			}
-			ask.Omitted = kept && gap
+			ask.Omitted = gap
 			window = append(window, ask)
 		}
 	} else {
@@ -394,6 +385,16 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 	}
 	out.Thread = window
 	return out
+}
+
+// readsReviewWhole reports whether a run's read of the draft-review request at i,
+// as ReadItem serves it, holds the latest review before it and every visible turn
+// since that review's request (DraftBasis.Read).
+func (w WorkItem) readsReviewWhole(i int) bool {
+	key := w.TurnKey(i)
+	win := ThreadWindow(w, key, MaxItemBytes)
+	k, ok := win.TurnIndex(key)
+	return ok && win.DraftBasis(k).Read
 }
 
 // truncationNote ends a message cut to fit a read.

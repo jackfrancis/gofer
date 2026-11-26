@@ -651,10 +651,11 @@ Wired on the web-tier side; they define what a runtime must respect:
   answered exchange (`WorkItem.HasDiscussion`: a review, or a Discuss question
   answered; no review request needed, except to draft an approval, which is pinned to
   a review's revision: with no visible review the thread offers "Review this pull
-  request" even while a redraft is redundant, and a draft run's `ThreadWindow` keeps
-  the latest review before the request whatever the discussion since, which the
-  store's approval check uses too; turns since it left out are marked `Omitted`,
-  and the run withholds an approval across that gap), "Draft Review Comments" (offered only with commenting configured; a connect
+  request" even while a redraft is redundant, and a draft run's `ThreadWindow` stays the
+  newest-first window, its request naming the latest review before it with that
+  review's revision, `WorkItem.DraftBasis`; an approval needs a read holding that
+  review and every visible turn since its request, which the run and the store both
+  check, the store on the read it serves), "Draft Review Comments" (offered only with commenting configured; a connect
   link without the grant) posts a `KindDraftReviewRequest` turn and dispatches a
   converse run by the default model. The button is not shown, and the handler refuses
   the request, while a redraft would only repeat the offered draft

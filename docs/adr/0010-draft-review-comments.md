@@ -38,13 +38,17 @@ review's text is written by a model, so this feature needs that rule amended.
    even while a redraft would only repeat the offered draft: comments need no review,
    but an approval is pinned to the revision a review read, so a draft from a
    discussion alone withholds an approval and says a review is needed for it. A draft
-   run's read keeps the latest review before the request (request and answer, the
-   answer cut if it must be) however long the discussion since, so it never mistakes
-   a review outside its window for none; the store judges an approval by that same
-   review. Visible turns since it that do not fit are marked as a gap
-   (`Message.Omitted`, `WorkItem.OmitsTurns`), and the run withholds an approval
-   across one, saying why: a later word it never read (the owner's "do not approve
-   yet") may disagree. When a
+   run's read is the ordinary newest-first window: a review kept out of order would
+   push out a later word that disagrees with it. The request names the latest review
+   before it and carries the revision that review recorded (`WorkItem.DraftBasis`),
+   so the run tells a review that did not fit from none, and reports a stale revision
+   first (hiding turns cannot make it current). An approval stands only on a read
+   holding that review and every visible turn since its request, an owner's word
+   posted while the review stalled included; otherwise the run withholds it and says
+   why, and the store applies the same rule to the read it serves, whatever the run
+   sent. A draft asked for before the latest review landed is what is stale, even if
+   its reply lands after that review: the thread offers drafting again, not a review
+   of that revision (`WorkItem.ReviewOutdated`). When a
    review request already has no answer (stalled, or
    ended by a reconnect notice), the thread offers "Retry the earlier review" instead,
    which retries that very turn (it runs as it was asked, without later messages)

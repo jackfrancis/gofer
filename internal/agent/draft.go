@@ -89,7 +89,12 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 	// rule (worklist.AppendReply), and the thread offers a review of the current
 	// revision (WorkItem.ReviewOutdated). A diff gofer cannot identify (too long to
 	// read whole, moving while read, a binary change with no patch) is never vouched
-	// for: an approval of it is withheld, and the reply says why.
+	// for: an approval of it is withheld, and the reply says why. The review is the
+	// latest before this request, which the read names with its revision whether or
+	// not it fits (DraftBasis); an approval stands only on a read holding it and every
+	// visible turn since it was asked for. A stale revision is reported first: hiding
+	// turns to make the read fit cannot make an old commit current.
+	basis := item.DraftBasis(triggerIndex(item, triggerKey))
 	var stale *staleReview
 	switch {
 	case diff.Unverifiable() != "":
@@ -97,23 +102,23 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 			stale = &staleReview{unverifiable: diff.Unverifiable(), approved: true}
 		}
 		prop.Approve = false
-	case item.LatestReviewAt() < 0:
+	case !basis.Review:
 		// Drafted from a discussion with no review in it: comments need none, but an
 		// approval is pinned to the revision a review read, so it needs one.
 		if prop.Approve {
 			stale = &staleReview{noReview: true, approved: true}
 		}
 		prop.Approve = false
-	case item.OmitsTurns(item.LatestReviewAt(), triggerIndex(item, triggerKey)):
-		// The read kept the latest review, but not every visible turn since it (the
-		// conversation is longer than a read): a later word the drafter never saw may
-		// disagree, so what it read is no agreement to approve.
-		if prop.Approve {
-			stale = &staleReview{gap: true, approved: true}
-		}
+	case !basis.Covers(rev):
+		stale = &staleReview{reviewed: basis.Revision, now: rev, approved: prop.Approve}
 		prop.Approve = false
-	case !item.Reviewed(rev):
-		stale = &staleReview{reviewed: item.ReviewedRevision(), now: rev, approved: prop.Approve}
+	case !basis.Read:
+		// The conversation since that review was asked for is longer than a read:
+		// a later word the drafter never saw (the owner's, even one posted while the
+		// review stalled) may disagree, so what it read is no agreement to approve.
+		if prop.Approve {
+			stale = &staleReview{unread: true, approved: true}
+		}
 		prop.Approve = false
 	}
 	pin := worklist.DraftReview{Repo: item.GitHub.Repo, Number: item.GitHub.Number, Commit: diff.HeadSHA, BaseRef: diff.BaseRef, Patches: patches, Diff: rev.Diff}
@@ -138,7 +143,7 @@ type staleReview struct {
 	reviewed, now worklist.Revision
 	unverifiable  string
 	noReview      bool // the conversation has no visible review
-	gap           bool // the read left out turns since the latest review
+	unread        bool // the read does not hold the latest review and every turn since it was asked for
 	approved      bool
 }
 
@@ -326,8 +331,8 @@ func draftContent(d *worklist.DraftReview, excluded []string, moved, omitted int
 	case stale == nil:
 	case stale.noReview:
 		b.WriteString("\n**No approval drafted.** The conversation agrees on approving, but an approval is pinned to the revision a review read, and this conversation has no visible review. Use Review this pull request, then draft again.\n")
-	case stale.gap:
-		b.WriteString("\n**No approval drafted.** The conversation since its latest review is longer than gofer reads at once, so some of it was not read, and a later message could disagree. Hide the turns you no longer need since that review, then draft again.\n")
+	case stale.unread:
+		b.WriteString("\n**No approval drafted.** The conversation agrees on approving, but since its latest review was asked for it is longer than gofer reads at once, so some of it was not read, and a message there could disagree. Hide the turns you no longer need since that review, then draft again.\n")
 	case stale.unverifiable != "":
 		fmt.Fprintf(&b, "\n**No approval drafted.** The conversation agrees on approving, but %s, so gofer cannot check that an approval covers exactly what was reviewed.\n", stale.unverifiable)
 	default:

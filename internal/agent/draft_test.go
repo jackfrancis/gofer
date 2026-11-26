@@ -429,30 +429,55 @@ func TestRunConverseDraftsFromADiscussion(t *testing.T) {
 	}
 }
 
-// A conversation since its latest review longer than a read leaves turns out of the
-// draft's read: a later word the drafter never saw (the owner's "do not approve yet",
-// say) may disagree, so an approval is withheld, and the reply says why.
-func TestRunConverseWithholdsAnApprovalAcrossAGap(t *testing.T) {
-	it := draftItem()
-	draft := it.Thread[len(it.Thread)-1]
-	th := it.Thread[:len(it.Thread)-1]
-	th = append(th, worklist.Message{ID: "hold", Role: worklist.RoleUser, Content: "Do not approve yet."})
-	for i := range 24 {
-		id := strconv.Itoa(i)
-		th = append(th,
-			worklist.Message{ID: "u" + id, Role: worklist.RoleUser, Content: strings.Repeat("chat ", 40000)},
-			worklist.Message{ID: "g" + id, ReplyTo: "u" + id, Role: worklist.RoleAgent, Content: "ok"})
+// A conversation since its latest review was asked for that is longer than a read
+// leaves turns out of the draft's read: a word the drafter never saw (the owner's
+// "do not approve yet", even one posted while the review stalled and answered after
+// it) may disagree, so an approval is withheld, and the reply says why. The drafter
+// reads only the newest turns, contiguous, never the review kept out of order. A
+// stale revision is reported first, since hiding turns cannot make it current.
+func TestRunConverseWithholdsAnApprovalOverAnUnreadConversation(t *testing.T) {
+	build := func(hold bool, reviewHead string) worklist.WorkItem {
+		it := draftItem()
+		q, r, draft := it.Thread[0], it.Thread[1], it.Thread[len(it.Thread)-1]
+		r.Head = reviewHead
+		th := []worklist.Message{q}
+		if hold {
+			th = append(th, worklist.Message{ID: "hold", Role: worklist.RoleUser, Content: "Do not approve yet."})
+		}
+		th = append(th, r) // the review, answered after the hold
+		for i := range 24 {
+			id := strconv.Itoa(i)
+			th = append(th,
+				worklist.Message{ID: "u" + id, Role: worklist.RoleUser, Content: strings.Repeat("chat ", 40000)},
+				worklist.Message{ID: "g" + id, ReplyTo: "u" + id, Role: worklist.RoleAgent, Content: "ok"})
+		}
+		it.Thread = append(th, draft)
+		return it
 	}
-	it.Thread = append(th, draft)
-	sink := &memSink{items: []worklist.WorkItem{it}}
-	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: it.ID, Turn: "d", Converser: &fakeConverser{}, Drafter: &fakeDrafter{prop: worklist.DraftProposal{Approve: true}}},
-		fakeVendor{token: "t"}, sink); err != nil {
-		t.Fatal(err)
+	run := func(t *testing.T, it worklist.WorkItem) (worklist.Message, *fakeDrafter) {
+		t.Helper()
+		sink := &memSink{items: []worklist.WorkItem{it}}
+		fd := &fakeDrafter{prop: worklist.DraftProposal{Approve: true}}
+		if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: it.ID, Turn: "d", Converser: &fakeConverser{}, Drafter: fd},
+			fakeVendor{token: "t"}, sink); err != nil {
+			t.Fatal(err)
+		}
+		got := sink.items[0].Thread
+		return got[len(got)-1], fd
 	}
-	got := sink.items[0].Thread
-	m := got[len(got)-1]
+	m, fd := run(t, build(true, draftHead))
 	if m.Draft != nil || !strings.Contains(m.Content, "No approval drafted") || !strings.Contains(m.Content, "longer than gofer reads") {
-		t.Errorf("an approval across a gap: %+v\n%s", m.Draft, m.Content)
+		t.Errorf("an approval over an unread hold: %+v\n%s", m.Draft, m.Content)
+	}
+	for _, h := range fd.got.History {
+		if h.Content == "rename new1" {
+			t.Error("the review was kept out of order for the drafter")
+		}
+	}
+	const pushed = "fedcba9876543210fedcba9876543210fedcba98"
+	m, _ = run(t, build(false, pushed))
+	if m.Draft != nil || !strings.Contains(m.Content, "read commit `"+pushed[:12]) || strings.Contains(m.Content, "longer than gofer reads") {
+		t.Errorf("a stale review over an unread conversation: %+v\n%s", m.Draft, m.Content)
 	}
 }
 

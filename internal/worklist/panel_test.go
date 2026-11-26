@@ -287,16 +287,18 @@ func TestThreadWindowKeepsSynthesisReviews(t *testing.T) {
 	}
 }
 
-// A draft-review request's read keeps the latest review, request and answer, however
-// long the discussion since: the run decides from it whether the draft may approve,
-// so a review pushed out of the window would read as no review at all. An answer too
-// long for the room left is cut, keeping the revision it recorded.
-func TestThreadWindowKeepsTheLatestReviewForADraft(t *testing.T) {
+// A draft-review request's read is the ordinary newest-first window, never a review
+// kept out of order (which would push out a later word disagreeing with it): the
+// request names the latest review before it and carries its revision, so the run
+// tells a review that did not fit (DraftBasis.Read false) from none, and judges the
+// revision either way. A review landing after the request is not the one named.
+func TestThreadWindowNamesTheLatestReviewForADraft(t *testing.T) {
 	th := []Message{
 		{ID: "q1", Role: RoleUser, Content: "review", Kind: KindReviewRequest, At: t1},
 		{ID: "a1", Role: RoleAgent, ReplyTo: "q1", Content: "old review", Head: "aaaa", Base: "main", Diff: strings.Repeat("1", 64), At: t1},
 		{ID: "q2", Role: RoleUser, Content: "review", Kind: KindReviewRequest, At: t2},
-		{ID: "a2", Role: RoleAgent, ReplyTo: "q2", Content: strings.Repeat("finding ", 4000), Head: "bbbb", Base: "main", Diff: strings.Repeat("2", 64), At: t2},
+		{ID: "hold", Role: RoleUser, Content: "Do not approve yet.", At: t2}, // posted while the review stalled
+		{ID: "a2", Role: RoleAgent, ReplyTo: "q2", Content: "LGTM", Head: "bbbb", Base: "main", Diff: strings.Repeat("2", 64), At: t2},
 	}
 	for i := range 40 {
 		id := string(rune('a'+i%26)) + string(rune('a'+i/26))
@@ -305,51 +307,49 @@ func TestThreadWindowKeepsTheLatestReviewForADraft(t *testing.T) {
 			Message{ID: "g" + id, Role: RoleAgent, ReplyTo: "u" + id, Content: strings.Repeat("reply ", 400), At: t2})
 	}
 	th = append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, At: t2},
-		// A review that landed after the request, before the run read it: not the one
-		// the draft reads, and it must not displace that one.
 		Message{ID: "q3", Role: RoleUser, Content: "review", Kind: KindReviewRequest, At: t2},
 		Message{ID: "a3", Role: RoleAgent, ReplyTo: "q3", Content: "newer review", Head: "cccc", Base: "main", Diff: strings.Repeat("3", 64), At: t2})
 	w := WorkItem{ID: "a", Type: TypePullRequest, Thread: th}
-	d, _ := w.TurnIndex("d")
-	before := w
-	before.Thread = th[:d]
+	reviewed := Revision{"bbbb", "main", strings.Repeat("2", 64)}
 
-	// The whole conversation fits: nothing is marked omitted.
+	// The whole conversation fits: the review is read, with every turn since its request.
 	whole := ThreadWindow(w, "d", MaxItemBytes)
-	if n := len(whole.Thread); n != d+1 || whole.OmitsTurns(-1, n-1) {
-		t.Fatalf("whole: %d of %d turns, omits %v", n, d+1, whole.OmitsTurns(-1, n-1))
+	n := len(whole.Thread)
+	if b := whole.DraftBasis(n - 1); !b.Review || !b.Read || b.Revision != reviewed || whole.OmitsTurns(-1, n-1) {
+		t.Fatalf("whole: %d turns, basis %+v, omits %v", n, b, whole.OmitsTurns(-1, n-1))
+	}
+	if _, ok := w.TurnIndex("d"); !ok || w.Thread[len(w.Thread)-3].Reviews != nil || w.Thread[len(w.Thread)-3].Head != "" {
+		t.Fatal("the read wrote into the stored request")
 	}
 
-	for name, room := range map[string]int{"fits": 40 << 10, "cut": 12 << 10} {
-		win := ThreadWindow(w, "d", encodedSize(Project(w))+room)
-		if len(win.Thread) >= len(th) || win.Thread[len(win.Thread)-1].ID != "d" {
-			t.Fatalf("%s: the window ends at the draft request and is cut, got %d of %d turns", name, len(win.Thread), len(th))
-		}
-		j := win.LatestReviewAt()
-		if j < 0 || win.Thread[j].ID != "a2" || win.ReviewedRevision() != before.ReviewedRevision() {
-			t.Fatalf("%s: the window lost the latest review before the request (at %d)", name, j)
-		}
-		// The discussion since the review did not all fit, and the read says so, on
-		// the turns after the gap only.
-		if !win.OmitsTurns(j, len(win.Thread)-1) {
-			t.Errorf("%s: the gap after the review is not marked", name)
-		}
-		if win.OmitsTurns(-1, j) {
-			t.Errorf("%s: turns up to the review are marked, but nothing between them was left out", name)
-		}
-		if name == "cut" && !strings.Contains(win.Thread[j].Content, "was cut from") {
-			t.Errorf("cut: the review answer should be cut with a note")
-		}
-		if encodedSize(win) > encodedSize(Project(w))+room {
-			t.Errorf("%s: the window is over budget", name)
-		}
-		for i := 1; i < len(win.Thread); i++ {
-			a, _ := w.TurnIndex(win.Thread[i-1].ID)
-			b, _ := w.TurnIndex(win.Thread[i].ID)
-			if a >= b {
-				t.Fatalf("%s: the window keeps thread order", name)
-			}
-		}
+	// It does not fit: the newest turns are read, contiguous, the first marked as
+	// following turns left out; the review is named, with its revision, but not read.
+	win := ThreadWindow(w, "d", encodedSize(Project(w))+40<<10)
+	n = len(win.Thread)
+	if win.Thread[n-1].ID != "d" || n >= len(th) || !win.Thread[0].Omitted || win.OmitsTurns(0, n-1) {
+		t.Fatalf("cut: %d turns, first omitted %v, later omitted %v", n, win.Thread[0].Omitted, win.OmitsTurns(0, n-1))
+	}
+	if _, ok := win.TurnIndex("hold"); ok {
+		t.Fatal("fixture: the hold should not fit")
+	}
+	if b := win.DraftBasis(n - 1); !b.Review || b.Read || b.Revision != reviewed || !b.Covers(reviewed) || b.Covers(Revision{"cccc", "main", strings.Repeat("3", 64)}) {
+		t.Fatalf("cut: basis %+v", b)
+	}
+	if win.LatestReviewAt() >= 0 {
+		t.Error("cut: a review was kept out of order")
+	}
+	if encodedSize(win) > encodedSize(Project(w))+40<<10 {
+		t.Error("cut: the window is over budget")
+	}
+
+	// No visible review before the request: none is named.
+	w.Thread[2].Hidden = true
+	if b := ThreadWindow(w, "d", MaxItemBytes); b.DraftBasis(len(b.Thread)-1).Revision.Head != "aaaa" {
+		t.Error("with the latest review hidden, the one before it is named")
+	}
+	w.Thread[0].Hidden = true
+	if b := ThreadWindow(w, "d", MaxItemBytes); b.DraftBasis(len(b.Thread) - 1).Review {
+		t.Error("with every review hidden, one is named")
 	}
 }
 

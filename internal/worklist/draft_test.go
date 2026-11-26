@@ -3,6 +3,7 @@ package worklist
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -412,6 +413,61 @@ func TestAppendReplyApprovalJudgedByTheReviewBeforeTheRequest(t *testing.T) {
 	}
 	if m.Omitted {
 		t.Error("a read's Omitted mark was stored")
+	}
+}
+
+// The store keeps an approval only if the run's read held the latest review and
+// every visible turn since it was asked for, judged on the read it serves, whatever
+// the run sent: a run that never checked (one from before the check) cannot approve
+// past an owner's word it did not read, even one posted while the review stalled.
+func TestAppendReplyApprovalNeedsTheWholeConversationSinceTheReview(t *testing.T) {
+	build := func(filler int) WorkItem {
+		th := []Message{
+			{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+			{ID: "hold", Role: RoleUser, Content: "Do not approve yet."},
+			{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+		}
+		for i := range filler {
+			th = append(th, Message{ID: "u" + strconv.Itoa(i), Role: RoleUser, Content: strings.Repeat("chat ", 40000)})
+		}
+		return draftPR(append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest})...)
+	}
+	approve := func(it *WorkItem) *DraftReview {
+		d := pinned("")
+		d.Approve, d.Diff = true, testDiff
+		if _, err := AppendReply(it, "d", Message{ID: "a", Content: "approve", Draft: d}); err != nil {
+			t.Fatal(err)
+		}
+		return it.Thread[len(it.Thread)-1].Draft
+	}
+	short := build(2)
+	if d := approve(&short); d == nil || !d.Approve {
+		t.Fatalf("approval on a whole read = %+v", d)
+	}
+	long := build(24) // about 4.8 MB since the review: more than a read holds
+	if d := approve(&long); d != nil {
+		t.Errorf("approval past an unread hold kept: %+v", d)
+	}
+}
+
+// A draft asked for before the latest review landed is what is stale, even when its
+// reply lands after that review: the thread offers drafting again, never a review
+// of the revision that review already read.
+func TestLateDraftDoesNotOutdateANewerReview(t *testing.T) {
+	const pushed = "fedcba9876543210fedcba9876543210fedcba98"
+	it := draftPR(
+		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest},
+		Message{ID: "q2", Role: RoleUser, Content: "again", Kind: KindReviewRequest},
+		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: pushed, Base: "main", Diff: testDiff},
+		Message{ID: "a", ReplyTo: "d", Role: RoleAgent, Content: "drafted", Head: testCommit, Base: "main", Diff: testDiff},
+	)
+	if it.ReviewOutdated() {
+		t.Error("a late draft makes the newer review outdated")
+	}
+	if it.RedraftRedundant() {
+		t.Error("a late draft is redundant to redraft")
 	}
 }
 
