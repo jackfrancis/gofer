@@ -684,3 +684,23 @@ func TestNewerReviewIsNotOutdated(t *testing.T) {
 		t.Error("a review newer than the draft is outdated")
 	}
 }
+
+// A refused current attempt is neither pending nor waiting to stall: it is retryable
+// at once. A retry's new attempt is pending as usual.
+func TestRefusedAttemptIsNotPending(t *testing.T) {
+	now := time.Now()
+	it := draftPR(Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest, At: now})
+	if !it.ReplyPending(now, 5*time.Minute) {
+		t.Fatal("a fresh turn is not pending")
+	}
+	if !it.MarkRefused("q", "") || it.ReplyPending(now, 5*time.Minute) || !it.ReplyStalled(now, 5*time.Minute) || !it.Ended("q") {
+		t.Fatal("a refused attempt is pending, or not retryable at once")
+	}
+	if it.MarkRefused("q", "") {
+		t.Error("marking the same refusal again changed something")
+	}
+	it.Restamp(0, now)
+	if !it.ReplyPending(now, 5*time.Minute) || it.Ended("q") {
+		t.Error("a retry's new attempt is covered by the earlier refusal")
+	}
+}

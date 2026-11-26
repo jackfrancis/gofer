@@ -29,6 +29,28 @@ review's text is written by a model, so this feature needs that rule amended.
    the default model, as any Discuss turn. It is offered only when commenting is
    configured, on a pull request on the radar with a completed review and no reply in
    flight; without a connected write grant the thread links to connecting it instead.
+   While it is disabled the thread says why in visible text (Safari shows no tooltip
+   on a disabled button), and with no review yet it offers "Review this pull request"
+   right there (`webui.ReviewAgain`), since a review asked for in a Discuss message is
+   not a review request. When a review request already has no answer (stalled, or
+   ended by a reconnect notice), the thread offers "Retry the earlier review" instead,
+   which retries that very turn (it runs as it was asked, without later messages)
+   rather than adding another: the dispatcher's gate shares a run still in flight and
+   the store keeps one answer per turn, so a first review is never answered twice, and
+   there is nothing to wait out first. It offers the newest request it can retry: a
+   hidden request is not retried until the user unhides it, and a 2nd opinion only
+   blind, by a model it may use, so an older ordinary request is offered past a 2nd
+   opinion no model can run. A request that may still answer but cannot be retried
+   blocks a new one; once its current attempt can no longer answer (a notice ended its
+   run, or the backend certainly refused its dispatch, which the turn records,
+   `Message.Refused`; a refused attempt is also neither pending nor waiting to stall,
+   and a retry rolled back after a refusal keeps the earlier attempt's record), a new
+   ordinary review may be asked for. "Review the current revision" retries, in the
+   same way, an unanswered review request asked since the latest review landed:
+   requests before it are superseded by it, and a redraft of the same revision moves
+   no review, so an outstanding re-review stays the one to retry. A dispatch the backend certainly refused is said so on
+   the thread (about that attempt, and not while a later one runs) and leaves the turn
+   retryable at once; an uncertain one stays pending.
    It is not shown while drafting again would only repeat the offered draft
    (`WorkItem.RedraftRedundant`), because the drafter would read the conversation it
    read: the draft is unconfirmed and pinned to the item's pull request, no turn after

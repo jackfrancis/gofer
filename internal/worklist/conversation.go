@@ -128,6 +128,13 @@ type Message struct {
 	// no HiddenRev either, so its ReadRev of 0 says nothing: such a draft never counts
 	// as redundant (RedraftRedundant). Cleared on a reply, as the revisions are.
 	ReadRevKnown bool `json:"read_rev_known,omitempty"`
+	// Refused and RefusedAttempt record, on a user turn, that the backend certainly
+	// refused the dispatch of attempt RefusedAttempt (ingest.ErrNotAccepted), so no
+	// run exists for it: while that is still the turn's attempt it can no longer be
+	// answered (WorkItem.Ended). A retry starts a new attempt, which they do not
+	// cover. The web tier's alone: AppendReply clears them on a reply.
+	Refused        bool   `json:"refused,omitempty"`
+	RefusedAttempt string `json:"refused_attempt,omitempty"`
 	// Notice marks an agent turn that is a system notice (NoticeReconnect), not an
 	// answer: it does not answer the turn it replies to. Empty on every other turn.
 	Notice string `json:"notice,omitempty"`
@@ -339,6 +346,44 @@ func (w WorkItem) Answered(key string) bool {
 	return ok
 }
 
+// Ended reports whether the current attempt at the user turn with key can no longer
+// be answered: a system notice ended it (noticed), or the backend certainly refused
+// its dispatch (Refused, for that very attempt).
+func (w WorkItem) Ended(key string) bool {
+	if w.noticed()[key] {
+		return true
+	}
+	i, ok := w.TurnIndex(key)
+	return ok && w.refused(i)
+}
+
+// refused reports whether the backend certainly refused the current attempt at turn
+// i (MarkRefused): no run exists for it, so it is neither pending nor waiting out
+// staleAfter before a retry.
+func (w WorkItem) refused(i int) bool {
+	return w.Thread[i].Refused && w.Thread[i].RefusedAttempt == w.Thread[i].Attempt
+}
+
+// LatestReviewAt returns the position of the latest review (the visible answer to a
+// visible review request that landed last), or -1. Review requests before it are
+// superseded by it: a review cycle starts there.
+func (w WorkItem) LatestReviewAt() int { return w.latestReview() }
+
+// MarkRefused records that the backend certainly refused the dispatch of attempt at
+// the user turn with key, so no run exists for it (Ended). It applies only while that
+// attempt is the turn's current one and the turn has no answer, and reports whether
+// it changed anything. The web tier calls it inside the store update that saves it.
+func (w *WorkItem) MarkRefused(key, attempt string) bool {
+	i, ok := w.TurnIndex(key)
+	if !ok || w.Thread[i].Role != RoleUser || w.Thread[i].Attempt != attempt || w.Answered(key) ||
+		(w.Thread[i].Refused && w.Thread[i].RefusedAttempt == attempt) {
+		return false
+	}
+	w.Thread = slices.Clone(w.Thread)
+	w.Thread[i].Refused, w.Thread[i].RefusedAttempt = true, attempt
+	return true
+}
+
 // TurnIndex returns the position of the turn with key.
 func (w WorkItem) TurnIndex(key string) (int, bool) {
 	for i := range w.Thread {
@@ -433,22 +478,26 @@ func (w WorkItem) Reviewed(rev Revision) bool {
 // is stale, and drafting again (never counted redundant once a turn follows it) is
 // the way forward, not another review. A draft reply without a revision, a hidden
 // one, or a notice says nothing.
-func (w WorkItem) ReviewOutdated() bool {
+func (w WorkItem) ReviewOutdated() bool { return w.reviewOutdatedAt() >= 0 }
+
+// reviewOutdatedAt returns the position of the draft reply that makes the latest
+// review outdated (ReviewOutdated), or -1.
+func (w WorkItem) reviewOutdatedAt() int {
 	for i := len(w.Thread) - 1; i >= 0; i-- {
 		if !w.IsDraftReviewRequest(i) {
 			continue
 		}
 		j, ok := w.replies()[w.TurnKey(i)]
 		if w.Thread[i].Hidden || !ok || w.Thread[j].Hidden || w.Thread[j].Head == "" {
-			return false
+			return -1
 		}
 		latest := w.latestReview()
-		if j < latest {
-			return false
+		if j < latest || (latest >= 0 && w.Thread[latest].revision() == w.Thread[j].revision()) {
+			return -1
 		}
-		return latest < 0 || w.Thread[latest].revision() != w.Thread[j].revision()
+		return j
 	}
-	return false
+	return -1
 }
 
 // FirstReviewModel returns the chat model that produced the item's first visible
@@ -628,11 +677,12 @@ func (w WorkItem) hasSynthesisRequest() bool {
 // plausibly in flight (younger than staleAfter). Past that window the run has almost
 // certainly finished or failed, so the turn is eligible for a retry.
 //
-// A turn a system notice replied to is not pending: its run is done.
+// A turn a system notice replied to is not pending: its run is done. Nor is one whose
+// current attempt the backend certainly refused (MarkRefused): no run started.
 func (w WorkItem) ReplyPending(now time.Time, staleAfter time.Duration) bool {
 	answered, noticed := w.replies(), w.noticed()
 	for i, m := range w.Thread {
-		if m.Role != RoleUser || now.Sub(m.At) >= staleAfter {
+		if m.Role != RoleUser || now.Sub(m.At) >= staleAfter || w.refused(i) {
 			continue
 		}
 		key := w.TurnKey(i)
@@ -644,15 +694,16 @@ func (w WorkItem) ReplyPending(now time.Time, staleAfter time.Duration) bool {
 }
 
 // ReplyStalled reports whether the most recent user turn has no reply and is past
-// staleAfter, so its run has almost certainly failed and the turn can be retried. A
-// turn a system notice replied to has not stalled: the notice says what to do.
+// staleAfter, so its run has almost certainly failed and the turn can be retried, or
+// its current attempt was certainly refused (no run started), so it can be retried at
+// once. A turn a system notice replied to has not stalled: the notice says what to do.
 func (w WorkItem) ReplyStalled(now time.Time, staleAfter time.Duration) bool {
 	i, ok := w.LastUserTurn()
 	if !ok {
 		return false
 	}
 	key := w.TurnKey(i)
-	return now.Sub(w.Thread[i].At) >= staleAfter && !w.Answered(key) && !w.noticed()[key]
+	return (now.Sub(w.Thread[i].At) >= staleAfter || w.refused(i)) && !w.Answered(key) && !w.noticed()[key]
 }
 
 // RetryableTurn returns the position of the turn RetryStalled would retry: the
@@ -736,10 +787,21 @@ func (w *WorkItem) UndoRetry(s RetryStamp) bool {
 }
 
 // NeedsReview reports whether the pull request still needs a first review dispatched
-// now: it is on the radar and not waiting on someone else (Actionable), has no completed review, and none is currently
-// in flight (a stale pending request is treated as failed, so it is eligible again).
+// now, by Review all PRs: it is on the radar and not waiting on someone else
+// (Actionable), has no completed review, and none is currently in flight (a stale
+// pending request is treated as failed, so it is eligible again). A 2nd opinion
+// awaiting a retry is left to the thread, which retries it blind: the bulk action
+// would retry it through its ordinary dispatch, letting it read the conversation
+// while it still counts as independent. The radar's count and the action both use
+// this, so the button shows only what it will review.
 func (w WorkItem) NeedsReview(now time.Time, staleAfter time.Duration) bool {
-	return w.Type == TypePullRequest && w.Actionable() && !w.HasReview() && !w.ReplyPending(now, staleAfter)
+	if w.Type != TypePullRequest || !w.Actionable() || w.HasReview() || w.ReplyPending(now, staleAfter) {
+		return false
+	}
+	if i, ok := w.RetryableTurn(now, staleAfter); ok && w.Thread[i].IsPanelReview() {
+		return false
+	}
+	return true
 }
 
 // NeedsSecondOpinion reports whether the pull request has been reviewed once but has

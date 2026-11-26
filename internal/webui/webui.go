@@ -421,6 +421,11 @@ func (h *Handler) Thread(w http.ResponseWriter, r *http.Request) {
 			}
 			if !it.IsHidden() {
 				data.Draft = h.draftThreadView(r.Context(), user, it, now)
+				if data.Draft != nil {
+					// The flag describes the attempt the redirect came from: once a later one
+					// is running (a retry in another tab, say), it is not shown.
+					data.Draft.ReviewRefused = r.URL.Query().Get("review_refused") == "1" && !it.ReplyPending(now, reviewStaleAfter)
+				}
 				if data.Draft != nil && data.Draft.Index >= 0 {
 					// The draft's Create button posts same-origin only; this lets it send
 					// its real Origin on a browser without fetch metadata (see sameOrigin).
@@ -612,28 +617,68 @@ func (h *Handler) ThreadRetry(w http.ResponseWriter, r *http.Request) {
 		// The refusal can be the request's own cancellation (the browser went away
 		// before the dispatch was sent), so the rollback must not use the request's
 		// context: it runs detached from it, under its own bound.
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), undoRetryTimeout)
-		undone := false
-		err := h.store.Update(ctx, user.ID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
-			undone = false
-			for _, it := range current {
-				if it.ID == id && it.UndoRetry(stamp) {
-					undone = true
-					return []worklist.WorkItem{it}, nil
-				}
-			}
-			return nil, nil
-		})
-		cancel()
-		switch {
-		case err != nil:
-			// The turn stays pending until reviewStaleAfter, then offers Retry again.
-			slog.WarnContext(ctx, "retry refused, and restoring the turn failed", "user", user.ID, "item", id, "turn", turn, "err", err)
-		case undone:
+		if h.undoRefusedRetry(r.Context(), user.ID, stamp) {
 			back += "&retry=refused"
 		}
 	}
 	http.Redirect(w, r, back, http.StatusSeeOther)
+}
+
+// markRefused records on each turn in refs that the backend certainly refused the
+// dispatch of that attempt (worklist.WorkItem.MarkRefused), so a request whose only
+// attempt never ran is known to be unable to answer and blocks nothing. It runs
+// detached from the request, under undoRetryTimeout; a failure only logs, and the
+// turn's outcome then stays unknown.
+func (h *Handler) markRefused(ctx context.Context, ownerID string, refs []worklist.TurnRef) {
+	if len(refs) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoRetryTimeout)
+	defer cancel()
+	err := h.store.Update(ctx, ownerID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		var changed []worklist.WorkItem
+		for _, it := range current {
+			marked := false
+			for _, ref := range refs {
+				if ref.Item == it.ID && it.MarkRefused(ref.Turn, ref.Attempt) {
+					marked = true
+				}
+			}
+			if marked {
+				changed = append(changed, it)
+			}
+		}
+		return changed, nil
+	})
+	if err != nil {
+		slog.WarnContext(ctx, "dispatch refused, and recording it failed", "user", ownerID, "err", err)
+	}
+}
+
+// undoRefusedRetry puts back the turn a retry re-stamped (stamp) after the backend
+// refused its dispatch (ingest.ErrNotAccepted), so the page offers it again at once,
+// reporting whether it did. It runs detached from the request, under
+// undoRetryTimeout; a failure only logs, and the turn then waits out
+// reviewStaleAfter. A later attempt or an answer that landed meanwhile is left alone.
+func (h *Handler) undoRefusedRetry(ctx context.Context, ownerID string, stamp worklist.RetryStamp) bool {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoRetryTimeout)
+	defer cancel()
+	undone := false
+	err := h.store.Update(ctx, ownerID, func(current []worklist.WorkItem) ([]worklist.WorkItem, error) {
+		undone = false
+		for _, it := range current {
+			if it.ID == stamp.Item && it.UndoRetry(stamp) {
+				undone = true
+				return []worklist.WorkItem{it}, nil
+			}
+		}
+		return nil, nil
+	})
+	if err != nil {
+		slog.WarnContext(ctx, "retry refused, and restoring the turn failed", "user", ownerID, "item", stamp.Item, "turn", stamp.Key, "err", err)
+		return false
+	}
+	return undone
 }
 
 // retryChoices returns the models a retry of item turn i may use, which the
@@ -896,14 +941,12 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		var changed []worklist.WorkItem
 		refs, retries = refs[:0], retries[:0]
 		for _, it := range current {
-			if it.Type != worklist.TypePullRequest || !it.Actionable() || !scope.includes(it) {
-				continue // off the radar (hidden or closed), waiting on someone else, or outside the page's projects and labels: never review it in bulk
-			}
-			if it.HasReview() {
-				continue // already reviewed at least once — a first-review is no longer needed
-			}
-			if it.ReplyPending(at, reviewStaleAfter) {
-				continue // a reply is plausibly in flight
+			if !scope.includes(it) || !it.NeedsReview(at, reviewStaleAfter) {
+				// Outside the page's projects and labels, or not a first review this batch
+				// may dispatch (WorkItem.NeedsReview, the same check the radar's count
+				// uses): off the radar or waiting on someone else, already reviewed, a
+				// reply plausibly in flight, or a 2nd opinion the thread retries blind.
+				continue
 			}
 			// If the last request's run has finished or failed, retry it — reusing the
 			// prompt (refresh its timestamp) rather than stacking a second one. This is
@@ -929,6 +972,7 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		opt, _ := h.resolveOption(strings.TrimSpace(r.FormValue("choice")))
 		err := h.pipeline.ReviewAll(r.Context(), user.ID, refs, opt.Endpoint, opt.Model)
 		h.revertShared(r.Context(), user.ID, err, retries)
+		h.markRefused(r.Context(), user.ID, ingest.RefusedRuns(err))
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
@@ -1010,7 +1054,10 @@ func (h *Handler) SecondOpinion(w http.ResponseWriter, r *http.Request) {
 		return true
 	}
 	if h.appendTurnIf(r.Context(), user.ID, id, msg, ready) {
-		_ = h.pipeline.SecondOpinion(r.Context(), user.ID, worklist.TurnRef{Item: id, Turn: msg.ID}, opt.Endpoint, opt.Model)
+		ref := worklist.TurnRef{Item: id, Turn: msg.ID}
+		if err := h.pipeline.SecondOpinion(r.Context(), user.ID, ref, opt.Endpoint, opt.Model); errors.Is(err, ingest.ErrNotAccepted) {
+			h.markRefused(r.Context(), user.ID, []worklist.TurnRef{ref})
+		}
 	}
 	http.Redirect(w, r, "/items/thread?id="+url.QueryEscape(id), http.StatusSeeOther)
 }
@@ -1098,10 +1145,13 @@ func (h *Handler) SecondOpinionAllPRs(w http.ResponseWriter, r *http.Request) {
 		for i, d := range plan {
 			refs[i] = d.ref
 		}
-		_ = h.pipeline.SecondOpinionAll(r.Context(), user.ID, refs, plan[0].opt.Endpoint, plan[0].opt.Model)
+		err := h.pipeline.SecondOpinionAll(r.Context(), user.ID, refs, plan[0].opt.Endpoint, plan[0].opt.Model)
+		h.markRefused(r.Context(), user.ID, ingest.RefusedRuns(err))
 	} else {
 		for _, d := range plan {
-			_ = h.pipeline.SecondOpinion(r.Context(), user.ID, d.ref, d.opt.Endpoint, d.opt.Model)
+			if err := h.pipeline.SecondOpinion(r.Context(), user.ID, d.ref, d.opt.Endpoint, d.opt.Model); errors.Is(err, ingest.ErrNotAccepted) {
+				h.markRefused(r.Context(), user.ID, []worklist.TurnRef{d.ref})
+			}
 		}
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)

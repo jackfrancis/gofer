@@ -688,7 +688,27 @@ Wired on the web-tier side; they define what a runtime must respect:
   checked by `AppendReply` whatever the run sent; the run flags a stale review
   whatever the model answered, and while the latest review is older than the draft
   the thread offers "Review the current revision", `WorkItem.ReviewOutdated`,
-  `POST /items/review-again`; model-written draft text is LF-normalized and has
+  `POST /items/review-again`, which with no review at all offers "Review this pull
+  request" (form `review=first`; the re-review form says `again`, and each action is
+  checked against its own condition in the store update); while a review request has
+  no answer it offers "Retry the earlier review" instead (`review=retry` naming the
+  turn: same turn, new attempt, so the gate shares a run in flight and the store keeps
+  one answer), for the newest one it can retry (`retryCandidate`: visible, a 2nd
+  opinion only blind), and a request that may still answer but cannot be retried
+  (hidden, or a 2nd opinion no model may run) blocks a new one until its attempt can
+  no longer answer (`reviewBlocker`, `WorkItem.Ended`: a notice ended it, or the
+  backend certainly refused it, recorded by `WorkItem.MarkRefused` from every review
+  dispatch site, batches through `ingest.RefusedRuns`, but never for a retry that is
+  rolled back, which restores the earlier attempt's record; a refused attempt is
+  neither pending nor waiting to stall); "Review the current revision" likewise
+  retries an unanswered review request asked since the latest review landed
+  (`WorkItem.LatestReviewAt`: earlier ones are superseded, and a redraft moves no
+  review), instead of asking again; Review all PRs leaves a 2nd opinion awaiting a
+  retry to the thread's blind Retry; a definite dispatch
+  refusal shows on the thread (`review_refused`, describing that attempt, hidden
+  while a later one runs) and leaves the turn retryable at once (a disabled draft
+  button says why in text: Safari
+  shows no tooltip on a disabled button, and `.btn:disabled` must look disabled); model-written draft text is LF-normalized and has
   every bot-command line made inert, `worklist.NeutralizeCommands` in `BoundDraft`,
   a suggestion block holding one (found by goldmark, lists included) turned into
   plain code rather than altered, so the checkbox is the only source of a command; a stored draft `BoundDraft` would change

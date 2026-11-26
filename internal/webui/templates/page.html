@@ -226,13 +226,19 @@
         <p>The reviews this consensus compares are too large to read together, so it can&rsquo;t be retried. Hide some of them and get another 2nd opinion for a smaller comparison.</p>
       </div>
       {{end}}
+      {{with .Draft}}{{if .ReviewRefused}}
+      <p class="zz-stalled" role="alert">That review attempt did not start: the agent backend refused it. Try again in a moment.</p>
+      {{end}}{{end}}
       {{with .Draft}}{{if .ReviewOutdated}}
       <div class="zz-draft-review">
         <p class="zz-meta">The latest review read an earlier revision of this pull request (it was pushed or retargeted since), so no approval can be drafted from it. Review the current revision, then draft again.</p>
         <form method="post" action="/items/review-again">
           <input type="hidden" name="id" value="{{$.Item.ID}}">
-          <button class="btn btn-sm" type="submit"{{if not .ReviewReady}} disabled title="Wait for the reply in progress."{{else}} title="Reviews the pull request as it stands now, keeping this conversation."{{end}}>Review the current revision</button>
+          {{with .AgainKey}}<input type="hidden" name="review" value="retry">
+          <input type="hidden" name="turn" value="{{.}}">{{else}}<input type="hidden" name="review" value="again">{{end}}
+          <button class="btn btn-sm" type="submit"{{if not .ReviewReady}} disabled title="{{.AgainWhy}}"{{else if .AgainKey}} title="Runs the review asked for earlier again, as it was asked; a review reads the pull request as it stands."{{else}} title="Reviews the pull request as it stands now, keeping this conversation."{{end}}>{{if .AgainKey}}Retry the earlier review{{else}}Review the current revision{{end}}</button>
         </form>
+        {{if not .ReviewReady}}<p class="zz-meta zz-why">{{.AgainWhy}}</p>{{end}}
       </div>
       {{end}}{{end}}
       {{with .Draft}}{{if not .Redundant}}
@@ -243,6 +249,23 @@
           <input type="hidden" name="id" value="{{$.Item.ID}}">
           <button class="btn btn-sm" type="submit"{{if not .Ready}} disabled title="{{.Why}}"{{else}} title="Drafts review comments for the points this conversation agrees on, and an approval (/lgtm, /approve) when it agrees the pull request is ready. Nothing is posted until you create the pending review."{{end}}>Draft Review Comments</button>
         </form>
+        {{/* The reason as text: a disabled button shows no tooltip in Safari. */}}
+        {{if not .Ready}}<p class="zz-meta zz-why">{{.Why}}</p>{{end}}
+        {{if .NeedsReview}}
+        <form method="post" action="/items/review-again">
+          <input type="hidden" name="id" value="{{$.Item.ID}}">
+          <input type="hidden" name="review" value="first">
+          <button class="btn btn-sm" type="submit" title="Reviews the pull request, keeping this conversation.">Review this pull request</button>
+        </form>
+        {{end}}
+        {{with .RetryKey}}
+        <form method="post" action="/items/review-again">
+          <input type="hidden" name="id" value="{{$.Item.ID}}">
+          <input type="hidden" name="review" value="retry">
+          <input type="hidden" name="turn" value="{{.}}">
+          <button class="btn btn-sm" type="submit" title="Runs the review asked for earlier again, as it was asked.">Retry the earlier review</button>
+        </form>
+        {{end}}
         {{else}}
         <p class="zz-meta"><a href="/auth/github-write/login">Connect GitHub to comment</a> to draft review comments from this conversation as a pending review on GitHub.</p>
         {{end}}
