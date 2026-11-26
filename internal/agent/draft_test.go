@@ -398,6 +398,36 @@ func TestRunConverseReviewRecordsItsSnapshot(t *testing.T) {
 	}
 }
 
+// A draft from a discussion with no review never pins an approval: comments need no
+// review, so the reply says nothing about one unless the drafter proposed an
+// approval, which it withholds and says a review is needed for.
+func TestRunConverseDraftsFromADiscussion(t *testing.T) {
+	discussion := func() worklist.WorkItem {
+		it := draftItem()
+		it.Thread[0].Kind = "" // a Discuss question, not a review request
+		it.Thread[1].Head, it.Thread[1].Base, it.Thread[1].Diff = draftHead, "main", ""
+		return it
+	}
+	run := func(t *testing.T, prop worklist.DraftProposal) worklist.Message {
+		t.Helper()
+		sink := &memSink{items: []worklist.WorkItem{discussion()}}
+		if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: "github:o/r#1", Turn: "d", Converser: &fakeConverser{}, Drafter: &fakeDrafter{prop: prop}},
+			fakeVendor{token: "t"}, sink); err != nil {
+			t.Fatal(err)
+		}
+		th := sink.items[0].Thread
+		return th[len(th)-1]
+	}
+	m := run(t, worklist.DraftProposal{Comments: []worklist.DraftComment{{Path: "a.go", Line: 11, Side: "RIGHT", Body: "Note the override."}}})
+	if m.Draft == nil || len(m.Draft.Comments) != 1 || m.Draft.Approve || strings.Contains(m.Content, "review") && strings.Contains(m.Content, "out of date") {
+		t.Errorf("comments from a discussion: %+v\n%s", m.Draft, m.Content)
+	}
+	m = run(t, worklist.DraftProposal{Approve: true})
+	if m.Draft != nil || !strings.Contains(m.Content, "this conversation has no review") || !strings.Contains(m.Content, "Review this pull request") {
+		t.Errorf("an approval from a discussion: %+v\n%s", m.Draft, m.Content)
+	}
+}
+
 // Without GitHub there is no diff to anchor to: the run says so and drafts nothing.
 func TestRunConverseDraftWithoutGitHub(t *testing.T) {
 	sink := &memSink{items: []worklist.WorkItem{draftItem()}}

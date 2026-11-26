@@ -27,12 +27,16 @@ review's text is written by a model, so this feature needs that rule amended.
 1. **Request.** At the bottom of a pull request's thread, "Draft Review Comments" posts
    a user turn of kind `draft_review_request` and dispatches a `github-converse` run by
    the default model, as any Discuss turn. It is offered only when commenting is
-   configured, on a pull request on the radar with a completed review and no reply in
-   flight; without a connected write grant the thread links to connecting it instead.
-   While it is disabled the thread says why in visible text (Safari shows no tooltip
-   on a disabled button), and with no review yet it offers "Review this pull request"
-   right there (`webui.ReviewAgain`), since a review asked for in a Discuss message is
-   not a review request. When a review request already has no answer (stalled, or
+   configured, on a pull request on the radar whose conversation has an answered
+   exchange (`WorkItem.HasDiscussion`: a review, or a Discuss question answered with
+   an assessment; the drafter judges what is agreed) and no reply in flight; without a
+   connected write grant the thread links to connecting it instead. While it is
+   disabled the thread says why in visible text (Safari shows no tooltip on a disabled
+   button). With no review yet it also offers "Review this pull request" right there
+   (`webui.ReviewAgain`), as an option when drafting already works: comments need no
+   review, but an approval is pinned to the revision a review read, so a draft from a
+   discussion alone withholds an approval and says a review is needed for it. When a
+   review request already has no answer (stalled, or
    ended by a reconnect notice), the thread offers "Retry the earlier review" instead,
    which retries that very turn (it runs as it was asked, without later messages)
    rather than adding another: the dispatcher's gate shares a run still in flight and

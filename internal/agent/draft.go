@@ -97,6 +97,13 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 			stale = &staleReview{unverifiable: diff.Unverifiable(), approved: true}
 		}
 		prop.Approve = false
+	case item.LatestReviewAt() < 0:
+		// Drafted from a discussion with no review in it: comments need none, but an
+		// approval is pinned to the revision a review read, so it needs one.
+		if prop.Approve {
+			stale = &staleReview{noReview: true, approved: true}
+		}
+		prop.Approve = false
 	case !item.Reviewed(rev):
 		stale = &staleReview{reviewed: item.ReviewedRevision(), now: rev, approved: prop.Approve}
 		prop.Approve = false
@@ -113,6 +120,7 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 type staleReview struct {
 	reviewed, now worklist.Revision
 	unverifiable  string
+	noReview      bool // the conversation has no review at all
 	approved      bool
 }
 
@@ -298,6 +306,8 @@ func draftContent(d *worklist.DraftReview, excluded []string, moved, omitted int
 	}
 	switch {
 	case stale == nil:
+	case stale.noReview:
+		b.WriteString("\n**No approval drafted.** The conversation agrees on approving, but an approval is pinned to the revision a review read, and this conversation has no review. Use Review this pull request, then draft again.\n")
 	case stale.unverifiable != "":
 		fmt.Fprintf(&b, "\n**No approval drafted.** The conversation agrees on approving, but %s, so gofer cannot check that an approval covers exactly what was reviewed.\n", stale.unverifiable)
 	default:

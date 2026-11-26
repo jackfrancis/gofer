@@ -251,6 +251,7 @@
         </form>
         {{/* The reason as text: a disabled button shows no tooltip in Safari. */}}
         {{if not .Ready}}<p class="zz-meta zz-why">{{.Why}}</p>{{end}}
+        {{with .ReviewNote}}<p class="zz-meta">{{.}}</p>{{end}}
         {{if .NeedsReview}}
         <form method="post" action="/items/review-again">
           <input type="hidden" name="id" value="{{$.Item.ID}}">

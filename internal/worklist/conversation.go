@@ -423,6 +423,20 @@ func (w WorkItem) hasCompletedRequest(kind string) bool {
 // request answered by the assistant).
 func (w WorkItem) HasReview() bool { return w.hasCompletedRequest(KindReviewRequest) }
 
+// HasDiscussion reports whether the conversation has something to draft review
+// comments from: a visible user turn (other than a draft-review request) answered by
+// a visible reply. A review is one, and so is a Discuss question answered with a
+// review in all but name; the drafter judges what the conversation agrees on.
+func (w WorkItem) HasDiscussion() bool {
+	for key, j := range w.replies() {
+		i, ok := w.TurnIndex(key)
+		if ok && !w.Thread[i].Hidden && !w.IsDraftReviewRequest(i) && !w.Thread[j].Hidden {
+			return true
+		}
+	}
+	return false
+}
+
 // Revision is the pull request revision a run read: its head commit, base branch,
 // and the digest of the whole diff GitHub showed (github.DiffDigest; "" when the
 // run did not read it whole).
@@ -492,8 +506,8 @@ func (w WorkItem) reviewOutdatedAt() int {
 			return -1
 		}
 		latest := w.latestReview()
-		if j < latest || (latest >= 0 && w.Thread[latest].revision() == w.Thread[j].revision()) {
-			return -1
+		if latest < 0 || j < latest || w.Thread[latest].revision() == w.Thread[j].revision() {
+			return -1 // no review to be out of date, a newer one, or the same revision
 		}
 		return j
 	}
