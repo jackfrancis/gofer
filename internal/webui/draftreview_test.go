@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1276,5 +1277,36 @@ func TestReviewAllLeavesSecondOpinionsToTheThread(t *testing.T) {
 	h.ReviewAllPRs(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/items/review-all", nil))
 	if len(p.reviewed) != 1 {
 		t.Errorf("Review all skipped an ordinary stalled review: %v", p.reviewed)
+	}
+}
+
+// The radar counts only the pull requests Review all PRs will review: a 2nd opinion
+// awaiting a retry is left to the thread, so it is not counted, and with nothing else
+// the button is not shown. The count and the action use one check.
+func TestReviewAllCountsOnlyWhatItReviews(t *testing.T) {
+	refused := worklist.WorkItem{ID: "github:o/r#1", Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1, Title: "panel", State: "open"},
+		Thread: []worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: worklist.IndependentReviewPrompt, Kind: worklist.KindReviewRequest, Refused: true, At: time.Now()}}}
+	ordinary := func(n int) worklist.WorkItem {
+		return worklist.WorkItem{ID: "github:o/r#" + strconv.Itoa(n), Type: worklist.TypePullRequest, GitHub: worklist.GitHubRef{Repo: "o/r", Number: n, Title: "pr", State: "open"}}
+	}
+	radar := func(items ...worklist.WorkItem) (string, *recordPipeline, *Handler) {
+		store := worklist.NewMemoryStore()
+		store.Seed("u1", items...)
+		pipe := &recordPipeline{}
+		h := New(fakeSessions{&session.User{ID: "u1"}}, store, pipe, reconnectProviders{}, true, nil)
+		rec := httptest.NewRecorder()
+		h.Index(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+		return rec.Body.String(), pipe, h
+	}
+	if out, _, _ := radar(refused); strings.Contains(out, "Review all PRs") {
+		t.Error("Review all PRs is offered with only a 2nd opinion awaiting a retry")
+	}
+	out, pipe, h := radar(refused, ordinary(2), ordinary(3))
+	if !strings.Contains(out, "Review all PRs (2)") || strings.Contains(out, "Review all PRs (3)") {
+		t.Errorf("the radar's count includes the 2nd opinion:\n%s", out)
+	}
+	h.ReviewAllPRs(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/items/review-all", nil))
+	if len(pipe.reviewed) != 2 {
+		t.Errorf("Review all dispatched %v, want the 2 it counted", pipe.reviewed)
 	}
 }

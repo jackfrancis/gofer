@@ -787,10 +787,21 @@ func (w *WorkItem) UndoRetry(s RetryStamp) bool {
 }
 
 // NeedsReview reports whether the pull request still needs a first review dispatched
-// now: it is on the radar and not waiting on someone else (Actionable), has no completed review, and none is currently
-// in flight (a stale pending request is treated as failed, so it is eligible again).
+// now, by Review all PRs: it is on the radar and not waiting on someone else
+// (Actionable), has no completed review, and none is currently in flight (a stale
+// pending request is treated as failed, so it is eligible again). A 2nd opinion
+// awaiting a retry is left to the thread, which retries it blind: the bulk action
+// would retry it through its ordinary dispatch, letting it read the conversation
+// while it still counts as independent. The radar's count and the action both use
+// this, so the button shows only what it will review.
 func (w WorkItem) NeedsReview(now time.Time, staleAfter time.Duration) bool {
-	return w.Type == TypePullRequest && w.Actionable() && !w.HasReview() && !w.ReplyPending(now, staleAfter)
+	if w.Type != TypePullRequest || !w.Actionable() || w.HasReview() || w.ReplyPending(now, staleAfter) {
+		return false
+	}
+	if i, ok := w.RetryableTurn(now, staleAfter); ok && w.Thread[i].IsPanelReview() {
+		return false
+	}
+	return true
 }
 
 // NeedsSecondOpinion reports whether the pull request has been reviewed once but has

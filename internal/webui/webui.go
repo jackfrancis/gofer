@@ -941,20 +941,11 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 		var changed []worklist.WorkItem
 		refs, retries = refs[:0], retries[:0]
 		for _, it := range current {
-			if it.Type != worklist.TypePullRequest || !it.Actionable() || !scope.includes(it) {
-				continue // off the radar (hidden or closed), waiting on someone else, or outside the page's projects and labels: never review it in bulk
-			}
-			if it.HasReview() {
-				continue // already reviewed at least once — a first-review is no longer needed
-			}
-			if it.ReplyPending(at, reviewStaleAfter) {
-				continue // a reply is plausibly in flight
-			}
-			if i, ok := it.RetryableTurn(at, reviewStaleAfter); ok && isSecondOpinionRequest(it.Thread[i]) {
-				// A 2nd opinion awaiting a retry is retried only blind, by a model it may
-				// use (the thread's Retry, retryChoices): this ordinary batch would let it
-				// read the conversation while it still counts as independent, and a new
-				// review beside it could be answered twice. Leave it to the thread.
+			if !scope.includes(it) || !it.NeedsReview(at, reviewStaleAfter) {
+				// Outside the page's projects and labels, or not a first review this batch
+				// may dispatch (WorkItem.NeedsReview, the same check the radar's count
+				// uses): off the radar or waiting on someone else, already reviewed, a
+				// reply plausibly in flight, or a 2nd opinion the thread retries blind.
 				continue
 			}
 			// If the last request's run has finished or failed, retry it — reusing the
