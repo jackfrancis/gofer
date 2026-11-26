@@ -287,6 +287,51 @@ func TestThreadWindowKeepsSynthesisReviews(t *testing.T) {
 	}
 }
 
+// A draft-review request's read keeps the latest review, request and answer, however
+// long the discussion since: the run decides from it whether the draft may approve,
+// so a review pushed out of the window would read as no review at all. An answer too
+// long for the room left is cut, keeping the revision it recorded.
+func TestThreadWindowKeepsTheLatestReviewForADraft(t *testing.T) {
+	th := []Message{
+		{ID: "q1", Role: RoleUser, Content: "review", Kind: KindReviewRequest, At: t1},
+		{ID: "a1", Role: RoleAgent, ReplyTo: "q1", Content: "old review", Head: "aaaa", Base: "main", Diff: strings.Repeat("1", 64), At: t1},
+		{ID: "q2", Role: RoleUser, Content: "review", Kind: KindReviewRequest, At: t2},
+		{ID: "a2", Role: RoleAgent, ReplyTo: "q2", Content: strings.Repeat("finding ", 4000), Head: "bbbb", Base: "main", Diff: strings.Repeat("2", 64), At: t2},
+	}
+	for i := range 40 {
+		id := string(rune('a'+i%26)) + string(rune('a'+i/26))
+		th = append(th,
+			Message{ID: "u" + id, Role: RoleUser, Content: strings.Repeat("chat ", 400), At: t2},
+			Message{ID: "g" + id, Role: RoleAgent, ReplyTo: "u" + id, Content: strings.Repeat("reply ", 400), At: t2})
+	}
+	th = append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, At: t2})
+	w := WorkItem{ID: "a", Type: TypePullRequest, Thread: th}
+
+	for name, room := range map[string]int{"fits": 40 << 10, "cut": 12 << 10} {
+		win := ThreadWindow(w, "d", encodedSize(Project(w))+room)
+		if len(win.Thread) >= len(th) || win.Thread[len(win.Thread)-1].ID != "d" {
+			t.Fatalf("%s: the window ends at the draft request and is cut, got %d of %d turns", name, len(win.Thread), len(th))
+		}
+		j := win.LatestReviewAt()
+		if j < 0 || win.Thread[j].ID != "a2" || win.ReviewedRevision() != w.ReviewedRevision() {
+			t.Fatalf("%s: the window lost the latest review (at %d)", name, j)
+		}
+		if name == "cut" && !strings.Contains(win.Thread[j].Content, "was cut from") {
+			t.Errorf("cut: the review answer should be cut with a note")
+		}
+		if encodedSize(win) > encodedSize(Project(w))+room {
+			t.Errorf("%s: the window is over budget", name)
+		}
+		for i := 1; i < len(win.Thread); i++ {
+			a, _ := w.TurnIndex(win.Thread[i-1].ID)
+			b, _ := w.TurnIndex(win.Thread[i].ID)
+			if a >= b {
+				t.Fatalf("%s: the window keeps thread order", name)
+			}
+		}
+	}
+}
+
 // The first reviewer is the first visible one: a hidden review, or a review whose
 // answer is hidden, is out of the conversation and does not count.
 func TestFirstReviewModelIsTheFirstVisible(t *testing.T) {

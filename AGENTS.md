@@ -650,7 +650,9 @@ Wired on the web-tier side; they define what a runtime must respect:
 - Draft review comments (ADR 0010): at the bottom of a pull request's thread with an
   answered exchange (`WorkItem.HasDiscussion`: a review, or a Discuss question
   answered; no review request needed, except to draft an approval, which is pinned to
-  a review's revision), "Draft Review Comments" (offered only with commenting configured; a connect
+  a review's revision: with no visible review the thread offers "Review this pull
+  request" even while a redraft is redundant, and a draft run's `ThreadWindow` keeps
+  the latest review whatever the discussion since), "Draft Review Comments" (offered only with commenting configured; a connect
   link without the grant) posts a `KindDraftReviewRequest` turn and dispatches a
   converse run by the default model. The button is not shown, and the handler refuses
   the request, while a redraft would only repeat the offered draft

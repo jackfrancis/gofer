@@ -423,7 +423,7 @@ func TestRunConverseDraftsFromADiscussion(t *testing.T) {
 		t.Errorf("comments from a discussion: %+v\n%s", m.Draft, m.Content)
 	}
 	m = run(t, worklist.DraftProposal{Approve: true})
-	if m.Draft != nil || !strings.Contains(m.Content, "this conversation has no review") || !strings.Contains(m.Content, "Review this pull request") {
+	if m.Draft != nil || !strings.Contains(m.Content, "this conversation has no visible review") || !strings.Contains(m.Content, "Review this pull request") {
 		t.Errorf("an approval from a discussion: %+v\n%s", m.Draft, m.Content)
 	}
 }

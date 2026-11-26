@@ -240,7 +240,9 @@ func ReadItem(ctx context.Context, store Store, ownerID, id, turn string) (WorkI
 // as many of the visible turns as fit, newest first; turns after it are left out
 // (none of them answers it, and the model sees only what precedes it). For a
 // synthesis request, the reviews it weighs (Message.Reviews) are kept before any
-// other turn.
+// other turn, and for a draft-review request the latest review (its request and
+// answer, the answer cut if it must be), whose recorded revision decides whether
+// the draft may approve.
 //
 // LatestUserTurn names the stored thread's newest user turn (a Discuss run
 // dispatched without a turn answers it), resolved here against the whole thread,
@@ -309,6 +311,29 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 					if s := messageSize(th[q]) + messageSize(th[a]); used+s <= left {
 						used += s
 						keep[q], keep[a] = true, true
+					}
+				}
+			}
+			// A draft-review request approves only the revision the latest review read
+			// (WorkItem.Reviewed), and the run judges that from this window: that review
+			// goes in next, its request and answer, so a long discussion since cannot
+			// push it out and make the run say the conversation has none. An answer too
+			// long for what is left is cut, keeping the revision it recorded.
+			if th[anchor].Kind == KindDraftReviewRequest {
+				if a := keyed.latestReview(); a >= 0 && a < anchor {
+					q := -1
+					for k, j := range keyed.replies() {
+						if j == a {
+							q, _ = keyed.TurnIndex(k)
+						}
+					}
+					if q >= 0 && q < anchor {
+						answer := truncateMessage(th[a], left-used-messageSize(th[q]))
+						if s := messageSize(th[q]) + messageSize(answer); used+s <= left {
+							used += s
+							th[a] = answer
+							keep[q], keep[a] = true, true
+						}
 					}
 				}
 			}

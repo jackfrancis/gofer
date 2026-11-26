@@ -32,10 +32,15 @@ review's text is written by a model, so this feature needs that rule amended.
    an assessment; the drafter judges what is agreed) and no reply in flight; without a
    connected write grant the thread links to connecting it instead. While it is
    disabled the thread says why in visible text (Safari shows no tooltip on a disabled
-   button). With no review yet it also offers "Review this pull request" right there
-   (`webui.ReviewAgain`), as an option when drafting already works: comments need no
-   review, but an approval is pinned to the revision a review read, so a draft from a
-   discussion alone withholds an approval and says a review is needed for it. When a
+   button). With no visible review yet (a review whose request or answer is hidden
+   counts for nothing, as for an approval) it also offers "Review this pull request"
+   right there (`webui.ReviewAgain`), as an option when drafting already works, and
+   even while a redraft would only repeat the offered draft: comments need no review,
+   but an approval is pinned to the revision a review read, so a draft from a
+   discussion alone withholds an approval and says a review is needed for it. A draft
+   run's read keeps the latest review (request and answer, the answer cut if it must
+   be) however long the discussion since, so it never mistakes a review outside its
+   window for none. When a
    review request already has no answer (stalled, or
    ended by a reconnect notice), the thread offers "Retry the earlier review" instead,
    which retries that very turn (it runs as it was asked, without later messages)

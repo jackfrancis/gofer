@@ -871,6 +871,53 @@ func TestDraftFromDiscussionWithoutReview(t *testing.T) {
 	}
 }
 
+// A draft from a discussion that withheld an approval tells the user to ask for a
+// review, so the thread offers one even while a redraft would only repeat that draft
+// (RedraftRedundant hides only the draft button). A review whose request or answer
+// is hidden approves nothing, as an approval counts reviews, so it leaves the first
+// review offered too.
+func TestReviewOfferedBesideARedundantDraftOrAHiddenReview(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	at := time.Now().Add(-time.Hour)
+	drafted := draftedThread(at)[2:] // the draft request and its draft, no review
+	asked := []worklist.Message{{ID: "u", Role: worklist.RoleUser, Content: "Ready to merge?", At: at}, {ID: "v", ReplyTo: "u", Role: worklist.RoleAgent, Content: "Yes, with one nit.", At: at}}
+	h, p, store := draftFixture(t, c, append(asked, drafted...))
+	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); !it.RedraftRedundant() {
+		t.Fatal("fixture: the draft should be redundant to redraft")
+	}
+	page, _ := threadPage(t, h)
+	if strings.Contains(page, `action="/items/draft-review"`) {
+		t.Error("a redundant redraft is offered")
+	}
+	for _, want := range []string{`name="review" value="first"`, ">Review this pull request</button>", "A review is needed only to draft an approval"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("redundant draft: thread lacks %q", want)
+		}
+	}
+	postReview(h, "first")
+	if len(p.turns) != 1 {
+		t.Fatalf("redundant draft: the first review was not dispatched: %+v", p.turns)
+	}
+
+	for name, hide := range map[string]int{"request hidden": 0, "answer hidden": 1} {
+		th := append(draftedThread(at)[:2], asked...)
+		th[hide].Hidden = true
+		h, p, _ := draftFixture(t, c, th)
+		page, _ := threadPage(t, h)
+		i := strings.Index(page, `action="/items/draft-review"`)
+		if i < 0 || strings.Contains(page[i:strings.Index(page[i:], "</form>")+i], "disabled") {
+			t.Errorf("%s: drafting from the visible discussion is not enabled", name)
+		}
+		if !strings.Contains(page, ">Review this pull request</button>") {
+			t.Errorf("%s: no review offered:\n%s", name, page)
+		}
+		postReview(h, "first")
+		if len(p.turns) != 1 {
+			t.Errorf("%s: the first review was not dispatched: %+v", name, p.turns)
+		}
+	}
+}
+
 // postReview posts a ReviewAgain form naming action ("" for a form rendered before
 // forms named one).
 func postReview(h *Handler, action string, turn ...string) *httptest.ResponseRecorder {
