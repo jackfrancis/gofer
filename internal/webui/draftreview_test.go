@@ -1256,3 +1256,25 @@ func TestRefusedSecondOpinionIsNotPending(t *testing.T) {
 		t.Error("a refused 2nd opinion shows the working cue")
 	}
 }
+
+// Review all PRs never retries a 2nd opinion through its ordinary path (the model
+// would read the conversation while the answer still counts as independent), nor
+// adds a review beside it: it leaves the pull request to the thread's blind Retry.
+func TestReviewAllLeavesSecondOpinionsToTheThread(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	panel := worklist.Message{ID: "q", Role: worklist.RoleUser, Content: worklist.IndependentReviewPrompt, Kind: worklist.KindReviewRequest, Refused: true, At: time.Now()}
+	h, p, store := draftFixture(t, c, []worklist.Message{panel})
+	h.ReviewAllPRs(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/items/review-all", nil))
+	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+	if len(p.reviewed) != 0 || len(it.Thread) != 1 || it.Thread[0].Attempt != "" {
+		t.Errorf("Review all touched the 2nd opinion: reviewed %v, thread %+v", p.reviewed, it.Thread)
+	}
+	// An ordinary stalled review is still retried by the batch.
+	ordinary := panel
+	ordinary.Content = reviewPrompt
+	h, p, _ = draftFixture(t, c, []worklist.Message{ordinary})
+	h.ReviewAllPRs(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/items/review-all", nil))
+	if len(p.reviewed) != 1 {
+		t.Errorf("Review all skipped an ordinary stalled review: %v", p.reviewed)
+	}
+}

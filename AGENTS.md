@@ -703,7 +703,8 @@ Wired on the web-tier side; they define what a runtime must respect:
   neither pending nor waiting to stall); "Review the current revision" likewise
   retries an unanswered review request asked since the latest review landed
   (`WorkItem.LatestReviewAt`: earlier ones are superseded, and a redraft moves no
-  review), instead of asking again; a definite dispatch
+  review), instead of asking again; Review all PRs leaves a 2nd opinion awaiting a
+  retry to the thread's blind Retry; a definite dispatch
   refusal shows on the thread (`review_refused`, describing that attempt, hidden
   while a later one runs) and leaves the turn retryable at once (a disabled draft
   button says why in text: Safari

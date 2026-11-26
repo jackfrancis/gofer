@@ -950,6 +950,13 @@ func (h *Handler) ReviewAllPRs(w http.ResponseWriter, r *http.Request) {
 			if it.ReplyPending(at, reviewStaleAfter) {
 				continue // a reply is plausibly in flight
 			}
+			if i, ok := it.RetryableTurn(at, reviewStaleAfter); ok && isSecondOpinionRequest(it.Thread[i]) {
+				// A 2nd opinion awaiting a retry is retried only blind, by a model it may
+				// use (the thread's Retry, retryChoices): this ordinary batch would let it
+				// read the conversation while it still counts as independent, and a new
+				// review beside it could be answered twice. Leave it to the thread.
+				continue
+			}
 			// If the last request's run has finished or failed, retry it — reusing the
 			// prompt (refresh its timestamp) rather than stacking a second one. This is
 			// what makes the button self-healing after a rate-limited batch.
