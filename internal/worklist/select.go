@@ -299,6 +299,7 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 				// keeping the review out of order would push out a later word that
 				// disagrees with it.
 				th[anchor].Reviews, th[anchor].Head, th[anchor].Base, th[anchor].Diff = nil, "", "", ""
+				th[anchor].BasisNamed = true
 				if j := keyed.latestReviewBefore(anchor); j >= 0 {
 					r := th[j].revision()
 					th[anchor].Reviews = []string{th[keyed.requestOf(j)].ID}

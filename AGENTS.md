@@ -655,7 +655,15 @@ Wired on the web-tier side; they define what a runtime must respect:
   newest-first window, its request naming the latest review before it with that
   review's revision, `WorkItem.DraftBasis`; an approval needs a read holding that
   review and every visible turn since its request, which the run and the store both
-  check, the store on the read it serves), "Draft Review Comments" (offered only with commenting configured; a connect
+  check, the store on the read it serves, and only while no earlier turn was hidden or
+  unhidden since the request was saved, since the store keeps no copy of the read the
+  run got; a read from an older web tier names no review, `DraftBasis.Named`, and the
+  run withholds an approval, says to draft again, and keeps that offered,
+  `Message.RedraftHelps`; a store-withheld approval rewrites the reply's text to match,
+  `withholdApproval`, over the shared `worklist.ApprovalLead`/`ApprovalAlso`/`ApprovalBlock`;
+  the drafter is not shown an answer whose question a cut read left out,
+  `WorkItem.Unpaired`, and is told the conversation is partial, `DraftInput.Partial`),
+  "Draft Review Comments" (offered only with commenting configured; a connect
   link without the grant) posts a `KindDraftReviewRequest` turn and dispatches a
   converse run by the default model. The button is not shown, and the handler refuses
   the request, while a redraft would only repeat the offered draft

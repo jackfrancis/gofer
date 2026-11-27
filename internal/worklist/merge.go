@@ -217,7 +217,7 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 	reply.Reviews = nil
 	reply.Hidden = false
 	reply.HiddenRev, reply.ReadRev, reply.ReadRevKnown = 0, 0, false // the web tier's revisions, never a run's
-	reply.Omitted = false                                            // a read's mark, never stored
+	reply.Omitted, reply.BasisNamed = false, false                   // a read's marks, never stored
 	reply.Refused, reply.RefusedAttempt = false, ""                  // the web tier's record of a refusal, never a run's
 	if !knownNotice(reply.Notice) {
 		reply.Notice = "" // only notices gofer knows
@@ -258,20 +258,30 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 	// sent. A run never writes a receipt: that is the owner's confirmation.
 	reply.DraftReceipt = nil
 	if i, _ := item.TurnIndex(replyTo); item.IsDraftReviewRequest(i) && reply.Notice == "" {
+		proposed := reply.Draft != nil && reply.Draft.Approve
 		if reply.Draft = BoundDraft(reply.Draft); !reply.Draft.For(*item) {
 			reply.Draft = nil
 		}
 		// An approval approves the revision the latest review before the request read
 		// (the one the draft's run judged by; a review landing after the request is
-		// not), so it stands only on a draft pinned to that head, base and diff, and
-		// only if the run's read held that review and every visible turn since its
-		// request (DraftBasis.Read, judged on the read the store serves now), whatever
-		// the run decided: a run from before that check, or one that ignored it, never
-		// approves past an owner's later word it did not read.
-		if d := reply.Draft; d != nil && d.Approve && !(reviewedAs(item.revisionAt(item.latestReviewBefore(i)), Revision{d.Commit, d.BaseRef, d.Diff}) && item.readsReviewWhole(i)) {
-			d.Approve, d.Diff = false, "" // as BoundDraft stores a draft that does not approve, so it stays Current
-			if d.Empty() {
-				reply.Draft = nil
+		// not), so it stands only on a draft pinned to that head, base and diff; only
+		// if no turn before the request was hidden or unhidden since it was saved, so
+		// the read the store can rebuild now is the one the run got (toggledSince:
+		// the store keeps no copy of a read); and only if that read held that review
+		// and every visible turn since its request (DraftBasis.Read). Each is judged
+		// here whatever the run decided: a run from before these checks, or one that
+		// ignored them, never approves past an owner's word it did not read. The
+		// reply's text then says the approval was withheld, and why
+		// (withholdApproval), and keeps the comments.
+		if proposed {
+			d := reply.Draft
+			switch {
+			case d == nil || !d.Approve || !reviewedAs(item.revisionAt(item.latestReviewBefore(i)), Revision{d.Commit, d.BaseRef, d.Diff}):
+				withholdApproval(&reply, noApprovalStale)
+			case item.toggledSince(i):
+				withholdApproval(&reply, noApprovalToggled)
+			case !item.readsReviewWhole(i):
+				withholdApproval(&reply, NoApprovalUnread)
 			}
 		}
 	} else {

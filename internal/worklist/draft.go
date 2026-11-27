@@ -49,6 +49,49 @@ const (
 // read them from a submitted review's body.
 const ApprovalCommands = "/lgtm\n/approve"
 
+// The parts of a draft reply's text that describe its approval. The draft run
+// (internal/agent) writes them, and the store removes them when it withholds the
+// approval (AppendReply), so a reply never claims an approval its stored draft does
+// not carry.
+const (
+	// ApprovalLead starts the line that opens a reply whose draft is an approval and
+	// nothing else.
+	ApprovalLead = "**Drafted an approval**"
+	// ApprovalAlso is the sentence a reply with comments adds for an approval.
+	ApprovalAlso = " The conversation also agrees the pull request is ready to approve."
+	// ApprovalBlock shows the approval's commands.
+	ApprovalBlock = "\n**Approval** (a general comment, on lines of its own)\n\n```\n" + ApprovalCommands + "\n```\n"
+)
+
+// Why an approval the conversation agreed on was withheld, as a draft reply's text
+// says it. The run writes NoApprovalUnread too; the store writes them all when it
+// withholds an approval the run sent (AppendReply).
+const (
+	NoApprovalUnread  = "\n**No approval drafted.** The conversation agrees on approving, but since its latest review was asked for it is longer than gofer reads at once, so some of it was not read, and a message there could disagree. Hide the turns you no longer need since that review, then draft again.\n"
+	noApprovalToggled = "\n**No approval drafted.** The conversation agrees on approving, but a turn before the request was hidden or unhidden after this draft was asked for, so gofer cannot confirm the conversation the draft read. Draft again.\n"
+	noApprovalStale   = "\n**No approval drafted.** The conversation agrees on approving, but its latest review did not read the revision this draft is anchored to, so no approval can be drafted from it. Review the current revision, then draft again.\n"
+)
+
+// withholdApproval drops the approval from reply's draft (the whole draft, when that
+// was all of it) and rewrites the text to match: the approval's parts go, and why
+// is added, so the thread never describes an approval the stored draft does not
+// carry. The comments and everything else the text says stand.
+func withholdApproval(reply *Message, why string) {
+	if d := reply.Draft; d != nil {
+		d.Approve, d.Diff = false, "" // as BoundDraft stores a draft that does not approve, so it stays Current
+		if d.Empty() {
+			reply.Draft = nil
+		}
+	}
+	c := reply.Content
+	if strings.HasPrefix(c, ApprovalLead) {
+		_, c, _ = strings.Cut(c, "\n") // the approval was the whole draft: its line goes
+	}
+	c = strings.Replace(c, ApprovalAlso, "", 1)
+	c = strings.Replace(c, ApprovalBlock, "", 1)
+	reply.Content = strings.TrimLeft(strings.TrimLeft(c, "\n")+why, "\n")
+}
+
 // DraftReview is the structured result of a draft-review run: inline comments
 // anchored to lines of one pull request's diff, a summary Body for the agreed points
 // no diff line carries, and Approve when the conversation agrees the pull request is
@@ -409,6 +452,7 @@ func (w WorkItem) latestDraft() (req, reply int) {
 // slow first run's draft is still judged by what it could have read. A request
 // saved before revisions were recorded (no ReadRevKnown) cannot be judged so, and
 // its draft never counts as redundant: the thread keeps the button, as it did then.
+// Nor does a draft whose run said drafting again may help (Message.RedraftHelps).
 // A toggle after
 // the request but before its run read the thread counts too, which errs toward
 // offering the button. A confirmed draft (any receipt) is used up: the thread says to
@@ -427,21 +471,31 @@ func (w WorkItem) RedraftRedundant() bool {
 	if !w.Thread[i].Draft.For(w) || !w.Thread[i].Draft.Current() || w.Thread[i].DraftReceipt != nil {
 		return false
 	}
-	if !w.Thread[req].ReadRevKnown {
+	if w.toggledSince(req) || w.Thread[i].RedraftHelps {
 		return false
 	}
-	read := w.Thread[req].ReadRev
-	for j := range w.Thread {
-		switch {
-		case j < req:
-			if w.Thread[j].HiddenRev > read {
-				return false
-			}
-		case j > req && j != i && !w.Thread[j].Hidden:
+	for j := req + 1; j < len(w.Thread); j++ {
+		if j != i && !w.Thread[j].Hidden {
 			return false
 		}
 	}
 	return true
+}
+
+// toggledSince reports whether a turn before the draft-review request at req was
+// hidden or unhidden since the request was saved (a HiddenRev above its ReadRev), or
+// whether that cannot be told (a request saved before revisions, no ReadRevKnown):
+// either way, the conversation its run read may not be the one the thread shows now.
+func (w WorkItem) toggledSince(req int) bool {
+	if !w.Thread[req].ReadRevKnown {
+		return true
+	}
+	for j := range req {
+		if w.Thread[j].HiddenRev > w.Thread[req].ReadRev {
+			return true
+		}
+	}
+	return false
 }
 
 // VisibilityRev is the thread's visibility revision: the highest HiddenRev in it, or
@@ -586,7 +640,10 @@ type DraftInput struct {
 	Item        WorkItem
 	ViewerLogin string
 	History     []Message
-	Diff        string
+	// Partial is true when History is the newest part of a conversation too long to
+	// read whole: earlier turns were left out.
+	Partial bool
+	Diff    string
 	// Head and Base are the pull request's head commit and base branch the diff
 	// shows, which the draft is anchored to; a history turn's Head and Base are the
 	// revision it read.

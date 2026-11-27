@@ -71,7 +71,7 @@ func draftItem() worklist.WorkItem {
 			{ID: "q", Role: worklist.RoleUser, Content: "review?", Kind: worklist.KindReviewRequest},
 			{ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "rename new1", Model: "m1", Head: draftHead, Base: "main", Diff: draftDiff},
 			{ID: "h", Role: worklist.RoleUser, Content: "secret aside", Hidden: true},
-			{ID: "d", Role: worklist.RoleUser, Content: "draft", Kind: worklist.KindDraftReviewRequest},
+			{ID: "d", Role: worklist.RoleUser, Content: "draft", Kind: worklist.KindDraftReviewRequest, ReadRevKnown: true},
 		},
 	}
 }
@@ -478,6 +478,66 @@ func TestRunConverseWithholdsAnApprovalOverAnUnreadConversation(t *testing.T) {
 	m, _ = run(t, build(false, pushed))
 	if m.Draft != nil || !strings.Contains(m.Content, "read commit `"+pushed[:12]) || strings.Contains(m.Content, "longer than gofer reads") {
 		t.Errorf("a stale review over an unread conversation: %+v\n%s", m.Draft, m.Content)
+	}
+}
+
+// olderWebTier serves reads as a web tier from before reads named a draft's review:
+// a draft-review request carries no basis.
+type olderWebTier struct{ *memSink }
+
+func (o olderWebTier) Item(ctx context.Context, id, turn string) (worklist.WorkItem, bool, error) {
+	it, ok, err := o.memSink.Item(ctx, id, turn)
+	for i := range it.Thread {
+		if it.Thread[i].Kind == worklist.KindDraftReviewRequest {
+			m := &it.Thread[i]
+			m.Reviews, m.Head, m.Base, m.Diff, m.BasisNamed = nil, "", "", "", false
+		}
+	}
+	return it, ok, err
+}
+
+// A read from an older web tier names no review: the run cannot tell a missing
+// review from one it was not told about, so it withholds an approval without
+// sending the owner to a first review the thread does not offer, says to draft
+// again once the update is done, and keeps that offered (Message.RedraftHelps).
+func TestRunConverseApprovalAgainstAnOlderWebTier(t *testing.T) {
+	sink := &memSink{items: []worklist.WorkItem{draftItem()}}
+	fd := &fakeDrafter{prop: worklist.DraftProposal{Approve: true, Comments: []worklist.DraftComment{{Path: "a.go", Line: 11, Side: "RIGHT", Body: "nit"}}}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: "github:o/r#1", Turn: "d", Converser: &fakeConverser{}, Drafter: fd},
+		fakeVendor{token: "t"}, olderWebTier{sink}); err != nil {
+		t.Fatal(err)
+	}
+	it := sink.items[0]
+	m := it.Thread[len(it.Thread)-1]
+	if m.Draft == nil || m.Draft.Approve || len(m.Draft.Comments) != 1 {
+		t.Fatalf("draft against an older web tier: %+v", m.Draft)
+	}
+	if strings.Contains(m.Content, "no visible review") || strings.Contains(m.Content, "Review this pull request") || !strings.Contains(m.Content, "once the update is done") {
+		t.Errorf("reply against an older web tier:\n%s", m.Content)
+	}
+	if !m.RedraftHelps || it.RedraftRedundant() {
+		t.Error("drafting again is not kept offered")
+	}
+}
+
+// The drafter is not shown an answer whose question the read left out: alone it is
+// no evidence of agreement (the owner may have rejected its point in a turn left out
+// with the question), and it is told the conversation is only the newest part. An
+// answer whose question the read holds, or one to a hidden question, is shown.
+func TestDraftHistoryLeavesOutUnpairedAnswers(t *testing.T) {
+	read := worklist.WorkItem{Thread: []worklist.Message{
+		{ID: "a", ReplyTo: "q", Role: worklist.RoleAgent, Content: "Please rename x to y.", Omitted: true},
+		{ID: "u", Role: worklist.RoleUser, Content: "and the docs?"},
+		{ID: "g", ReplyTo: "u", Role: worklist.RoleAgent, Content: "Fix the typo."},
+		{ID: "d", Role: worklist.RoleUser, Content: "draft", Kind: worklist.KindDraftReviewRequest},
+	}}
+	history, partial := draftHistory(read, 3)
+	if !partial || len(history) != 2 || history[0].ID != "u" || history[1].ID != "g" {
+		t.Errorf("partial read: partial %v, history %+v", partial, history)
+	}
+	read.Thread[0].Omitted = false // nothing left out: the question was hidden
+	if history, partial := draftHistory(read, 3); partial || len(history) != 3 {
+		t.Errorf("whole read: partial %v, history %+v", partial, history)
 	}
 }
 

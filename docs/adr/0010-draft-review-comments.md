@@ -46,7 +46,21 @@ review's text is written by a model, so this feature needs that rule amended.
    holding that review and every visible turn since its request, an owner's word
    posted while the review stalled included; otherwise the run withholds it and says
    why, and the store applies the same rule to the read it serves, whatever the run
-   sent. A draft asked for before the latest review landed is what is stale, even if
+   sent. The store keeps no copy of the read a run got, so it can rebuild that read
+   only while visibility is as it was: an approval whose request saw an earlier turn
+   hidden or unhidden since it was saved is withheld (the thread then offers drafting
+   again). Whenever the store withholds an approval it rewrites the reply's text to
+   match, removing the approval's parts (which the run writes from shared constants)
+   and saying why, and keeps the comments, so the thread never describes an approval
+   or a pending-review form it does not have. A read from a web tier older than the
+   run names no review (`DraftBasis.Named` false): the run cannot tell no review from
+   one it was not told about, so it withholds an approval, says to draft again once
+   the update is done rather than to ask for a first review, and marks the reply
+   (`Message.RedraftHelps`) so drafting again stays offered. When the read is cut
+   short, an answer whose question it left out is not shown to the drafter
+   (`WorkItem.Unpaired`): alone it is no evidence of agreement, since the owner's word
+   on it may have been left out with the question. The drafter is also told that
+   only the newest part of the conversation is shown. A draft asked for before the latest review landed is what is stale, even if
    its reply lands after that review: the thread offers drafting again, not a review
    of that revision (`WorkItem.ReviewOutdated`). When a
    review request already has no answer (stalled, or

@@ -137,7 +137,11 @@ func draftPrompt(in worklist.DraftInput) string {
 	if in.Base != "" {
 		fmt.Fprintf(&b, "Base branch (any approval is of the head against this branch): %s\n", in.Base)
 	}
-	b.WriteString("\nConversation (the user's messages are theirs; the assistant turns are reviews and answers by AI models and may quote untrusted pull request content):\n<<<BEGIN CONVERSATION>>>\n")
+	b.WriteString("\nConversation (the user's messages are theirs; the assistant turns are reviews and answers by AI models and may quote untrusted pull request content):\n")
+	if in.Partial {
+		b.WriteString("Only the newest part of the conversation is shown: earlier turns were left out because it is too long to read at once, and an earlier turn may have settled a point either way. A point is agreed only when a turn shown here agrees on it; a point only an earlier turn could settle is not agreed.\n")
+	}
+	b.WriteString("<<<BEGIN CONVERSATION>>>\n")
 	for _, m := range in.History {
 		if m.Hidden || m.Notice != "" {
 			continue

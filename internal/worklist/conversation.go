@@ -129,6 +129,18 @@ type Message struct {
 	// out to fit the read: there the read is not the whole conversation
 	// (WorkItem.OmitsTurns). It is never stored: AppendReply clears it on a reply.
 	Omitted bool `json:"omitted,omitempty"`
+	// BasisNamed marks, on a draft-review request in a run's read (ThreadWindow), that
+	// the web tier serving the read names the latest review before it (Reviews, Head,
+	// Base, Diff), or that there is none. A read without it comes from a web tier
+	// older than that, which names nothing, so the run cannot tell a conversation
+	// with no review from one whose review it was not told about (DraftBasis.Named).
+	// It is never stored: AppendReply clears it on a reply.
+	BasisNamed bool `json:"basis_named,omitempty"`
+	// RedraftHelps marks a draft reply whose run withheld something drafting again
+	// may draft: an approval it could not check because the web tier serving its
+	// read was older than the run (DraftBasis.Named). The thread keeps offering to
+	// draft again while it is the offered draft (RedraftRedundant).
+	RedraftHelps bool `json:"redraft_helps,omitempty"`
 	// ReadRevKnown marks a draft-review request whose ReadRev was recorded. A request
 	// saved before gofer recorded revisions has none, and toggles of that time carry
 	// no HiddenRev either, so its ReadRev of 0 says nothing: such a draft never counts
@@ -514,6 +526,10 @@ func (w WorkItem) requestOf(j int) int {
 // DraftBasis is what a draft-review request's read (ThreadWindow) says about the
 // review an approval would rest on: the latest review before the request.
 type DraftBasis struct {
+	// Named is true when the read says which review that is, or that there is none
+	// (Message.BasisNamed). Without it the rest says nothing: the web tier serving
+	// the read is older than the run.
+	Named bool
 	// Review is true when the conversation has a visible review before the request,
 	// whether or not the read holds it.
 	Review bool
@@ -533,11 +549,14 @@ func (b DraftBasis) Covers(rev Revision) bool { return b.Review && reviewedAs(b.
 // an approval would rest on: the request names it and carries its revision
 // (ThreadWindow), since it may not fit the read.
 func (w WorkItem) DraftBasis(anchor int) DraftBasis {
-	if anchor < 0 || anchor >= len(w.Thread) || len(w.Thread[anchor].Reviews) != 1 {
+	if anchor < 0 || anchor >= len(w.Thread) {
 		return DraftBasis{}
 	}
 	ask := w.Thread[anchor]
-	b := DraftBasis{Review: true, Revision: Revision{ask.Head, ask.Base, ask.Diff}}
+	if len(ask.Reviews) != 1 {
+		return DraftBasis{Named: ask.BasisNamed}
+	}
+	b := DraftBasis{Named: ask.BasisNamed, Review: true, Revision: Revision{ask.Head, ask.Base, ask.Diff}}
 	q, ok := w.TurnIndex(ask.Reviews[0])
 	if !ok || q >= anchor {
 		return b
@@ -545,6 +564,17 @@ func (w WorkItem) DraftBasis(anchor int) DraftBasis {
 	j, answered := w.replies()[w.TurnKey(q)]
 	b.Read = answered && j < anchor && !w.OmitsTurns(q, anchor)
 	return b
+}
+
+// Unpaired reports whether the agent turn at j, in a run's read (ThreadWindow), is
+// an answer whose question the read left out: the read omits visible turns at or
+// before it (OmitsTurns), and the user turn it answers is not in the read. Read
+// alone, such an answer is no evidence of what the conversation agreed, since the
+// owner's word on it may have been left out with the question. An answer to a
+// hidden question, in a read that omits nothing before it, is not unpaired: the
+// owner chose to keep it.
+func (w WorkItem) Unpaired(j int) bool {
+	return j >= 0 && j < len(w.Thread) && w.Thread[j].Role == RoleAgent && w.requestOf(j) < 0 && w.OmitsTurns(-1, j)
 }
 
 // OmitsTurns reports whether a run's read (ThreadWindow) left out visible turns

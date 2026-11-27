@@ -3,6 +3,7 @@ package worklist
 import (
 	"context"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -348,8 +349,65 @@ func TestThreadWindowNamesTheLatestReviewForADraft(t *testing.T) {
 		t.Error("with the latest review hidden, the one before it is named")
 	}
 	w.Thread[0].Hidden = true
-	if b := ThreadWindow(w, "d", MaxItemBytes); b.DraftBasis(len(b.Thread) - 1).Review {
-		t.Error("with every review hidden, one is named")
+	if b := ThreadWindow(w, "d", MaxItemBytes); b.DraftBasis(len(b.Thread)-1).Review || !b.DraftBasis(len(b.Thread)-1).Named {
+		t.Error("with every review hidden, one is named, or none is said to be")
+	}
+	// A read without the mark comes from an older web tier, which names nothing:
+	// it says nothing about whether there is a review.
+	older := whole
+	older.Thread = slices.Clone(whole.Thread)
+	older.Thread[len(older.Thread)-1].Reviews, older.Thread[len(older.Thread)-1].BasisNamed = nil, false
+	if b := older.DraftBasis(len(older.Thread) - 1); b.Named || b.Review {
+		t.Errorf("an older web tier's read: basis %+v", b)
+	}
+	if !whole.DraftBasis(len(whole.Thread) - 1).Named {
+		t.Error("the read does not say it names the review")
+	}
+}
+
+// In a read cut short, an answer whose question was left out is unpaired: alone it
+// is no evidence of agreement. An answer whose question the read holds is not, nor
+// is one to a hidden question in a read that left nothing out before it.
+func TestUnpairedAnswers(t *testing.T) {
+	th := []Message{
+		{ID: "q", Role: RoleUser, Content: "rename x?"},
+		{ID: "no", Role: RoleUser, Content: "No, keep x."},
+		{ID: "a", ReplyTo: "q", Role: RoleAgent, Content: "Please rename x to y."}, // answered late
+	}
+	for i := range 40 {
+		id := strconv.Itoa(i)
+		th = append(th,
+			Message{ID: "u" + id, Role: RoleUser, Content: strings.Repeat("chat ", 400)},
+			Message{ID: "g" + id, Role: RoleAgent, ReplyTo: "u" + id, Content: strings.Repeat("reply ", 400)})
+	}
+	th = append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest})
+	w := WorkItem{ID: "a", Type: TypePullRequest, Thread: th}
+	// Cut the read so that the late answer is its first turn: its question and the
+	// rejection are left out.
+	var win WorkItem
+	for b := encodedSize(w); b > 0; b -= 16 {
+		win = ThreadWindow(w, "d", b)
+		if len(win.Thread) < 2 || win.Thread[0].ID == "a" {
+			break
+		}
+	}
+	if len(win.Thread) < 2 || win.Thread[0].ID != "a" {
+		t.Fatal("fixture: no budget makes the late answer the read's first turn")
+	}
+	if !win.Unpaired(0) {
+		t.Error("an answer whose question the read left out is not unpaired")
+	}
+	for k := 1; k < len(win.Thread); k++ {
+		if win.Unpaired(k) {
+			t.Errorf("turn %s, whose question the read holds, is unpaired", win.Thread[k].ID)
+		}
+	}
+	whole := ThreadWindow(w, "d", MaxItemBytes)
+	hidden := whole
+	hidden.Thread = slices.Clone(whole.Thread)
+	hidden.Thread = hidden.Thread[1:] // the question hidden: not in the read, and no gap marked
+	if hidden.Unpaired(1) || whole.Unpaired(2) {
+		t.Error("an answer to a hidden question, or one with its question, is unpaired")
 	}
 }
 

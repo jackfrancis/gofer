@@ -398,7 +398,7 @@ func TestAppendReplyApprovalJudgedByTheReviewBeforeTheRequest(t *testing.T) {
 	item := draftPR(
 		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
 		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
-		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest},
+		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true},
 		Message{ID: "q2", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
 		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: later, Base: "main", Diff: testDiff},
 	)
@@ -416,6 +416,70 @@ func TestAppendReplyApprovalJudgedByTheReviewBeforeTheRequest(t *testing.T) {
 	}
 }
 
+// The store cannot rebuild a read made before a turn was hidden or unhidden: an
+// approval whose request saw an earlier turn's visibility change since it was saved
+// is withheld, even when the read the store would serve now fits (a run that missed
+// a visible hold, then unrelated turns hidden while it worked). The reply's text
+// says so, and the comments stand.
+func TestAppendReplyWithholdsAnApprovalAfterAVisibilityChange(t *testing.T) {
+	th := []Message{
+		{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		{ID: "hold", Role: RoleUser, Content: "Do not approve yet."},
+		{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+	}
+	for i := range 24 { // about 4.8 MB since the review: more than a read holds
+		th = append(th, Message{ID: "u" + strconv.Itoa(i), Role: RoleUser, Content: strings.Repeat("chat ", 40000)})
+	}
+	item := draftPR(append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true})...)
+	for i := range 24 { // hidden while the run worked: now the read fits
+		item.SetHidden(3+i, true)
+	}
+	if !item.readsReviewWhole(len(item.Thread) - 1) {
+		t.Fatal("fixture: the read should fit once the filler is hidden")
+	}
+	d := pinned("", DraftComment{Path: "a.go", Line: 1, Side: SideRight, Body: "nit"})
+	d.Approve, d.Diff = true, testDiff
+	text := "**Drafted 1 inline review comment** from the points this conversation agrees on." + ApprovalAlso + " Nothing is posted until you create the pending review below.\n\n1. `a.go` line 1:\n\n   nit\n" + ApprovalBlock
+	if _, err := AppendReply(&item, "d", Message{ID: "a", Content: text, Draft: d}); err != nil {
+		t.Fatal(err)
+	}
+	m := item.Thread[len(item.Thread)-1]
+	if m.Draft == nil || m.Draft.Approve || len(m.Draft.Comments) != 1 {
+		t.Fatalf("approval after a visibility change: %+v", m.Draft)
+	}
+	if strings.Contains(m.Content, ApprovalAlso) || strings.Contains(m.Content, ApprovalCommands) || !strings.Contains(m.Content, "hidden or unhidden after this draft was asked for") || !strings.Contains(m.Content, "   nit") {
+		t.Errorf("the text does not match the stored draft:\n%s", m.Content)
+	}
+	if item.RedraftRedundant() {
+		t.Error("drafting again is not offered")
+	}
+}
+
+// When the approval was the whole draft, withholding it leaves no draft, and the
+// text keeps no line about one: no pending review is offered, and none is described.
+func TestWithheldApprovalOnlyDraftLeavesNoClaim(t *testing.T) {
+	d := pinned("")
+	d.Approve, d.Diff = true, testDiff
+	reply := Message{Content: ApprovalLead + " of commit `0123`: this conversation agrees. Nothing is posted until you create the pending review below.\n\n**Left out — no consensus yet**\n\n- the rename\n" + ApprovalBlock, Draft: d}
+	withholdApproval(&reply, NoApprovalUnread)
+	if reply.Draft != nil || strings.Contains(reply.Content, ApprovalLead) || strings.Contains(reply.Content, "pending review") || strings.Contains(reply.Content, ApprovalCommands) {
+		t.Errorf("withheld approval-only draft: %+v\n%s", reply.Draft, reply.Content)
+	}
+	if !strings.Contains(reply.Content, "- the rename") || !strings.HasSuffix(reply.Content, NoApprovalUnread) {
+		t.Errorf("the rest of the text, or why, is gone:\n%s", reply.Content)
+	}
+}
+
+// A run that withheld what drafting again may draft (an approval it could not check
+// against an older web tier's read) keeps the button.
+func TestRedraftOfferedWhenTheRunSaysItHelps(t *testing.T) {
+	d1 := Message{ID: "d1", Role: RoleUser, Kind: KindDraftReviewRequest, Content: "draft", ReadRevKnown: true}
+	a1 := Message{ID: "a1", ReplyTo: "d1", Role: RoleAgent, Content: "drafted", Draft: pinned("x"), RedraftHelps: true}
+	if draftPR(d1, a1).RedraftRedundant() {
+		t.Error("a draft whose run said drafting again helps counts as redundant")
+	}
+}
+
 // The store keeps an approval only if the run's read held the latest review and
 // every visible turn since it was asked for, judged on the read it serves, whatever
 // the run sent: a run that never checked (one from before the check) cannot approve
@@ -430,7 +494,7 @@ func TestAppendReplyApprovalNeedsTheWholeConversationSinceTheReview(t *testing.T
 		for i := range filler {
 			th = append(th, Message{ID: "u" + strconv.Itoa(i), Role: RoleUser, Content: strings.Repeat("chat ", 40000)})
 		}
-		return draftPR(append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest})...)
+		return draftPR(append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true})...)
 	}
 	approve := func(it *WorkItem) *DraftReview {
 		d := pinned("")
@@ -458,7 +522,7 @@ func TestLateDraftDoesNotOutdateANewerReview(t *testing.T) {
 	it := draftPR(
 		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
 		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
-		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest},
+		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true},
 		Message{ID: "q2", Role: RoleUser, Content: "again", Kind: KindReviewRequest},
 		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: pushed, Base: "main", Diff: testDiff},
 		Message{ID: "a", ReplyTo: "d", Role: RoleAgent, Content: "drafted", Head: testCommit, Base: "main", Diff: testDiff},
@@ -486,7 +550,7 @@ func TestAppendReplyApprovalNeedsTheReviewedHead(t *testing.T) {
 		return draftPR(
 			Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
 			Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: reviewHead, Base: "main", Diff: testDiff},
-			Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest},
+			Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true},
 		)
 	}
 	item := thread(testCommit)
