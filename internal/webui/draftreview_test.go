@@ -106,8 +106,8 @@ func TestThreadDraftReviewButton(t *testing.T) {
 	}
 
 	h, _, _ = draftFixture(t, connected, []worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: "hi", At: old}})
-	if page, _ := threadPage(t, h); !strings.Contains(page, "disabled title=\"Review this pull request first") {
-		t.Error("an unreviewed pull request's button is not disabled")
+	if page, _ := threadPage(t, h); !strings.Contains(page, "disabled title=\"There is nothing in this conversation to draft") {
+		t.Error("a pull request with nothing answered yet does not disable the button")
 	}
 	pending := append(draftedThread(old)[:2], worklist.Message{ID: "p", Role: worklist.RoleUser, Content: "more?", At: time.Now()})
 	h, _, _ = draftFixture(t, connected, pending)
@@ -817,30 +817,42 @@ func TestClaimSavesTheBody(t *testing.T) {
 	}
 }
 
-// A disabled Draft Review Comments button says why in visible text, since Safari
-// shows no tooltip on a disabled button and the stylesheet must mark it disabled.
-// With no review yet, the thread offers one right there: it appends a review
-// request (keeping the conversation) and dispatches it to the default model. While
-// a reply is in flight the reason is to wait, and no review is offered.
-func TestDisabledDraftButtonSaysWhy(t *testing.T) {
+// Drafting works from any answered discussion, not only a review request: a
+// Discuss question answered with an assessment is enough, so the button is enabled.
+// With no review yet the thread still offers one, saying it is needed only to draft
+// an approval; it appends a review request (keeping the conversation) and
+// dispatches it to the default model. While a reply is in flight the reason is to
+// wait, and no review is offered.
+func TestDraftFromDiscussionWithoutReview(t *testing.T) {
 	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
-	asked := []worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: "can you review this?", At: time.Now().Add(-time.Hour)}, {ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "Looks fine.", At: time.Now().Add(-time.Hour)}}
+	asked := []worklist.Message{{ID: "q", Role: worklist.RoleUser, Content: "Any review comments, or is this ready to merge?", At: time.Now().Add(-time.Hour)}, {ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "I'd hold /lgtm for one correction.", At: time.Now().Add(-time.Hour)}}
 	h, p, store := draftFixture(t, c, asked)
 	page, _ := threadPage(t, h)
-	for _, want := range []string{`<p class="zz-meta zz-why">Review this pull request first`, `action="/items/review-again"`, `name="review" value="first"`, ">Review this pull request</button>"} {
+	i := strings.Index(page, `action="/items/draft-review"`)
+	if i < 0 || strings.Contains(page[i:strings.Index(page[i:], "</form>")+i], "disabled") {
+		t.Fatalf("drafting from a discussion is not enabled:\n%s", page)
+	}
+	for _, want := range []string{"A review is needed only to draft an approval", `name="review" value="first"`, ">Review this pull request</button>"} {
 		if !strings.Contains(page, want) {
 			t.Errorf("thread lacks %q", want)
 		}
 	}
-	req := httptest.NewRequest(http.MethodPost, "/items/review-again", strings.NewReader(url.Values{"id": {draftItemID}, "review": {"first"}}.Encode()))
+	// The draft request is accepted and dispatched.
+	req := httptest.NewRequest(http.MethodPost, "/items/draft-review", strings.NewReader(url.Values{"id": {draftItemID}}.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	h.ReviewAgain(httptest.NewRecorder(), req)
+	h.DraftReview(httptest.NewRecorder(), req)
 	it, _, _ := store.Get(context.Background(), "github:42", draftItemID)
+	if last := it.Thread[len(it.Thread)-1]; last.Kind != worklist.KindDraftReviewRequest || len(p.turns) != 1 {
+		t.Fatalf("draft from a discussion: appended %+v, dispatched %+v", last, p.turns)
+	}
+	// The optional review is still available, and once in flight the reason is to wait.
+	h, p, store = draftFixture(t, c, asked)
+	postReview(h, "first")
+	it, _, _ = store.Get(context.Background(), "github:42", draftItemID)
 	last := it.Thread[len(it.Thread)-1]
-	if len(it.Thread) != 3 || last.Kind != worklist.KindReviewRequest || last.Content != reviewPrompt || len(p.turns) != 1 || p.turns[0].Turn != last.ID || p.converseModels[0] != "m0" {
+	if len(it.Thread) != 3 || last.Kind != worklist.KindReviewRequest || last.Content != reviewPrompt || len(p.turns) != 1 || p.converseModels[0] != "m0" {
 		t.Fatalf("appended %+v, dispatched %+v", last, p.turns)
 	}
-	// The review is now in flight: wait, and no second review is offered.
 	page, _ = threadPage(t, h)
 	if !strings.Contains(page, `<p class="zz-meta zz-why">Wait for the reply in progress`) || strings.Contains(page, ">Review this pull request</button>") {
 		t.Errorf("pending review: reason or button wrong:\n%s", page)
@@ -852,12 +864,57 @@ func TestDisabledDraftButtonSaysWhy(t *testing.T) {
 		t.Errorf("a reviewed pull request shows a reason or a review button")
 	}
 	for _, action := range []string{"first", "again", ""} {
-		req = httptest.NewRequest(http.MethodPost, "/items/review-again", strings.NewReader(url.Values{"id": {draftItemID}, "review": {action}}.Encode()))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		h.ReviewAgain(httptest.NewRecorder(), req)
+		postReview(h, action)
 	}
 	if len(p.turns) != 0 {
 		t.Error("a reviewed pull request with a current review was reviewed again")
+	}
+}
+
+// A draft from a discussion that withheld an approval tells the user to ask for a
+// review, so the thread offers one even while a redraft would only repeat that draft
+// (RedraftRedundant hides only the draft button). A review whose request or answer
+// is hidden approves nothing, as an approval counts reviews, so it leaves the first
+// review offered too.
+func TestReviewOfferedBesideARedundantDraftOrAHiddenReview(t *testing.T) {
+	c := &fakeReviewCommenter{fakeCommenter: fakeCommenter{enabled: true, connected: true}}
+	at := time.Now().Add(-time.Hour)
+	drafted := draftedThread(at)[2:] // the draft request and its draft, no review
+	asked := []worklist.Message{{ID: "u", Role: worklist.RoleUser, Content: "Ready to merge?", At: at}, {ID: "v", ReplyTo: "u", Role: worklist.RoleAgent, Content: "Yes, with one nit.", At: at}}
+	h, p, store := draftFixture(t, c, append(asked, drafted...))
+	if it, _, _ := store.Get(context.Background(), "github:42", draftItemID); !it.RedraftRedundant() {
+		t.Fatal("fixture: the draft should be redundant to redraft")
+	}
+	page, _ := threadPage(t, h)
+	if strings.Contains(page, `action="/items/draft-review"`) {
+		t.Error("a redundant redraft is offered")
+	}
+	for _, want := range []string{`name="review" value="first"`, ">Review this pull request</button>", "A review is needed only to draft an approval"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("redundant draft: thread lacks %q", want)
+		}
+	}
+	postReview(h, "first")
+	if len(p.turns) != 1 {
+		t.Fatalf("redundant draft: the first review was not dispatched: %+v", p.turns)
+	}
+
+	for name, hide := range map[string]int{"request hidden": 0, "answer hidden": 1} {
+		th := append(draftedThread(at)[:2], asked...)
+		th[hide].Hidden = true
+		h, p, _ := draftFixture(t, c, th)
+		page, _ := threadPage(t, h)
+		i := strings.Index(page, `action="/items/draft-review"`)
+		if i < 0 || strings.Contains(page[i:strings.Index(page[i:], "</form>")+i], "disabled") {
+			t.Errorf("%s: drafting from the visible discussion is not enabled", name)
+		}
+		if !strings.Contains(page, ">Review this pull request</button>") {
+			t.Errorf("%s: no review offered:\n%s", name, page)
+		}
+		postReview(h, "first")
+		if len(p.turns) != 1 {
+			t.Errorf("%s: the first review was not dispatched: %+v", name, p.turns)
+		}
 	}
 }
 

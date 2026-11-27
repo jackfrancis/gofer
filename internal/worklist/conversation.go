@@ -97,7 +97,8 @@ type Message struct {
 	// weighs, recorded when it is chained (ChainSynthesis): the run compares exactly
 	// those reviews, and declines (NoticePanelInputs) if any is no longer visible to it
 	// (SynthesisReady). Empty on every other turn, and on synthesis requests stored
-	// before it was recorded.
+	// before it was recorded, except on a draft-review request in a run's read
+	// (ThreadWindow), where it names the latest review before it (WorkItem.DraftBasis).
 	Reviews []string `json:"reviews,omitempty"`
 	// Attempt identifies the current attempt at answering a user turn: a retry that
 	// starts a new run gives the turn a new one (Restamp; a retry that shares a run
@@ -123,6 +124,18 @@ type Message struct {
 	// (RedraftRedundant). A retry (Restamp) leaves it as it is. Zero on other turns.
 	// Both revisions are the web tier's alone: AppendReply clears them on a reply.
 	ReadRev int `json:"read_rev,omitempty"`
+	// Omitted marks, on a turn in a run's read (ThreadWindow), that visible turns
+	// between it and the read's turn before it (or the start of the thread) were left
+	// out to fit the read: there the read is not the whole conversation
+	// (WorkItem.OmitsTurns). It is never stored: AppendReply clears it on a reply.
+	Omitted bool `json:"omitted,omitempty"`
+	// BasisNamed marks, on a draft-review request in a run's read (ThreadWindow), that
+	// the web tier serving the read names the latest review before it (Reviews, Head,
+	// Base, Diff), or that there is none. A read without it comes from a web tier
+	// older than that, which names nothing, so the run cannot tell a conversation
+	// with no review from one whose review it was not told about (DraftBasis.Named).
+	// It is never stored: AppendReply clears it on a reply.
+	BasisNamed bool `json:"basis_named,omitempty"`
 	// ReadRevKnown marks a draft-review request whose ReadRev was recorded. A request
 	// saved before gofer recorded revisions has none, and toggles of that time carry
 	// no HiddenRev either, so its ReadRev of 0 says nothing: such a draft never counts
@@ -150,7 +163,9 @@ type Message struct {
 	// AppendReply keeps them only as a valid pair. An approving draft stands only on
 	// the revision its latest review read (ReviewedRevision), since a push or a
 	// retarget changes what would merge. Empty on user turns, on non-pull-request
-	// items, and on replies stored before they were recorded.
+	// items, and on replies stored before they were recorded, except on a
+	// draft-review request in a run's read (ThreadWindow), which carries there the
+	// revision of the latest review before it (WorkItem.DraftBasis).
 	Head string `json:"head,omitempty"`
 	Base string `json:"base,omitempty"`
 	// Diff is the digest of the whole diff the run read with Head and Base
@@ -423,6 +438,23 @@ func (w WorkItem) hasCompletedRequest(kind string) bool {
 // request answered by the assistant).
 func (w WorkItem) HasReview() bool { return w.hasCompletedRequest(KindReviewRequest) }
 
+// HasDiscussion reports whether the conversation has something to draft review
+// comments from: a visible user turn (other than a draft-review request) answered by
+// a visible reply. A review is one, and so is a Discuss question answered with a
+// review in all but name; the drafter judges what the conversation agrees on.
+func (w WorkItem) HasDiscussion() bool {
+	replies := w.replies()
+	for i, m := range w.Thread {
+		if m.Role != RoleUser || m.Hidden || w.IsDraftReviewRequest(i) {
+			continue
+		}
+		if j, ok := replies[w.TurnKey(i)]; ok && !w.Thread[j].Hidden {
+			return true
+		}
+	}
+	return false
+}
+
 // Revision is the pull request revision a run read: its head commit, base branch,
 // and the digest of the whole diff GitHub showed (github.DiffDigest; "" when the
 // run did not read it whole).
@@ -435,14 +467,23 @@ func (m Message) revision() Revision { return Revision{m.Head, m.Base, m.Diff} }
 
 // latestReview returns the position of the visible answer to a visible review
 // request that landed last in the thread, or -1.
-func (w WorkItem) latestReview() int {
+func (w WorkItem) latestReview() int { return w.latestReviewBefore(len(w.Thread)) }
+
+// latestReviewBefore returns the position of the latest review among the turns
+// before end (a visible review request answered by a visible reply, both before
+// end), or -1: the review a draft requested at end read, whatever landed after the
+// request. One pass over the thread.
+func (w WorkItem) latestReviewBefore(end int) int {
+	replies := w.replies()
 	latest := -1
-	for key, j := range w.replies() {
-		i, ok := w.TurnIndex(key)
-		if !ok || w.Thread[i].Role != RoleUser || w.Thread[i].Kind != KindReviewRequest || w.Thread[i].Hidden || w.Thread[j].Hidden {
+	for i := 0; i < end && i < len(w.Thread); i++ {
+		m := w.Thread[i]
+		if m.Role != RoleUser || m.Kind != KindReviewRequest || m.Hidden {
 			continue
 		}
-		latest = max(latest, j)
+		if j, ok := replies[w.TurnKey(i)]; ok && j < end && !w.Thread[j].Hidden {
+			latest = max(latest, j)
+		}
 	}
 	return latest
 }
@@ -451,11 +492,115 @@ func (w WorkItem) latestReview() int {
 // (latestReview): the zero Revision when there is no such review, or when that
 // answer recorded none. An approval drafted from the conversation approves that
 // revision, and nothing else.
-func (w WorkItem) ReviewedRevision() Revision {
-	if j := w.latestReview(); j >= 0 {
+func (w WorkItem) ReviewedRevision() Revision { return w.revisionAt(w.latestReview()) }
+
+// revisionAt is the revision recorded on the turn at j, or the zero Revision for -1.
+func (w WorkItem) revisionAt(j int) Revision {
+	if j >= 0 {
 		return w.Thread[j].revision()
 	}
 	return Revision{}
+}
+
+// requestOf returns the position of the user turn the agent turn at j answers (the
+// one its ReplyTo names, or for a legacy reply the turn directly before it), or -1.
+func (w WorkItem) requestOf(j int) int {
+	key := w.Thread[j].ReplyTo
+	if key == "" {
+		if j > 0 && w.Thread[j-1].Role == RoleUser {
+			return j - 1
+		}
+		return -1
+	}
+	if i, ok := w.TurnIndex(key); ok {
+		return i
+	}
+	return -1
+}
+
+// DraftBasis is what a draft-review request's read (ThreadWindow) says about the
+// review an approval would rest on: the latest review before the request.
+type DraftBasis struct {
+	// Named is true when the read says which review that is, or that there is none
+	// (Message.BasisNamed). Without it the rest says nothing: the web tier serving
+	// the read is older than the run.
+	Named bool
+	// Review is true when the conversation has a visible review before the request,
+	// whether or not the read holds it.
+	Review bool
+	// Revision is the revision that review recorded (ReviewedRevision).
+	Revision Revision
+	// Read is true when the read holds that review, request and answer, and every
+	// visible turn before the draft request, the earliest included: nothing the owner
+	// ever said is missing (a hold placed before the review was asked for is not
+	// lifted by asking for one), so what the drafter reads is the whole agreement.
+	// Only a read that is Named marks what it left out, so only it can be Read.
+	Read bool
+}
+
+// Covers reports whether the review read exactly rev (as Reviewed).
+func (b DraftBasis) Covers(rev Revision) bool { return b.Review && reviewedAs(b.Revision, rev) }
+
+// DraftBasis reads, from a read of the draft-review request at anchor, the review
+// an approval would rest on: the request names it and carries its revision
+// (ThreadWindow), since it may not fit the read.
+func (w WorkItem) DraftBasis(anchor int) DraftBasis {
+	if anchor < 0 || anchor >= len(w.Thread) {
+		return DraftBasis{}
+	}
+	ask := w.Thread[anchor]
+	if len(ask.Reviews) != 1 {
+		return DraftBasis{Named: ask.BasisNamed}
+	}
+	b := DraftBasis{Named: ask.BasisNamed, Review: true, Revision: Revision{ask.Head, ask.Base, ask.Diff}}
+	q, ok := w.TurnIndex(ask.Reviews[0])
+	if !ok || q >= anchor {
+		return b
+	}
+	j, answered := w.replies()[w.TurnKey(q)]
+	b.Read = b.Named && answered && j < anchor && !w.OmitsTurns(-1, anchor)
+	return b
+}
+
+// Unpaired returns the positions, before the draft-review request at anchor in a
+// run's read (ThreadWindow), of the answers whose question the read left out: the
+// user turn an answer replies to is not in the read, and the read omits visible
+// turns at or before the answer (OmitsTurns). Read alone, such an answer is no
+// evidence of what the conversation agreed, since the owner's word on it may have
+// been left out with the question. An answer to a hidden question, in a read that
+// omits nothing before it, is not unpaired: the owner chose to keep it. A read whose
+// request is not BasisNamed comes from an older web tier, which marks no omission,
+// so there every answer whose question the read does not hold is unpaired. A system
+// notice is no answer. One pass: an answer always follows its question.
+func (w WorkItem) Unpaired(anchor int) map[int]bool {
+	end := min(max(anchor, 0), len(w.Thread))
+	omitted := anchor >= len(w.Thread) || anchor < 0 || !w.Thread[anchor].BasisNamed
+	held := map[string]bool{}
+	out := map[int]bool{}
+	for j, m := range w.Thread[:end] {
+		omitted = omitted || m.Omitted
+		switch {
+		case m.Role == RoleUser:
+			held[w.TurnKey(j)] = true
+		case m.Notice != "" || !omitted:
+		case m.ReplyTo != "" && !held[m.ReplyTo],
+			m.ReplyTo == "" && (j == 0 || w.Thread[j-1].Role != RoleUser):
+			out[j] = true
+		}
+	}
+	return out
+}
+
+// OmitsTurns reports whether a run's read (ThreadWindow) left out visible turns
+// after position from, up to and including position to: some turn in (from, to]
+// is marked Omitted. Only a read carries the mark.
+func (w WorkItem) OmitsTurns(from, to int) bool {
+	for k := max(from+1, 0); k <= to && k < len(w.Thread); k++ {
+		if w.Thread[k].Omitted {
+			return true
+		}
+	}
+	return false
 }
 
 // Reviewed reports whether the latest review read exactly rev (ReviewedRevision):
@@ -464,8 +609,11 @@ func (w WorkItem) ReviewedRevision() Revision {
 // retarget the base, and a related change merged into the base (a stacked pull
 // request's dependency) the diff while leaving both alone; an unrelated advance of
 // the base changes none of them.
-func (w WorkItem) Reviewed(rev Revision) bool {
-	r := w.ReviewedRevision()
+func (w WorkItem) Reviewed(rev Revision) bool { return reviewedAs(w.ReviewedRevision(), rev) }
+
+// reviewedAs reports whether a review that recorded r read exactly rev, which it
+// must have read whole (Reviewed).
+func reviewedAs(r, rev Revision) bool {
 	return r.Head != "" && r.Diff != "" && r.Head == strings.ToLower(rev.Head) && r.Base == rev.Base && r.Diff == rev.Diff
 }
 
@@ -474,9 +622,10 @@ func (w WorkItem) Reviewed(rev Revision) bool {
 // revision its run read) landed after the latest review, and the revisions differ,
 // so the head was pushed, the base retargeted, or the diff moved since that review,
 // and no approval can be drafted from it until the pull request is reviewed again.
-// A review that landed after the draft is the newer reading: then the draft is what
-// is stale, and drafting again (never counted redundant once a turn follows it) is
-// the way forward, not another review. A draft reply without a revision, a hidden
+// A review that landed after the draft was asked for is the newer reading, even if
+// the draft's reply landed later still: then the draft is what is stale, and
+// drafting again (never counted redundant once a turn follows its request) is the
+// way forward, not another review. A draft reply without a revision, a hidden
 // one, or a notice says nothing.
 func (w WorkItem) ReviewOutdated() bool { return w.reviewOutdatedAt() >= 0 }
 
@@ -492,7 +641,10 @@ func (w WorkItem) reviewOutdatedAt() int {
 			return -1
 		}
 		latest := w.latestReview()
-		if j < latest || (latest >= 0 && w.Thread[latest].revision() == w.Thread[j].revision()) {
+		if latest < 0 || latest > i || w.Thread[latest].revision() == w.Thread[j].revision() {
+			// No review to be out of date; one that landed after the draft was asked
+			// for, so the draft is what is stale (it read the pull request before that
+			// review, and drafting again is the way forward); or the same revision.
 			return -1
 		}
 		return j

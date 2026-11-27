@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -70,7 +71,7 @@ func draftItem() worklist.WorkItem {
 			{ID: "q", Role: worklist.RoleUser, Content: "review?", Kind: worklist.KindReviewRequest},
 			{ID: "r", ReplyTo: "q", Role: worklist.RoleAgent, Content: "rename new1", Model: "m1", Head: draftHead, Base: "main", Diff: draftDiff},
 			{ID: "h", Role: worklist.RoleUser, Content: "secret aside", Hidden: true},
-			{ID: "d", Role: worklist.RoleUser, Content: "draft", Kind: worklist.KindDraftReviewRequest},
+			{ID: "d", Role: worklist.RoleUser, Content: "draft", Kind: worklist.KindDraftReviewRequest, ReadRevKnown: true},
 		},
 	}
 }
@@ -395,6 +396,185 @@ func TestRunConverseReviewRecordsItsSnapshot(t *testing.T) {
 	th := sink.items[0].Thread
 	if m := th[len(th)-1]; m.Head != draftHead || m.Diff != "" {
 		t.Errorf("a review that saw the pull request move vouches for a diff: %+v", m)
+	}
+}
+
+// A draft from a discussion with no review never pins an approval: comments need no
+// review, so the reply says nothing about one unless the drafter proposed an
+// approval, which it withholds and says a review is needed for.
+func TestRunConverseDraftsFromADiscussion(t *testing.T) {
+	discussion := func() worklist.WorkItem {
+		it := draftItem()
+		it.Thread[0].Kind = "" // a Discuss question, not a review request
+		it.Thread[1].Head, it.Thread[1].Base, it.Thread[1].Diff = draftHead, "main", ""
+		return it
+	}
+	run := func(t *testing.T, prop worklist.DraftProposal) worklist.Message {
+		t.Helper()
+		sink := &memSink{items: []worklist.WorkItem{discussion()}}
+		if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: "github:o/r#1", Turn: "d", Converser: &fakeConverser{}, Drafter: &fakeDrafter{prop: prop}},
+			fakeVendor{token: "t"}, sink); err != nil {
+			t.Fatal(err)
+		}
+		th := sink.items[0].Thread
+		return th[len(th)-1]
+	}
+	m := run(t, worklist.DraftProposal{Comments: []worklist.DraftComment{{Path: "a.go", Line: 11, Side: "RIGHT", Body: "Note the override."}}})
+	if m.Draft == nil || len(m.Draft.Comments) != 1 || m.Draft.Approve || strings.Contains(m.Content, "review") && strings.Contains(m.Content, "out of date") {
+		t.Errorf("comments from a discussion: %+v\n%s", m.Draft, m.Content)
+	}
+	m = run(t, worklist.DraftProposal{Approve: true})
+	if m.Draft != nil || !strings.Contains(m.Content, "this conversation has no visible review") || !strings.Contains(m.Content, "Review this pull request") {
+		t.Errorf("an approval from a discussion: %+v\n%s", m.Draft, m.Content)
+	}
+}
+
+// A conversation since its latest review was asked for that is longer than a read
+// leaves turns out of the draft's read: a word the drafter never saw (the owner's
+// "do not approve yet", even one posted while the review stalled and answered after
+// it) may disagree, so an approval is withheld, and the reply says why. The drafter
+// reads only the newest turns, contiguous, never the review kept out of order. A
+// stale revision is reported first, since hiding turns cannot make it current.
+func TestRunConverseWithholdsAnApprovalOverAnUnreadConversation(t *testing.T) {
+	build := func(hold bool, reviewHead string) worklist.WorkItem {
+		it := draftItem()
+		q, r, draft := it.Thread[0], it.Thread[1], it.Thread[len(it.Thread)-1]
+		r.Head = reviewHead
+		th := []worklist.Message{q}
+		if hold {
+			th = append(th, worklist.Message{ID: "hold", Role: worklist.RoleUser, Content: "Do not approve yet."})
+		}
+		th = append(th, r) // the review, answered after the hold
+		for i := range 24 {
+			id := strconv.Itoa(i)
+			th = append(th,
+				worklist.Message{ID: "u" + id, Role: worklist.RoleUser, Content: strings.Repeat("chat ", 40000)},
+				worklist.Message{ID: "g" + id, ReplyTo: "u" + id, Role: worklist.RoleAgent, Content: "ok"})
+		}
+		it.Thread = append(th, draft)
+		return it
+	}
+	run := func(t *testing.T, it worklist.WorkItem) (worklist.Message, *fakeDrafter) {
+		t.Helper()
+		sink := &memSink{items: []worklist.WorkItem{it}}
+		fd := &fakeDrafter{prop: worklist.DraftProposal{Approve: true}}
+		if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: it.ID, Turn: "d", Converser: &fakeConverser{}, Drafter: fd},
+			fakeVendor{token: "t"}, sink); err != nil {
+			t.Fatal(err)
+		}
+		got := sink.items[0].Thread
+		return got[len(got)-1], fd
+	}
+	m, fd := run(t, build(true, draftHead))
+	if m.Draft != nil || !strings.Contains(m.Content, "No approval drafted") || !strings.Contains(m.Content, "longer than gofer reads") {
+		t.Errorf("an approval over an unread hold: %+v\n%s", m.Draft, m.Content)
+	}
+	for _, h := range fd.got.History {
+		if h.Content == "rename new1" {
+			t.Error("the review was kept out of order for the drafter")
+		}
+	}
+	const pushed = "fedcba9876543210fedcba9876543210fedcba98"
+	m, _ = run(t, build(false, pushed))
+	if m.Draft != nil || !strings.Contains(m.Content, "read commit `"+pushed[:12]) || strings.Contains(m.Content, "longer than gofer reads") {
+		t.Errorf("a stale review over an unread conversation: %+v\n%s", m.Draft, m.Content)
+	}
+}
+
+// olderWebTier serves reads as a web tier from before reads named a draft's review:
+// a draft-review request carries no basis.
+type olderWebTier struct{ *memSink }
+
+func (o olderWebTier) Item(ctx context.Context, id, turn string) (worklist.WorkItem, bool, error) {
+	it, ok, err := o.memSink.Item(ctx, id, turn)
+	for i := range it.Thread {
+		if it.Thread[i].Kind == worklist.KindDraftReviewRequest {
+			m := &it.Thread[i]
+			m.Reviews, m.Head, m.Base, m.Diff, m.BasisNamed = nil, "", "", "", false
+		}
+	}
+	return it, ok, err
+}
+
+// A read from an older web tier names no review: the run cannot tell a missing
+// review from one it was not told about, so it withholds an approval without
+// sending the owner to a first review the thread does not offer, says to draft
+// again once the update is done, and drafts nothing, so drafting again stays
+// offered whichever tier stores the reply.
+func TestRunConverseApprovalAgainstAnOlderWebTier(t *testing.T) {
+	sink := &memSink{items: []worklist.WorkItem{draftItem()}}
+	fd := &fakeDrafter{prop: worklist.DraftProposal{Approve: true, Comments: []worklist.DraftComment{{Path: "a.go", Line: 11, Side: "RIGHT", Body: "nit"}}}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: "github:o/r#1", Turn: "d", Converser: &fakeConverser{}, Drafter: fd},
+		fakeVendor{token: "t"}, olderWebTier{sink}); err != nil {
+		t.Fatal(err)
+	}
+	it := sink.items[0]
+	m := it.Thread[len(it.Thread)-1]
+	if m.Draft != nil || m.Content != draftUpdatingReply || strings.Contains(m.Content, "Review this pull request") {
+		t.Fatalf("reply against an older web tier: %+v\n%s", m.Draft, m.Content)
+	}
+	if it.RedraftRedundant() {
+		t.Error("drafting again is not kept offered")
+	}
+}
+
+// The drafter is not shown an answer whose question the read left out: alone it is
+// no evidence of agreement (the owner may have rejected its point in a turn left out
+// with the question), and it is told the conversation is only the newest part. An
+// answer whose question the read holds, or one to a hidden question, is shown.
+func TestDraftHistoryLeavesOutUnpairedAnswers(t *testing.T) {
+	read := worklist.WorkItem{Thread: []worklist.Message{
+		{ID: "a", ReplyTo: "q", Role: worklist.RoleAgent, Content: "Please rename x to y.", Omitted: true},
+		{ID: "u", Role: worklist.RoleUser, Content: "and the docs?"},
+		{ID: "g", ReplyTo: "u", Role: worklist.RoleAgent, Content: "Fix the typo."},
+		{ID: "d", Role: worklist.RoleUser, Content: "draft", Kind: worklist.KindDraftReviewRequest, BasisNamed: true},
+	}}
+	history, partial := draftHistory(read, 3)
+	if !partial || len(history) != 2 || history[0].ID != "u" || history[1].ID != "g" {
+		t.Errorf("partial read: partial %v, history %+v", partial, history)
+	}
+	read.Thread[0].Omitted = false // nothing left out: the question was hidden
+	if history, partial := draftHistory(read, 3); partial || len(history) != 3 {
+		t.Errorf("whole read: partial %v, history %+v", partial, history)
+	}
+	// An older web tier marks no omission: the answer without its question is left
+	// out all the same, and the read is called partial.
+	read.Thread[3].BasisNamed = false
+	if history, partial := draftHistory(read, 3); !partial || len(history) != 2 {
+		t.Errorf("older web tier's read: partial %v, history %+v", partial, history)
+	}
+	// Nor can it tell a read cut between whole exchanges, with no answer unpaired,
+	// from the whole conversation: it is always called partial.
+	read.Thread = read.Thread[1:]
+	if history, partial := draftHistory(read, 2); !partial || len(history) != 2 {
+		t.Errorf("older web tier's read of whole exchanges: partial %v, history %+v", partial, history)
+	}
+}
+
+// Filtering out an answer since the review was asked for leaves the drafter less
+// than the whole agreement since it, so no approval is drafted, though every turn
+// since the review's request fits the read.
+func TestRunConverseNoApprovalPastAFilteredAnswer(t *testing.T) {
+	it := draftItem()
+	q, r, d := it.Thread[0], it.Thread[1], it.Thread[len(it.Thread)-1]
+	it.Thread = []worklist.Message{
+		{ID: "u", Role: worklist.RoleUser, Content: strings.Repeat("Does the regression test pass? ", 140000)},
+		q, r,
+		{ID: "g", ReplyTo: "u", Role: worklist.RoleAgent, Content: "The regression test fails. Do not approve until it passes."},
+		d,
+	}
+	sink := &memSink{items: []worklist.WorkItem{it}}
+	fd := &fakeDrafter{prop: worklist.DraftProposal{Approve: true}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: it.ID, Turn: "d", Converser: &fakeConverser{}, Drafter: fd},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := sink.items[0].Thread
+	if m := got[len(got)-1]; m.Draft != nil || !strings.Contains(m.Content, "longer than gofer reads") {
+		t.Errorf("approval past a filtered answer: %+v\n%s", m.Draft, m.Content)
+	}
+	if !fd.got.Partial {
+		t.Error("the drafter was not told the conversation is partial")
 	}
 }
 

@@ -76,11 +76,16 @@ type draftThread struct {
 	ReviewReady    bool
 	AgainKey       string
 	AgainWhy       string
-	// NeedsReview marks a pull request with no completed review, no reply in flight
-	// (firstReviewable) and no review request at all: the draft button is disabled
-	// for want of a review, so the thread offers one right there ("Review this pull
-	// request", webui.ReviewAgain).
+	// NeedsReview marks a pull request with no visible completed review, no reply in
+	// flight (firstReviewable) and no review request to retry or waiting: the thread
+	// offers one right there ("Review this pull request", webui.ReviewAgain), even
+	// while a redraft would be redundant. Drafting does not need it when the
+	// conversation already has an answered discussion (WorkItem.HasDiscussion); an
+	// approval does, which ReviewNote then says.
 	NeedsReview bool
+	// ReviewNote, with drafting ready but no review in the conversation, says what a
+	// review is still for (or why one cannot be asked for now).
+	ReviewNote string
 	// RetryKey names, in that state but with a review request that has no answer,
 	// the request "Retry the earlier review" retries (retryCandidate): never a second
 	// request, which the first's run could also answer.
@@ -151,10 +156,12 @@ func (h *Handler) reviewBlocker(it worklist.WorkItem, after int) string {
 }
 
 // firstReviewable reports whether the thread may act on a first review now: a pull
-// request on the radar with no completed review and no reply plausibly in flight
-// (the page polls while one is).
+// request on the radar with no visible completed review and no reply plausibly in
+// flight (the page polls while one is). Visible, as an approval counts it
+// (WorkItem.LatestReviewAt): a review whose request or answer is hidden is out of
+// the conversation, approves nothing, and so does not stand in the way of a new one.
 func firstReviewable(it worklist.WorkItem, now time.Time) bool {
-	return it.Type == worklist.TypePullRequest && it.OnRadar() && !it.HasReview() && !it.ReplyPending(now, reviewStaleAfter)
+	return it.Type == worklist.TypePullRequest && it.OnRadar() && it.LatestReviewAt() < 0 && !it.ReplyPending(now, reviewStaleAfter)
 }
 
 // againReviewable reports whether the thread may act on a review of the current
@@ -183,21 +190,33 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 	case connected && it.RedraftRedundant():
 		v.Redundant = true
 	case it.ReplyPending(now, reviewStaleAfter):
-		// Before the review check: a first review still running is a wait, not a
-		// missing review.
+		// Before the discussion check: a first answer still running is a wait.
 		v.Why = "Wait for the reply in progress, so the draft includes it."
-	case !it.HasReview():
-		if j := h.retryCandidate(it, -1); j >= 0 {
-			v.Why = "The review asked for earlier has no answer, so there are no review comments to draft yet. Retry it: it runs as it was asked, without the messages that came after it."
-			v.RetryKey = it.TurnKey(j)
-		} else if why := h.reviewBlocker(it, -1); why != "" {
-			v.Why = why
-		} else {
-			v.Why = "Review this pull request first: there are no review comments to draft yet. A review asked for in a Discuss message does not count; use Review this pull request."
-			v.NeedsReview = true
-		}
+	case !it.HasDiscussion():
+		v.Why = "There is nothing in this conversation to draft review comments from yet: ask about this pull request, or have it reviewed."
 	default:
 		v.Ready = true
+	}
+	// With no review yet, offer one (or the retry of one already asked for) whether
+	// or not drafting is ready, and whether or not a redraft would be redundant:
+	// comments can come from any discussion, but an approval is pinned to the
+	// revision a review read, so a draft that withheld one says to ask for a review,
+	// and the thread must offer it.
+	if firstReviewable(it, now) {
+		switch j := h.retryCandidate(it, -1); {
+		case j >= 0:
+			v.RetryKey = it.TurnKey(j)
+			v.ReviewNote = "The review asked for earlier has no answer. Retry it to have one: it runs as it was asked, without the messages that came after it."
+		default:
+			if why := h.reviewBlocker(it, -1); why != "" {
+				v.ReviewNote = why
+			} else {
+				v.NeedsReview = true
+				if v.Ready || v.Redundant {
+					v.ReviewNote = "Drafting works from this conversation. A review is needed only to draft an approval (/lgtm, /approve)."
+				}
+			}
+		}
 	}
 	if it.ReviewOutdated() {
 		v.ReviewOutdated = true
@@ -241,7 +260,7 @@ func (h *Handler) draftThreadView(ctx context.Context, user *session.User, it wo
 // ordinary check: once anything replaced the draft (a redraft from another tab, say,
 // and a discussion since), a stale result page must not retire the newer one.
 func draftable(it worklist.WorkItem, now time.Time, redraft *draftRef) bool {
-	if it.Type != worklist.TypePullRequest || !it.OnRadar() || !it.HasReview() || it.ReplyPending(now, reviewStaleAfter) {
+	if it.Type != worklist.TypePullRequest || !it.OnRadar() || !it.HasDiscussion() || it.ReplyPending(now, reviewStaleAfter) {
 		return false
 	}
 	if redraft != nil {

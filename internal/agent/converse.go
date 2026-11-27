@@ -120,7 +120,7 @@ func runConverse(ctx context.Context, p Params, vendor Vendor, sink Sink) error 
 			if holder.Reconnect() != nil {
 				return postReconnect(ctx, sink, item.ID, triggerKey, attempt)
 			}
-			return runDraftReview(ctx, p, sink, item, triggerKey, history, gh, holder, viewerLogin)
+			return runDraftReview(ctx, p, sink, item, triggerKey, gh, holder, viewerLogin)
 		}
 		isPR := item.Type == worklist.TypePullRequest
 		// A review records the revision it read, whole diff included, so an approval

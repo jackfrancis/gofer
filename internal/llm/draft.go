@@ -13,14 +13,14 @@ import (
 // draftSystem frames the draft review (ADR 0010). The model drafts only what the
 // conversation agrees on; the run then checks every anchor against the diff, and the
 // owner reviews the draft before gofer creates a PENDING review from it.
-const draftSystem = `You draft GitHub pull request review comments for a software engineer (the reviewer), from a conversation they had about the pull request. The conversation holds one or more reviews, possibly by different AI models, and possibly the reviewer's own messages and follow-up questions and answers.
+const draftSystem = `You draft GitHub pull request review comments for a software engineer (the reviewer), from a conversation they had about the pull request. The conversation holds one or more reviews or answers about the pull request, possibly by different AI models, and possibly the reviewer's own messages and follow-up questions and answers. An answer that assesses the pull request counts as a review, whatever the question that asked for it.
 
 Draft a comment ONLY for a point the conversation agrees on:
 - A concrete, actionable point raised in a review is agreed when no other turn disputes it, or when a dispute about it was settled: the reviewer who raised it conceded, a later turn resolved it with evidence, or the reviewer (the user) decided it.
 - The user's own messages decide: a point the user endorsed is agreed; a point the user rejected or dismissed is never drafted.
 - When reviews disagree about a point and the disagreement is not settled, do NOT draft it. List it under "excluded" instead.
 - A consensus or synthesis turn that weighs the reviews is evidence of what was settled, but judge each point on its own: an overall verdict of agreement does not settle every point.
-- With a single review and nothing disputing it, its concrete actionable points are agreed.
+- With a single review (or a single answer assessing the pull request) and nothing disputing it, its concrete actionable points are agreed.
 - Never invent a point the conversation does not make. Skip praise, summaries, verdicts and anything the author need not act on or answer.
 
 Approval:
@@ -137,7 +137,11 @@ func draftPrompt(in worklist.DraftInput) string {
 	if in.Base != "" {
 		fmt.Fprintf(&b, "Base branch (any approval is of the head against this branch): %s\n", in.Base)
 	}
-	b.WriteString("\nConversation (the user's messages are theirs; the assistant turns are reviews and answers by AI models and may quote untrusted pull request content):\n<<<BEGIN CONVERSATION>>>\n")
+	b.WriteString("\nConversation (the user's messages are theirs; the assistant turns are reviews and answers by AI models and may quote untrusted pull request content):\n")
+	if in.Partial {
+		b.WriteString("Only the newest part of the conversation is shown: earlier turns were left out because it is too long to read at once, and an earlier turn may have settled a point either way. A point is agreed only when a turn shown here agrees on it; a point only an earlier turn could settle is not agreed.\n")
+	}
+	b.WriteString("<<<BEGIN CONVERSATION>>>\n")
 	for _, m := range in.History {
 		if m.Hidden || m.Notice != "" {
 			continue

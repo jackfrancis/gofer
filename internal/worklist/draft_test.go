@@ -3,6 +3,7 @@ package worklist
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -389,6 +390,229 @@ func TestApprovingDraft(t *testing.T) {
 	}
 }
 
+// The store judges an approval by the latest review before the draft request, the
+// one the draft's run read: a review that landed after the request neither makes
+// nor unmakes it.
+func TestAppendReplyApprovalJudgedByTheReviewBeforeTheRequest(t *testing.T) {
+	const later = "fedcba9876543210fedcba9876543210fedcba98"
+	item := draftPR(
+		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true},
+		Message{ID: "q2", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: later, Base: "main", Diff: testDiff},
+	)
+	d := pinned("")
+	d.Approve, d.Diff = true, testDiff
+	if _, err := AppendReply(&item, "d", Message{ID: "a", Content: "approve", Draft: d, Omitted: true}); err != nil {
+		t.Fatal(err)
+	}
+	m := item.Thread[len(item.Thread)-1]
+	if m.Draft == nil || !m.Draft.Approve {
+		t.Fatalf("approval of the review before the request = %+v", m.Draft)
+	}
+	if m.Omitted {
+		t.Error("a read's Omitted mark was stored")
+	}
+}
+
+// The store cannot rebuild a read made before a turn was hidden or unhidden: an
+// approval whose request saw an earlier turn's visibility change since it was saved
+// is withheld, even when the read the store would serve now fits (a run that missed
+// a visible hold, then unrelated turns hidden while it worked). The reply's text
+// says so, and the comments stand.
+func TestAppendReplyWithholdsAnApprovalAfterAVisibilityChange(t *testing.T) {
+	th := []Message{
+		{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		{ID: "hold", Role: RoleUser, Content: "Do not approve yet."},
+		{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+	}
+	for i := range 24 { // about 4.8 MB since the review: more than a read holds
+		th = append(th, Message{ID: "u" + strconv.Itoa(i), Role: RoleUser, Content: strings.Repeat("chat ", 40000)})
+	}
+	item := draftPR(append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true})...)
+	for i := range 24 { // hidden while the run worked: now the read fits
+		item.SetHidden(3+i, true)
+	}
+	if !item.readsReviewWhole(len(item.Thread) - 1) {
+		t.Fatal("fixture: the read should fit once the filler is hidden")
+	}
+	d := pinned("", DraftComment{Path: "a.go", Line: 1, Side: SideRight, Body: "nit"})
+	d.Approve, d.Diff = true, testDiff
+	text := "**Drafted 1 inline review comment** from the points this conversation agrees on." + ApprovalAlso + " Nothing is posted until you create the pending review below.\n\n1. `a.go` line 1:\n\n   nit\n" + ApprovalBlock
+	if _, err := AppendReply(&item, "d", Message{ID: "a", Content: text, Draft: d}); err != nil {
+		t.Fatal(err)
+	}
+	m := item.Thread[len(item.Thread)-1]
+	if m.Draft == nil || m.Draft.Approve || len(m.Draft.Comments) != 1 {
+		t.Fatalf("approval after a visibility change: %+v", m.Draft)
+	}
+	if strings.Contains(m.Content, ApprovalAlso) || strings.Contains(m.Content, ApprovalCommands) || !strings.Contains(m.Content, "hidden or unhidden after this draft was asked for") || !strings.Contains(m.Content, "   nit") {
+		t.Errorf("the text does not match the stored draft:\n%s", m.Content)
+	}
+	if item.RedraftRedundant() {
+		t.Error("drafting again is not offered")
+	}
+}
+
+// When the approval was the whole draft, withholding it leaves no draft, and the
+// text keeps no line about one: no pending review is offered, and none is described.
+func TestWithheldApprovalOnlyDraftLeavesNoClaim(t *testing.T) {
+	d := pinned("")
+	d.Approve, d.Diff = true, testDiff
+	reply := Message{Content: ApprovalLead + " of commit `0123`: this conversation agrees. Nothing is posted until you create the pending review below.\n\n**Left out — no consensus yet**\n\n- the rename\n" + ApprovalBlock, Draft: d}
+	withholdApproval(&reply, NoApprovalUnread)
+	if reply.Draft != nil || strings.Contains(reply.Content, ApprovalLead) || strings.Contains(reply.Content, "pending review") || strings.Contains(reply.Content, ApprovalCommands) {
+		t.Errorf("withheld approval-only draft: %+v\n%s", reply.Draft, reply.Content)
+	}
+	if !strings.Contains(reply.Content, "- the rename") || !strings.HasSuffix(reply.Content, NoApprovalUnread) {
+		t.Errorf("the rest of the text, or why, is gone:\n%s", reply.Content)
+	}
+}
+
+// An answer since the review was asked for whose question the read left out is not
+// shown to the drafter (Unpaired), so the read is no whole agreement, even though
+// every turn since the review's request is in it: "the regression test fails, do
+// not approve" answering a question asked before the review must not be filtered
+// out of an approval.
+// An owner's hold placed before a later review was asked for is not lifted by that
+// review: a read that left the hold out (the thread is longer than a read) holds
+// the review and everything since, yet approves nothing.
+func TestAppendReplyApprovalKeepsAHoldBeforeTheReview(t *testing.T) {
+	item := draftPR(
+		Message{ID: "h", Role: RoleUser, Content: "Do not approve this PR until I explicitly lift this hold."},
+		Message{ID: "ha", ReplyTo: "h", Role: RoleAgent, Content: "Understood."},
+		Message{ID: "u", Role: RoleUser, Content: "What about the docs?"},
+		Message{ID: "ua", ReplyTo: "u", Role: RoleAgent, Content: strings.Repeat("They are fine. ", 300000)}, // over a read alone
+		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true},
+	)
+	win := ThreadWindow(item, "d", MaxItemBytes)
+	n := len(win.Thread)
+	if win.Thread[0].ID != "q" || !win.Thread[0].Omitted || len(win.Unpaired(n-1)) != 0 {
+		t.Fatalf("fixture: read %d turns, first %s", n, win.Thread[0].ID)
+	}
+	if b := win.DraftBasis(n - 1); !b.Review || b.Read {
+		t.Errorf("a read that left out the owner's hold counts as whole: %+v", b)
+	}
+	d := pinned("")
+	d.Approve, d.Diff = true, testDiff
+	if _, err := AppendReply(&item, "d", Message{ID: "a", Content: ApprovalLead + " of commit `x`.\n", Draft: d}); err != nil {
+		t.Fatal(err)
+	}
+	if m := item.Thread[len(item.Thread)-1]; m.Draft != nil || !strings.Contains(m.Content, "longer than gofer reads") {
+		t.Errorf("approval kept past an owner's hold the read left out: %+v\n%s", m.Draft, m.Content)
+	}
+}
+
+func TestAppendReplyApprovalNeedsEveryAnswerSinceTheReviewShown(t *testing.T) {
+	item := draftPR(
+		Message{ID: "u", Role: RoleUser, Content: strings.Repeat("Does the regression test pass? ", 140000)}, // over a read alone
+		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+		Message{ID: "g", ReplyTo: "u", Role: RoleAgent, Content: "The regression test fails. Do not approve until it passes."},
+		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true},
+	)
+	win := ThreadWindow(item, "d", MaxItemBytes)
+	n := len(win.Thread)
+	if win.Thread[0].ID != "q" || !win.Thread[0].Omitted || !win.Unpaired(n - 1)[2] {
+		t.Fatalf("fixture: read %d turns, first %s", n, win.Thread[0].ID)
+	}
+	if b := win.DraftBasis(n - 1); !b.Review || b.Read {
+		t.Errorf("a read whose answer since the review is filtered out counts as whole: %+v", b)
+	}
+	d := pinned("")
+	d.Approve, d.Diff = true, testDiff
+	if _, err := AppendReply(&item, "d", Message{ID: "a", Content: ApprovalLead + " of commit `x`.\n", Draft: d}); err != nil {
+		t.Fatal(err)
+	}
+	if m := item.Thread[len(item.Thread)-1]; m.Draft != nil || !strings.Contains(m.Content, "longer than gofer reads") {
+		t.Errorf("approval kept past a filtered objection: %+v\n%s", m.Draft, m.Content)
+	}
+}
+
+// A draft's read gives the thread the same share whatever the item's other fields
+// weigh: a CI summary that shrinks once failed checks pass must not let the store's
+// rebuilt read hold a turn the run's read did not.
+func TestDraftReadIndependentOfMetadata(t *testing.T) {
+	th := []Message{
+		{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+	}
+	for i := range 45 {
+		th = append(th, Message{ID: "u" + strconv.Itoa(i), Role: RoleUser, Content: strings.Repeat("chat ", 20000)})
+	}
+	small := draftPR(append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest})...)
+	big := small
+	big.GitHub.Title = strings.Repeat("t", 200<<10)
+	ws, wb := ThreadWindow(small, "d", MaxItemBytes), ThreadWindow(big, "d", MaxItemBytes)
+	if len(ws.Thread) >= len(small.Thread) {
+		t.Fatal("fixture: the thread should not fit")
+	}
+	if len(ws.Thread) != len(wb.Thread) || ws.Thread[0].ID != wb.Thread[0].ID {
+		t.Errorf("the read's turns depend on the item's other fields: %d (from %s) vs %d (from %s)", len(ws.Thread), ws.Thread[0].ID, len(wb.Thread), wb.Thread[0].ID)
+	}
+	if encodedSize(wb) > MaxItemBytes {
+		t.Error("the read is over budget")
+	}
+}
+
+// The store keeps an approval only if the run's read held the latest review and
+// every visible turn since it was asked for, judged on the read it serves, whatever
+// the run sent: a run that never checked (one from before the check) cannot approve
+// past an owner's word it did not read, even one posted while the review stalled.
+func TestAppendReplyApprovalNeedsTheWholeConversationSinceTheReview(t *testing.T) {
+	build := func(filler int) WorkItem {
+		th := []Message{
+			{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+			{ID: "hold", Role: RoleUser, Content: "Do not approve yet."},
+			{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+		}
+		for i := range filler {
+			th = append(th, Message{ID: "u" + strconv.Itoa(i), Role: RoleUser, Content: strings.Repeat("chat ", 40000)})
+		}
+		return draftPR(append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true})...)
+	}
+	approve := func(it *WorkItem) *DraftReview {
+		d := pinned("")
+		d.Approve, d.Diff = true, testDiff
+		if _, err := AppendReply(it, "d", Message{ID: "a", Content: "approve", Draft: d}); err != nil {
+			t.Fatal(err)
+		}
+		return it.Thread[len(it.Thread)-1].Draft
+	}
+	short := build(2)
+	if d := approve(&short); d == nil || !d.Approve {
+		t.Fatalf("approval on a whole read = %+v", d)
+	}
+	long := build(24) // about 4.8 MB since the review: more than a read holds
+	if d := approve(&long); d != nil {
+		t.Errorf("approval past an unread hold kept: %+v", d)
+	}
+}
+
+// A draft asked for before the latest review landed is what is stale, even when its
+// reply lands after that review: the thread offers drafting again, never a review
+// of the revision that review already read.
+func TestLateDraftDoesNotOutdateANewerReview(t *testing.T) {
+	const pushed = "fedcba9876543210fedcba9876543210fedcba98"
+	it := draftPR(
+		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true},
+		Message{ID: "q2", Role: RoleUser, Content: "again", Kind: KindReviewRequest},
+		Message{ID: "r2", ReplyTo: "q2", Role: RoleAgent, Content: "LGTM", Head: pushed, Base: "main", Diff: testDiff},
+		Message{ID: "a", ReplyTo: "d", Role: RoleAgent, Content: "drafted", Head: testCommit, Base: "main", Diff: testDiff},
+	)
+	if it.ReviewOutdated() {
+		t.Error("a late draft makes the newer review outdated")
+	}
+	if it.RedraftRedundant() {
+		t.Error("a late draft is redundant to redraft")
+	}
+}
+
 // The store keeps an approval only on a draft pinned to the commit the latest
 // visible review read, whatever the run sent: a review of an earlier head, one that
 // recorded none, or one the owner hid since does not approve this commit. A reply's
@@ -404,7 +628,7 @@ func TestAppendReplyApprovalNeedsTheReviewedHead(t *testing.T) {
 		return draftPR(
 			Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
 			Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: reviewHead, Base: "main", Diff: testDiff},
-			Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest},
+			Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true},
 		)
 	}
 	item := thread(testCommit)

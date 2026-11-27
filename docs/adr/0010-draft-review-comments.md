@@ -27,12 +27,52 @@ review's text is written by a model, so this feature needs that rule amended.
 1. **Request.** At the bottom of a pull request's thread, "Draft Review Comments" posts
    a user turn of kind `draft_review_request` and dispatches a `github-converse` run by
    the default model, as any Discuss turn. It is offered only when commenting is
-   configured, on a pull request on the radar with a completed review and no reply in
-   flight; without a connected write grant the thread links to connecting it instead.
-   While it is disabled the thread says why in visible text (Safari shows no tooltip
-   on a disabled button), and with no review yet it offers "Review this pull request"
-   right there (`webui.ReviewAgain`), since a review asked for in a Discuss message is
-   not a review request. When a review request already has no answer (stalled, or
+   configured, on a pull request on the radar whose conversation has an answered
+   exchange (`WorkItem.HasDiscussion`: a review, or a Discuss question answered with
+   an assessment; the drafter judges what is agreed) and no reply in flight; without a
+   connected write grant the thread links to connecting it instead. While it is
+   disabled the thread says why in visible text (Safari shows no tooltip on a disabled
+   button). With no visible review yet (a review whose request or answer is hidden
+   counts for nothing, as for an approval) it also offers "Review this pull request"
+   right there (`webui.ReviewAgain`), as an option when drafting already works, and
+   even while a redraft would only repeat the offered draft: comments need no review,
+   but an approval is pinned to the revision a review read, so a draft from a
+   discussion alone withholds an approval and says a review is needed for it. A draft
+   run's read is the ordinary newest-first window: a review kept out of order would
+   push out a later word that disagrees with it. The request names the latest review
+   before it and carries the revision that review recorded (`WorkItem.DraftBasis`),
+   so the run tells a review that did not fit from none, and reports a stale revision
+   first (hiding turns cannot make it current). An approval stands only on a read
+   holding that review and every visible turn before the draft request, the earliest
+   included: an owner's hold placed before the review was asked for is not lifted by
+   asking for one, and the read is cut only on a thread of several megabytes, so
+   requiring all of it costs little; otherwise the run withholds it and says
+   why, and the store applies the same rule to the read it serves, whatever the run
+   sent. The store keeps no copy of the read a run got, so it can rebuild that read
+   only while visibility is as it was: an approval whose request saw an earlier turn
+   hidden or unhidden since it was saved is withheld (the thread then offers drafting
+   again). A draft read gives the thread a fixed share, what is left beside the largest
+   item a read carries, not what the item's other fields leave now: a CI summary that
+   shrinks once checks pass, or a label change, would otherwise let the store's rebuilt
+   read hold a turn the run's did not. Whenever the store withholds an approval it rewrites the reply's text to
+   match, removing the approval's parts (which the run writes from shared constants)
+   and saying why, and keeps the comments, so the thread never describes an approval
+   or a pending-review form it does not have. A read from a web tier older than the
+   run names no review (`DraftBasis.Named` false): the run cannot tell no review from
+   one it was not told about, so a draft that would approve drafts nothing and says
+   to draft again once the update is done rather than to ask for a first review: a
+   reply with no draft keeps drafting offered whichever tier stores it, where a field
+   an older tier does not know would be dropped. When the read is cut short, an answer
+   whose question it left out is not shown to the drafter (`WorkItem.Unpaired`): alone
+   it is no evidence of agreement, since the owner's word on it may have been left
+   out with the question. An older web tier marks no omission, so in its read any
+   answer whose question is missing counts. The drafter is also told that only the
+   newest part of the conversation is shown, whenever the read left anything out or
+   comes from an older web tier, which can drop whole exchanges and leave no answer
+   unpaired, so its completeness is unknown. A draft asked for before the latest review landed is what is stale, even if
+   its reply lands after that review: the thread offers drafting again, not a review
+   of that revision (`WorkItem.ReviewOutdated`). When a
+   review request already has no answer (stalled, or
    ended by a reconnect notice), the thread offers "Retry the earlier review" instead,
    which retries that very turn (it runs as it was asked, without later messages)
    rather than adding another: the dispatcher's gate shares a run still in flight and

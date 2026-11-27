@@ -65,3 +65,17 @@ func TestReviewDrafter(t *testing.T) {
 		t.Errorf("a hidden turn or notice reached the prompt:\n%s", prompt)
 	}
 }
+
+// A conversation cut short is said to be: the drafter is told earlier turns were left
+// out, and that only what it is shown can make a point agreed.
+func TestDraftPromptSaysWhenTheConversationIsPartial(t *testing.T) {
+	in := worklist.DraftInput{Item: worklist.WorkItem{GitHub: worklist.GitHubRef{Repo: "o/r", Number: 1}}}
+	const note = "Only the newest part of the conversation is shown"
+	if strings.Contains(draftPrompt(in), note) {
+		t.Error("a whole conversation is called partial")
+	}
+	in.Partial = true
+	if !strings.Contains(draftPrompt(in), note) {
+		t.Error("a partial conversation is not called partial")
+	}
+}

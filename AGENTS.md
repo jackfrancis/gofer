@@ -647,8 +647,29 @@ Wired on the web-tier side; they define what a runtime must respect:
   suggestions are each repository's assignees, read with the user's read credential
   and cached in memory, counted against every selected repository (unchecked ones are
   unknown). `reload.js` does not reload while items are checked.
-- Draft review comments (ADR 0010): at the bottom of a reviewed pull request's
-  thread, "Draft Review Comments" (offered only with commenting configured; a connect
+- Draft review comments (ADR 0010): at the bottom of a pull request's thread with an
+  answered exchange (`WorkItem.HasDiscussion`: a review, or a Discuss question
+  answered; no review request needed, except to draft an approval, which is pinned to
+  a review's revision: with no visible review the thread offers "Review this pull
+  request" even while a redraft is redundant, and a draft run's `ThreadWindow` stays the
+  newest-first window, its request naming the latest review before it with that
+  review's revision, `WorkItem.DraftBasis`; an approval needs a read holding that
+  review and every visible turn before the request (an owner's hold placed before the
+  review was asked for is not lifted by asking for one), which the run and the store both
+  check, the store on the read it serves, and only while no earlier turn was hidden or
+  unhidden since the request was saved, since the store keeps no copy of the read the
+  run got; a draft read gives the thread a share fixed beside the largest item
+  (`MaxBriefBytes`), never what the item's other fields leave, so a CI or label change
+  cannot change the turns it holds; a read from an older web tier names no review,
+  `DraftBasis.Named`, and a run that would approve on it drafts nothing and says to
+  draft again (no draft keeps the button on any tier); a store-withheld approval
+  rewrites the reply's text to match, `withholdApproval`, over the shared
+  `worklist.ApprovalLead`/`ApprovalAlso`/`ApprovalBlock`; the drafter is not shown an
+  answer whose question a cut read left out, `WorkItem.Unpaired` (in an older web
+  tier's read, which marks no omission, any answer whose question it lacks), and is
+  told the conversation is partial, `DraftInput.Partial`, whenever the read left
+  anything out or is an older web tier's, whose completeness is unknown),
+  "Draft Review Comments" (offered only with commenting configured; a connect
   link without the grant) posts a `KindDraftReviewRequest` turn and dispatches a
   converse run by the default model. The button is not shown, and the handler refuses
   the request, while a redraft would only repeat the offered draft

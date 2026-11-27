@@ -241,16 +241,20 @@
         {{if not .ReviewReady}}<p class="zz-meta zz-why">{{.AgainWhy}}</p>{{end}}
       </div>
       {{end}}{{end}}
-      {{with .Draft}}{{if not .Redundant}}
+      {{with .Draft}}{{if or (not .Redundant) .ReviewNote .NeedsReview .RetryKey}}
       <div class="zz-draft-review">
         {{if .Outdated}}<p class="zz-meta">The last draft was saved before gofer's current checks on drafted text, so it is not offered. Draft the review comments again.</p>{{end}}
         {{if .Connected}}
+        {{/* A redraft that would only repeat the offered draft is not offered; the review controls below still are. */}}
+        {{if not .Redundant}}
         <form method="post" action="/items/draft-review">
           <input type="hidden" name="id" value="{{$.Item.ID}}">
           <button class="btn btn-sm" type="submit"{{if not .Ready}} disabled title="{{.Why}}"{{else}} title="Drafts review comments for the points this conversation agrees on, and an approval (/lgtm, /approve) when it agrees the pull request is ready. Nothing is posted until you create the pending review."{{end}}>Draft Review Comments</button>
         </form>
         {{/* The reason as text: a disabled button shows no tooltip in Safari. */}}
         {{if not .Ready}}<p class="zz-meta zz-why">{{.Why}}</p>{{end}}
+        {{end}}
+        {{with .ReviewNote}}<p class="zz-meta">{{.}}</p>{{end}}
         {{if .NeedsReview}}
         <form method="post" action="/items/review-again">
           <input type="hidden" name="id" value="{{$.Item.ID}}">

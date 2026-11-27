@@ -3,6 +3,7 @@ package worklist
 import (
 	"context"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -284,6 +285,139 @@ func TestThreadWindowKeepsSynthesisReviews(t *testing.T) {
 	w.Thread[3].Hidden = true // the blind review's answer
 	if win := ThreadWindow(w, "s1", budget); win.SynthesisReady("s1") {
 		t.Fatal("a hidden review is not sent, so the run must decline")
+	}
+}
+
+// A draft-review request's read is the ordinary newest-first window, never a review
+// kept out of order (which would push out a later word disagreeing with it): the
+// request names the latest review before it and carries its revision, so the run
+// tells a review that did not fit (DraftBasis.Read false) from none, and judges the
+// revision either way. A review landing after the request is not the one named.
+func TestThreadWindowNamesTheLatestReviewForADraft(t *testing.T) {
+	th := []Message{
+		{ID: "q1", Role: RoleUser, Content: "review", Kind: KindReviewRequest, At: t1},
+		{ID: "a1", Role: RoleAgent, ReplyTo: "q1", Content: "old review", Head: "aaaa", Base: "main", Diff: strings.Repeat("1", 64), At: t1},
+		{ID: "q2", Role: RoleUser, Content: "review", Kind: KindReviewRequest, At: t2},
+		{ID: "hold", Role: RoleUser, Content: "Do not approve yet.", At: t2}, // posted while the review stalled
+		{ID: "a2", Role: RoleAgent, ReplyTo: "q2", Content: "LGTM", Head: "bbbb", Base: "main", Diff: strings.Repeat("2", 64), At: t2},
+	}
+	for i := range 40 {
+		id := string(rune('a'+i%26)) + string(rune('a'+i/26))
+		th = append(th,
+			Message{ID: "u" + id, Role: RoleUser, Content: strings.Repeat("chat ", 400), At: t2},
+			Message{ID: "g" + id, Role: RoleAgent, ReplyTo: "u" + id, Content: strings.Repeat("reply ", 400), At: t2})
+	}
+	th = append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, At: t2},
+		Message{ID: "q3", Role: RoleUser, Content: "review", Kind: KindReviewRequest, At: t2},
+		Message{ID: "a3", Role: RoleAgent, ReplyTo: "q3", Content: "newer review", Head: "cccc", Base: "main", Diff: strings.Repeat("3", 64), At: t2})
+	w := WorkItem{ID: "a", Type: TypePullRequest, Thread: th}
+	reviewed := Revision{"bbbb", "main", strings.Repeat("2", 64)}
+
+	// The whole conversation fits: the review is read, with every turn since its request.
+	whole := ThreadWindow(w, "d", MaxItemBytes)
+	n := len(whole.Thread)
+	if b := whole.DraftBasis(n - 1); !b.Review || !b.Read || b.Revision != reviewed || whole.OmitsTurns(-1, n-1) {
+		t.Fatalf("whole: %d turns, basis %+v, omits %v", n, b, whole.OmitsTurns(-1, n-1))
+	}
+	if _, ok := w.TurnIndex("d"); !ok || w.Thread[len(w.Thread)-3].Reviews != nil || w.Thread[len(w.Thread)-3].Head != "" {
+		t.Fatal("the read wrote into the stored request")
+	}
+
+	// It does not fit: the newest turns are read, contiguous, the first marked as
+	// following turns left out; the review is named, with its revision, but not read.
+	win := ThreadWindow(w, "d", encodedSize(Project(w))+40<<10)
+	n = len(win.Thread)
+	if win.Thread[n-1].ID != "d" || n >= len(th) || !win.Thread[0].Omitted || win.OmitsTurns(0, n-1) {
+		t.Fatalf("cut: %d turns, first omitted %v, later omitted %v", n, win.Thread[0].Omitted, win.OmitsTurns(0, n-1))
+	}
+	if _, ok := win.TurnIndex("hold"); ok {
+		t.Fatal("fixture: the hold should not fit")
+	}
+	if b := win.DraftBasis(n - 1); !b.Review || b.Read || b.Revision != reviewed || !b.Covers(reviewed) || b.Covers(Revision{"cccc", "main", strings.Repeat("3", 64)}) {
+		t.Fatalf("cut: basis %+v", b)
+	}
+	if win.LatestReviewAt() >= 0 {
+		t.Error("cut: a review was kept out of order")
+	}
+	if encodedSize(win) > encodedSize(Project(w))+40<<10 {
+		t.Error("cut: the window is over budget")
+	}
+
+	// No visible review before the request: none is named.
+	w.Thread[2].Hidden = true
+	if b := ThreadWindow(w, "d", MaxItemBytes); b.DraftBasis(len(b.Thread)-1).Revision.Head != "aaaa" {
+		t.Error("with the latest review hidden, the one before it is named")
+	}
+	w.Thread[0].Hidden = true
+	if b := ThreadWindow(w, "d", MaxItemBytes); b.DraftBasis(len(b.Thread)-1).Review || !b.DraftBasis(len(b.Thread)-1).Named {
+		t.Error("with every review hidden, one is named, or none is said to be")
+	}
+	// A read without the mark comes from an older web tier, which names nothing:
+	// it says nothing about whether there is a review.
+	older := whole
+	older.Thread = slices.Clone(whole.Thread)
+	older.Thread[len(older.Thread)-1].Reviews, older.Thread[len(older.Thread)-1].BasisNamed = nil, false
+	if b := older.DraftBasis(len(older.Thread) - 1); b.Named || b.Review {
+		t.Errorf("an older web tier's read: basis %+v", b)
+	}
+	if !whole.DraftBasis(len(whole.Thread) - 1).Named {
+		t.Error("the read does not say it names the review")
+	}
+}
+
+// In a read cut short, an answer whose question was left out is unpaired: alone it
+// is no evidence of agreement. An answer whose question the read holds is not, nor
+// is one to a hidden question in a read that left nothing out before it.
+func TestUnpairedAnswers(t *testing.T) {
+	th := []Message{
+		{ID: "q", Role: RoleUser, Content: "rename x?"},
+		{ID: "no", Role: RoleUser, Content: "No, keep x."},
+		{ID: "a", ReplyTo: "q", Role: RoleAgent, Content: "Please rename x to y."}, // answered late
+	}
+	for i := range 40 {
+		id := strconv.Itoa(i)
+		th = append(th,
+			Message{ID: "u" + id, Role: RoleUser, Content: strings.Repeat("chat ", 400)},
+			Message{ID: "g" + id, Role: RoleAgent, ReplyTo: "u" + id, Content: strings.Repeat("reply ", 400)})
+	}
+	th = append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest})
+	w := WorkItem{ID: "a", Type: TypePullRequest, Thread: th}
+	// Cut the read so that the late answer is its first turn: its question and the
+	// rejection are left out.
+	var win WorkItem
+	for b := encodedSize(w); b > 0; b -= 16 {
+		win = ThreadWindow(w, "d", b)
+		if len(win.Thread) < 2 || win.Thread[0].ID == "a" {
+			break
+		}
+	}
+	if len(win.Thread) < 2 || win.Thread[0].ID != "a" {
+		t.Fatal("fixture: no budget makes the late answer the read's first turn")
+	}
+	if !win.Thread[len(win.Thread)-1].BasisNamed {
+		t.Fatal("fixture: the read does not name its basis")
+	}
+	n := len(win.Thread)
+	if u := win.Unpaired(n - 1); len(u) != 1 || !u[0] {
+		t.Errorf("unpaired in the cut read = %v, want only the late answer", u)
+	}
+	// An older web tier marks no omission: an answer whose question it does not hold
+	// is unpaired all the same.
+	legacy := win
+	legacy.Thread = slices.Clone(win.Thread)
+	legacy.Thread[0].Omitted, legacy.Thread[n-1].BasisNamed = false, false
+	if u := legacy.Unpaired(n - 1); len(u) != 1 || !u[0] {
+		t.Errorf("unpaired in an older web tier's read = %v, want only the late answer", u)
+	}
+	whole := ThreadWindow(w, "d", MaxItemBytes)
+	hidden := whole
+	hidden.Thread = slices.Clone(whole.Thread)
+	hidden.Thread = hidden.Thread[1:] // the question hidden: not in the read, and no gap marked
+	if u := hidden.Unpaired(len(hidden.Thread) - 1); len(u) != 0 {
+		t.Errorf("an answer to a hidden question is unpaired: %v", u)
+	}
+	if u := whole.Unpaired(len(whole.Thread) - 1); len(u) != 0 {
+		t.Errorf("an answer with its question is unpaired: %v", u)
 	}
 }
 
