@@ -303,8 +303,8 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 					left = min(left, fixed)
 				}
 				// A draft approves only the revision the latest review before it read,
-				// and only on the whole conversation since that review's request: the
-				// request carries both into the read (DraftBasis), so the run can tell a
+				// and only on a read of the whole visible conversation: the request
+				// carries the review into the read (DraftBasis), so the run can tell a
 				// review that did not fit from none, and a stale revision from a read
 				// cut short. The turns themselves are the ordinary newest-first window:
 				// keeping the review out of order would push out a later word that
@@ -401,7 +401,7 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 
 // readsReviewWhole reports whether a run's read of the draft-review request at i,
 // as ReadItem serves it, holds the latest review before it and every visible turn
-// since that review's request (DraftBasis.Read).
+// before the request (DraftBasis.Read).
 func (w WorkItem) readsReviewWhole(i int) bool {
 	key := w.TurnKey(i)
 	win := ThreadWindow(w, key, MaxItemBytes)

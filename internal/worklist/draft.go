@@ -67,7 +67,7 @@ const (
 // says it. The run writes NoApprovalUnread too; the store writes them all when it
 // withholds an approval the run sent (AppendReply).
 const (
-	NoApprovalUnread  = "\n**No approval drafted.** The conversation agrees on approving, but since its latest review was asked for it is longer than gofer reads at once, so some of it was not read, and a message there could disagree. Hide the turns you no longer need since that review, then draft again.\n"
+	NoApprovalUnread  = "\n**No approval drafted.** The conversation agrees on approving, but it is longer than gofer reads at once, so some of it was not read, and a message there (a hold you placed, say) could disagree. Hide the turns you no longer need, then draft again.\n"
 	noApprovalToggled = "\n**No approval drafted.** The conversation agrees on approving, but a turn before the request was hidden or unhidden after this draft was asked for, so gofer cannot confirm the conversation the draft read. Draft again.\n"
 	noApprovalStale   = "\n**No approval drafted.** The conversation agrees on approving, but its latest review did not read the revision this draft is anchored to, so no approval can be drafted from it. Review the current revision, then draft again.\n"
 )

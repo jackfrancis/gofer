@@ -142,9 +142,10 @@ func runDraftReview(ctx context.Context, p Params, sink Sink, item worklist.Work
 // read) that the drafter is shown, and whether the read left earlier turns out
 // (partial). An answer whose question the read left out (WorkItem.Unpaired) is not
 // shown: alone it is no evidence of agreement, since the owner's word on it, even a
-// rejection, may have been left out with the question. An approval then needs no
-// such answer since its review was asked for (DraftBasis.Read). A read from an older
-// web tier marks no omission, so one that drops an answer is called partial.
+// rejection, may have been left out with the question. An approval needs a read
+// that left nothing out (DraftBasis.Read). A read from an older web tier marks no
+// omission, so whether it is whole is unknown, and it is always called partial: it
+// can drop whole exchanges and leave no answer unpaired.
 func draftHistory(item worklist.WorkItem, at int) (history []worklist.Message, partial bool) {
 	unpaired := item.Unpaired(at)
 	for k := range min(at, len(item.Thread)) {
@@ -152,7 +153,8 @@ func draftHistory(item worklist.WorkItem, at int) (history []worklist.Message, p
 			history = append(history, item.Thread[k])
 		}
 	}
-	return history, item.OmitsTurns(-1, at) || len(unpaired) > 0
+	named := at < len(item.Thread) && item.Thread[at].BasisNamed
+	return history, !named || item.OmitsTurns(-1, at) || len(unpaired) > 0
 }
 
 // triggerIndex is the position of the turn with key in item's thread, or the end
@@ -172,7 +174,7 @@ type staleReview struct {
 	reviewed, now worklist.Revision
 	unverifiable  string
 	noReview      bool // the conversation has no visible review
-	unread        bool // the read does not hold the latest review and every turn since it was asked for
+	unread        bool // the read does not hold the latest review and every visible turn before the request
 	approved      bool
 }
 

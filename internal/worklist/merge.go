@@ -268,7 +268,7 @@ func AppendReply(item *WorkItem, replyTo string, reply Message) (bool, error) {
 		// if no turn before the request was hidden or unhidden since it was saved, so
 		// the read the store can rebuild now is the one the run got (toggledSince:
 		// the store keeps no copy of a read); and only if that read held that review
-		// and every visible turn since its request (DraftBasis.Read). Each is judged
+		// and every visible turn before the request (DraftBasis.Read). Each is judged
 		// here whatever the run decided: a run from before these checks, or one that
 		// ignored them, never approves past an owner's word it did not read. The
 		// reply's text then says the approval was withheld, and why

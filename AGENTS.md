@@ -654,7 +654,8 @@ Wired on the web-tier side; they define what a runtime must respect:
   request" even while a redraft is redundant, and a draft run's `ThreadWindow` stays the
   newest-first window, its request naming the latest review before it with that
   review's revision, `WorkItem.DraftBasis`; an approval needs a read holding that
-  review and every visible turn since its request, which the run and the store both
+  review and every visible turn before the request (an owner's hold placed before the
+  review was asked for is not lifted by asking for one), which the run and the store both
   check, the store on the read it serves, and only while no earlier turn was hidden or
   unhidden since the request was saved, since the store keeps no copy of the read the
   run got; a draft read gives the thread a share fixed beside the largest item
@@ -665,9 +666,9 @@ Wired on the web-tier side; they define what a runtime must respect:
   rewrites the reply's text to match, `withholdApproval`, over the shared
   `worklist.ApprovalLead`/`ApprovalAlso`/`ApprovalBlock`; the drafter is not shown an
   answer whose question a cut read left out, `WorkItem.Unpaired` (in an older web
-  tier's read, which marks no omission, any answer whose question it lacks), is told
-  the conversation is partial, `DraftInput.Partial`, and an approval needs no such
-  answer since its review was asked for, `DraftBasis.Read`),
+  tier's read, which marks no omission, any answer whose question it lacks), and is
+  told the conversation is partial, `DraftInput.Partial`, whenever the read left
+  anything out or is an older web tier's, whose completeness is unknown),
   "Draft Review Comments" (offered only with commenting configured; a connect
   link without the grant) posts a `KindDraftReviewRequest` turn and dispatches a
   converse run by the default model. The button is not shown, and the handler refuses

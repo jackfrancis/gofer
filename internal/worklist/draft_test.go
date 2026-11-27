@@ -475,6 +475,37 @@ func TestWithheldApprovalOnlyDraftLeavesNoClaim(t *testing.T) {
 // every turn since the review's request is in it: "the regression test fails, do
 // not approve" answering a question asked before the review must not be filtered
 // out of an approval.
+// An owner's hold placed before a later review was asked for is not lifted by that
+// review: a read that left the hold out (the thread is longer than a read) holds
+// the review and everything since, yet approves nothing.
+func TestAppendReplyApprovalKeepsAHoldBeforeTheReview(t *testing.T) {
+	item := draftPR(
+		Message{ID: "h", Role: RoleUser, Content: "Do not approve this PR until I explicitly lift this hold."},
+		Message{ID: "ha", ReplyTo: "h", Role: RoleAgent, Content: "Understood."},
+		Message{ID: "u", Role: RoleUser, Content: "What about the docs?"},
+		Message{ID: "ua", ReplyTo: "u", Role: RoleAgent, Content: strings.Repeat("They are fine. ", 300000)}, // over a read alone
+		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true},
+	)
+	win := ThreadWindow(item, "d", MaxItemBytes)
+	n := len(win.Thread)
+	if win.Thread[0].ID != "q" || !win.Thread[0].Omitted || len(win.Unpaired(n-1)) != 0 {
+		t.Fatalf("fixture: read %d turns, first %s", n, win.Thread[0].ID)
+	}
+	if b := win.DraftBasis(n - 1); !b.Review || b.Read {
+		t.Errorf("a read that left out the owner's hold counts as whole: %+v", b)
+	}
+	d := pinned("")
+	d.Approve, d.Diff = true, testDiff
+	if _, err := AppendReply(&item, "d", Message{ID: "a", Content: ApprovalLead + " of commit `x`.\n", Draft: d}); err != nil {
+		t.Fatal(err)
+	}
+	if m := item.Thread[len(item.Thread)-1]; m.Draft != nil || !strings.Contains(m.Content, "longer than gofer reads") {
+		t.Errorf("approval kept past an owner's hold the read left out: %+v\n%s", m.Draft, m.Content)
+	}
+}
+
 func TestAppendReplyApprovalNeedsEveryAnswerSinceTheReviewShown(t *testing.T) {
 	item := draftPR(
 		Message{ID: "u", Role: RoleUser, Content: strings.Repeat("Does the regression test pass? ", 140000)}, // over a read alone

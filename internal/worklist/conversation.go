@@ -531,10 +531,10 @@ type DraftBasis struct {
 	// Revision is the revision that review recorded (ReviewedRevision).
 	Revision Revision
 	// Read is true when the read holds that review, request and answer, and every
-	// visible turn since its request, and the drafter is shown each of them (no
-	// answer since is Unpaired): nothing the owner said after asking for it, even
-	// while it stalled, and no answer since, is missing, so what the drafter reads is
-	// the whole agreement since.
+	// visible turn before the draft request, the earliest included: nothing the owner
+	// ever said is missing (a hold placed before the review was asked for is not
+	// lifted by asking for one), so what the drafter reads is the whole agreement.
+	// Only a read that is Named marks what it left out, so only it can be Read.
 	Read bool
 }
 
@@ -558,10 +558,7 @@ func (w WorkItem) DraftBasis(anchor int) DraftBasis {
 		return b
 	}
 	j, answered := w.replies()[w.TurnKey(q)]
-	b.Read = answered && j < anchor && !w.OmitsTurns(q, anchor)
-	for k := range w.Unpaired(anchor) {
-		b.Read = b.Read && k <= q
-	}
+	b.Read = b.Named && answered && j < anchor && !w.OmitsTurns(-1, anchor)
 	return b
 }
 

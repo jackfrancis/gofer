@@ -43,8 +43,10 @@ review's text is written by a model, so this feature needs that rule amended.
    before it and carries the revision that review recorded (`WorkItem.DraftBasis`),
    so the run tells a review that did not fit from none, and reports a stale revision
    first (hiding turns cannot make it current). An approval stands only on a read
-   holding that review and every visible turn since its request, an owner's word
-   posted while the review stalled included; otherwise the run withholds it and says
+   holding that review and every visible turn before the draft request, the earliest
+   included: an owner's hold placed before the review was asked for is not lifted by
+   asking for one, and the read is cut only on a thread of several megabytes, so
+   requiring all of it costs little; otherwise the run withholds it and says
    why, and the store applies the same rule to the read it serves, whatever the run
    sent. The store keeps no copy of the read a run got, so it can rebuild that read
    only while visibility is as it was: an approval whose request saw an earlier turn
@@ -65,8 +67,9 @@ review's text is written by a model, so this feature needs that rule amended.
    it is no evidence of agreement, since the owner's word on it may have been left
    out with the question. An older web tier marks no omission, so in its read any
    answer whose question is missing counts. The drafter is also told that only the
-   newest part of the conversation is shown, and an approval needs every answer since
-   its review was asked for to be shown: one left out may be the objection. A draft asked for before the latest review landed is what is stale, even if
+   newest part of the conversation is shown, whenever the read left anything out or
+   comes from an older web tier, which can drop whole exchanges and leave no answer
+   unpaired, so its completeness is unknown. A draft asked for before the latest review landed is what is stale, even if
    its reply lands after that review: the thread offers drafting again, not a review
    of that revision (`WorkItem.ReviewOutdated`). When a
    review request already has no answer (stalled, or

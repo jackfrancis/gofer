@@ -543,6 +543,12 @@ func TestDraftHistoryLeavesOutUnpairedAnswers(t *testing.T) {
 	if history, partial := draftHistory(read, 3); !partial || len(history) != 2 {
 		t.Errorf("older web tier's read: partial %v, history %+v", partial, history)
 	}
+	// Nor can it tell a read cut between whole exchanges, with no answer unpaired,
+	// from the whole conversation: it is always called partial.
+	read.Thread = read.Thread[1:]
+	if history, partial := draftHistory(read, 2); !partial || len(history) != 2 {
+		t.Errorf("older web tier's read of whole exchanges: partial %v, history %+v", partial, history)
+	}
 }
 
 // Filtering out an answer since the review was asked for leaves the drafter less
