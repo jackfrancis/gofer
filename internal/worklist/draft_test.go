@@ -470,13 +470,60 @@ func TestWithheldApprovalOnlyDraftLeavesNoClaim(t *testing.T) {
 	}
 }
 
-// A run that withheld what drafting again may draft (an approval it could not check
-// against an older web tier's read) keeps the button.
-func TestRedraftOfferedWhenTheRunSaysItHelps(t *testing.T) {
-	d1 := Message{ID: "d1", Role: RoleUser, Kind: KindDraftReviewRequest, Content: "draft", ReadRevKnown: true}
-	a1 := Message{ID: "a1", ReplyTo: "d1", Role: RoleAgent, Content: "drafted", Draft: pinned("x"), RedraftHelps: true}
-	if draftPR(d1, a1).RedraftRedundant() {
-		t.Error("a draft whose run said drafting again helps counts as redundant")
+// An answer since the review was asked for whose question the read left out is not
+// shown to the drafter (Unpaired), so the read is no whole agreement, even though
+// every turn since the review's request is in it: "the regression test fails, do
+// not approve" answering a question asked before the review must not be filtered
+// out of an approval.
+func TestAppendReplyApprovalNeedsEveryAnswerSinceTheReviewShown(t *testing.T) {
+	item := draftPR(
+		Message{ID: "u", Role: RoleUser, Content: strings.Repeat("Does the regression test pass? ", 140000)}, // over a read alone
+		Message{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		Message{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+		Message{ID: "g", ReplyTo: "u", Role: RoleAgent, Content: "The regression test fails. Do not approve until it passes."},
+		Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest, ReadRevKnown: true},
+	)
+	win := ThreadWindow(item, "d", MaxItemBytes)
+	n := len(win.Thread)
+	if win.Thread[0].ID != "q" || !win.Thread[0].Omitted || !win.Unpaired(n - 1)[2] {
+		t.Fatalf("fixture: read %d turns, first %s", n, win.Thread[0].ID)
+	}
+	if b := win.DraftBasis(n - 1); !b.Review || b.Read {
+		t.Errorf("a read whose answer since the review is filtered out counts as whole: %+v", b)
+	}
+	d := pinned("")
+	d.Approve, d.Diff = true, testDiff
+	if _, err := AppendReply(&item, "d", Message{ID: "a", Content: ApprovalLead + " of commit `x`.\n", Draft: d}); err != nil {
+		t.Fatal(err)
+	}
+	if m := item.Thread[len(item.Thread)-1]; m.Draft != nil || !strings.Contains(m.Content, "longer than gofer reads") {
+		t.Errorf("approval kept past a filtered objection: %+v\n%s", m.Draft, m.Content)
+	}
+}
+
+// A draft's read gives the thread the same share whatever the item's other fields
+// weigh: a CI summary that shrinks once failed checks pass must not let the store's
+// rebuilt read hold a turn the run's read did not.
+func TestDraftReadIndependentOfMetadata(t *testing.T) {
+	th := []Message{
+		{ID: "q", Role: RoleUser, Content: "review?", Kind: KindReviewRequest},
+		{ID: "r", ReplyTo: "q", Role: RoleAgent, Content: "LGTM", Head: testCommit, Base: "main", Diff: testDiff},
+	}
+	for i := range 45 {
+		th = append(th, Message{ID: "u" + strconv.Itoa(i), Role: RoleUser, Content: strings.Repeat("chat ", 20000)})
+	}
+	small := draftPR(append(th, Message{ID: "d", Role: RoleUser, Content: "draft", Kind: KindDraftReviewRequest})...)
+	big := small
+	big.GitHub.Title = strings.Repeat("t", 200<<10)
+	ws, wb := ThreadWindow(small, "d", MaxItemBytes), ThreadWindow(big, "d", MaxItemBytes)
+	if len(ws.Thread) >= len(small.Thread) {
+		t.Fatal("fixture: the thread should not fit")
+	}
+	if len(ws.Thread) != len(wb.Thread) || ws.Thread[0].ID != wb.Thread[0].ID {
+		t.Errorf("the read's turns depend on the item's other fields: %d (from %s) vs %d (from %s)", len(ws.Thread), ws.Thread[0].ID, len(wb.Thread), wb.Thread[0].ID)
+	}
+	if encodedSize(wb) > MaxItemBytes {
+		t.Error("the read is over budget")
 	}
 }
 

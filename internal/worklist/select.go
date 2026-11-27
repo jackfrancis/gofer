@@ -291,6 +291,17 @@ func ThreadWindow(item WorkItem, turn string, budget int) WorkItem {
 				th[anchor].Reviews = keyed.synthesisReviews(anchor, keyed.replies())
 			}
 			if th[anchor].Kind == KindDraftReviewRequest {
+				// The thread's share of a draft's read does not depend on the item's
+				// other fields (a CI summary, labels), which change without the
+				// conversation changing: it is what is left beside the largest item a
+				// read carries (MaxBriefBytes). So the store, rebuilding the read to
+				// judge an approval (readsReviewWhole), rebuilds the read the run got
+				// while the visible thread is the same, and no read of an older web tier
+				// (whose share was at least that) held less. A budget too small for
+				// that reserve (tests only) keeps the ordinary share.
+				if fixed := budget - MaxBriefBytes - len(`,"thread":[]`); fixed > 0 {
+					left = min(left, fixed)
+				}
 				// A draft approves only the revision the latest review before it read,
 				// and only on the whole conversation since that review's request: the
 				// request carries both into the read (DraftBasis), so the run can tell a

@@ -657,12 +657,17 @@ Wired on the web-tier side; they define what a runtime must respect:
   review and every visible turn since its request, which the run and the store both
   check, the store on the read it serves, and only while no earlier turn was hidden or
   unhidden since the request was saved, since the store keeps no copy of the read the
-  run got; a read from an older web tier names no review, `DraftBasis.Named`, and the
-  run withholds an approval, says to draft again, and keeps that offered,
-  `Message.RedraftHelps`; a store-withheld approval rewrites the reply's text to match,
-  `withholdApproval`, over the shared `worklist.ApprovalLead`/`ApprovalAlso`/`ApprovalBlock`;
-  the drafter is not shown an answer whose question a cut read left out,
-  `WorkItem.Unpaired`, and is told the conversation is partial, `DraftInput.Partial`),
+  run got; a draft read gives the thread a share fixed beside the largest item
+  (`MaxBriefBytes`), never what the item's other fields leave, so a CI or label change
+  cannot change the turns it holds; a read from an older web tier names no review,
+  `DraftBasis.Named`, and a run that would approve on it drafts nothing and says to
+  draft again (no draft keeps the button on any tier); a store-withheld approval
+  rewrites the reply's text to match, `withholdApproval`, over the shared
+  `worklist.ApprovalLead`/`ApprovalAlso`/`ApprovalBlock`; the drafter is not shown an
+  answer whose question a cut read left out, `WorkItem.Unpaired` (in an older web
+  tier's read, which marks no omission, any answer whose question it lacks), is told
+  the conversation is partial, `DraftInput.Partial`, and an approval needs no such
+  answer since its review was asked for, `DraftBasis.Read`),
   "Draft Review Comments" (offered only with commenting configured; a connect
   link without the grant) posts a `KindDraftReviewRequest` turn and dispatches a
   converse run by the default model. The button is not shown, and the handler refuses

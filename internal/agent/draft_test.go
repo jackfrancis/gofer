@@ -499,7 +499,8 @@ func (o olderWebTier) Item(ctx context.Context, id, turn string) (worklist.WorkI
 // A read from an older web tier names no review: the run cannot tell a missing
 // review from one it was not told about, so it withholds an approval without
 // sending the owner to a first review the thread does not offer, says to draft
-// again once the update is done, and keeps that offered (Message.RedraftHelps).
+// again once the update is done, and drafts nothing, so drafting again stays
+// offered whichever tier stores the reply.
 func TestRunConverseApprovalAgainstAnOlderWebTier(t *testing.T) {
 	sink := &memSink{items: []worklist.WorkItem{draftItem()}}
 	fd := &fakeDrafter{prop: worklist.DraftProposal{Approve: true, Comments: []worklist.DraftComment{{Path: "a.go", Line: 11, Side: "RIGHT", Body: "nit"}}}}
@@ -509,13 +510,10 @@ func TestRunConverseApprovalAgainstAnOlderWebTier(t *testing.T) {
 	}
 	it := sink.items[0]
 	m := it.Thread[len(it.Thread)-1]
-	if m.Draft == nil || m.Draft.Approve || len(m.Draft.Comments) != 1 {
-		t.Fatalf("draft against an older web tier: %+v", m.Draft)
+	if m.Draft != nil || m.Content != draftUpdatingReply || strings.Contains(m.Content, "Review this pull request") {
+		t.Fatalf("reply against an older web tier: %+v\n%s", m.Draft, m.Content)
 	}
-	if strings.Contains(m.Content, "no visible review") || strings.Contains(m.Content, "Review this pull request") || !strings.Contains(m.Content, "once the update is done") {
-		t.Errorf("reply against an older web tier:\n%s", m.Content)
-	}
-	if !m.RedraftHelps || it.RedraftRedundant() {
+	if it.RedraftRedundant() {
 		t.Error("drafting again is not kept offered")
 	}
 }
@@ -529,7 +527,7 @@ func TestDraftHistoryLeavesOutUnpairedAnswers(t *testing.T) {
 		{ID: "a", ReplyTo: "q", Role: worklist.RoleAgent, Content: "Please rename x to y.", Omitted: true},
 		{ID: "u", Role: worklist.RoleUser, Content: "and the docs?"},
 		{ID: "g", ReplyTo: "u", Role: worklist.RoleAgent, Content: "Fix the typo."},
-		{ID: "d", Role: worklist.RoleUser, Content: "draft", Kind: worklist.KindDraftReviewRequest},
+		{ID: "d", Role: worklist.RoleUser, Content: "draft", Kind: worklist.KindDraftReviewRequest, BasisNamed: true},
 	}}
 	history, partial := draftHistory(read, 3)
 	if !partial || len(history) != 2 || history[0].ID != "u" || history[1].ID != "g" {
@@ -538,6 +536,39 @@ func TestDraftHistoryLeavesOutUnpairedAnswers(t *testing.T) {
 	read.Thread[0].Omitted = false // nothing left out: the question was hidden
 	if history, partial := draftHistory(read, 3); partial || len(history) != 3 {
 		t.Errorf("whole read: partial %v, history %+v", partial, history)
+	}
+	// An older web tier marks no omission: the answer without its question is left
+	// out all the same, and the read is called partial.
+	read.Thread[3].BasisNamed = false
+	if history, partial := draftHistory(read, 3); !partial || len(history) != 2 {
+		t.Errorf("older web tier's read: partial %v, history %+v", partial, history)
+	}
+}
+
+// Filtering out an answer since the review was asked for leaves the drafter less
+// than the whole agreement since it, so no approval is drafted, though every turn
+// since the review's request fits the read.
+func TestRunConverseNoApprovalPastAFilteredAnswer(t *testing.T) {
+	it := draftItem()
+	q, r, d := it.Thread[0], it.Thread[1], it.Thread[len(it.Thread)-1]
+	it.Thread = []worklist.Message{
+		{ID: "u", Role: worklist.RoleUser, Content: strings.Repeat("Does the regression test pass? ", 140000)},
+		q, r,
+		{ID: "g", ReplyTo: "u", Role: worklist.RoleAgent, Content: "The regression test fails. Do not approve until it passes."},
+		d,
+	}
+	sink := &memSink{items: []worklist.WorkItem{it}}
+	fd := &fakeDrafter{prop: worklist.DraftProposal{Approve: true}}
+	if err := Run(context.Background(), Params{JobType: JobConverse, GitHubBaseURL: draftGitHub(t, "open"), ItemID: it.ID, Turn: "d", Converser: &fakeConverser{}, Drafter: fd},
+		fakeVendor{token: "t"}, sink); err != nil {
+		t.Fatal(err)
+	}
+	got := sink.items[0].Thread
+	if m := got[len(got)-1]; m.Draft != nil || !strings.Contains(m.Content, "longer than gofer reads") {
+		t.Errorf("approval past a filtered answer: %+v\n%s", m.Draft, m.Content)
+	}
+	if !fd.got.Partial {
+		t.Error("the drafter was not told the conversation is partial")
 	}
 }
 

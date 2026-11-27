@@ -136,11 +136,6 @@ type Message struct {
 	// with no review from one whose review it was not told about (DraftBasis.Named).
 	// It is never stored: AppendReply clears it on a reply.
 	BasisNamed bool `json:"basis_named,omitempty"`
-	// RedraftHelps marks a draft reply whose run withheld something drafting again
-	// may draft: an approval it could not check because the web tier serving its
-	// read was older than the run (DraftBasis.Named). The thread keeps offering to
-	// draft again while it is the offered draft (RedraftRedundant).
-	RedraftHelps bool `json:"redraft_helps,omitempty"`
 	// ReadRevKnown marks a draft-review request whose ReadRev was recorded. A request
 	// saved before gofer recorded revisions has none, and toggles of that time carry
 	// no HiddenRev either, so its ReadRev of 0 says nothing: such a draft never counts
@@ -536,9 +531,10 @@ type DraftBasis struct {
 	// Revision is the revision that review recorded (ReviewedRevision).
 	Revision Revision
 	// Read is true when the read holds that review, request and answer, and every
-	// visible turn since its request: nothing the owner said after asking for it,
-	// even while it stalled, is missing, so what the read shows is the whole
-	// agreement since.
+	// visible turn since its request, and the drafter is shown each of them (no
+	// answer since is Unpaired): nothing the owner said after asking for it, even
+	// while it stalled, and no answer since, is missing, so what the drafter reads is
+	// the whole agreement since.
 	Read bool
 }
 
@@ -563,18 +559,39 @@ func (w WorkItem) DraftBasis(anchor int) DraftBasis {
 	}
 	j, answered := w.replies()[w.TurnKey(q)]
 	b.Read = answered && j < anchor && !w.OmitsTurns(q, anchor)
+	for k := range w.Unpaired(anchor) {
+		b.Read = b.Read && k <= q
+	}
 	return b
 }
 
-// Unpaired reports whether the agent turn at j, in a run's read (ThreadWindow), is
-// an answer whose question the read left out: the read omits visible turns at or
-// before it (OmitsTurns), and the user turn it answers is not in the read. Read
-// alone, such an answer is no evidence of what the conversation agreed, since the
-// owner's word on it may have been left out with the question. An answer to a
-// hidden question, in a read that omits nothing before it, is not unpaired: the
-// owner chose to keep it.
-func (w WorkItem) Unpaired(j int) bool {
-	return j >= 0 && j < len(w.Thread) && w.Thread[j].Role == RoleAgent && w.requestOf(j) < 0 && w.OmitsTurns(-1, j)
+// Unpaired returns the positions, before the draft-review request at anchor in a
+// run's read (ThreadWindow), of the answers whose question the read left out: the
+// user turn an answer replies to is not in the read, and the read omits visible
+// turns at or before the answer (OmitsTurns). Read alone, such an answer is no
+// evidence of what the conversation agreed, since the owner's word on it may have
+// been left out with the question. An answer to a hidden question, in a read that
+// omits nothing before it, is not unpaired: the owner chose to keep it. A read whose
+// request is not BasisNamed comes from an older web tier, which marks no omission,
+// so there every answer whose question the read does not hold is unpaired. A system
+// notice is no answer. One pass: an answer always follows its question.
+func (w WorkItem) Unpaired(anchor int) map[int]bool {
+	end := min(max(anchor, 0), len(w.Thread))
+	omitted := anchor >= len(w.Thread) || anchor < 0 || !w.Thread[anchor].BasisNamed
+	held := map[string]bool{}
+	out := map[int]bool{}
+	for j, m := range w.Thread[:end] {
+		omitted = omitted || m.Omitted
+		switch {
+		case m.Role == RoleUser:
+			held[w.TurnKey(j)] = true
+		case m.Notice != "" || !omitted:
+		case m.ReplyTo != "" && !held[m.ReplyTo],
+			m.ReplyTo == "" && (j == 0 || w.Thread[j-1].Role != RoleUser):
+			out[j] = true
+		}
+	}
+	return out
 }
 
 // OmitsTurns reports whether a run's read (ThreadWindow) left out visible turns

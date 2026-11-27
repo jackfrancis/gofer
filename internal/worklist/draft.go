@@ -452,7 +452,6 @@ func (w WorkItem) latestDraft() (req, reply int) {
 // slow first run's draft is still judged by what it could have read. A request
 // saved before revisions were recorded (no ReadRevKnown) cannot be judged so, and
 // its draft never counts as redundant: the thread keeps the button, as it did then.
-// Nor does a draft whose run said drafting again may help (Message.RedraftHelps).
 // A toggle after
 // the request but before its run read the thread counts too, which errs toward
 // offering the button. A confirmed draft (any receipt) is used up: the thread says to
@@ -471,7 +470,7 @@ func (w WorkItem) RedraftRedundant() bool {
 	if !w.Thread[i].Draft.For(w) || !w.Thread[i].Draft.Current() || w.Thread[i].DraftReceipt != nil {
 		return false
 	}
-	if w.toggledSince(req) || w.Thread[i].RedraftHelps {
+	if w.toggledSince(req) {
 		return false
 	}
 	for j := req + 1; j < len(w.Thread); j++ {

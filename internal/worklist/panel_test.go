@@ -394,20 +394,30 @@ func TestUnpairedAnswers(t *testing.T) {
 	if len(win.Thread) < 2 || win.Thread[0].ID != "a" {
 		t.Fatal("fixture: no budget makes the late answer the read's first turn")
 	}
-	if !win.Unpaired(0) {
-		t.Error("an answer whose question the read left out is not unpaired")
+	if !win.Thread[len(win.Thread)-1].BasisNamed {
+		t.Fatal("fixture: the read does not name its basis")
 	}
-	for k := 1; k < len(win.Thread); k++ {
-		if win.Unpaired(k) {
-			t.Errorf("turn %s, whose question the read holds, is unpaired", win.Thread[k].ID)
-		}
+	n := len(win.Thread)
+	if u := win.Unpaired(n - 1); len(u) != 1 || !u[0] {
+		t.Errorf("unpaired in the cut read = %v, want only the late answer", u)
+	}
+	// An older web tier marks no omission: an answer whose question it does not hold
+	// is unpaired all the same.
+	legacy := win
+	legacy.Thread = slices.Clone(win.Thread)
+	legacy.Thread[0].Omitted, legacy.Thread[n-1].BasisNamed = false, false
+	if u := legacy.Unpaired(n - 1); len(u) != 1 || !u[0] {
+		t.Errorf("unpaired in an older web tier's read = %v, want only the late answer", u)
 	}
 	whole := ThreadWindow(w, "d", MaxItemBytes)
 	hidden := whole
 	hidden.Thread = slices.Clone(whole.Thread)
 	hidden.Thread = hidden.Thread[1:] // the question hidden: not in the read, and no gap marked
-	if hidden.Unpaired(1) || whole.Unpaired(2) {
-		t.Error("an answer to a hidden question, or one with its question, is unpaired")
+	if u := hidden.Unpaired(len(hidden.Thread) - 1); len(u) != 0 {
+		t.Errorf("an answer to a hidden question is unpaired: %v", u)
+	}
+	if u := whole.Unpaired(len(whole.Thread) - 1); len(u) != 0 {
+		t.Errorf("an answer with its question is unpaired: %v", u)
 	}
 }
 
